@@ -1,0 +1,70 @@
+#------------------------------------------------------------------------------
+#$Date: 2017-10-15 03:23:08 +0300 (Sun, 15 Oct 2017) $
+#$Revision: 202022 $
+#$URL: file:///home/coder/svn-repositories/cod/cif/2/10/14/2101499.cif $
+#------------------------------------------------------------------------------
+#
+# This file is available in the Crystallography Open Database (COD),
+# http://www.crystallography.net/. The original data for this entry
+# were provided by IUCr Journals, http://journals.iucr.org/.
+#
+# The file may be used within the scientific community so long as
+# proper attribution is given to the journal article from which the
+# data were obtained.
+#
+data_2101499
+loop_
+_publ_author_name
+'Yamanaka, T.'
+'Morimoto, S.'
+_publ_section_title
+;
+ Isotope effect on anharmonic thermal atomic vibration and \k
+ refinement of ^12^C and ^3^C diamond
+;
+_journal_issue                   2
+_journal_name_full               'Acta Crystallographica Section B'
+_journal_page_first              232
+_journal_page_last               238
+_journal_paper_doi               10.1107/S0108768195010810
+_journal_volume                  52
+_journal_year                    1996
+_chemical_formula_moiety         C1
+_chemical_formula_sum            C
+_symmetry_cell_setting           cubic
+_symmetry_space_group_name_Hall  '-F 4vw 2vw 3'
+_symmetry_space_group_name_H-M   'F d -3 m'
+_cell_angle_alpha                90.0
+_cell_angle_beta                 90.0
+_cell_angle_gamma                90.0
+_cell_formula_units_Z            8
+_cell_length_a                   3.56658(7)
+_cell_length_b                   3.56658(7)
+_cell_length_c                   3.56658(7)
+_cell_volume                     45.3687(15)
+_diffrn_radiation_type           synchroton
+_diffrn_radiation_wavelength     0.69715(3)
+_cod_data_source_file            oh0046.cif
+_cod_data_source_block           oh0046a
+_cod_original_cell_volume        45.381
+_cod_original_sg_symbol_H-M      'F d -3 m {origin @ centre (-3m)}'
+_cod_original_formula_sum        C1
+_cod_database_code               2101499
+loop_
+_atom_site_label
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_U_iso_or_equiv
+C 0.375 0.375 0.375 0.01
+loop_
+_cod_related_entry_id
+_cod_related_entry_database
+_cod_related_entry_code
+1 MPOD 1000017
+2 MPOD 1000101
+3 MPOD 1000234
+4 MPOD 1000280
+5 MPOD 1000299
+6 MPOD 1000300
+7 MPOD 1000311
