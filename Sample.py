@@ -384,7 +384,8 @@ class sample:
             chunk_position -> vector of chunk origin position.
             chunk_dimension -> array of number of unit cells per chunk direction.
         Outputs:
-            atomic_positions_S -> the position of lattice sites in the sample frame
+            atomic_positions_S -> the position of lattice sites in the sample frame (GPU)
+            atomic_species -> the species of the lattice sites in the sample frame (CPU)
         '''
         ## Todo: Add species to this.
         lattice_atom_cartesian_cp = cp.asarray(material.lattice_atom_cartesian,dtype=cp.float32)
@@ -420,16 +421,55 @@ class sample:
         lattice_positions_S = lattice_positions_C@lattice_matrix_cp + chunk_position_cp
         return lattice_positions_S
     
-    def generate_sample(self,material): #incomplete
-        ## Todo: Add accumulation of chunks (modify chunk total and save large enough chunks on the fly)
-        # Also need to output species
+    def generate_sample(self, material, flush_size=100000000):
+        """
+        Accumulates the atomic positions/species from each geometric chunk.
+        Each written chunk will contain exactly `flush_size` atoms, except
+        for the last chunk if there are fewer than `flush_size` atoms left.
+        """
+        # 1) Determine the geometric chunk positions for the sample
         self._chunk_positions, self._chunk_dimensions = self.get_chunk_positions(material)
-        self._chunk_total = self.chunk_positions.shape[0] #need to change chunk total once accumulation gets implemented
+        self._chunk_total = self.chunk_positions.shape[0]
+        # 2) Prepare accumulators (lists) in CPU memory
+        acc_positions = []
+        acc_species = []
+        # We'll use this to name each *written* chunk
+        file_chunk_index = 1
+        # 3) Loop over all geometric chunks
         for i in range(self.chunk_total):
-            atomic_positions,atomic_species = self.get_atomic_data(material,self.chunk_positions[i,:],self.chunk_dimensions)
-            self.write_chunk_positions(atomic_positions,i+1)
-            self.write_chunk_species(atomic_species,i+1)
+            # -- a) Get atomic data on the GPU
+            atomic_positions_gpu, atomic_species = self.get_atomic_data(material, self.chunk_positions[i, :], self.chunk_dimensions)
+            # -- b) Bring data back to CPU
+            atomic_positions = atomic_positions_gpu.get()  # shape (N, 3)
+            acc_positions.append(atomic_positions)
+            acc_species.append(atomic_species)
+            # -- d) While total atoms >= flush_size, write out exactly 50,000,000
+            while sum(arr.shape[0] for arr in acc_positions) >= flush_size:
+                # Concatenate all accumulated so far
+                cat_positions = np.concatenate(acc_positions, axis=0)
+                cat_species   = np.concatenate(acc_species,   axis=0)
+                # Slice out exactly flush_size atoms
+                chunk_positions = cat_positions[:flush_size]
+                chunk_species   = cat_species[:flush_size]
+                # Write them as one file-chunk
+                self.write_chunk_positions(chunk_positions, file_chunk_index)
+                self.write_chunk_species(chunk_species, file_chunk_index)
+                file_chunk_index += 1
+                # Put leftover back into accumulators
+                leftover_positions = cat_positions[flush_size:]
+                leftover_species   = cat_species[flush_size:]
+                acc_positions = [leftover_positions] if leftover_positions.size > 0 else []
+                acc_species   = [leftover_species] if leftover_species.size > 0 else []
+        # 4) After processing all geometric chunks, check for leftover < flush_size
+        leftover_atoms = sum(arr.shape[0] for arr in acc_positions)
+        if leftover_atoms > 0:
+            cat_positions = np.concatenate(acc_positions, axis=0)
+            cat_species   = np.concatenate(acc_species, axis=0)
+            # Final chunk (possibly less than flush_size)
+            self.write_chunk_positions(cat_positions, file_chunk_index)
+            self.write_chunk_species(cat_species, file_chunk_index)
         return
+
     
     def plot_sample(self,elev=0, azim=0):
         import matplotlib.pyplot as plt
