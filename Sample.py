@@ -18,9 +18,9 @@ class sample:
     ## Initialization
     def __init__(self,directory=os.getcwd()):
         self.directory = directory
-        self.dimensions = None #Todo: make property
-        self.offset = None #Todo: make property
-        self.chunk_volume = None #Todo: make property
+        self._dimensions = None #Todo: make property
+        self._offset = None #Todo: make property
+        self._chunk_volume = None #Todo: make property
         self._chunk_total = None 
         self._matrix = None
         self._corners = None
@@ -30,9 +30,11 @@ class sample:
             os.makedirs(self.directory)
             
     def create_sample(self,dimensions,offset=[0,0,0],chunk_volume=(600*600*600)):
-        self.dimensions = np.array(dimensions,dtype=np.float32)
-        self.offset = np.array(offset,dtype=np.float32)
-        self.chunk_volume = np.array(chunk_volume,dtype=np.float32)
+        self._dimensions = np.array(dimensions,dtype=np.float32)
+        self._offset = np.array(offset,dtype=np.float32)
+        self._chunk_volume = np.array(chunk_volume,dtype=np.float32)
+        self._matrix = np.diag(self.dimensions)
+        self._corners = self.get_unit_corners()@self.matrix - self.dimensions/2 + self.offset
         
     def read_sample(self): #incomplete
         ## Once write format is complete, finish this.
@@ -117,7 +119,6 @@ class sample:
         c_source = r'''
         #include <math.h>
         #include <stdlib.h> // for malloc/free if needed
-
         // Dot product
         static double dot3(const double *a, const double *b){
             return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
@@ -293,16 +294,12 @@ class sample:
             return 0; // success
         }
         '''
-
         # Create CFFI instance
         ffi_obj = FFI()
-
         # Provide the C prototypes
         ffi_obj.cdef("""int check_parallelepipeds_intersect_batch(const double *all_pts1,const double *pts2,double eps,int n,int *out_intersect);""")
-
         # Compile and link in-memory
         C_mod = ffi_obj.verify(c_source,extra_compile_args=["-O3"],libraries=[])
-
         return ffi_obj, C_mod
         
     ## Main Functions
@@ -434,7 +431,7 @@ class sample:
         acc_positions = []
         acc_species = []
         # We'll use this to name each *written* chunk
-        file_chunk_index = 1
+        file_chunk_index = 0
         # 3) Loop over all geometric chunks
         for i in range(self.chunk_total):
             # -- a) Get atomic data on the GPU
@@ -452,9 +449,9 @@ class sample:
                 chunk_positions = cat_positions[:flush_size]
                 chunk_species   = cat_species[:flush_size]
                 # Write them as one file-chunk
+                file_chunk_index += 1
                 self.write_chunk_positions(chunk_positions, file_chunk_index)
                 self.write_chunk_species(chunk_species, file_chunk_index)
-                file_chunk_index += 1
                 # Put leftover back into accumulators
                 leftover_positions = cat_positions[flush_size:]
                 leftover_species   = cat_species[flush_size:]
@@ -466,8 +463,10 @@ class sample:
             cat_positions = np.concatenate(acc_positions, axis=0)
             cat_species   = np.concatenate(acc_species, axis=0)
             # Final chunk (possibly less than flush_size)
+            file_chunk_index += 1
             self.write_chunk_positions(cat_positions, file_chunk_index)
             self.write_chunk_species(cat_species, file_chunk_index)
+        self._chunk_total = file_chunk_index
         return
 
     
@@ -489,6 +488,33 @@ class sample:
         return fig, ax1
         
     ## Properties
+    @property
+    def dimensions(self):
+        """
+        Return the 3x3 matrix of vectors (as a NumPy array).
+        """
+        if self._dimensions is None:
+            print("self._dimensions has not been initialized yet")
+        return self._dimensions
+
+    @property
+    def offset(self):
+        """
+        Return the offset of the .
+        """
+        if self._offset is None:
+            print("self._offset has not been initialized yet")
+        return self._offset
+
+    @property
+    def chunk_volume(self):
+        """
+        Return the chunk volume.
+        """
+        if self._chunk_volume is None:
+            print("self._chunk_volume has not been initialized yet")
+        return self._chunk_volume
+
     @property
     def matrix(self): #fix for new convention
         """
