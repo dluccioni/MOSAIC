@@ -18,14 +18,13 @@ class sample:
     ## Initialization
     def __init__(self,directory=os.getcwd()):
         self.directory = directory
-        self._dimensions = None #Todo: make property
-        self._offset = None #Todo: make property
-        self._chunk_volume = None #Todo: make property
+        self._dimensions = None
+        self._offset = None
+        self._chunk_volume = None
         self._chunk_total = None 
         self._matrix = None
         self._corners = None
         self._default_filenames = np.array(["atomic_positions.npy","atomic_species.npy","sample_metadata.npy"]) #sample_metadata will be a struct
-        # self._chunk_filenames = None
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
             
@@ -39,9 +38,9 @@ class sample:
     def read_sample(self): #incomplete
         ## Once write format is complete, finish this.
         ## Reads sample metadata
-        self.dimensions = None
-        self.offset = None
-        self.chunk_volume = None
+        self._dimensions = None
+        self._offset = None
+        self._chunk_volume = None
         self._chunk_total = None
     
     ## Data Handling Functions
@@ -384,7 +383,6 @@ class sample:
             atomic_positions_S -> the position of lattice sites in the sample frame (GPU)
             atomic_species -> the species of the lattice sites in the sample frame (CPU)
         '''
-        ## Todo: Add species to this.
         lattice_atom_cartesian_cp = cp.asarray(material.lattice_atom_cartesian,dtype=cp.float32)
         lattice_positions_cp = self.get_lattice_positions(material,chunk_position,chunk_dimensions)
         # Cast atomic positions together with lattice positions to get full array of positions
