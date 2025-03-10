@@ -6,11 +6,10 @@ import cupy as cp
 import pandas as pd
 import pickle
 import os
+import sys
 import gc
 import threading
-import sys
-sys.path.insert(1, 'X://Dresselhaus Lab/Code/Phase Retreival/Wave_Optics/waveoptics_fwrd_sim/')
-
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + '\databases')
 # -----------------------------------------------------------------------------
 # Class
 # -----------------------------------------------------------------------------
@@ -438,10 +437,10 @@ class beam:
         Loads the entire f0 database for all elements in the file.
         Returns a dict: { "H": [a1, a2, a3, a4, a5, c, b1, b2, b3, b4, b5], ... }
         """
-        import databases
+        import scattering
         import importlib.resources as pkg_resources
         db_dict = {}
-        db_file = pkg_resources.open_text(databases, database_name)
+        db_file = pkg_resources.open_text(scattering, database_name)
         element = None
         for line in db_file:
             if line.startswith('#S'):
@@ -458,10 +457,10 @@ class beam:
         Loads the entire f1f2 database for all elements.
         Returns a dict: { "H": array([[E1, f1_1, f2_1],[E2, f1_2, f2_2],...]), ... }
         """
-        import databases
+        import scattering
         import importlib.resources as pkg_resources
         f1f2_dict = {}
-        db_file = pkg_resources.open_text(databases, database_name)
+        db_file = pkg_resources.open_text(scattering, database_name)
         element = None
         param_list = []
         for line in db_file:
