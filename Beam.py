@@ -2,13 +2,18 @@
 # Modules
 # -----------------------------------------------------------------------------
 import numpy as np
-import cupy as cp
 import pandas as pd
 import pickle
 import os
 import sys
 import gc
 import threading
+try:
+    import cupy as cp
+except ImportError:
+    print("No cupy detected, changing over to CPU mode")
+    cp = None
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + '\databases')
 
 # -----------------------------------------------------------------------------
@@ -52,13 +57,13 @@ class beam:
         beam_metadata = [self._energy]
 
     ## Static Functions
+    # GPU kernal
     @staticmethod
     def build_interaction_kernel():
         """
         Returns the precompiled CuPy RawKernel object for computing scattering
-        with a shared-memory approach.
+        with a shared-memory approach. Only invoked if `cp` is not None.
         """
-        # Includes both fastmath and shared memory tiling over standard (fastest)
         _cuda_source_memtile = r'''
         #define CHUNK_SIZE 128
         extern "C" {
@@ -168,12 +173,12 @@ class beam:
 
                         float r_det = sqrtf(dx*dx + dy*dy + dz*dz);
                         if (r_det == 0.0f) {
-                            // If the pixel is exactly at the atom's location, skip
+                            // If pixel is exactly at the atom's location, skip
                             continue;
                         }
 
                         float rdx = dx / r_det;
-                        // Q_val = k*sqrt(2*(1 - rdx))
+                        // Q_val = k * sqrt(2*(1 - rdx))
                         float Q_val = k * __fsqrt_rn(2.0f * (1.0f - rdx));
 
                         // Evaluate f0
@@ -212,14 +217,14 @@ class beam:
         }
         }
         '''
-        mod = cp.RawModule(
+        # Build raw module
+        kernel_module = cp.RawModule(
             code=_cuda_source_memtile,
             backend='nvcc',
-            options=('--gpu-architecture=sm_89','-O3','--ftz=true','--fmad=true')
+            options=('--gpu-architecture=sm_89', '-O3', '--ftz=true', '--fmad=true')
         )
-        kernel = mod.get_function('interaction_kernal')
-        return kernel
-    
+        return kernel_module.get_function('interaction_kernal')
+
     @staticmethod
     def parse_f0_db_all(database_name='f0_WaasKirf.dat'):
         """
@@ -290,93 +295,249 @@ class beam:
         return f1 + 1j*f2
 
     ## Main Functions
-    def atomic_direct_scattering(self, sample, detector, offset=0):
+    # CPU function
+    def cpu_scatter_chunk(self,chunk_id,sample,Nx,Ny,x_coords_cpu,y_coords_cpu,z_coords_cpu,db_dict_f0_all,db_dict_f1f2_all,k_val):
         """
-        If multigpu=True, call the multi-GPU version; otherwise fallback to single-GPU.
+        Compute the partial scattering field for a single chunk (CPU path).
+        Returns a (Ny, Nx) complex64 array.
         """
-        measurement_positions = detector.pixel_coordinates
-        Nx, Ny = detector.shape
-        pixel_values = self.interact_beam(sample, measurement_positions, (Nx, Ny))
-        detector.input_pixel_values(pixel_values - offset)
-    
-    def interact_beam(self, sample, measurement_positions, measurement_shape):
+        # Load species
+        species_chunk_np = sample.load_chunk_species(chunk_id, gpu=False)
+        atom_count = species_chunk_np.shape[0]
+        if atom_count == 0:
+            return np.zeros((Ny, Nx), dtype=np.complex64)
+
+        # Build scattering arrays
+        scattering_anom_np = np.zeros(atom_count, dtype=np.complex64)
+        f0_params_np       = np.zeros((atom_count, 11), dtype=np.float32)
+
+        unique_elements = pd.unique(species_chunk_np)
+        for el in unique_elements:
+            if el not in db_dict_f0_all:
+                continue
+            mask = (species_chunk_np == el)
+            # f1, f2
+            table = db_dict_f1f2_all.get(el, None)
+            if table is not None:
+                scattering_anom_np[mask] = self.get_f1f2_from_params(self._energy, table)
+            # f0
+            f0_params_np[mask] = db_dict_f0_all[el]
+
+        # Load positions
+        positions_chunk = sample.load_chunk_positions(chunk_id, gpu=False)  # shape (atom_count, 3)
+        # Convert to meters
+        px = positions_chunk[:, 0] / 1e10
+        py = positions_chunk[:, 1] / 1e10
+        pz = positions_chunk[:, 2] / 1e10
+
+        # Flatten the detector coords for convenience
+        # We'll accumulate into a (Ny, Nx) array
+        partial_field = np.zeros((Ny, Nx), dtype=np.complex64)
+
+        # Evaluate scattering
+        # Naive approach: for each atom, for each pixel
+        #   1) distance
+        #   2) Q_val
+        #   3) f0 from f0_params
+        #   4) sum the complex field
+        # This is O(Nx*Ny * nAtoms). For large Nx,Ny, consider chunking further if needed.
+        for atom_idx in range(atom_count):
+            ax, ay, az = px[atom_idx], py[atom_idx], pz[atom_idx]
+            f0p = f0_params_np[atom_idx]  # shape (11,)
+            s_anom = scattering_anom_np[atom_idx]
+
+            for iy in range(Ny):
+                for ix in range(Nx):
+                    dx = x_coords_cpu[iy*Nx + ix]/1e10 - ax  # also in meters
+                    dy = y_coords_cpu[iy*Nx + ix]/1e10 - ay
+                    dz = z_coords_cpu[iy*Nx + ix]/1e10 - az
+                    r_det = np.sqrt(dx*dx + dy*dy + dz*dz)
+                    if r_det == 0.0:
+                        continue  # skip
+
+                    rdx = dx / r_det
+                    # Q_val = k * sqrt(2*(1 - rdx))
+                    Q_val = k_val * np.sqrt(2.0 * (1.0 - rdx))
+
+                    # Evaluate f0(Q_val, f0p)
+                    # f0_params layout: [a1,a2,a3,a4,a5, c, b1,b2,b3,b4,b5]
+                    c = f0p[5]
+                    f0_val = c
+                    # k = 0.25f * Q_val * 1.0e-10f / pi  in GPU
+                    # We'll replicate it closely in Python
+                    pi_f = 3.141592653589793
+                    ktmp = 0.25 * Q_val * 1.0e-10 / pi_f
+                    ktmp2 = ktmp * ktmp
+
+                    for i in range(5):
+                        ai = f0p[i]
+                        bi = f0p[6 + i]
+                        f0_val += ai * np.exp(-bi * ktmp2)
+
+                    # Add anomalous
+                    s_tot = f0_val + s_anom  # complex: real + complex64
+
+                    # Phase = k * (atom_x + r_det)
+                    phase = k_val * (ax + r_det)
+                    cph = np.cos(phase)
+                    sph = np.sin(phase)
+
+                    val_real = s_tot.real * cph - s_tot.imag * sph
+                    val_imag = s_tot.real * sph + s_tot.imag * cph
+
+                    partial_field[iy, ix] += (val_real + 1j*val_imag)
+
+        return partial_field
+
+    # CPU function
+    def interact_beam_cpu(self, sample, measurement_positions, measurement_shape):
         """
-        Perform beam-sample interaction using multiple GPUs in parallel,
-        assigning one CPU thread per GPU. Each thread processes a subset
-        of sample chunks and accumulates partial scattering results, which
-        are then summed on the CPU.
+        Multi-threaded CPU approach. Splits sample chunks among threads
+        and accumulates partial fields.
         """
-        # Number of GPUs available
-        n_gpus = cp.cuda.runtime.getDeviceCount()
-        print(f"Found {n_gpus} GPU(s).")
-        # Prepare constants in CPU memory (will be copied to each GPU thread)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        Nx, Ny = measurement_shape
+
+        # Parse DB on CPU
         db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
         db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
+
+        # Precompute wave number
+        k_val = 2.0 * np.pi / self._wavelength
+        k_val = np.float32(k_val)
+
+        # Flattened coords
+        if cp is not None and isinstance(measurement_positions, cp.ndarray):
+            measurement_positions = measurement_positions.get()
+        x_coords_cpu = measurement_positions[0, :].astype(np.float32)
+        y_coords_cpu = measurement_positions[1, :].astype(np.float32)
+        z_coords_cpu = measurement_positions[2, :].astype(np.float32)
+
+        chunk_total = sample.chunk_total
+        if chunk_total == 0:
+            return np.zeros((Ny, Nx), dtype=np.complex64)
+
+        # We'll launch one thread per chunk, or fewer if chunk_total > core_count
+        # Typically, you'll want min(chunk_total, #hardware threads).
+        import multiprocessing
+        max_threads = multiprocessing.cpu_count()
+        n_threads = min(chunk_total, max_threads)
+
+        # Worker function calls the chunk CPU scatter
+        def worker(chunk_id):
+            return self.cpu_scatter_chunk(
+                chunk_id, sample, Nx, Ny,
+                x_coords_cpu, y_coords_cpu, z_coords_cpu,
+                db_dict_f0_all, db_dict_f1f2_all, k_val
+            )
+
+        # Collect partial results in parallel
+        final_result = np.zeros((Ny, Nx), dtype=np.complex64)
+
+        # We'll assign chunk IDs from 1..chunk_total
+        chunk_ids = range(1, chunk_total+1)
+
+        with ThreadPoolExecutor(max_workers=n_threads) as exe:
+            futures = {exe.submit(worker, cid): cid for cid in chunk_ids}
+            for fut in as_completed(futures):
+                partial_2d = fut.result()
+                final_result += partial_2d
+
+        return final_result
+
+    # GPU function
+    def interact_beam_gpu(self, sample, measurement_positions, measurement_shape):
+        """
+        Perform beam-sample interaction using all available GPUs in parallel,
+        chunk-based. Each GPU gets a subset of chunks. Summation on CPU.
+        """
+        if cp is None:
+            # If somehow called without cupy installed, fallback to CPU
+            print("[beam] Cupy not installed, falling back to CPU mode.")
+            return self.interact_beam_cpu(sample, measurement_positions, measurement_shape)
+
+        n_gpus = cp.cuda.runtime.getDeviceCount()
+        if n_gpus < 1:
+            print("[beam] No GPUs found, falling back to CPU mode.")
+            return self.interact_beam_cpu(sample, measurement_positions, measurement_shape)
+
+        print(f"[beam] Found {n_gpus} GPU(s).")
+        db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
+        db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
+
         Nx, Ny = measurement_shape
         k_val = np.float32(2.0 * np.pi / self._wavelength)
+
         # Convert measurement_positions to float32 CPU arrays
         x_coords_cpu = measurement_positions[0, :].astype(np.float32)
         y_coords_cpu = measurement_positions[1, :].astype(np.float32)
         z_coords_cpu = measurement_positions[2, :].astype(np.float32)
+
         chunk_total = sample.chunk_total
-        print(f"Total of {chunk_total} chunk(s) to process.")
-        # We will divide the chunk indices among the GPUs
-        # (contiguous split in this example)
+        print(f"[beam] Total of {chunk_total} chunk(s) to process.")
+
+        # Divide chunk indices among GPUs
         chunks_per_gpu = chunk_total // n_gpus
         remainder = chunk_total % n_gpus
-        # A place to store each GPU's partial result (on CPU)
+
+        # A place to store partial results
         partial_results = [None] * n_gpus
 
         def gpu_worker(gpu_id, chunk_indices, result_index):
-            """
-            Runs on a single GPU (gpu_id), processes the given chunk_indices,
-            and stores the final partial detector array in partial_results[result_index].
-            """
-            cp.cuda.Device(gpu_id).use()  # Select GPU
-            # Build the kernel inside this thread (optional; can also build globally)
+            """One thread per GPU."""
+            cp.cuda.Device(gpu_id).use()
             interaction_kernel = self.build_interaction_kernel()
-            # Allocate GPU arrays for coordinates & output
+
+            # Copy coordinate arrays to this GPU
             x_coords_gpu = cp.asarray(x_coords_cpu, dtype=cp.float32)
             y_coords_gpu = cp.asarray(y_coords_cpu, dtype=cp.float32)
             z_coords_gpu = cp.asarray(z_coords_cpu, dtype=cp.float32)
+
             detector_field_gpu = cp.zeros((Nx * Ny,), dtype=cp.complex64)
-            # We can create a few streams to overlap chunk processing on this GPU
+
+            # Use streams for concurrency on that GPU
             num_streams = 4
             streams = [cp.cuda.Stream() for _ in range(num_streams)]
+
             block_size = (16, 16)
             grid_size = ((Nx + block_size[0] - 1) // block_size[0],
                          (Ny + block_size[1] - 1) // block_size[1])
-            # Process assigned chunks on this GPU
-            for i, chunk_id in enumerate(chunk_indices):
+
+            for i, cidx in enumerate(chunk_indices):
                 stream = streams[i % num_streams]
+
                 # Load species (CPU)
-                species_chunk_np = sample.load_chunk_species(chunk_id, gpu=False)
+                species_chunk_np = sample.load_chunk_species(cidx, gpu=False)
                 atom_count = species_chunk_np.shape[0]
                 if atom_count == 0:
                     continue
-                # Prepare arrays on CPU
+
+                # Build scattering arrays on CPU
                 scattering_anom_np = np.zeros(atom_count, dtype=np.complex64)
-                f0_params_np = np.zeros((atom_count, 11), dtype=np.float32)
+                f0_params_np       = np.zeros((atom_count, 11), dtype=np.float32)
+
                 unique_elements = pd.unique(species_chunk_np)
                 for el in unique_elements:
                     if el not in db_dict_f0_all:
-                        continue  # skip missing
+                        continue
                     mask = (species_chunk_np == el)
-                    # f1,f2
+                    # Interpolate f1,f2
                     table = db_dict_f1f2_all.get(el, None)
                     if table is not None:
                         scattering_anom_np[mask] = self.get_f1f2_from_params(self._energy, table)
                     # f0
                     f0_params_np[mask] = db_dict_f0_all[el]
-                # Transfer positions & scattering arrays to GPU
+
                 with stream:
-                    # positions_chunk can be loaded directly in GPU format
-                    positions_chunk_cp = cp.array(sample.load_chunk_positions(chunk_id, gpu=True),dtype=cp.float32)
+                    positions_chunk_cp = cp.array(sample.load_chunk_positions(cidx, gpu=True),
+                                                  dtype=cp.float32)
                     px = positions_chunk_cp[:, 0] / 1e10
                     py = positions_chunk_cp[:, 1] / 1e10
                     pz = positions_chunk_cp[:, 2] / 1e10
+
                     scattering_anom_cp = cp.asarray(scattering_anom_np)
-                    f0_params_cp = cp.asarray(f0_params_np)
+                    f0_params_cp       = cp.asarray(f0_params_np)
+
                     interaction_kernel(
                         grid_size,
                         block_size,
@@ -393,41 +554,79 @@ class beam:
                             z_coords_gpu / 1e10,
                             detector_field_gpu,
                             np.int32(Nx),
-                            np.int32(Ny),
+                            np.int32(Ny)
                         ),
                         stream=stream
                     )
-            # Wait for all chunks on this GPU to finish
+
+            # Sync streams
             for s in streams:
                 s.synchronize()
-            # Bring partial result back to CPU
+
+            # Copy partial back to CPU
             partial_results[result_index] = detector_field_gpu.reshape((Ny, Nx)).get()
-            # Cleanup GPU memory
+
+            # Cleanup
             del x_coords_gpu, y_coords_gpu, z_coords_gpu
             del detector_field_gpu
             for s in streams:
                 del s
             cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
-        # Create and start threads
+
+        # Launch one thread per GPU
         threads = []
         start_chunk = 1
         for gpu_id in range(n_gpus):
-            # Determine which chunks this GPU should handle
             my_count = chunks_per_gpu + (1 if gpu_id < remainder else 0)
             end_chunk = start_chunk + my_count
             chunk_indices = list(range(start_chunk, end_chunk))
             start_chunk = end_chunk
-            t = threading.Thread(target=gpu_worker,args=(gpu_id, chunk_indices, gpu_id))
+
+            t = threading.Thread(target=gpu_worker, args=(gpu_id, chunk_indices, gpu_id))
             t.start()
             threads.append(t)
-        # Join threads
+
+        # Join
         for t in threads:
             t.join()
-        # Sum partial results on CPU
+
+        # Sum partial results
         final_result = np.zeros((Ny, Nx), dtype=np.complex64)
         for pr in partial_results:
             if pr is not None:
                 final_result += pr
+
         return final_result
 
+    # Main API
+    def atomic_direct_scattering(self, sample, detector, offset=0, use_gpu=True):
+        """
+        High-level entry point for beam-sample scattering.
+        Parameters
+        ----------
+        sample : object
+            Must provide 'chunk_total', 'load_chunk_species(i)', 
+            'load_chunk_positions(i)', etc.
+        detector : object
+            Must provide 'pixel_coordinates' (shape (3, Nx*Ny)) and 'shape' -> (Nx, Ny).
+            Also must provide 'input_pixel_values(...)' method.
+        offset : float
+            Offset to subtract from final result.
+        use_gpu : bool
+            If True and cupy is installed with GPU(s) available, use GPU. Otherwise CPU.
+        """
+        measurement_positions = detector.pixel_coordinates
+        Nx, Ny = detector.shape
+
+        # Check if we can run GPU
+        if use_gpu and (cp is not None):
+            # Attempt GPU path
+            final_field = self.interact_beam_gpu(sample, measurement_positions, (Nx, Ny))
+        else:
+            # CPU fallback
+            if cp is None and use_gpu:
+                print("[beam] Cupy not installed, running CPU mode.")
+            final_field = self.interact_beam_cpu(sample, measurement_positions, (Nx, Ny))
+
+        detector.input_pixel_values(final_field - offset)
