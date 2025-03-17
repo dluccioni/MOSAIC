@@ -2,11 +2,15 @@
 # Modules
 # -----------------------------------------------------------------------------
 import numpy as np
-import cupy as cp
-from cffi import FFI
-import pickle
 import os
 import gc
+import pickle
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
+from cffi import FFI
+
 # -----------------------------------------------------------------------------
 # Class
 # -----------------------------------------------------------------------------
@@ -24,96 +28,123 @@ class sample:
         self._chunk_total = None 
         self._matrix = None
         self._corners = None
-        self._default_filenames = np.array(["atomic_positions.npy","atomic_species.npy","sample_metadata.npy"]) #sample_metadata will be a struct
+        self._default_filenames = np.array([
+            "atomic_positions.npy",
+            "atomic_species.npy",
+            "sample_metadata.npy"
+        ])  # sample_metadata will be a struct
+        self._ffi_object, self._intersect_function = self.compile_parallelepipeds_intersect_batch_cffi()
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
             
-    def create_sample(self,dimensions,offset=[0,0,0],chunk_volume=(600*600*600)):
-        self._dimensions = np.array(dimensions,dtype=np.float32)
-        self._offset = np.array(offset,dtype=np.float32)
-        self._chunk_volume = np.array(chunk_volume,dtype=np.float32)
+    def create_sample(self, dimensions, offset=[0,0,0], chunk_volume=(600*600*600)):
+        self._dimensions = np.array(dimensions, dtype=np.float32)
+        self._offset = np.array(offset, dtype=np.float32)
+        self._chunk_volume = np.array(chunk_volume, dtype=np.float32)
         self._matrix = np.diag(self.dimensions)
-        self._corners = self.get_unit_corners()@self.matrix - self.dimensions/2 + self.offset
+        # Slightly rewritten for small overhead reduction (no functional change)
+        self._corners = (self.get_unit_corners() @ self.matrix) - (self.dimensions * 0.5) + self.offset
         
-    def read_sample(self): #incomplete
-        ## Once write format is complete, finish this.
-        ## Reads sample metadata
+    def read_sample(self):
+        # Incomplete - read logic will go here
         self._dimensions = None
         self._offset = None
         self._chunk_volume = None
         self._chunk_total = None
     
     ## Data Handling Functions
-    def write_chunk_positions(self,data,chunk_num):
+    def write_chunk_positions(self, data, chunk_num):
         base, ext = os.path.splitext(self._default_filenames[0])
         chunk_filename = f"{base}_{chunk_num}{ext}"
-        np.save(os.path.join(self.directory,chunk_filename), data)
+        np.save(os.path.join(self.directory, chunk_filename), data)
     
-    def write_chunk_species(self,data,chunk_num):
+    def write_chunk_species(self, data, chunk_num):
         base, ext = os.path.splitext(self._default_filenames[1])
         chunk_filename = f"{base}_{chunk_num}{ext}"
-        np.save(os.path.join(self.directory,chunk_filename), data)
+        np.save(os.path.join(self.directory, chunk_filename), data)
             
-    def write_sample_metadata(self): #incomplete
-        sample_metadata = [self.dimensions,self.offset,self.chunk_dimensions,self.chunk_total]
-        
-    def load_chunk_positions(self,chunk_number,gpu=True):
-        # Load a specific chunk as either GPU or CPU array
+    def write_sample_metadata(self):
+        # Incomplete - implement once write format is final
+        sample_metadata = [self.dimensions, self.offset, self.chunk_dimensions, self.chunk_total]
+        # Example placeholder (not fully implemented)
+        metadata_filename = self._default_filenames[2]
+        np.save(os.path.join(self.directory, metadata_filename), sample_metadata)
+
+    def load_chunk_positions(self, chunk_number, gpu=True):
+        """
+        Load positions from disk. If gpu=True and cupy is available, return a cp.ndarray.
+        Otherwise, return an np.ndarray.
+        """
         base, ext = os.path.splitext(self._default_filenames[0])
         positions_filename = f"{base}_{chunk_number}{ext}"
-        if gpu:
-            positions_chunk = cp.load(os.path.join(self.directory,positions_filename))
-        else:    
-            positions_chunk = np.load(os.path.join(self.directory,positions_filename))
-        return positions_chunk
-    
-    def load_chunk_species(self,chunk_number,gpu=True):
+        full_path = os.path.join(self.directory, positions_filename)
+        # Switch logic
+        if gpu and (cp is not None):
+            return cp.load(full_path)
+        else:
+            return np.load(full_path)
+
+    def load_chunk_species(self, chunk_number, gpu=True):
+        """
+        Load species from disk. If gpu=True and cupy is available, return a cp.ndarray.
+        Otherwise, return an np.ndarray.
+        """
         base, ext = os.path.splitext(self._default_filenames[1])
         species_filename = f"{base}_{chunk_number}{ext}"
-        if gpu:
-            species_chunk = cp.load(os.path.join(self.directory,species_filename))
-        else:    
-            species_chunk = np.load(os.path.join(self.directory,species_filename))
-        return species_chunk
-    
+        full_path = os.path.join(self.directory, species_filename)
+        if gpu and (cp is not None):
+            return cp.load(full_path)
+        else:
+            return np.load(full_path)
+
     ## Static Functions
     @staticmethod
     def get_unit_corners():
         unit_corners = np.array([
-        [0, 0, 0],
-        [1, 0, 0],
-        [0, 1, 0],
-        [0, 0, 1],
-        [1, 1, 0],
-        [1, 0, 1],
-        [0, 1, 1],
-        [1, 1, 1]])
+            [0, 0, 0],
+            [1, 0, 0],
+            [0, 1, 0],
+            [0, 0, 1],
+            [1, 1, 0],
+            [1, 0, 1],
+            [0, 1, 1],
+            [1, 1, 1]], dtype=np.float32)
         return unit_corners
     
     @staticmethod
-    def get_flat_grid(dimensions,gpu=False):
-        if gpu:
-            # Grid chunk points
-            ii, jj, kk = cp.meshgrid(cp.arange(dimensions[0], dtype=cp.float32), 
-                                    cp.arange(dimensions[1], dtype=cp.float32), 
-                                    cp.arange(dimensions[2], dtype=cp.float32), indexing='ij')
-            # Generate positions in the crystal frame
+    def get_flat_grid(dimensions, gpu=False):
+        """
+        Create a 3D grid of integer coordinates. If gpu=True and cupy is available,
+        use CuPy arrays; otherwise use NumPy arrays.
+        """
+        if gpu and (cp is not None):
+            # GPU path
+            ii, jj, kk = cp.meshgrid(
+                cp.arange(dimensions[0], dtype=cp.float32),
+                cp.arange(dimensions[1], dtype=cp.float32),
+                cp.arange(dimensions[2], dtype=cp.float32),
+                indexing='ij'
+            )
             flat_grid_cp = cp.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
             return flat_grid_cp
         else:
-            # Grid chunk points
-            ii, jj, kk = np.meshgrid(np.arange(dimensions[0], dtype=np.float32), 
-                                    np.arange(dimensions[1], dtype=np.float32), 
-                                    np.arange(dimensions[2], dtype=np.float32), indexing='ij')
-            # Generate positions in the crystal frame
+            # CPU path
+            # Force float32 for CPU so it matches GPU's single precision
+            dims_np = np.array(dimensions, dtype=np.float32)
+            ii, jj, kk = np.meshgrid(
+                np.arange(dims_np[0], dtype=np.float32),
+                np.arange(dims_np[1], dtype=np.float32),
+                np.arange(dims_np[2], dtype=np.float32),
+                indexing='ij'
+            )
             flat_grid = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
             return flat_grid
     
     @staticmethod    
     def compile_parallelepipeds_intersect_batch_cffi():
         '''
-        C++ code using 15-axis SAT method for determining if a set of cornerpoints intersects with another,
-        made to run a batch operation of corner point against a single reference.
+        C++ code using 15-axis SAT method for determining if a set of cornerpoints intersects
+        with another, made to run a batch operation of corner points against a single reference.
         '''
         c_source = r'''
         #include <math.h>
@@ -183,7 +214,7 @@ class sample:
             double f2[3]  = { pts2[6] - c2[0], pts2[7] - c2[1], pts2[8] - c2[2] };
             double f3[3]  = { pts2[9] - c2[0], pts2[10] - c2[1], pts2[11] - c2[2] };
 
-            // 3) Rebuild all 8 corners for shape1 (so we can do standard projection)
+            // 3) Rebuild all 8 corners for shape1
             //    shape1[i] = c1 + alpha1 * e1 + alpha2 * e2 + alpha3 * e3,
             //    where alphaN is either 0 or 1. The corner ordering matches get_unit_corners().
             double shape1[24];
@@ -225,13 +256,12 @@ class sample:
             cross3(f3, f1, m3);
 
             double edges1[3][3] = {{e1[0], e1[1], e1[2]},
-                                {e2[0], e2[1], e2[2]},
-                                {e3[0], e3[1], e3[2]}};
+                                   {e2[0], e2[1], e2[2]},
+                                   {e3[0], e3[1], e3[2]}};
             double edges2[3][3] = {{f1[0], f1[1], f1[2]},
-                                {f2[0], f2[1], f2[2]},
-                                {f3[0], f3[1], f3[2]}};
+                                   {f2[0], f2[1], f2[2]},
+                                   {f3[0], f3[1], f3[2]}};
 
-            // Fill up to 15 axes in an array
             double axes[15][3];
             int axisCount = 0;
 
@@ -280,11 +310,13 @@ class sample:
         // pts2    : just one shape of 8 corners = 24 floats
         // out_intersect[i] = 0 or 1
         // --------------------------------------------------------------------
-        int check_parallelepipeds_intersect_batch(const double *all_pts1,
-                                                const double *pts2,
-                                                double eps,
-                                                int n,
-                                                int *out_intersect)
+        int check_parallelepipeds_intersect_batch(
+            const double *all_pts1,
+            const double *pts2,
+            double eps,
+            int n,
+            int *out_intersect
+        )
         {
             for(int i=0; i<n; i++){
                 const double *shape_i = all_pts1 + 24*i; 
@@ -293,61 +325,79 @@ class sample:
             return 0; // success
         }
         '''
-        # Create CFFI instance
         ffi_obj = FFI()
-        # Provide the C prototypes
-        ffi_obj.cdef("""int check_parallelepipeds_intersect_batch(const double *all_pts1,const double *pts2,double eps,int n,int *out_intersect);""")
-        # Compile and link in-memory
-        C_mod = ffi_obj.verify(c_source,extra_compile_args=["-O3"],libraries=[])
+        ffi_obj.cdef("""int check_parallelepipeds_intersect_batch(
+            const double *all_pts1,
+            const double *pts2,
+            double eps,
+            int n,
+            int *out_intersect);
+        """)
+        C_mod = ffi_obj.verify(c_source, extra_compile_args=["-O3"], libraries=[])
         return ffi_obj, C_mod
         
     ## Main Functions
-    def get_chunk_positions(self,material):
+    def get_chunk_positions(self, material):
         '''
         Gets the list of clipped chunk positions in real space the and chunk dimensions in unit cell lengths
         Works for any arbitrary sample dimensions or unit cell.
         Inputs:
             material -> crystal class object
         Outputs:
-            chunk_positions_S -> chunk corner positions in the sampke frame
+            chunk_positions_S -> chunk corner positions in the sample frame
             chunk_dimensions -> chunk dimensions in unit cell lengths
         '''
         lattice_matrix = material.lattice_matrix.T
         lattice_volume = material.lattice_volume
-        #lattice_lengths = material.lattice_lengths
-        # Get number of lattice units along sample in crystal frame
-        lattice_units = np.ceil(np.max(self.corners@np.linalg.inv(lattice_matrix),axis=0)-np.min(self.corners@np.linalg.inv(lattice_matrix),axis=0))
-        # Get default chunk size in number of unit cells for each direction.
-        # Note: use np.ceil or np.min(([1,1,1],xxx)) to prevent 0 chunk size error, foor is to always make chunk smaller than requested volume
-        chunk_dimensions = np.zeros(lattice_units.shape)+np.floor((self.chunk_volume/lattice_volume)**(1/3))
-        # Check if any dimensions are smaller than sample for more efficient chunking
-        size_check = lattice_units>chunk_dimensions
-        if ~np.all(size_check):
-            # Adjust size if dimensions are smaller.
-            chunk_dimensions[~size_check] = np.min((chunk_dimensions,lattice_units),axis=0)[~size_check]
-            chunk_dimensions[size_check] = np.floor(((self.chunk_volume/lattice_volume)/np.prod(chunk_dimensions[~size_check]))**(1/np.sum(size_check)))
-            # Try to make dimensions an integer number of unit cells
-            chunk_dimensions[size_check] = np.floor(lattice_units[size_check]/np.ceil(lattice_units[size_check]/chunk_dimensions[size_check]))
-        chunk_units = np.ceil(lattice_units/chunk_dimensions)
-        # Generate positions in the crystal frame
-        chunk_positions_C = self.get_flat_grid(chunk_units,gpu=False)*chunk_dimensions # note this is still in crystal coordinates
-        # Convert to sample frame
-        # Adjust chunk positions to the center of the sample and center of a chunk
-        chunk_positions_S = (chunk_positions_C-(lattice_units/2-self.dimensions@np.linalg.inv(lattice_matrix)/2))@lattice_matrix #+ (self.dimensions)/2 #- ((lattice_units+1)@lattice_matrix)/2
-        # Trim chunks on cpu
-        # Generate corners array
-        # Note: Could do "((self.get_unit_corners()*(chunk_dimensions+2)-1)" for padding of 1 unit cell on all sides
-        chunk_corners_S = chunk_positions_S[:,np.newaxis,:] + ((self.get_unit_corners()*(chunk_dimensions))@lattice_matrix)[np.newaxis,:,:]
-        # Compile and call function
-        ffi_object, intersect_function = self.compile_parallelepipeds_intersect_batch_cffi()
-        # Using self.get_unit_corners()@self.matrix for sample corner positions to avoid unecessary offset calculations on the CPU
-        mask_arr = self.parallelepipeds_intersect_cffi(intersect_function,ffi_object,chunk_corners_S,self.get_unit_corners()@self.matrix,eps=1e-12)
-        chunk_positions_S = chunk_positions_S[mask_arr,:]
-        return chunk_positions_S, chunk_dimensions #chunk_positions_S, chunk_dimensions
         
-    def parallelepipeds_intersect_cffi(self,compiled_code,ffi_object,pts1, pts2, eps=1e-12):
+        # Precompute for performance
+        inv_lattice_matrix = np.linalg.inv(lattice_matrix)
+        corners_in_lattice = self.corners @ inv_lattice_matrix
+        
+        # Get number of lattice units along sample in crystal frame
+        lattice_units = np.ceil(np.max(corners_in_lattice, axis=0) - np.min(corners_in_lattice, axis=0))
+        
+        # Get default chunk size in number of unit cells for each direction.
+        chunk_dimensions = np.zeros(lattice_units.shape) + np.floor((self.chunk_volume / lattice_volume)**(1/3))
+        
+        # Check if any dimensions are smaller than sample for more efficient chunking
+        size_check = lattice_units > chunk_dimensions
+        if not np.all(size_check):
+            chunk_dimensions[~size_check] = np.min((chunk_dimensions, lattice_units), axis=0)[~size_check]
+            chunk_dimensions[size_check] = np.floor(
+                ((self.chunk_volume/lattice_volume) / np.prod(chunk_dimensions[~size_check])) ** 
+                (1/np.sum(size_check))
+            )
+            chunk_dimensions[size_check] = np.floor(lattice_units[size_check] / np.ceil(lattice_units[size_check] / chunk_dimensions[size_check]))
+        
+        chunk_units = np.ceil(lattice_units / chunk_dimensions)
+        
+        # Generate positions in the crystal frame (CPU by default)
+        chunk_positions_C = self.get_flat_grid(chunk_units, gpu=False) * chunk_dimensions
+        
+        # Convert to sample frame, adjusting positions to center
+        adj_val = (lattice_units * 0.5) - (self.dimensions @ inv_lattice_matrix * 0.5)
+        chunk_positions_S = (chunk_positions_C - adj_val) @ lattice_matrix
+        
+        # Generate corners array
+        chunk_corners_S = chunk_positions_S[:, np.newaxis, :] + ((self.get_unit_corners() * chunk_dimensions) @ lattice_matrix)[np.newaxis, :, :]
+        
+        # Using self.get_unit_corners() @ self.matrix for sample corner positions
+        mask_arr = self.parallelepipeds_intersect_cffi(
+            self._intersect_function,
+            self._ffi_object,
+            chunk_corners_S,
+            (self.get_unit_corners() @ self.matrix),
+            eps=1e-12
+        )
+        chunk_positions_S = chunk_positions_S[mask_arr, :]
+        return chunk_positions_S, chunk_dimensions
+        
+    def parallelepipeds_intersect_cffi(self, compiled_code, ffi_object, pts1, pts2, eps=1e-12):
         '''
-        Code to check if two parallelepipeds intersect (in this case seeing if a chunk intersects with the sample).
+        Code to check if two parallelepipeds intersect (in this case seeing if
+        a chunk intersects with the sample).
+        
         Inputs:
             compiled_code, ffi_object -> required inputs to call fast C code
             pts1 -> set of n chunk corner points
@@ -355,120 +405,182 @@ class sample:
         Outputs:
             mask_arr -> a mask of which chunks intersect the sample
         '''
-        # Convert Python inputs to a contiguous C array of fp32
-        # Variable pts1 should be lists of shape (n,8,3), pts2 should be lists of shape (8,3).
         pts1 = np.ascontiguousarray(pts1, dtype=np.float64)
         pts2 = np.ascontiguousarray(pts2, dtype=np.float64)
         n = pts1.shape[0]
-        arr_all = pts1.ravel()
-        arr2 = pts2.ravel()
-        # Bring variables to C
-        c_all   = ffi_object.new("double[]", arr_all.tolist())  # 24*n floats
-        c_arr2  = ffi_object.new("double[]", arr2.tolist())     # 24 floats
+        
+        arr_all = pts1.ravel().tolist()  # cffi needs a Python list
+        arr2 = pts2.ravel().tolist()
+        
+        c_all   = ffi_object.new("double[]", arr_all)
+        c_arr2  = ffi_object.new("double[]", arr2)
         results_int = np.zeros(n, dtype=np.int32)
         c_out = ffi_object.cast("int *", results_int.ctypes.data)
-        # Call the compiled function
-        compiled_code.check_parallelepipeds_intersect_batch(c_all,c_arr2,float(eps),n,c_out)
+        
+        compiled_code.check_parallelepipeds_intersect_batch(c_all, c_arr2, float(eps), n, c_out)
         mask_arr = (results_int == 1)
         return mask_arr
-    
-    def get_atomic_data(self,material,chunk_position,chunk_dimensions):
-        '''
-        Gets the location of all lattice points in the sample frame in a given chunk.
-        Inputs:
-            material -> crystal class object
-            chunk_position -> vector of chunk origin position.
-            chunk_dimension -> array of number of unit cells per chunk direction.
-        Outputs:
-            atomic_positions_S -> the position of lattice sites in the sample frame (GPU)
-            atomic_species -> the species of the lattice sites in the sample frame (CPU)
-        '''
-        lattice_atom_cartesian_cp = cp.asarray(material.lattice_atom_cartesian,dtype=cp.float32)
-        lattice_positions_cp = self.get_lattice_positions(material,chunk_position,chunk_dimensions)
-        # Cast atomic positions together with lattice positions to get full array of positions
-        atomic_positions_S = (lattice_positions_cp[:, cp.newaxis, :] + lattice_atom_cartesian_cp[cp.newaxis, :, :]).reshape(-1, 3)
-        atomic_species = np.tile(material.species, lattice_positions_cp.shape[0])
-        mask = (((atomic_positions_S[:,0] >= 0) & (atomic_positions_S[:,0] <= self.dimensions[0])) & 
-        ((atomic_positions_S[:,1] >= 0) & (atomic_positions_S[:,1] <= self.dimensions[1])) & 
-        ((atomic_positions_S[:,2] >= 0) & (atomic_positions_S[:,2] <= self.dimensions[2])))
-        atomic_positions_S = atomic_positions_S[mask,:]
-        atomic_species = atomic_species[mask.get()]
-        # Offset positions
-        atomic_positions_S += cp.asarray(self.offset) - cp.asarray(self.dimensions/2)
-        return atomic_positions_S,atomic_species
 
-    def get_lattice_positions(self,material,chunk_position,chunk_dimensions):
+    def get_lattice_positions(self, material, chunk_position, chunk_dimensions, gpu=True):
         '''
-        Gets the location of all lattice points in the sample frame in a given chunk.
-        Inputs:
-            material -> crystal class object
-            chunk_position -> vector of chunk origin position.
-            chunk_dimension -> array of number of unit cells per chunk direction.
-        Outputs:
-            lattice_positions_S -> the position of lattice sites in the sample frame
+        Gets the location of lattice points in the sample frame in a given chunk.
+        
+        If gpu=True and cupy is installed, returns a cp.ndarray.
+        Otherwise returns a np.ndarray.
         '''
         lattice_matrix = material.lattice_matrix.T
-        # Convert values to GPU
-        lattice_matrix_cp = cp.asarray(lattice_matrix,dtype=cp.float32)
-        chunk_position_cp = cp.asarray(chunk_position,dtype=cp.float32)
-        # Create lattice position grid
-        lattice_positions_C = self.get_flat_grid(chunk_dimensions,gpu=True)
-        lattice_positions_S = lattice_positions_C@lattice_matrix_cp + chunk_position_cp
-        return lattice_positions_S
-    
-    def generate_sample(self, material, flush_size=100000000):
+
+        if gpu and (cp is not None):
+            # GPU path
+            lattice_matrix_cp = cp.asarray(lattice_matrix, dtype=cp.float32)
+            chunk_position_cp = cp.asarray(chunk_position, dtype=cp.float32)
+
+            lattice_positions_C = self.get_flat_grid(chunk_dimensions, gpu=True)
+            lattice_positions_S = lattice_positions_C @ lattice_matrix_cp + chunk_position_cp
+            return lattice_positions_S
+
+        else:
+            # CPU path
+            # Ensure single-precision on CPU
+            lattice_matrix_np = lattice_matrix.astype(np.float32)
+            chunk_position_np = np.array(chunk_position, dtype=np.float32)
+
+            lattice_positions_C = self.get_flat_grid(chunk_dimensions, gpu=False)
+            lattice_positions_S = lattice_positions_C @ lattice_matrix_np + chunk_position_np
+            return lattice_positions_S
+
+    def get_atomic_data(self, material, chunk_position, chunk_dimensions, gpu=True):
+        '''
+        Gets the location of all lattice points in the sample frame in a given chunk,
+        plus the species. Returns (positions, species).
+        
+        - If gpu=True and cupy is available, positions will be a cp.ndarray
+          (until masking finishes, then we bring them partially back).
+        - If gpu=False or cupy is unavailable, positions will be an np.ndarray.
+        '''
+        # If we have a GPU available and user wants GPU, do it on GPU
+        use_gpu = (gpu and (cp is not None))
+
+        if use_gpu:
+            # GPU branch
+            lattice_atom_cartesian_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
+            lattice_positions_cp = self.get_lattice_positions(material, chunk_position, chunk_dimensions, gpu=True)
+            
+            atomic_positions_S = (
+                lattice_positions_cp[:, cp.newaxis, :] + 
+                lattice_atom_cartesian_cp[cp.newaxis, :, :]
+            ).reshape(-1, 3)
+            
+            atomic_species = np.tile(material.species, lattice_positions_cp.shape[0])
+            mask = (
+                (atomic_positions_S[:, 0] >= 0) & (atomic_positions_S[:, 0] <= self.dimensions[0]) &
+                (atomic_positions_S[:, 1] >= 0) & (atomic_positions_S[:, 1] <= self.dimensions[1]) &
+                (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= self.dimensions[2])
+            )
+            mask_np = mask.get()  # bring mask back to CPU
+            
+            atomic_positions_S = atomic_positions_S[mask, :]  # still cp array
+            atomic_species = atomic_species[mask_np]
+            
+            offset_gpu = cp.array(self.offset, dtype=cp.float32)
+            dim_half_gpu = cp.array(self.dimensions * 0.5, dtype=cp.float32)
+            atomic_positions_S += (offset_gpu - dim_half_gpu)
+
+            # Return final positions to CPU
+            atomic_positions_S = atomic_positions_S.get()
+            return atomic_positions_S, atomic_species
+
+        else:
+            # CPU branch
+            # Convert all relevant data to float32 to match GPU path
+            lattice_atom_cartesian_np = material.lattice_atom_cartesian.astype(np.float32)
+            lattice_positions_np = self.get_lattice_positions(material, chunk_position, chunk_dimensions, gpu=False)
+            
+            atomic_positions_S = (
+                lattice_positions_np[:, np.newaxis, :].astype(np.float32) +
+                lattice_atom_cartesian_np[np.newaxis, :, :]
+            ).reshape(-1, 3)
+            
+            atomic_species = np.tile(material.species, lattice_positions_np.shape[0])
+            # Mask
+            mask = (
+                (atomic_positions_S[:, 0] >= 0) & (atomic_positions_S[:, 0] <= self.dimensions[0]) &
+                (atomic_positions_S[:, 1] >= 0) & (atomic_positions_S[:, 1] <= self.dimensions[1]) &
+                (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= self.dimensions[2])
+            )
+            atomic_positions_S = atomic_positions_S[mask, :].astype(np.float32)
+            atomic_species = atomic_species[mask]
+
+            # Offset in float32
+            offset_np = self.offset.astype(np.float32)
+            dim_half_np = (self.dimensions * 0.5).astype(np.float32)
+            atomic_positions_S += (offset_np - dim_half_np)
+            return atomic_positions_S, atomic_species
+
+    def generate_sample(self, material, flush_size=100000000, gpu=True):
         """
         Accumulates the atomic positions/species from each geometric chunk.
         Each written chunk will contain exactly `flush_size` atoms, except
         for the last chunk if there are fewer than `flush_size` atoms left.
+
+        The `gpu` parameter controls whether to use GPU acceleration (if available)
+        or force CPU-only. 
         """
-        # 1) Determine the geometric chunk positions for the sample
+        # 1) Determine the geometric chunk positions
         self._chunk_positions, self._chunk_dimensions = self.get_chunk_positions(material)
         self._chunk_total = self.chunk_positions.shape[0]
+        
         # 2) Prepare accumulators (lists) in CPU memory
         acc_positions = []
         acc_species = []
+        
         # We'll use this to name each *written* chunk
         file_chunk_index = 0
+        
         # 3) Loop over all geometric chunks
         for i in range(self.chunk_total):
-            # -- a) Get atomic data on the GPU
-            atomic_positions_gpu, atomic_species = self.get_atomic_data(material, self.chunk_positions[i, :], self.chunk_dimensions)
-            # -- b) Bring data back to CPU
-            atomic_positions = atomic_positions_gpu.get()  # shape (N, 3)
+            # -- a) Get atomic data
+            atomic_positions, atomic_species = self.get_atomic_data(
+                material,
+                self.chunk_positions[i, :],
+                self._chunk_dimensions,
+                gpu=gpu
+            )
+            
             acc_positions.append(atomic_positions)
             acc_species.append(atomic_species)
-            # -- d) While total atoms >= flush_size, write out exactly 50,000,000
+            
+            # -- c) While total atoms >= flush_size, write out exactly flush_size
             while sum(arr.shape[0] for arr in acc_positions) >= flush_size:
-                # Concatenate all accumulated so far
                 cat_positions = np.concatenate(acc_positions, axis=0)
                 cat_species   = np.concatenate(acc_species,   axis=0)
-                # Slice out exactly flush_size atoms
+                
                 chunk_positions = cat_positions[:flush_size]
                 chunk_species   = cat_species[:flush_size]
-                # Write them as one file-chunk
+                
                 file_chunk_index += 1
                 self.write_chunk_positions(chunk_positions, file_chunk_index)
                 self.write_chunk_species(chunk_species, file_chunk_index)
-                # Put leftover back into accumulators
+                
                 leftover_positions = cat_positions[flush_size:]
                 leftover_species   = cat_species[flush_size:]
                 acc_positions = [leftover_positions] if leftover_positions.size > 0 else []
                 acc_species   = [leftover_species] if leftover_species.size > 0 else []
-        # 4) After processing all geometric chunks, check for leftover < flush_size
+        
+        # 4) After processing all geometric chunks, check leftover
         leftover_atoms = sum(arr.shape[0] for arr in acc_positions)
         if leftover_atoms > 0:
             cat_positions = np.concatenate(acc_positions, axis=0)
             cat_species   = np.concatenate(acc_species, axis=0)
-            # Final chunk (possibly less than flush_size)
+            
             file_chunk_index += 1
             self.write_chunk_positions(cat_positions, file_chunk_index)
             self.write_chunk_species(cat_species, file_chunk_index)
+        
         self._chunk_total = file_chunk_index
         return
 
-    
-    def plot_sample(self,elev=0, azim=0):
+    def plot_sample(self, elev=0, azim=0):
         import matplotlib.pyplot as plt
         fig = plt.figure(figsize=(8, 8))
         ax1 = fig.add_subplot(1, 1, 1, projection='3d')
@@ -479,17 +591,22 @@ class sample:
         ax1.set_proj_type('ortho')
         ax1.axis('equal')
         plt.tight_layout()
+
         for i in range(self.chunk_total):
-                positions_chunk_np = self.load_chunk_positions(i + 1, gpu=False)
-                ax1.scatter(positions_chunk_np[:, 0], positions_chunk_np[:, 1], positions_chunk_np[:, 2], c='b',marker='.')
-        # plt.show()
+            positions_chunk_np = self.load_chunk_positions(i + 1, gpu=False)
+            ax1.scatter(
+                positions_chunk_np[:, 0],
+                positions_chunk_np[:, 1],
+                positions_chunk_np[:, 2],
+                c='b', marker='.'
+            )
         return fig, ax1
         
     ## Properties
     @property
     def dimensions(self):
         """
-        Return the 3x3 matrix of vectors (as a NumPy array).
+        Return the dimensions array (length 3).
         """
         if self._dimensions is None:
             print("self._dimensions has not been initialized yet")
@@ -498,7 +615,7 @@ class sample:
     @property
     def offset(self):
         """
-        Return the offset of the .
+        Return the offset array (length 3).
         """
         if self._offset is None:
             print("self._offset has not been initialized yet")
@@ -514,27 +631,27 @@ class sample:
         return self._chunk_volume
 
     @property
-    def matrix(self): #fix for new convention
+    def matrix(self):
         """
-        Return the 3x3 matrix of vectors (as a NumPy array).
+        Return the sample matrix (3x3).
         """
         if self._matrix is None:
             self._matrix = np.diag(self.dimensions)
         return self._matrix
 
     @property
-    def corners(self): #fix for new convention
+    def corners(self):
         """
-        Return the lengths of the a, b, c lattice vectors (in Angstroms).
+        Return the corners of the sample parallelepiped (8x3).
         """
         if self._corners is None:
-            self._corners = self.get_unit_corners()@self.matrix - self.dimensions/2 + self.offset
+            self._corners = (self.get_unit_corners() @ self.matrix) - (self.dimensions * 0.5) + self.offset
         return self._corners
     
     @property
     def chunk_positions(self):
         """
-        Return the 3x3 matrix of vectors (as a NumPy array).
+        Return the array of chunk positions (Nx3).
         """
         if self._chunk_positions is None:
             print("self._chunk_positions has not been initialized yet")
@@ -543,7 +660,7 @@ class sample:
     @property
     def chunk_dimensions(self):
         """
-        Return the 3x3 matrix of vectors (as a NumPy array).
+        Return the chunk dimensions (in lattice units).
         """
         if self._chunk_dimensions is None:
             print("self._chunk_dimensions has not been initialized yet")
