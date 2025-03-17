@@ -536,6 +536,8 @@ class sample:
         
         # We'll use this to name each *written* chunk
         file_chunk_index = 0
+        # Keep track of total atoms in accumulator
+        total_accumulated = 0
         
         # 3) Loop over all geometric chunks
         for i in range(self.chunk_total):
@@ -547,32 +549,52 @@ class sample:
                 gpu=gpu
             )
             
+            # -- b) If this chunk alone is bigger than flush_size, split immediately
+            if atomic_positions.shape[0] >= flush_size:
+                start_idx = 0
+                while start_idx < atomic_positions.shape[0]:
+                    end_idx = start_idx + flush_size
+                    chunk_positions = atomic_positions[start_idx:end_idx]
+                    chunk_species   = atomic_species[start_idx:end_idx]
+
+                    file_chunk_index += 1
+                    self.write_chunk_positions(chunk_positions, file_chunk_index)
+                    self.write_chunk_species(chunk_species, file_chunk_index)
+
+                    start_idx = end_idx
+                # Move on to next geometric chunk
+                continue
+            
+            # Otherwise, accumulate
             acc_positions.append(atomic_positions)
             acc_species.append(atomic_species)
+            total_accumulated += atomic_positions.shape[0]
             
             # -- c) While total atoms >= flush_size, write out exactly flush_size
-            while sum(arr.shape[0] for arr in acc_positions) >= flush_size:
+            while total_accumulated >= flush_size:
                 cat_positions = np.concatenate(acc_positions, axis=0)
                 cat_species   = np.concatenate(acc_species,   axis=0)
-                
+
                 chunk_positions = cat_positions[:flush_size]
                 chunk_species   = cat_species[:flush_size]
-                
+
                 file_chunk_index += 1
                 self.write_chunk_positions(chunk_positions, file_chunk_index)
                 self.write_chunk_species(chunk_species, file_chunk_index)
-                
+
                 leftover_positions = cat_positions[flush_size:]
                 leftover_species   = cat_species[flush_size:]
+
                 acc_positions = [leftover_positions] if leftover_positions.size > 0 else []
                 acc_species   = [leftover_species] if leftover_species.size > 0 else []
+                total_accumulated = leftover_positions.shape[0] if leftover_positions.size > 0 else 0
         
         # 4) After processing all geometric chunks, check leftover
-        leftover_atoms = sum(arr.shape[0] for arr in acc_positions)
+        leftover_atoms = total_accumulated
         if leftover_atoms > 0:
             cat_positions = np.concatenate(acc_positions, axis=0)
             cat_species   = np.concatenate(acc_species, axis=0)
-            
+
             file_chunk_index += 1
             self.write_chunk_positions(cat_positions, file_chunk_index)
             self.write_chunk_species(cat_species, file_chunk_index)
