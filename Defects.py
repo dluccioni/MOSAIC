@@ -5,6 +5,7 @@ import numpy as np
 import cupy as cp
 import pickle
 import os
+
 # -----------------------------------------------------------------------------
 # Class
 # -----------------------------------------------------------------------------
@@ -14,11 +15,10 @@ class defects:
     # Functions
     # -----------------------------------------------------------------------------
     ## Initialization
-    def __init__(self,directory=os.getcwd()):
+    def __init__(self,directory=None):
         self.directory = directory
-        if not os.path.isdir(self.directory):
-            print("Sample directory does not exist")
-            return
+        if self.directory is not None and not os.path.isdir(self.directory):
+            os.makedirs(self.directory)
         self._default_filenames = np.array(["defects_metadata.npy"])
         self._defect_history = []
         self._stacking_faults = None
@@ -47,9 +47,9 @@ class defects:
             print("self._cracks has not been initialized yet")
         return self._cracks
 
-# -----------------------------------------------------------------------------
-# Sub-Classes
-# -----------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Sub-Classes
+    # -------------------------------------------------------------------------
     class stacking_fault():
         
         # -----------------------------------------------------------------------------
@@ -62,11 +62,16 @@ class defects:
             self.fault_normal = fault_normal/np.linalg.norm(fault_normal)
             self.interfault_spacing = interfault_spacing
             self.burgers_vector = burgers_vector
-            self.fault_orientation = np.array([fault_orientation[i % len(fault_orientation)]for i in range(self.fault_number)])
+            self.fault_orientation = np.array([fault_orientation[i % len(fault_orientation)] for i in range(self.fault_number)])
             self.fault_gap = fault_gap
             self.global_fault_positions = None
             self.rotated_fault_normal = None
             self.rotated_burgers_vector = None
+            self._global_fault_positions_cp = None
+            self._rotated_burgers_vector_cp = None
+            self._fault_gap_cp = None
+            self._fault_normal_cp = None
+            self._fault_orientation_cp = None
         
         ## Main Functions    
         def generate_global_positions(self,sample,crystal,plotting=False):
@@ -77,6 +82,11 @@ class defects:
             sample_center_proj = np.dot(sample_center,self.rotated_fault_normal)
             fault_offest_proj = np.dot(self.fault_offset,self.rotated_fault_normal)
             self.global_fault_positions = sample_center_proj + fault_offest_proj - (self.fault_number - 1)*(self.interfault_spacing+self.fault_gap)/2 + np.arange(self.fault_number, dtype=np.float32)*(self.interfault_spacing+self.fault_gap)
+            self._global_fault_positions_cp = cp.asarray(self.global_fault_positions)
+            self._rotated_burgers_vector_cp = cp.asarray(self.rotated_burgers_vector)
+            self._fault_gap_cp = cp.float32(self.fault_gap)
+            self._fault_normal_cp = cp.asarray(self.rotated_fault_normal)
+            self._fault_orientation_cp = cp.asarray(self.fault_orientation, dtype=cp.int8)
             if plotting:
                 self.plot_global_positions(sample)
             
@@ -175,7 +185,7 @@ class defects:
 
         def apply_to_sample(self,sample):
             """
-            Apply stacking faults To full sample.
+            Apply stacking faults to the full sample.
             Read chunk -> apply stacking faults to chunk -> write chunk
             """
             for i in range(sample.chunk_total):
@@ -190,19 +200,14 @@ class defects:
             Apply stacking faults to a chunk by shifting atoms that lie 'beyond' each fault plane.
             A small 'fault_gap' is added each time an atom crosses a fault plane.
             """
-            # Bring vars to GPU
-            global_fault_positions_cp = cp.asarray(self.global_fault_positions)
-            burgers_vector_cp = cp.asarray(self.rotated_burgers_vector)
-            fault_gap_cp = cp.asarray(self.fault_gap)
-            fault_normal_cp = cp.asarray(self.rotated_fault_normal)
-            fault_orientation_cp = cp.array(self.fault_orientation, dtype=cp.int8)
-            # Create projection mask
-            position_projection = cp.dot(positions_chunk_cp, fault_normal_cp)
-            mask = cp.array(position_projection[:, None] > global_fault_positions_cp[None, :], dtype=cp.int8)
-            count_faults = cp.sum(mask * fault_orientation_cp, axis=1)  # orientation-based sum
+            position_projection = cp.dot(positions_chunk_cp, self._fault_normal_cp)
+            mask = cp.array(position_projection[:, None] > self._global_fault_positions_cp[None, :], dtype=cp.int8)
+            count_faults = cp.sum(mask * self._fault_orientation_cp, axis=1)  # orientation-based sum
             count_faults_abs = cp.sum(mask, axis=1)  # how many planes crossed, ignoring orientation
-            # Shift positions: one displacement for each plane crossing + small normal gap - global shift to keep sample centered
-            positions_chunk_cp = positions_chunk_cp + count_faults[:, None]*burgers_vector_cp + count_faults_abs[:, None]*fault_normal_cp*fault_gap_cp - fault_normal_cp*fault_gap_cp*self.fault_number/2
+            positions_chunk_cp = positions_chunk_cp \
+                + count_faults[:, None] * self._rotated_burgers_vector_cp \
+                + count_faults_abs[:, None] * self._fault_normal_cp * self._fault_gap_cp \
+                - self._fault_normal_cp * self._fault_gap_cp * self.fault_number/2
             return positions_chunk_cp
         
     class crack():
@@ -222,13 +227,12 @@ class defects:
             from scipy.spatial import ConvexHull
             # Store input points
             self.crack_points = np.asarray(crack_points, dtype=float)
-
             # Build convex hull
             self.hull = ConvexHull(self.crack_points)
-
             # Keep a copy of the plane equations: shape (M, 4)
             # Each row [a, b, c, d] => a*x + b*y + c*z + d <= 0 for points inside
             self.hull_equations = self.hull.equations
+            self._hull_equations_cp = None
 
         ## Main Functions
         def apply_to_sample(self, sample):
@@ -238,7 +242,7 @@ class defects:
             for i in range(sample.chunk_total):
                 positions_chunk_cp = sample.load_chunk_positions(i + 1, gpu=True)
                 species_chunk_np = sample.load_chunk_species(i + 1, gpu=False)
-                positions_chunk_cp,species_chunk_np = self.apply_crack_chunk(positions_chunk_cp,species_chunk_np)
+                positions_chunk_cp, species_chunk_np = self.apply_crack_chunk(positions_chunk_cp,species_chunk_np)
                 sample.write_chunk_positions(cp.asnumpy(positions_chunk_cp), i + 1)
                 sample.write_chunk_species(species_chunk_np,i+1)
             return
@@ -247,18 +251,20 @@ class defects:
             """
             Removes all positions inside the convex hull by checking the half-space inequalities from self.hull_equations.
             """
-            eq = cp.asarray(self.hull_equations)  # shape (M,4)
+            if self._hull_equations_cp is None:
+                self._hull_equations_cp = cp.asarray(self.hull_equations)
+
+            eq = self._hull_equations_cp  # shape (M,4)
             # eq[:, :3] are the normal vectors, eq[:, 3] the offset
             # For each facet i, inside points satisfy (n_i . r + d_i) <= 0
-            # => We'll check all facets
             normals = eq[:, :3]            # shape (M,3)
             offsets = eq[:, 3]            # shape (M,)
             # Dot each facet's normal with each position
             # positions_chunk_cp shape: (N,3)
             # We'll do a matrix multiply: result shape => (M, N)
             dot_vals = normals @ positions_chunk_cp.T + offsets[:, None]
-            # A point is inside the hull if dot_vals <= 0 for *all* facets
-            inside_mask = cp.all(dot_vals <= 1e-12, axis=0)  # shape (N,)
+            # A point is inside the hull if dot_vals <= 1e-12 for *all* facets
+            inside_mask = cp.all(dot_vals <= 1e-12, axis=0)
             # Remove all points that are inside the hull
             positions_chunk_cp = positions_chunk_cp[~inside_mask]
             species_chunk_np = species_chunk_np[~(inside_mask.get())]
@@ -299,7 +305,6 @@ class defects:
             ax.set_xlim(x.min(), x.max())
             ax.set_ylim(y.min(), y.max())
             ax.set_zlim(z.min(), z.max())
-            # (Optional) Label axes
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
             ax.set_zlabel("Z")
