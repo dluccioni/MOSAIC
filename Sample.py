@@ -46,53 +46,91 @@ class sample:
         self._corners = (self.get_unit_corners() @ self.matrix) - (self.dimensions * 0.5) + self.offset
         
     def read_sample(self):
-        # Incomplete - read logic will go here
-        self._dimensions = None
-        self._offset = None
-        self._chunk_volume = None
-        self._chunk_total = None
+        """
+        Reads the metadata pickle file from disk and restores
+        this sample object's state.
+        """
+        metadata_filename = os.path.join(self.directory, self._default_filenames[2])
+        if not os.path.isfile(metadata_filename):
+            raise FileNotFoundError(f"No metadata file found at {metadata_filename}")
+        with open(metadata_filename, "rb") as f:
+            sample_metadata = pickle.load(f)
+        # Restore all fields
+        self._dimensions = sample_metadata["dimensions"]
+        self._offset = sample_metadata["offset"]
+        self._chunk_volume = sample_metadata["chunk_volume"]
+        self._chunk_total = sample_metadata["chunk_total"]
+        self._matrix = sample_metadata["matrix"]
+        self._corners = sample_metadata["corners"]
+        self._chunk_positions = sample_metadata["chunk_positions"]
+        self._chunk_dimensions = sample_metadata["chunk_dimensions"]
+        print(f"Metadata loaded from {metadata_filename}")
     
     ## Data Handling Functions
-    def write_chunk_positions(self, data, chunk_num):
+    def write_chunk_positions(self, data, chunk_num, override_directory=None):
         base, ext = os.path.splitext(self._default_filenames[0])
         chunk_filename = f"{base}_{chunk_num}{ext}"
-        np.save(os.path.join(self.directory, chunk_filename), data)
+        if override_directory is not None:
+            np.save(os.path.join(override_directory, chunk_filename), data)
+        else:
+            np.save(os.path.join(self.directory, chunk_filename), data)
     
-    def write_chunk_species(self, data, chunk_num):
+    def write_chunk_species(self, data, chunk_num, override_directory=None):
         base, ext = os.path.splitext(self._default_filenames[1])
         chunk_filename = f"{base}_{chunk_num}{ext}"
-        np.save(os.path.join(self.directory, chunk_filename), data)
+        if override_directory is not None:
+            np.save(os.path.join(override_directory, chunk_filename), data)
+        else:
+            np.save(os.path.join(self.directory, chunk_filename), data)
             
-    def write_sample_metadata(self):
-        # Incomplete - implement once write format is final
-        sample_metadata = [self.dimensions, self.offset, self.chunk_dimensions, self.chunk_total]
-        # Example placeholder (not fully implemented)
-        metadata_filename = self._default_filenames[2]
-        np.save(os.path.join(self.directory, metadata_filename), sample_metadata)
-
-    def load_chunk_positions(self, chunk_number, gpu=True):
+    def write_sample_metadata(self, override_directory=None):
         """
-        Load positions from disk. If gpu=True and cupy is available, return a cp.ndarray.
+        Serializes the sample objects critical internal fields to disk 
+        so that the state can be restored later.
+        """
+        # Gather all fields needed to reconstruct the object's state
+        sample_metadata = {
+            "dimensions": self._dimensions,
+            "offset": self._offset,
+            "chunk_volume": self._chunk_volume,
+            "chunk_total": self._chunk_total,
+            "matrix": self._matrix,
+            "corners": self._corners,
+            "chunk_positions": self._chunk_positions,
+            "chunk_dimensions": self._chunk_dimensions
+        }
+        if override_directory is not None:
+            metadata_filename = os.path.join(override_directory, self._default_filenames[2])
+            with open(metadata_filename, "wb") as f:
+                pickle.dump(sample_metadata, f)
+        else:
+            metadata_filename = os.path.join(self.directory, self._default_filenames[2])
+            with open(metadata_filename, "wb") as f:
+                pickle.dump(sample_metadata, f)
+
+    def load_chunk_positions(self, chunk_number, use_gpu=True):
+        """
+        Load positions from disk. If use_gpu=True and cupy is available, return a cp.ndarray.
         Otherwise, return an np.ndarray.
         """
         base, ext = os.path.splitext(self._default_filenames[0])
         positions_filename = f"{base}_{chunk_number}{ext}"
         full_path = os.path.join(self.directory, positions_filename)
         # Switch logic
-        if gpu and (cp is not None):
+        if use_gpu and (cp is not None):
             return cp.load(full_path)
         else:
             return np.load(full_path)
 
-    def load_chunk_species(self, chunk_number, gpu=True):
+    def load_chunk_species(self, chunk_number, use_gpu=True):
         """
-        Load species from disk. If gpu=True and cupy is available, return a cp.ndarray.
+        Load species from disk. If use_gpu=True and cupy is available, return a cp.ndarray.
         Otherwise, return an np.ndarray.
         """
         base, ext = os.path.splitext(self._default_filenames[1])
         species_filename = f"{base}_{chunk_number}{ext}"
         full_path = os.path.join(self.directory, species_filename)
-        if gpu and (cp is not None):
+        if use_gpu and (cp is not None):
             return cp.load(full_path)
         else:
             return np.load(full_path)
@@ -112,12 +150,12 @@ class sample:
         return unit_corners
     
     @staticmethod
-    def get_flat_grid(dimensions, gpu=False):
+    def get_flat_grid(dimensions, use_gpu=False):
         """
-        Create a 3D grid of integer coordinates. If gpu=True and cupy is available,
+        Create a 3D grid of integer coordinates. If use_gpu=True and cupy is available,
         use CuPy arrays; otherwise use NumPy arrays.
         """
-        if gpu and (cp is not None):
+        if use_gpu and (cp is not None):
             # GPU path
             ii, jj, kk = cp.meshgrid(
                 cp.arange(dimensions[0], dtype=cp.float32),
@@ -373,7 +411,7 @@ class sample:
         chunk_units = np.ceil(lattice_units / chunk_dimensions)
         
         # Generate positions in the crystal frame (CPU by default)
-        chunk_positions_C = self.get_flat_grid(chunk_units, gpu=False) * chunk_dimensions
+        chunk_positions_C = self.get_flat_grid(chunk_units, use_gpu=False) * chunk_dimensions
         
         # Convert to sample frame, adjusting positions to center
         adj_val = (lattice_units * 0.5) - (self.dimensions @ inv_lattice_matrix * 0.5)
@@ -421,21 +459,21 @@ class sample:
         mask_arr = (results_int == 1)
         return mask_arr
 
-    def get_lattice_positions(self, material, chunk_position, chunk_dimensions, gpu=True):
+    def get_lattice_positions(self, material, chunk_position, chunk_dimensions, use_gpu=True):
         '''
         Gets the location of lattice points in the sample frame in a given chunk.
         
-        If gpu=True and cupy is installed, returns a cp.ndarray.
+        If use_gpu=True and cupy is installed, returns a cp.ndarray.
         Otherwise returns a np.ndarray.
         '''
         lattice_matrix = material.lattice_matrix.T
 
-        if gpu and (cp is not None):
+        if use_gpu and (cp is not None):
             # GPU path
             lattice_matrix_cp = cp.asarray(lattice_matrix, dtype=cp.float32)
             chunk_position_cp = cp.asarray(chunk_position, dtype=cp.float32)
 
-            lattice_positions_C = self.get_flat_grid(chunk_dimensions, gpu=True)
+            lattice_positions_C = self.get_flat_grid(chunk_dimensions, use_gpu=True)
             lattice_positions_S = lattice_positions_C @ lattice_matrix_cp + chunk_position_cp
             return lattice_positions_S
 
@@ -445,26 +483,26 @@ class sample:
             lattice_matrix_np = lattice_matrix.astype(np.float32)
             chunk_position_np = np.array(chunk_position, dtype=np.float32)
 
-            lattice_positions_C = self.get_flat_grid(chunk_dimensions, gpu=False)
+            lattice_positions_C = self.get_flat_grid(chunk_dimensions, use_gpu=False)
             lattice_positions_S = lattice_positions_C @ lattice_matrix_np + chunk_position_np
             return lattice_positions_S
 
-    def get_atomic_data(self, material, chunk_position, chunk_dimensions, gpu=True):
+    def get_atomic_data(self, material, chunk_position, chunk_dimensions, use_gpu=True):
         '''
         Gets the location of all lattice points in the sample frame in a given chunk,
         plus the species. Returns (positions, species).
         
-        - If gpu=True and cupy is available, positions will be a cp.ndarray
+        - If use_gpu=True and cupy is available, positions will be a cp.ndarray
           (until masking finishes, then we bring them partially back).
-        - If gpu=False or cupy is unavailable, positions will be an np.ndarray.
+        - If use_gpu=False or cupy is unavailable, positions will be an np.ndarray.
         '''
         # If we have a GPU available and user wants GPU, do it on GPU
-        use_gpu = (gpu and (cp is not None))
+        use_gpu = (use_gpu and (cp is not None))
 
         if use_gpu:
             # GPU branch
             lattice_atom_cartesian_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
-            lattice_positions_cp = self.get_lattice_positions(material, chunk_position, chunk_dimensions, gpu=True)
+            lattice_positions_cp = self.get_lattice_positions(material, chunk_position, chunk_dimensions, use_gpu=True)
             
             atomic_positions_S = (
                 lattice_positions_cp[:, cp.newaxis, :] + 
@@ -494,7 +532,7 @@ class sample:
             # CPU branch
             # Convert all relevant data to float32 to match GPU path
             lattice_atom_cartesian_np = material.lattice_atom_cartesian.astype(np.float32)
-            lattice_positions_np = self.get_lattice_positions(material, chunk_position, chunk_dimensions, gpu=False)
+            lattice_positions_np = self.get_lattice_positions(material, chunk_position, chunk_dimensions, use_gpu=False)
             
             atomic_positions_S = (
                 lattice_positions_np[:, np.newaxis, :].astype(np.float32) +
@@ -517,7 +555,7 @@ class sample:
             atomic_positions_S += (offset_np - dim_half_np)
             return atomic_positions_S, atomic_species
 
-    def generate_sample(self, material, flush_size=100000000, gpu=True):
+    def generate_sample(self, material, flush_size=100000000, use_gpu=True):
         """
         Accumulates the atomic positions/species from each geometric chunk.
         Each written chunk will contain exactly `flush_size` atoms, except
@@ -540,13 +578,14 @@ class sample:
         total_accumulated = 0
         
         # 3) Loop over all geometric chunks
+        use_gpu = (use_gpu and (cp is not None))
         for i in range(self.chunk_total):
             # -- a) Get atomic data
             atomic_positions, atomic_species = self.get_atomic_data(
                 material,
                 self.chunk_positions[i, :],
                 self._chunk_dimensions,
-                gpu=gpu
+                use_gpu=use_gpu
             )
             
             # -- b) If this chunk alone is bigger than flush_size, split immediately
@@ -615,7 +654,7 @@ class sample:
         plt.tight_layout()
 
         for i in range(self.chunk_total):
-            positions_chunk_np = self.load_chunk_positions(i + 1, gpu=False)
+            positions_chunk_np = self.load_chunk_positions(i + 1, use_gpu=False)
             ax1.scatter(
                 positions_chunk_np[:, 0],
                 positions_chunk_np[:, 1],

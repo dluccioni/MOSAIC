@@ -418,7 +418,7 @@ class beam:
         Use CFFI for a single chunk scattering. Return (Ny, Nx) complex64 array.
         cffi_lib is the compiled library; ffi_obj is the FFI instance.
         """
-        species_chunk_np = sample.load_chunk_species(chunk_id, gpu=False)
+        species_chunk_np = sample.load_chunk_species(chunk_id, use_gpu=False)
         atom_count = species_chunk_np.shape[0]
         if atom_count == 0:
             return np.zeros((Ny, Nx), dtype=np.complex64)
@@ -442,7 +442,7 @@ class beam:
             f0_params_np[mask] = db_dict_f0_all[el]
 
         # Load positions -> meters
-        positions_chunk = sample.load_chunk_positions(chunk_id, gpu=False).astype(np.float32)
+        positions_chunk = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
         positions_chunk = np.ascontiguousarray(positions_chunk)  # ensure contiguous
         positions_chunk[:, 0] /= 1e10
         positions_chunk[:, 1] /= 1e10
@@ -589,7 +589,7 @@ class beam:
                 stream = streams[i % num_streams]
 
                 # Load species (CPU)
-                species_chunk_np = sample.load_chunk_species(cidx, gpu=False)
+                species_chunk_np = sample.load_chunk_species(cidx, use_gpu=False)
                 atom_count = species_chunk_np.shape[0]
                 if atom_count == 0:
                     continue
@@ -611,7 +611,7 @@ class beam:
                     f0_params_np[mask] = db_dict_f0_all[el]
 
                 with stream:
-                    positions_chunk_cp = cp.array(sample.load_chunk_positions(cidx, gpu=True),
+                    positions_chunk_cp = cp.array(sample.load_chunk_positions(cidx, use_gpu=True),
                                                   dtype=cp.float32)
                     px = positions_chunk_cp[:, 0] / 1e10
                     py = positions_chunk_cp[:, 1] / 1e10

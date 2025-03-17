@@ -29,10 +29,10 @@ class defects:
         defect_metadata = [self.stacking_faults,self.cracks]
 
     def add_stacking_faults(self,fault_number,fault_offset,fault_normal,interfault_spacing,burgers_vector,fault_orientation,fault_gap):
-        self._stacking_faults = self.stacking_fault(fault_number,fault_offset,fault_normal,interfault_spacing,burgers_vector,fault_orientation,fault_gap)
+        self._stacking_faults = self.stacking_fault(self.directory,fault_number,fault_offset,fault_normal,interfault_spacing,burgers_vector,fault_orientation,fault_gap)
     
     def add_cracks(self,crack_points):
-        self._cracks = self.crack(crack_points)
+        self._cracks = self.crack(self.directory,crack_points)
     
     ## Properties
     @property
@@ -56,7 +56,8 @@ class defects:
         # Functions
         # -----------------------------------------------------------------------------
         ## Initialization
-        def __init__(self,fault_number,fault_offset,fault_normal,interfault_spacing,burgers_vector,fault_orientation,fault_gap):
+        def __init__(self,directory,fault_number,fault_offset,fault_normal,interfault_spacing,burgers_vector,fault_orientation,fault_gap):
+            self.directory = directory
             self.fault_number = fault_number
             self.fault_offset = fault_offset
             self.fault_normal = fault_normal/np.linalg.norm(fault_normal)
@@ -75,7 +76,7 @@ class defects:
         
         ## Main Functions    
         def generate_global_positions(self,sample,crystal,plotting=False):
-            # Calculates the position of 
+            # Calculates the position of stacking faults
             self.rotated_fault_normal = (crystal.lattice_matrix_conventional/crystal.lattice_lengths_conventional[:,None])@self.fault_normal
             self.rotated_burgers_vector = (crystal.lattice_matrix_conventional/crystal.lattice_lengths_conventional[:,None])@self.burgers_vector
             sample_center = sample.offset
@@ -189,12 +190,15 @@ class defects:
             Read chunk -> apply stacking faults to chunk -> write chunk
             """
             for i in range(sample.chunk_total):
-                positions_chunk_cp = sample.load_chunk_positions(i+1,gpu=True)
-                if positions_chunk_cp.shape[0] > 0: # can remove this safeguard once chunking is accumulated in sample
-                    positions_chunk_cp = self.apply_stacking_fault_chunk(positions_chunk_cp)
-                    positions_chunk_np = cp.asnumpy(positions_chunk_cp)
-                    sample.write_chunk_positions(positions_chunk_np,i+1)
-        
+                positions_chunk_cp = sample.load_chunk_positions(i+1,use_gpu=True)
+                positions_chunk_cp = self.apply_stacking_fault_chunk(positions_chunk_cp)
+                positions_chunk_np = cp.asnumpy(positions_chunk_cp)
+                sample.write_chunk_positions(positions_chunk_np,i+1,override_directory=self.directory)
+                if self.directory is not None:
+                    species_chunk_np = sample.load_chunk_species(i + 1, use_gpu=False)
+                    sample.write_chunk_species(species_chunk_np,i+1,override_directory=self.directory)
+            sample.write_sample_metadata(override_directory=self.directory)
+            
         def apply_stacking_fault_chunk(self,positions_chunk_cp):
             """
             Apply stacking faults to a chunk by shifting atoms that lie 'beyond' each fault plane.
@@ -216,7 +220,7 @@ class defects:
         # Functions
         # -----------------------------------------------------------------------------
         ## Initialization
-        def __init__(self, crack_points):
+        def __init__(self, directory, crack_points):
             """
             Parameters
             ----------
@@ -224,6 +228,7 @@ class defects:
                 Coordinates defining the exterior of a convex hull in 3D.
                 The hull is assumed to be convex.
             """
+            self.directory = directory
             from scipy.spatial import ConvexHull
             # Store input points
             self.crack_points = np.asarray(crack_points, dtype=float)
@@ -240,12 +245,13 @@ class defects:
             Loops over each chunk in the sample and removes all atoms lying inside the convex hull.
             """
             for i in range(sample.chunk_total):
-                positions_chunk_cp = sample.load_chunk_positions(i + 1, gpu=True)
-                species_chunk_np = sample.load_chunk_species(i + 1, gpu=False)
+                positions_chunk_cp = sample.load_chunk_positions(i + 1, use_gpu=True)
+                species_chunk_np = sample.load_chunk_species(i + 1, use_gpu=False)
                 positions_chunk_cp, species_chunk_np = self.apply_crack_chunk(positions_chunk_cp,species_chunk_np)
-                sample.write_chunk_positions(cp.asnumpy(positions_chunk_cp), i + 1)
-                sample.write_chunk_species(species_chunk_np,i+1)
-            return
+                positions_chunk_np = cp.asnumpy(positions_chunk_cp)
+                sample.write_chunk_positions(positions_chunk_np,i+1,override_directory=self.directory)
+                sample.write_chunk_species(species_chunk_np,i+1,override_directory=self.directory)
+            sample.write_sample_metadata(override_directory=self.directory)
 
         def apply_crack_chunk(self, positions_chunk_cp,species_chunk_np):
             """
