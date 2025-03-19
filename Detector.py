@@ -2,7 +2,10 @@
 # Modules
 # -----------------------------------------------------------------------------
 import numpy as np
-import cupy as cp
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
 import pickle
 import os
 
@@ -31,7 +34,7 @@ class detector:
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
         
-    def create_detector(self,shape,pixel_size):
+    def create_detector(self,shape,pixel_size,use_gpu=True):
         self._shape = shape
         self._pixel_size = pixel_size
         self._center = np.array([0.0,0.0,0.0])
@@ -39,15 +42,26 @@ class detector:
         self._two_theta = 0
         self._nu = 0
         # Create detector pixel grid
-        y_lin = cp.linspace(-(self.shape[0]/2)*self.pixel_size[0],
-                            +(self.shape[0]/2)*self.pixel_size[0],
-                            self.shape[0], dtype=cp.float32)
-        z_lin = cp.linspace(-(self.shape[1]/2)*self.pixel_size[1],
-                            +(self.shape[1]/2)*self.pixel_size[1],
-                            self.shape[1], dtype=cp.float32)
-        Y,Z  = cp.meshgrid(y_lin,z_lin)
-        X = cp.full_like(Y,0)
-        self._pixel_coordinates = cp.vstack((X.ravel(),Y.ravel(),Z.ravel()))
+        if cp is None or not use_gpu:
+            y_lin = np.linspace(-(self.shape[0]/2)*self.pixel_size[0],
+                                +(self.shape[0]/2)*self.pixel_size[0],
+                                self.shape[0], dtype=np.float32)
+            z_lin = np.linspace(-(self.shape[1]/2)*self.pixel_size[1],
+                                +(self.shape[1]/2)*self.pixel_size[1],
+                                self.shape[1], dtype=np.float32)
+            Y,Z  = np.meshgrid(y_lin,z_lin)
+            X = np.full_like(Y,0)
+            self._pixel_coordinates = np.vstack((X.ravel(),Y.ravel(),Z.ravel()))
+        else:
+            y_lin = cp.linspace(-(self.shape[0]/2)*self.pixel_size[0],
+                                +(self.shape[0]/2)*self.pixel_size[0],
+                                self.shape[0], dtype=cp.float32)
+            z_lin = cp.linspace(-(self.shape[1]/2)*self.pixel_size[1],
+                                +(self.shape[1]/2)*self.pixel_size[1],
+                                self.shape[1], dtype=cp.float32)
+            Y,Z  = cp.meshgrid(y_lin,z_lin)
+            X = cp.full_like(Y,0)
+            self._pixel_coordinates = cp.vstack((X.ravel(),Y.ravel(),Z.ravel()))
     
     ## Data Handling Functions
     def write_detector_metadata(self): #incomplete
@@ -59,7 +73,7 @@ class detector:
         """
         Return the 3x3 rotation matrix for rotation by 'angle' radians
         around the (normalized) 'axis'.
-        """ 
+        """
         axis = axis / np.linalg.norm(axis)
         c = np.cos(angle)
         s = np.sin(angle)
@@ -75,30 +89,36 @@ class detector:
         self._center = detector_location
         self._pixel_coordinates = self._pixel_coordinates + self._center[:,None]
         
-    def position_detector_relative(self,distance,two_theta,nu,degrees=True):
+    def position_detector_relative(self,distance,two_theta,nu,degrees=True,use_gpu=True):
         if degrees:
             two_theta = np.deg2rad(two_theta)
             nu = np.deg2rad(nu)
         self._two_theta += self._two_theta
         self._nu += self._nu
         detector_rotation_np = self.get_rotation_detector(two_theta,nu)
-        detector_rotation_cp = cp.asarray(detector_rotation_np)
         self._direction = self._direction@detector_rotation_np.T
         self._center = distance*self._direction + self._center
-        self._pixel_coordinates = detector_rotation_cp@self._pixel_coordinates + cp.asarray(self._center[:,None])
+        if cp is None or not use_gpu:
+            self._pixel_coordinates = detector_rotation_np @ self._pixel_coordinates + self._center[:,None]
+        else:
+            detector_rotation_cp = cp.asarray(detector_rotation_np)
+            self._pixel_coordinates = detector_rotation_cp @ self._pixel_coordinates + cp.asarray(self._center[:,None])
         
-    def position_detector_absolute(self,distance,two_theta,nu,degrees=True):
-        self.create_detector(self.shape,self.pixel_size)
+    def position_detector_absolute(self,distance,two_theta,nu,degrees=True,use_gpu=True):
+        self.create_detector(self.shape,self.pixel_size,use_gpu=use_gpu)
         if degrees:
             two_theta = np.deg2rad(two_theta)
             nu = np.deg2rad(nu)
         self._two_theta = self._two_theta
         self._nu = self._nu
         detector_rotation_np = self.get_rotation_detector(two_theta,nu)
-        detector_rotation_cp = cp.asarray(detector_rotation_np)
         self._direction = self._direction@detector_rotation_np.T
         self._center = distance*self._direction + self._center
-        self._pixel_coordinates = detector_rotation_cp@self._pixel_coordinates + cp.asarray(self._center[:,None])
+        if cp is None or not use_gpu:
+            self._pixel_coordinates = detector_rotation_np @ self._pixel_coordinates + self._center[:,None]
+        else:
+            detector_rotation_cp = cp.asarray(detector_rotation_np)
+            self._pixel_coordinates = detector_rotation_cp @ self._pixel_coordinates + cp.asarray(self._center[:,None])
         
     def get_rotation_detector(self,two_theta,nu):
         """
