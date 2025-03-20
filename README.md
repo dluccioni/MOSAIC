@@ -2,7 +2,7 @@
 
 # Xray-Simulator – Wave Optics Forward Simulation
 
-This repository contains a set of Python classes and utilities for simulating diffraction and scattering from crystalline samples, modeling defects (stacking faults, cracks), and visualizing detector data. The code is modular and is split across multiple files, each serving a different purpose:
+This repository contains a set of Python classes and utilities for simulating diffraction and scattering from crystalline samples, modeling defects (stacking faults, cracks), and visualizing detector data. The code is modular and is split across multiple files, each serving a different purpose
 
 1. **Beam.py** – Models beam-sample interaction for forward scattering.
 2. **Crystal.py** – Provides functionality to read crystal structures (from CIF files), manipulate them, and calculate crystallographic properties.
