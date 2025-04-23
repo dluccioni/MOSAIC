@@ -2,7 +2,8 @@
 # Modules
 # -----------------------------------------------------------------------------
 import numpy as np
-import pickle
+import json
+import os
 from pymatgen.core import Structure
 
 # -----------------------------------------------------------------------------
@@ -47,9 +48,90 @@ class crystal:
         self._lattice_orientation = np.linalg.inv(self.lattice_matrix_conventional)/np.linalg.norm(np.linalg.inv(self.lattice_matrix_conventional), axis=0, keepdims=True)
         del self.structure
         
+    def read_crystal_metadata(self, override_directory=None):
+        """
+        Reads the crystal_metadata.json file from disk and restores this crystal 
+        object's internal fields.
+        """
+        if override_directory is not None:
+            base_dir = override_directory
+        else:
+            base_dir = os.path.dirname(self.filepath)
+        
+        metadata_filename = os.path.join(base_dir, "crystal_metadata.json")
+        if not os.path.isfile(metadata_filename):
+            raise FileNotFoundError(f"No JSON metadata file found at {metadata_filename}")
+
+        with open(metadata_filename, "r") as f:
+            data = json.load(f)
+
+        self.filepath = data["filepath"]
+        
+        if data["lattice_matrix"] is not None:
+            self._lattice_matrix = np.array(data["lattice_matrix"], dtype=np.float64)
+        if data["lattice_corners"] is not None:
+            self._lattice_corners = np.array(data["lattice_corners"], dtype=np.float64)
+        if data["lattice_center"] is not None:
+            self._lattice_center = np.array(data["lattice_center"], dtype=np.float64)
+        if data["lattice_lengths"] is not None:
+            self._lattice_lengths = np.array(data["lattice_lengths"], dtype=np.float64)
+        if data["lattice_volume"] is not None:
+            self._lattice_volume = float(data["lattice_volume"])
+        if data["lattice_atom_cartesian"] is not None:
+            self._lattice_atom_cartesian = np.array(data["lattice_atom_cartesian"], dtype=np.float64)
+        if data["species"] is not None:
+            self._species = np.array(data["species"], dtype=object)
+        if data["lattice_atom_fractional"] is not None:
+            self._lattice_atom_fractional = np.array(data["lattice_atom_fractional"], dtype=np.float64)
+        if data["lattice_matrix_conventional"] is not None:
+            self._lattice_matrix_conventional = np.array(data["lattice_matrix_conventional"], dtype=np.float64)
+        if data["lattice_lengths_conventional"] is not None:
+            self._lattice_lengths_conventional = np.array(data["lattice_lengths_conventional"], dtype=np.float64)
+        if data["lattice_volume_conventional"] is not None:
+            self._lattice_volume_conventional = float(data["lattice_volume_conventional"])
+        if data["lattice_orientation"] is not None:
+            self._lattice_orientation = np.array(data["lattice_orientation"], dtype=np.float64)
+        if data["cumulative_rotation"] is not None:
+            self._cumulative_rotation = np.array(data["cumulative_rotation"], dtype=np.float64)
+        
     ## Data Saving Functions
-    def write_crystal_metadata(self): 
-        crystal_metadata = [self.lattice_matrix]
+    def write_crystal_metadata(self, override_directory=None): 
+        """
+        Serializes the crystal object's critical internal fields to disk 
+        as human-readable JSON so that the state can be restored later.
+        """
+        if override_directory is not None:
+            base_dir = override_directory
+        else:
+            base_dir = os.path.dirname(self.filepath)
+            
+        metadata_filename = os.path.join(base_dir, "crystal_metadata.json")
+
+        crystal_metadata = {
+            "filepath":                  self.filepath,
+            "lattice_matrix":            self._lattice_matrix.tolist() if self._lattice_matrix is not None else None,
+            "lattice_corners":           self._lattice_corners.tolist() if self._lattice_corners is not None else None,
+            "lattice_center":            self._lattice_center.tolist() if self._lattice_center is not None else None,
+            "lattice_lengths":           self._lattice_lengths.tolist() if self._lattice_lengths is not None else None,
+            "lattice_volume":            float(self._lattice_volume) if self._lattice_volume is not None else None,
+            "lattice_atom_cartesian":    self._lattice_atom_cartesian.tolist() if self._lattice_atom_cartesian is not None else None,
+            "species":                   self._species.tolist() if self._species is not None else None,
+            "lattice_atom_fractional":   self._lattice_atom_fractional.tolist() if self._lattice_atom_fractional is not None else None,
+            "lattice_matrix_conventional": 
+                self._lattice_matrix_conventional.tolist() if self._lattice_matrix_conventional is not None else None,
+            "lattice_lengths_conventional": 
+                self._lattice_lengths_conventional.tolist() if self._lattice_lengths_conventional is not None else None,
+            "lattice_volume_conventional": 
+                float(self._lattice_volume_conventional) if self._lattice_volume_conventional is not None else None,
+            "lattice_orientation": 
+                self._lattice_orientation.tolist() if self._lattice_orientation is not None else None,
+            "cumulative_rotation": 
+                self._cumulative_rotation.tolist() if self._cumulative_rotation is not None else None
+        }
+
+        with open(metadata_filename, "w") as f:
+            json.dump(crystal_metadata, f, indent=4)
+        print(f"Metadata written to {metadata_filename}")
     
     ## Static Functions
     @staticmethod
