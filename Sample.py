@@ -4,7 +4,7 @@
 import numpy as np
 import os
 import gc
-import pickle
+import json
 try:
     import cupy as cp
 except ImportError:
@@ -45,27 +45,26 @@ class sample:
         # Slightly rewritten for small overhead reduction (no functional change)
         self._corners = (self.get_unit_corners() @ self.matrix) - (self.dimensions * 0.5) + self.offset
         
-    def read_sample(self):
+    def read_sample_metadata(self):
         """
-        Reads the metadata pickle file from disk and restores
+        Reads the metadata JSON file from disk and restores
         this sample object's state.
         """
-        metadata_filename = os.path.join(self.directory, self._default_filenames[2])
+        metadata_filename = os.path.join(self.directory, "sample_metadata.json")
         if not os.path.isfile(metadata_filename):
-            raise FileNotFoundError(f"No metadata file found at {metadata_filename}")
-        with open(metadata_filename, "rb") as f:
-            sample_metadata = pickle.load(f)
-        # Restore all fields
-        self._dimensions = sample_metadata["dimensions"]
-        self._offset = sample_metadata["offset"]
-        self._chunk_volume = sample_metadata["chunk_volume"]
-        self._chunk_total = sample_metadata["chunk_total"]
-        self._matrix = sample_metadata["matrix"]
-        self._corners = sample_metadata["corners"]
-        self._chunk_positions = sample_metadata["chunk_positions"]
-        self._chunk_dimensions = sample_metadata["chunk_dimensions"]
-        print(f"Metadata loaded from {metadata_filename}")
-    
+            raise FileNotFoundError(f"No JSON metadata file found at {metadata_filename}")
+
+        with open(metadata_filename, "r") as f:
+            sample_metadata = json.load(f)
+
+        # Convert lists back to NumPy arrays
+        if sample_metadata["dimensions"] is not None:
+            self._dimensions = np.array(sample_metadata["dimensions"], dtype=np.float32)
+        if sample_metadata["offset"] is not None:
+            self._offset = np.array(sample_metadata["offset"], dtype=np.float32)
+        if sample_metadata["chunk_total"] is not None:
+            self._chunk_total = int(sample_metadata["chunk_total"])
+        
     ## Data Handling Functions
     def write_chunk_positions(self, data, chunk_num, override_directory=None):
         base, ext = os.path.splitext(self._default_filenames[0])
@@ -85,28 +84,30 @@ class sample:
             
     def write_sample_metadata(self, override_directory=None):
         """
-        Serializes the sample objects critical internal fields to disk 
-        so that the state can be restored later.
+        Serializes the sample object's critical internal fields to disk 
+        as human-readable JSON so that the state can be restored later.
         """
-        # Gather all fields needed to reconstruct the object's state
+        # Convert NumPy arrays to Python lists so JSON can handle them
         sample_metadata = {
-            "dimensions": self._dimensions,
-            "offset": self._offset,
-            "chunk_volume": self._chunk_volume,
-            "chunk_total": self._chunk_total,
-            "matrix": self._matrix,
-            "corners": self._corners,
-            "chunk_positions": self._chunk_positions,
-            "chunk_dimensions": self._chunk_dimensions
+            "dimensions": self._dimensions.tolist() if self._dimensions is not None else None,
+            "offset": self._offset.tolist() if self._offset is not None else None,
+            "chunk_total": int(self._chunk_total) if self._chunk_total is not None else None,
         }
+
         if override_directory is not None:
-            metadata_filename = os.path.join(override_directory, self._default_filenames[2])
-            with open(metadata_filename, "wb") as f:
-                pickle.dump(sample_metadata, f)
+            metadata_filename = os.path.join(override_directory, "sample_metadata.json")
         else:
-            metadata_filename = os.path.join(self.directory, self._default_filenames[2])
-            with open(metadata_filename, "wb") as f:
-                pickle.dump(sample_metadata, f)
+            metadata_filename = os.path.join(self.directory, "sample_metadata.json")
+
+        # Write as nicely formatted JSON
+        with open(metadata_filename, "w") as f:
+            json.dump(sample_metadata, f, indent=4)
+        print(f"Metadata written to {metadata_filename} in JSON format.")
+                
+    def generate_sample_metadata(self, override_directory=None):
+        """
+        Generates sample metadata from atomic position files.
+        """
 
     def load_chunk_positions(self, chunk_number, use_gpu=True):
         """
@@ -116,7 +117,6 @@ class sample:
         base, ext = os.path.splitext(self._default_filenames[0])
         positions_filename = f"{base}_{chunk_number}{ext}"
         full_path = os.path.join(self.directory, positions_filename)
-        # Switch logic
         if use_gpu and (cp is not None):
             return cp.load(full_path)
         else:
@@ -134,6 +134,65 @@ class sample:
             return cp.load(full_path)
         else:
             return np.load(full_path)
+        
+    def import_LAMMPS(self, import_file, element_list, flush_size=100000000, override_directory=None):
+        """
+        Reads the atoms from a large text file, skipping the first 9 lines, and
+        chunks them into binary .npy files of size flush_size in the desired folder.
+        
+        The atomic positions are assumed to be in columns 3,4,5 of each line (1-based indexing).
+        Also recovers 'dimensions', 'offset', and 'chunk_total' from the bounding box
+        of these atomic positions.
+        """
+        chunk_num = 0
+        # Track min/max in x,y,z to calculate dimensions and offset afterward
+        x_min = y_min = z_min = float('inf')
+        x_max = y_max = z_max = float('-inf')
+        with open(import_file, "r") as f:
+            # Skip the first 9 lines
+            for _ in range(9):
+                next(f)
+            while True:
+                # Read up to flush_size lines at a time
+                lines = []
+                for _ in range(flush_size):
+                    line = f.readline()
+                    if not line:
+                        break
+                    lines.append(line)
+                # If no lines were read, we're at EOF
+                if not lines:
+                    break
+                # Parse positions from columns 3,4,5
+                data_arr = np.zeros((len(lines), 3), dtype=np.float32)
+                species_arr = []
+                for i, line in enumerate(lines):
+                    split_line = line.strip().split()
+                    species_arr.append(element_list[int(split_line[1])-1])
+                    data_arr[i, 0] = float(split_line[2])
+                    data_arr[i, 1] = float(split_line[3])
+                    data_arr[i, 2] = float(split_line[4])
+                    # Update bounding box
+                    if data_arr[i, 0] < x_min: x_min = data_arr[i, 0]
+                    if data_arr[i, 0] > x_max: x_max = data_arr[i, 0]
+                    if data_arr[i, 1] < y_min: y_min = data_arr[i, 1]
+                    if data_arr[i, 1] > y_max: y_max = data_arr[i, 1]
+                    if data_arr[i, 2] < z_min: z_min = data_arr[i, 2]
+                    if data_arr[i, 2] > z_max: z_max = data_arr[i, 2]
+                # Increment chunk number and save the positions
+                chunk_num += 1
+                self.write_chunk_positions(data_arr, chunk_num, override_directory=override_directory)
+                self.write_chunk_species(species_arr, chunk_num, override_directory=override_directory)
+        # Record how many chunks were created
+        self._chunk_total = chunk_num
+        # Infer dimensions from bounding box
+        self._dimensions = np.array([x_max - x_min, 
+                                    y_max - y_min, 
+                                    z_max - z_min], dtype=np.float32)
+        # Offset is the midpoint of the bounding box (center)
+        self._offset = np.array([(x_min + x_max) / 2.0,
+                                (y_min + y_max) / 2.0,
+                                (z_min + z_max) / 2.0], dtype=np.float32)
 
     ## Static Functions
     @staticmethod
@@ -640,6 +699,34 @@ class sample:
         
         self._chunk_total = file_chunk_index
         return
+    
+    def center_atomic_data(self, use_gpu=True):
+        """
+        Re-loads each chunk of atomic positions, subtracts the current self.offset
+        from every position (centering them), and writes them back out.
+        Finally sets self.offset to [0,0,0].
+        """
+        if self._offset is None:
+            raise ValueError("Offset is not initialized. Please set self._offset or load metadata first.")
+
+        if self._chunk_total is None:
+            raise ValueError("Chunk total is not initialized. Please generate sample or import atoms first.")
+        
+        offset_np = self.offset.astype(np.float32)
+
+        for i in range(self.chunk_total):
+            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
+            
+            if cp is not None and isinstance(positions_chunk, cp.ndarray):
+                positions_chunk -= cp.array(offset_np)
+                positions_chunk_cpu = positions_chunk.get()
+                self.write_chunk_positions(positions_chunk_cpu, i + 1)
+            else:
+                positions_chunk -= offset_np
+                self.write_chunk_positions(positions_chunk, i + 1)
+
+        self._offset = np.zeros(3, dtype=np.float32)
+        print("All atomic positions re-centered. Offset is now [0, 0, 0].")
 
     def plot_sample(self, elev=0, azim=0):
         import matplotlib.pyplot as plt
@@ -662,7 +749,7 @@ class sample:
                 c='b', marker='.'
             )
         return fig, ax1
-        
+    
     ## Properties
     @property
     def dimensions(self):
