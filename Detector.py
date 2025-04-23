@@ -83,21 +83,16 @@ class detector:
                          [d*y*x + z*s,   c + d*y*y,     d*y*z - x*s],
                          [d*z*x - y*s,   d*z*y + x*s,   c + d*z*z]])
         
-    ## Main Functions    
-    def position_detector_cartesian(self,detector_location,pointing_location=np.array([0.0,0.0,0.0])): #incomplete
-        # Need to figure out how to make detector point correctly without changing twist
-        self._center = detector_location
-        self._pixel_coordinates = self._pixel_coordinates + self._center[:,None]
-        
+    ## Main Functions     
     def position_detector_relative(self,distance,two_theta,nu,degrees=True,use_gpu=True):
         if degrees:
             two_theta = np.deg2rad(two_theta)
             nu = np.deg2rad(nu)
-        self._two_theta += self._two_theta
-        self._nu += self._nu
+        self._two_theta += two_theta
+        self._nu += nu
         detector_rotation_np = self.get_rotation_detector(two_theta,nu)
         self._direction = self._direction@detector_rotation_np.T
-        self._center = distance*self._direction + self._center
+        self._center = distance*np.array([np.cos(self._two_theta),np.sin(self._two_theta)*np.sin(self._nu),np.sin(self._two_theta)*np.cos(self._nu)])
         if cp is None or not use_gpu:
             self._pixel_coordinates = detector_rotation_np @ self._pixel_coordinates + self._center[:,None]
         else:
@@ -111,7 +106,7 @@ class detector:
             nu = np.deg2rad(nu)
         self._two_theta = self._two_theta
         self._nu = self._nu
-        detector_rotation_np = self.get_rotation_detector(two_theta,nu)
+        detector_rotation_np = self.get_rotation_detector(self._two_theta,self._nu)
         self._direction = self._direction@detector_rotation_np.T
         self._center = distance*self._direction + self._center
         if cp is None or not use_gpu:
@@ -124,9 +119,9 @@ class detector:
         """
         Return the 3x3 rotation matrix for the detector.
         """
-        two_theta_matrix = self.get_rotation(np.array([1.0,0.0,0.0]),two_theta)
-        nu_matrix = self.get_rotation(np.array([0.0,1.0,0.0]),nu)
-        return two_theta_matrix@nu_matrix
+        two_theta_matrix = self.get_rotation(np.array([0.0,-1.0,0.0]),two_theta)
+        nu_matrix = self.get_rotation(np.array([-1.0,0.0,0.0]),nu)
+        return nu_matrix@two_theta_matrix
         
     def get_detector_position_cartesian(self):
         return self._center,self._direction
@@ -137,10 +132,10 @@ class detector:
         self._pixel_amplitude = np.abs(self.pixel_values)
         self._pixel_intensity = self.pixel_amplitude**2
         
-    def plot_detector(self,type="Intensity"):
+    def plot_detector(self,type="Intensity",scaling="linear",limits=np.array([0,1])):
         import matplotlib.pyplot as plt
         import matplotlib.colors as pltcolor
-        if type=="Intensity":
+        if type == "Intensity":
             plot_val = self.pixel_intensity
             cmap = 'gist_yarg'
         elif type == "Phase":
@@ -150,6 +145,9 @@ class detector:
         elif type == "Amplitude":
             plot_val = self.pixel_amplitude
             cmap = 'gist_yarg'
+        if scaling == "log":
+            plot_val = np.log(plot_val)
+        
         detector_extent = self._shape*self._pixel_size/2
         fig = plt.figure(figsize=(8, 8))
         ax1 = fig.add_subplot(1, 1, 1)
@@ -163,6 +161,31 @@ class detector:
         ax1.set_title(type)
         fig.colorbar(im, ax=ax1)
         # fig.show()
+        return fig, ax1
+    
+    def plot_detector_position(self,elev=0,azim=90):
+        import matplotlib.pyplot as plt
+        fig = plt.figure(figsize=(8, 8))
+        ax1 = fig.add_subplot(1, 1, 1, projection='3d')
+        ax1.scatter(
+                0,
+                0,
+                0,
+                c='r', marker='o'
+            )
+        ax1.scatter(
+                self.pixel_coordinates[0, :].get(),
+                self.pixel_coordinates[1, :].get(),
+                self.pixel_coordinates[2, :].get(),
+                c='b', marker='.'
+            )
+        ax1.view_init(elev=elev, azim=azim)
+        ax1.set_proj_type('ortho')
+        ax1.axis('equal')
+        ax1.set_xlabel("X")
+        ax1.set_ylabel("Y")
+        ax1.set_ylabel("Z")
+        
         return fig, ax1
     
     @property
