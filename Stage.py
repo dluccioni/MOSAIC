@@ -106,6 +106,19 @@ class stage:
     
     ## Static Functions
     @staticmethod
+    def get_unit_corners():
+        unit_corners = np.array([
+            [0, 0, 0],
+            [1, 0, 0],
+            [0, 1, 0],
+            [0, 0, 1],
+            [1, 1, 0],
+            [1, 0, 1],
+            [0, 1, 1],
+            [1, 1, 1]], dtype=np.float32)
+        return unit_corners
+    
+    @staticmethod
     def get_axis_rotation(axis, angle):
         """
         Return the 3x3 rotation matrix for rotation by 'angle' radians
@@ -157,7 +170,7 @@ class stage:
             return np.eye(3, dtype=np.float32)
     
     ## Main Functions
-    def set_rotation_stage_absolute(self, omega, phi, chi, mu, degrees=True):
+    def set_rotation_stage_absolute(self, omega=0, phi=0, chi=0, mu=0, degrees=True):
         """
         Set the stage rotation to absolute angles (omega, phi, chi, mu).
         Overwrites any existing angles. Resets the stage to these angles.
@@ -175,7 +188,7 @@ class stage:
         
         print(f"Stage rotation set ABSOLUTE to: omega={omega}, phi={phi}, chi={chi}, mu={mu} (degrees={degrees}).")
     
-    def set_rotation_stage_relative(self, domega, dphi, dchi, dmu, degrees=True):
+    def set_rotation_stage_relative(self, domega=0, dphi=0, dchi=0, dmu=0, degrees=True):
         """
         Rotate the stage by angles (domega, dphi, dchi, dmu) relative to current angles.
         """
@@ -192,7 +205,7 @@ class stage:
         
         print(f"Stage rotation set RELATIVE by: domega={domega}, dphi={dphi}, dchi={dchi}, dmu={dmu} (degrees={degrees}).")
     
-    def set_translation_stage_absolute(self, x, y, z):
+    def set_translation_stage_absolute(self, x=0, y=0, z=0):
         """
         Set the stage translation to an absolute coordinate (x, y, z).
         """
@@ -201,7 +214,7 @@ class stage:
         self._translation = np.array([x, y, z], dtype=np.float32)
         print(f"Stage translation set ABSOLUTE to: [{x}, {y}, {z}].")
     
-    def set_translation_stage_relative(self, dx, dy, dz):
+    def set_translation_stage_relative(self, dx=0, dy=0, dz=0):
         """
         Move the stage by a relative vector (dx, dy, dz) from the current translation.
         """
@@ -226,6 +239,56 @@ class stage:
         self._translation = np.zeros(3, dtype=np.float32)
         
         print("Stage angles and translation have been zeroed.")
+    
+    def plot_stage(self, elev=30, azim=45):
+        """
+        Plots a centered unit cube (edges from -0.5 to +0.5 in each axis) after
+        applying the stage's rotation and translation. Also plots red lines along
+        the X, Y, and Z axes originating from [0,0,0].
+        """
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+        fig = plt.figure(figsize=(8, 8))
+        ax = fig.add_subplot(111, projection='3d')
+
+        # Get the cube corners
+        corners_local = self.get_unit_corners() - 0.5
+
+        # Apply rotation + translation to each corner
+        corners_lab = (corners_local @ self.rotation) + self.translation
+        edges = [
+            (0,1), (0,2), (0,3),
+            (1,4), (1,5),
+            (2,4), (2,6),
+            (3,5), (3,6),
+            (4,7), (5,7), (6,7)
+        ]
+
+        # Plot each edge of the cube as a black line
+        for (i1, i2) in edges:
+            x_vals = [corners_lab[i1, 0], corners_lab[i2, 0]]
+            y_vals = [corners_lab[i1, 1], corners_lab[i2, 1]]
+            z_vals = [corners_lab[i1, 2], corners_lab[i2, 2]]
+            ax.plot(x_vals, y_vals, z_vals, 'k-',linewidth=3)
+
+        # Plot red lines for the coordinate axes from origin
+        ax.plot([0, 2], [0, 0], [0, 0], 'r-')
+        ax.plot([0, 0], [0, 2], [0, 0], 'g-')
+        ax.plot([0, 0], [0, 0], [0, 2], 'b-')
+        ax.plot([0, -2], [0, 0], [0, 0], 'r--')
+        ax.plot([0, 0], [0, -2], [0, 0], 'g--')
+        ax.plot([0, 0], [0, 0], [0, -2], 'b--')
+
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_proj_type('ortho')
+        ax.axis('equal')
+
+        plt.tight_layout()
+        plt.show()
+        return fig, ax
     
     ## Properties
     @property
