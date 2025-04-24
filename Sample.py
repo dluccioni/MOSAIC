@@ -24,6 +24,7 @@ class sample:
         self.directory = directory
         self._dimensions = None
         self._offset = None
+        self._rotation = None
         self._chunk_volume = None
         self._chunk_total = None 
         self._matrix = None
@@ -40,6 +41,7 @@ class sample:
     def create_sample(self, dimensions, offset=[0,0,0], chunk_volume=(600*600*600)):
         self._dimensions = np.array(dimensions, dtype=np.float32)
         self._offset = np.array(offset, dtype=np.float32)
+        self._rotation = np.eye(3, dtype=np.float32)
         self._chunk_volume = np.array(chunk_volume, dtype=np.float32)
         self._matrix = np.diag(self.dimensions)
         # Slightly rewritten for small overhead reduction (no functional change)
@@ -62,6 +64,8 @@ class sample:
             self._dimensions = np.array(sample_metadata["dimensions"], dtype=np.float32)
         if sample_metadata["offset"] is not None:
             self._offset = np.array(sample_metadata["offset"], dtype=np.float32)
+        if sample_metadata["rotation"] is not None:
+            self._rotation = np.array(sample_metadata["rotation"], dtype=np.float32)
         if sample_metadata["chunk_total"] is not None:
             self._chunk_total = int(sample_metadata["chunk_total"])
         
@@ -91,6 +95,7 @@ class sample:
         sample_metadata = {
             "dimensions": self._dimensions.tolist() if self._dimensions is not None else None,
             "offset": self._offset.tolist() if self._offset is not None else None,
+            "rotation": self._rotation.tolist() if self._rotation is not None else None,
             "chunk_total": int(self._chunk_total) if self._chunk_total is not None else None,
         }
 
@@ -103,11 +108,6 @@ class sample:
         with open(metadata_filename, "w") as f:
             json.dump(sample_metadata, f, indent=4)
         print(f"Metadata written to {metadata_filename} in JSON format.")
-                
-    def generate_sample_metadata(self, override_directory=None):
-        """
-        Generates sample metadata from atomic position files.
-        """
 
     def load_chunk_positions(self, chunk_number, use_gpu=True):
         """
@@ -135,7 +135,7 @@ class sample:
         else:
             return np.load(full_path)
         
-    def import_LAMMPS(self, import_file, element_list, flush_size=100000000, override_directory=None):
+    def import_atomic_data(self, import_file, element_list, header_lines=9, ID_column=1, position_columns=[2,3,4], scale=1e-10, flush_size=100000000, override_directory=None):
         """
         Reads the atoms from a large text file, skipping the first 9 lines, and
         chunks them into binary .npy files of size flush_size in the desired folder.
@@ -150,7 +150,7 @@ class sample:
         x_max = y_max = z_max = float('-inf')
         with open(import_file, "r") as f:
             # Skip the first 9 lines
-            for _ in range(9):
+            for _ in range(header_lines):
                 next(f)
             while True:
                 # Read up to flush_size lines at a time
@@ -168,10 +168,10 @@ class sample:
                 species_arr = []
                 for i, line in enumerate(lines):
                     split_line = line.strip().split()
-                    species_arr.append(element_list[int(split_line[1])-1])
-                    data_arr[i, 0] = float(split_line[2])
-                    data_arr[i, 1] = float(split_line[3])
-                    data_arr[i, 2] = float(split_line[4])
+                    species_arr.append(element_list[int(split_line[ID_column])-1])
+                    data_arr[i, 0] = float(split_line[position_columns[0]])*float(scale/1e-10)
+                    data_arr[i, 1] = float(split_line[position_columns[1]])*float(scale/1e-10)
+                    data_arr[i, 2] = float(split_line[position_columns[2]])*float(scale/1e-10)
                     # Update bounding box
                     if data_arr[i, 0] < x_min: x_min = data_arr[i, 0]
                     if data_arr[i, 0] > x_max: x_max = data_arr[i, 0]
@@ -193,6 +193,7 @@ class sample:
         self._offset = np.array([(x_min + x_max) / 2.0,
                                 (y_min + y_max) / 2.0,
                                 (z_min + z_max) / 2.0], dtype=np.float32)
+        self._rotation = np.eye(3)
 
     ## Static Functions
     @staticmethod
@@ -207,6 +208,21 @@ class sample:
             [0, 1, 1],
             [1, 1, 1]], dtype=np.float32)
         return unit_corners
+    
+    @staticmethod
+    def get_rotation(axis,angle):
+        """
+        Return the 3x3 rotation matrix for rotation by 'angle' radians
+        around the (normalized) 'axis'.
+        """
+        axis = axis / np.linalg.norm(axis)
+        c = np.cos(angle)
+        s = np.sin(angle)
+        d = 1.0 - c
+        x, y, z = axis
+        return np.array([[c + d*x*x,     d*x*y - z*s,   d*x*z + y*s],
+                         [d*y*x + z*s,   c + d*y*y,     d*y*z - x*s],
+                         [d*z*x - y*s,   d*z*y + x*s,   c + d*z*z]])
     
     @staticmethod
     def get_flat_grid(dimensions, use_gpu=False):
@@ -700,7 +716,7 @@ class sample:
         self._chunk_total = file_chunk_index
         return
     
-    def center_atomic_data(self, use_gpu=True):
+    def zero_sample_position(self, use_gpu=True):
         """
         Re-loads each chunk of atomic positions, subtracts the current self.offset
         from every position (centering them), and writes them back out.
@@ -727,6 +743,95 @@ class sample:
 
         self._offset = np.zeros(3, dtype=np.float32)
         print("All atomic positions re-centered. Offset is now [0, 0, 0].")
+        
+    def zero_sample_rotation(self, use_gpu=True):
+        """
+        Re-loads each chunk of atomic positions, rotates all chunks by the inverse
+        of the current self._rotation, and writes them back out.
+        Finally sets self._rotation to the 3x3 identity matrix.
+        """
+        if self._rotation is None:
+            raise ValueError("No sample rotation matrix is set. Please initialize or load it first.")
+        
+        R_inv = self._rotation.T.astype(np.float32)
+        
+        if self._chunk_total is None:
+            raise ValueError("Chunk total is not initialized. Please generate or import sample data first.")
+        
+        for i in range(self.chunk_total):
+            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
+            
+            if cp is not None and isinstance(positions_chunk, cp.ndarray):
+                R_inv_cp = cp.asarray(R_inv)
+                positions_chunk = positions_chunk @ R_inv_cp
+                positions_chunk_cpu = positions_chunk.get()
+                self.write_chunk_positions(positions_chunk_cpu, i + 1)
+            else:
+                positions_chunk = positions_chunk @ R_inv
+                self.write_chunk_positions(positions_chunk, i + 1)
+        
+        self._rotation = np.eye(3, dtype=np.float32)
+        print("All atomic positions de-rotated. Sample rotation is now the identity matrix.")
+        
+    def zero_sample(self, use_gpu=True):
+        self.zero_sample_position(use_gpu=use_gpu)
+        self.zero_sample_rotation(use_gpu=use_gpu)
+        
+    def rotate_sample_relative(self, axis, dangle, degrees=True, use_gpu=True):
+        """
+        Re-loads each chunk of atomic positions, rotates it according to self.get_rotation(axis, dangle),
+        writes them back out, and then updates self._rotation by left-multiplying with the new rotation.
+        """
+        if degrees:
+            dangle = np.deg2rad(dangle)
+        
+        R = self.get_rotation(axis, dangle).astype(np.float32)
+        
+        if self._chunk_total is None:
+            raise ValueError("Chunk total is not initialized. Please generate or import sample data first.")
+        
+        for i in range(self.chunk_total):
+            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
+            if cp is not None and isinstance(positions_chunk, cp.ndarray):
+                R_cp = cp.asarray(R)
+                positions_chunk = positions_chunk @ R_cp
+                positions_chunk_cpu = positions_chunk.get()
+                self.write_chunk_positions(positions_chunk_cpu, i + 1)
+            else:
+                positions_chunk = positions_chunk @ R
+                self.write_chunk_positions(positions_chunk, i + 1)
+        
+        self._rotation = R @ self._rotation
+        print(f"Sample rotated by {dangle:.4f} radians about axis {axis}. "
+              f"Updated sample rotation matrix:\n{self._rotation}")
+
+    def translate_sample_relative(self, offset_vector, use_gpu=True): # update this to use dx, dy, dz
+        """
+        Re-loads each chunk of atomic positions, adds the offset_vector to every position,
+        and writes them back out.
+        Finally adds offset_vector to self._offset.
+        """
+        if self._chunk_total is None:
+            raise ValueError("Chunk total is not initialized. Please generate or import sample data first.")
+        
+        offset_np = np.array(offset_vector, dtype=np.float32)
+        
+        for i in range(self.chunk_total):
+            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
+            if cp is not None and isinstance(positions_chunk, cp.ndarray):
+                positions_chunk += cp.asarray(offset_np)
+                positions_chunk_cpu = positions_chunk.get()
+                self.write_chunk_positions(positions_chunk_cpu, i + 1)
+            else:
+                positions_chunk += offset_np
+                self.write_chunk_positions(positions_chunk, i + 1)
+        
+        if self._offset is None:
+            self._offset = offset_np
+        else:
+            self._offset += offset_np
+        
+        print(f"Sample translated by {offset_vector}. New offset is {self._offset}.")
 
     def plot_sample(self, elev=0, azim=0):
         import matplotlib.pyplot as plt
@@ -768,6 +873,15 @@ class sample:
         if self._offset is None:
             print("self._offset has not been initialized yet")
         return self._offset
+    
+    @property
+    def rotation(self):
+        """
+        Return the rotation matrix (3x3).
+        """
+        if self._rotation is None:
+            print("self._rotation has not been initialized yet")
+        return self._rotation
 
     @property
     def chunk_volume(self):
