@@ -149,7 +149,7 @@ class beam:
                 }
             }
         }
-        '''
+        ''';
 
         ffi_obj = FFI()
         ffi_obj.cdef(
@@ -413,10 +413,15 @@ class beam:
 
     ## Main Functions
     # CPU function
-    def cpu_scatter_chunk_cffi(self,complied_code,ffi_obj,chunk_id,sample,Nx,Ny,coords_x_m,coords_y_m,coords_z_m,db_dict_f0_all,db_dict_f1f2_all,k_val):
+    def cpu_scatter_chunk_cffi(self, complied_code, ffi_obj, chunk_id, sample,
+                               Nx, Ny, coords_x_m, coords_y_m, coords_z_m,
+                               db_dict_f0_all, db_dict_f1f2_all, k_val,
+                               stage):
         """
         Use CFFI for a single chunk scattering. Return (Ny, Nx) complex64 array.
-        cffi_lib is the compiled library; ffi_obj is the FFI instance.
+        
+        NOTE: We apply the stage rotation + translation to the positions
+              before converting to meters.
         """
         species_chunk_np = sample.load_chunk_species(chunk_id, use_gpu=False)
         atom_count = species_chunk_np.shape[0]
@@ -441,9 +446,17 @@ class beam:
 
             f0_params_np[mask] = db_dict_f0_all[el]
 
-        # Load positions -> meters
+        # Load positions (in Angstrom)
         positions_chunk = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
-        positions_chunk = np.ascontiguousarray(positions_chunk)  # ensure contiguous
+
+        # Stage translation and rotation
+        positions_chunk = positions_chunk @ stage.rotation
+        positions_chunk += stage.translation
+
+        # Convert to contiguous before dividing to meters
+        positions_chunk = np.ascontiguousarray(positions_chunk)
+
+        # Convert to meters
         positions_chunk[:, 0] /= 1e10
         positions_chunk[:, 1] /= 1e10
         positions_chunk[:, 2] /= 1e10
@@ -453,7 +466,7 @@ class beam:
         out_i = np.zeros(Nx*Ny, dtype=np.float32)
 
         # Ensure everything is contiguous for CFFI
-        f0_params_np         = np.ascontiguousarray(f0_params_np)
+        f0_params_np          = np.ascontiguousarray(f0_params_np)
         scattering_anom_np_real = np.ascontiguousarray(scattering_anom_np_real)
         scattering_anom_np_imag = np.ascontiguousarray(scattering_anom_np_imag)
 
@@ -470,20 +483,20 @@ class beam:
 
         # Call the C function
         complied_code.compute_scattering_cffi(
-            atom_count,positions_ptr,f0_params_ptr,
-            s_anom_r_ptr,s_anom_i_ptr,Nx,Ny,
-            coords_x_ptr,coords_y_ptr,coords_z_ptr,
-            k_val,out_r_ptr,out_i_ptr
+            atom_count, positions_ptr, f0_params_ptr,
+            s_anom_r_ptr, s_anom_i_ptr, Nx, Ny,
+            coords_x_ptr, coords_y_ptr, coords_z_ptr,
+            k_val, out_r_ptr, out_i_ptr
         )
 
         partial_field = (out_r + 1j*out_i).reshape((Ny, Nx)).astype(np.complex64)
         return partial_field
 
-    # CPU function
-    def interact_beam_cpu(self, sample, measurement_positions, measurement_shape):
+    def interact_beam_cpu(self, sample, measurement_positions, measurement_shape, stage):
         """
         Multi-threaded CPU approach. Splits sample chunks among threads,
-        accumulates partial fields. Uses CFFI for numeric loops.
+        accumulates partial fields. Uses CFFI for numeric loops,
+        applying stage transformations to each chunk.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         Nx, Ny = measurement_shape
@@ -510,14 +523,15 @@ class beam:
         n_threads = min(chunk_total, max_threads)
 
         # Build CFFI library only once
-        ffi_obj, complied_code= self.compile_compute_scattering_cffi()
+        ffi_obj, complied_code = self.compile_compute_scattering_cffi()
 
         def worker(chunk_id):
             return self.cpu_scatter_chunk_cffi(
-                complied_code,ffi_obj,
-                chunk_id,sample,Nx,Ny,
-                coords_x_m,coords_y_m,coords_z_m,
-                db_dict_f0_all,db_dict_f1f2_all,k_val
+                complied_code, ffi_obj,
+                chunk_id, sample, Nx, Ny,
+                coords_x_m, coords_y_m, coords_z_m,
+                db_dict_f0_all, db_dict_f1f2_all,
+                k_val, stage
             )
 
         final_result = np.zeros((Ny, Nx), dtype=np.complex64)
@@ -531,21 +545,22 @@ class beam:
 
         return final_result
 
-    # GPU function
-    def interact_beam_gpu(self, sample, measurement_positions, measurement_shape):
+    def interact_beam_gpu(self, sample, measurement_positions, measurement_shape, stage):
         """
         Perform beam-sample interaction using all available GPUs in parallel,
         chunk-based. Each GPU gets a subset of chunks. Summation on CPU.
+        
+        We also apply the stage rotation+translation on GPU before dividing by 1e10.
         """
         if cp is None:
             # If somehow called without cupy installed, fallback to CPU
             print("[beam] Cupy not installed, falling back to CPU mode.")
-            return self.interact_beam_cpu(sample, measurement_positions, measurement_shape)
+            return self.interact_beam_cpu(sample, measurement_positions, measurement_shape, stage)
 
         n_gpus = cp.cuda.runtime.getDeviceCount()
         if n_gpus < 1:
             print("[beam] No GPUs found, falling back to CPU mode.")
-            return self.interact_beam_cpu(sample, measurement_positions, measurement_shape)
+            return self.interact_beam_cpu(sample, measurement_positions, measurement_shape, stage)
 
         print(f"[beam] Found {n_gpus} GPU(s).")
         db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
@@ -555,13 +570,17 @@ class beam:
         k_val = np.float32(2.0 * np.pi / self._wavelength)
 
         if isinstance(measurement_positions, np.ndarray):
-            measurement_positions = cp.asarray(measurement_positions,dtype=cp.float32)
+            measurement_positions = cp.asarray(measurement_positions, dtype=cp.float32)
         x_coords_gpu = cp.ascontiguousarray(measurement_positions[0, :].astype(cp.float32) / 1e10)
         y_coords_gpu = cp.ascontiguousarray(measurement_positions[1, :].astype(cp.float32) / 1e10)
         z_coords_gpu = cp.ascontiguousarray(measurement_positions[2, :].astype(cp.float32) / 1e10)
         
         chunk_total = sample.chunk_total
         print(f"[beam] Total of {chunk_total} chunk(s) to process.")
+
+        # Create Stage variables 
+        R_stage_gpu = cp.asarray(stage.rotation, dtype=cp.float32)
+        trans_stage_gpu = cp.asarray(stage.translation, dtype=cp.float32)
 
         # Divide chunk indices among GPUs
         chunks_per_gpu = chunk_total // n_gpus
@@ -611,8 +630,15 @@ class beam:
                     f0_params_np[mask] = db_dict_f0_all[el]
 
                 with stream:
+                    # Load chunk positions on GPU
                     positions_chunk_cp = cp.array(sample.load_chunk_positions(cidx, use_gpu=True),
                                                   dtype=cp.float32)
+
+                    # Stage translation and rotation
+                    positions_chunk_cp = positions_chunk_cp @ R_stage_gpu
+                    positions_chunk_cp += trans_stage_gpu
+
+                    # Now convert to meters
                     px = positions_chunk_cp[:, 0] / 1e10
                     py = positions_chunk_cp[:, 1] / 1e10
                     pz = positions_chunk_cp[:, 2] / 1e10
@@ -664,7 +690,10 @@ class beam:
             end_chunk = start_chunk + my_count
             chunk_indices = list(range(start_chunk, end_chunk))
             start_chunk = end_chunk
-            t = threading.Thread(target=gpu_worker, args=(gpu_id, x_coords_gpu, y_coords_gpu, z_coords_gpu, chunk_indices, gpu_id))
+            t = threading.Thread(target=gpu_worker,
+                                 args=(gpu_id,
+                                       x_coords_gpu, y_coords_gpu, z_coords_gpu,
+                                       chunk_indices, gpu_id))
             t.start()
             threads.append(t)
 
@@ -681,14 +710,17 @@ class beam:
         return final_result
 
     # Main API
-    def atomic_direct_scattering(self, sample, detector, offset=0, use_gpu=True):
+    def atomic_direct_scattering(self, sample, detector, stage, offset=0, use_gpu=True):
         """
         High-level entry point for beam-sample scattering.
+        Now includes a 'stage' argument to apply its rotation+translation.
+        
         Parameters
         ----------
         sample : object with 'chunk_total', 'load_chunk_species(i)', 'load_chunk_positions(i)'
         detector : object with 'pixel_coordinates' (3, Nx*Ny), 'shape' -> (Nx, Ny),
                    and 'input_pixel_values(...)'
+        stage : stage object that provides rotation angles and translation
         offset : float
             Offset subtracted from final result
         use_gpu : bool
@@ -700,11 +732,11 @@ class beam:
         # Check if we can run GPU
         if use_gpu and (cp is not None):
             # Attempt GPU path
-            final_field = self.interact_beam_gpu(sample, measurement_positions, (Nx, Ny))
+            final_field = self.interact_beam_gpu(sample, measurement_positions, (Nx, Ny), stage)
         else:
             # CPU fallback
             if cp is None and use_gpu:
                 print("[beam] Cupy not installed, running CPU mode.")
-            final_field = self.interact_beam_cpu(sample, measurement_positions, (Nx, Ny))
+            final_field = self.interact_beam_cpu(sample, measurement_positions, (Nx, Ny), stage)
 
         detector.input_pixel_values(final_field - offset)
