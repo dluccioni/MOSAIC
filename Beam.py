@@ -106,6 +106,8 @@ class beam:
             float *out_i              // shape=(Nx*Ny)
         )
         {
+            const float PI_F = 3.14159265358979323846f;
+            float wavelength_m = (2.0f * PI_F) / k_val;
             int pixel_count = Nx * Ny;
 
             for(int a = 0; a < atom_count; a++){
@@ -136,8 +138,10 @@ class beam:
                     float real_tot = f0_val + sanom_r;
                     float imag_tot = sanom_i; // f0 is real
 
-                    // phase = k_val * (ax + r_det)
-                    float phase = k_val * (ax + r_det);
+                    float ax_mod = fmodf(ax, wavelength_m);
+                    float rdet_mod = fmodf(r_det, wavelength_m);
+                    // Phase = k_val * ( (ax % λ) + (r_det % λ) )
+                    float phase = k_val * (ax_mod + rdet_mod);
                     float cph = cosf(phase);
                     float sph = sinf(phase);
 
@@ -221,6 +225,8 @@ class beam:
             const int   Ny
         )
         {
+            const float PI_F = 3.14159265358979323846f;
+            float wavelength_m = (2.0f * PI_F) / k;
             // Determine which pixel this thread processes
             int pxid = blockIdx.x * blockDim.x + threadIdx.x;
             int pyid = blockIdx.y * blockDim.y + threadIdx.y;
@@ -307,7 +313,9 @@ class beam:
                         float2 s_tot = make_float2(f0c.x + s_a.x, f0c.y + s_a.y);
 
                         // Phase
-                        float phase = k * (s_px[j] + r_det);
+                        float px_mod    = fmodf(s_px[j], wavelength_m);
+                        float rdet_mod  = fmodf(r_det,   wavelength_m);
+                        float phase     = k * (px_mod + rdet_mod);
                         float cph, sph;
                         __sincosf(phase, &sph, &cph);
 
