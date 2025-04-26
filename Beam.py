@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------------------
 import numpy as np
 import pandas as pd
-import pickle
+import json
 import os
 import sys
 import gc
@@ -47,13 +47,47 @@ class beam:
             energy = energy / self._q
         self._energy = energy
         self._wavelength = self._hq * self._c / self._energy
+        
+    def read_beam_metadata(self):
+        """
+        Reads the metadata JSON file from disk and restores
+        this beam object's state.
+        """
+        metadata_filename = os.path.join(self.directory, "beam_metadata.json")
+        if not os.path.isfile(metadata_filename):
+            raise FileNotFoundError(f"No JSON metadata file found at {metadata_filename}")
+
+        with open(metadata_filename, "r") as f:
+            beam_metadata = json.load(f)
+
+        # Convert lists back to NumPy arrays
+        if beam_metadata["direction"] is not None:
+            self._direction = np.array(beam_metadata["direction"], dtype=np.float32)
+        self._energy = beam_metadata["energy"]
+        self._wavelength = beam_metadata["wavelength"]
+
+        print(f"Beam metadata loaded from {metadata_filename}.")
 
     ## Data Handling Functions    
-    def write_beam_metadata(self):
+    def write_beam_metadata(self, override_directory=None):
         """
-        (Placeholder) Writes beam metadata to disk.
+        Serializes the beam object's critical internal fields to disk 
+        as human-readable JSON so that the state can be restored later.
         """
-        beam_metadata = [self._energy]
+        beam_metadata = {
+            "direction": self._direction.tolist() if self._direction is not None else None,
+            "energy": self._energy,
+            "wavelength": self._wavelength
+        }
+
+        if override_directory is not None:
+            metadata_filename = os.path.join(override_directory, "beam_metadata.json")
+        else:
+            metadata_filename = os.path.join(self.directory, "beam_metadata.json")
+
+        with open(metadata_filename, "w") as f:
+            json.dump(beam_metadata, f, indent=4)
+        print(f"Beam metadata written to {metadata_filename} in JSON format.")
 
     ## Static Functions
     # CPU kernel
@@ -718,7 +752,7 @@ class beam:
         return final_result
 
     # Main API
-    def atomic_direct_scattering(self, sample, detector, stage, offset=0, use_gpu=True):
+    def atomic_direct_scattering(self, sample, detector, stage, offset=None, use_gpu=True):
         """
         High-level entry point for beam-sample scattering.
         Now includes a 'stage' argument to apply its rotation+translation.
@@ -747,4 +781,5 @@ class beam:
                 print("[beam] Cupy not installed, running CPU mode.")
             final_field = self.interact_beam_cpu(sample, measurement_positions, (Nx, Ny), stage)
 
-        detector.input_pixel_values(final_field - offset)
+        if offset is not None:
+            detector.input_pixel_values(final_field - offset)
