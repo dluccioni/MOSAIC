@@ -6,7 +6,7 @@ try:
     import cupy as cp
 except ImportError:
     cp = None
-import pickle
+import json
 import os
 
 # -----------------------------------------------------------------------------
@@ -26,10 +26,98 @@ class defects:
         self._defect_history = []
         self._stacking_faults = None
         self._cracks = None
-    
+        
+    def read_defect_metadata(self, override_directory=None):
+        """
+        Reads the defect metadata JSON file from disk and restores
+        this defect object's state, including stacking faults and cracks
+        if present.
+        """
+        if override_directory is not None:
+            metadata_filename = os.path.join(override_directory, "defects_metadata.json")
+        else:
+            metadata_filename = os.path.join(self.directory, "defects_metadata.json")
+        
+        if not os.path.isfile(metadata_filename):
+            raise FileNotFoundError(f"No JSON metadata file found at {metadata_filename}")
+        
+        with open(metadata_filename, "r") as f:
+            defect_metadata = json.load(f)
+        
+        # Restore defect history
+        self._defect_history = defect_metadata.get("defect_history", [])
+        
+        # Restore stacking_faults if present
+        sf_data = defect_metadata.get("stacking_faults", None)
+        if sf_data is not None:
+            self._stacking_faults = self.stacking_fault(
+                directory      = sf_data.get("directory", None),
+                fault_number   = sf_data.get("fault_number", 0),
+                fault_offset   = np.array(sf_data.get("fault_offset", [0,0,0]), dtype=np.float32),
+                fault_normal   = np.array(sf_data.get("fault_normal", [0,0,1]), dtype=np.float32),
+                interfault_spacing = sf_data.get("interfault_spacing", 0.0),
+                burgers_vector = np.array(sf_data.get("burgers_vector", [0,0,0]), dtype=np.float32),
+                fault_orientation = sf_data.get("fault_orientation", [0]),
+                fault_gap      = sf_data.get("fault_gap", 0.0)
+            )
+        
+        # Restore cracks if present
+        crack_data = defect_metadata.get("cracks", None)
+        if crack_data is not None:
+            self._cracks = self.crack(
+                directory    = crack_data.get("directory", None),
+                crack_points = crack_data.get("crack_points", [])
+            )
+        print(f"Defect metadata read from {metadata_filename}.")
+        
     ## Data Handling Functions
-    def write_defect_metadata(self): #incomplete
-        defect_metadata = [self.stacking_faults,self.cracks]
+    def write_defect_metadata(self, override_directory=None):
+        """
+        Serializes the defect object's critical internal fields to disk
+        as human-readable JSON so that the state can be restored later.
+        """
+        if override_directory is not None:
+            metadata_filename = os.path.join(override_directory, "defects_metadata.json")
+        else:
+            metadata_filename = os.path.join(self.directory, "defects_metadata.json")
+
+        # Prepare top-level defect data
+        defect_metadata = {
+            "defect_history": self._defect_history if self._defect_history else []
+        }
+        
+        # If stacking_faults exist, store them
+        if self._stacking_faults is not None:
+            sf = self._stacking_faults
+            defect_metadata["stacking_faults"] = {
+                "directory": sf.directory,
+                "fault_number": sf.fault_number,
+                "fault_offset": sf.fault_offset.tolist(),
+                "fault_normal": sf.fault_normal.tolist(),
+                "interfault_spacing": sf.interfault_spacing,
+                "burgers_vector": sf.burgers_vector.tolist(),
+                "fault_orientation": sf.fault_orientation.tolist(),
+                "fault_gap": sf.fault_gap
+            }
+        else:
+            defect_metadata["stacking_faults"] = None
+
+        # If cracks exist, store them
+        if self._cracks is not None:
+            cr = self._cracks
+            # crack_points is an Nx3 array. Make sure to convert to list of lists
+            crack_points_list = cr.crack_points.tolist() if len(cr.crack_points) > 0 else []
+            defect_metadata["cracks"] = {
+                "directory": cr.directory,
+                "crack_points": crack_points_list
+            }
+        else:
+            defect_metadata["cracks"] = None
+
+        # Write as nicely formatted JSON
+        with open(metadata_filename, "w") as f:
+            json.dump(defect_metadata, f, indent=4)
+        print(f"Defect metadata written to {metadata_filename} in JSON format.")
 
     def add_stacking_faults(self,fault_number,fault_offset,fault_normal,interfault_spacing,burgers_vector,fault_orientation,fault_gap):
         self._stacking_faults = self.stacking_fault(self.directory,fault_number,fault_offset,fault_normal,interfault_spacing,burgers_vector,fault_orientation,fault_gap)
