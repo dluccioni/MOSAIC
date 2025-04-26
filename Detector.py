@@ -6,7 +6,7 @@ try:
     import cupy as cp
 except ImportError:
     cp = None
-import pickle
+import json
 import os
 
 # -----------------------------------------------------------------------------
@@ -32,6 +32,7 @@ class detector:
         self._pixel_phase = None
         self._pixel_amplitude = None
         self._pixel_intensity = None
+        self._geometry = None
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
         
@@ -59,6 +60,7 @@ class detector:
         self._two_theta = 0
         self._eta = 0
         self._distance = 0
+        self._geometry = geometry.lower()
         if geometry.lower() == 'rectangular':
             if cp is None or not use_gpu:
                 y_lin = np.linspace(-(self.shape[0]/2)*self.pixel_size[0],
@@ -101,24 +103,78 @@ class detector:
             else:
                 i_lin = cp.arange(self.shape[0], dtype=cp.float32)
                 j_lin = cp.arange(self.shape[1], dtype=cp.float32)
-
                 r_lin = r_in + (i_lin + 0.5) * self.pixel_size[0]
                 phi_lin = 2.0 * cp.pi * (j_lin + 0.5) / self.shape[1]
-
                 PHI, R = cp.meshgrid(phi_lin, r_lin, indexing='xy')
-
                 Y = R * cp.cos(PHI)
                 Z = R * cp.sin(PHI)
                 X = cp.zeros_like(Y)
-
                 self._pixel_coordinates = cp.vstack((X.ravel(), Y.ravel(), Z.ravel()))
-
         else:
             raise ValueError(f"Unknown geometry '{geometry}'. Choose 'rectangular' or 'ring'.")
         
+    def read_detector_metadata(self, override_directory=None):
+        """
+        Reads the metadata JSON file from disk and restores
+        this detector object's state.
+        (Does not restore pixel values or pixel coordinates.)
+        """
+        if override_directory is not None:
+            metadata_filename = os.path.join(override_directory, "detector_metadata.json")
+        else:
+            metadata_filename = os.path.join(self.directory, "detector_metadata.json")
+
+        if not os.path.isfile(metadata_filename):
+            raise FileNotFoundError(f"No JSON metadata file found at {metadata_filename}")
+
+        with open(metadata_filename, "r") as f:
+            detector_metadata = json.load(f)
+
+        # Convert lists back to NumPy arrays (where appropriate)
+        if detector_metadata["shape"] is not None:
+            self._shape = tuple(detector_metadata["shape"])
+        if detector_metadata["pixel_size"] is not None:
+            self._pixel_size = np.array(detector_metadata["pixel_size"], dtype=np.float32)
+        if detector_metadata["center"] is not None:
+            self._center = np.array(detector_metadata["center"], dtype=np.float32)
+        if detector_metadata["direction"] is not None:
+            self._direction = np.array(detector_metadata["direction"], dtype=np.float32)
+        if detector_metadata["two_theta"] is not None:
+            self._two_theta = float(detector_metadata["two_theta"])
+        if detector_metadata["eta"] is not None:
+            self._eta = float(detector_metadata["eta"])
+        if detector_metadata["distance"] is not None:
+            self._distance = float(detector_metadata["distance"])
+        self._geometry = detector_metadata["geometry"]
+        
     ## Data Handling Functions
-    def write_detector_metadata(self): #incomplete
-        detector_metadata = [self._shape]
+    def write_detector_metadata(self, override_directory=None):
+        """
+        Serializes the detector object's critical internal fields to disk 
+        as human-readable JSON so that the state can be restored later.
+        (Does not store pixel values or pixel coordinates.)
+        """
+        # Convert NumPy arrays to Python lists so JSON can handle them
+        detector_metadata = {
+            "shape": list(self._shape) if self._shape is not None else None,
+            "pixel_size": list(self._pixel_size) if self._pixel_size is not None else None,
+            "center": self._center.tolist() if self._center is not None else None,
+            "direction": self._direction.tolist() if self._direction is not None else None,
+            "two_theta": float(self._two_theta) if self._two_theta is not None else None,
+            "eta": float(self._eta) if self._eta is not None else None,
+            "distance": float(self._distance) if self._distance is not None else None,
+            "geometry": self._geometry
+        }
+
+        if override_directory is not None:
+            metadata_filename = os.path.join(override_directory, "detector_metadata.json")
+        else:
+            metadata_filename = os.path.join(self.directory, "detector_metadata.json")
+
+        # Write as nicely formatted JSON
+        with open(metadata_filename, "w") as f:
+            json.dump(detector_metadata, f, indent=4)
+        print(f"Detector metadata written to {metadata_filename} in JSON format.")
     
     ## Static Functions
     @staticmethod
