@@ -251,8 +251,82 @@ class detector:
         self._pixel_phase = np.angle(self.pixel_values)
         self._pixel_amplitude = np.abs(self.pixel_values)
         self._pixel_intensity = self.pixel_amplitude**2
+
+    def coordinate_conversion(self,data,input_system="cartesian",output_system="angular",units="deg"):
+        """
+        Returns values in either cartesian or angular coordinates, depending on
+        the specified input_system and output_system.
+
+        Parameters
+        ----------
+        data : ndarray
+            Input coordinate array. The shape must be (3, N) where
+            - For 'cartesian': data[0] = X, data[1] = Y, data[2] = Z
+            - For 'angular': data[0] = eta, data[1] = 2theta, data[2] = distance
+        input_system : str
+            'cartesian' or 'angular'. Default = 'cartesian'.
+        output_system : str
+            'cartesian' or 'angular'. Default = 'cartesian'.
+
+        Returns
+        -------
+        converted : ndarray
+            The coordinate array after conversion. Same shape, (3, N).
+        """
+        if input_system == output_system:
+            return data
+        elif output_system == "cartesian":
+            two_theta_pixels = data[0]
+            eta_pixels = data[1]
+            distance = data[2]
+            x = distance * np.cos(two_theta_pixels)
+            y = distance * np.sin(two_theta_pixels) * np.sin(eta_pixels)
+            z = distance * np.sin(two_theta_pixels) * np.cos(eta_pixels)
+            return np.stack((x, y, z), axis=0)
+        elif output_system == "angular":
+            two_theta_pixels = np.arctan2(np.sqrt(data[1]**2 + data[2]**2), data[0])
+            eta_pixels = np.arctan2(data[1], data[2])
+            distance = np.sqrt(data[0]**2 + data[1]**2 + data[2]**2)
+            if units == "deg":
+                two_theta_pixels = np.rad2deg(two_theta_pixels)
+                eta_pixels = np.rad2deg(eta_pixels)
+            return np.stack((eta_pixels, two_theta_pixels, distance), axis=0)
         
-    def plot_detector(self,type="Intensity",scaling="linear",limits=np.array([0,1])):
+    def get_detector_axis(self, system="angular", units="deg", axis=None):
+        """
+        Returns the detector coordinates (3, Nx, Ny) in either cartesian or angular
+        form. If 'axis' is specified, return only that axis (0=x/eta, 1=y/2theta, 2=z/distance).
+
+        Parameters
+        ----------
+        system : str
+            "cartesian" or "angular". Default "angular".
+        units : str
+            "deg" or "rad" (only relevant for "angular" output).
+        axis : None or int
+            If None, return the full 3D array shaped (3, Nx, Ny).
+            If an integer (0, 1, or 2), return just that axis with shape (Nx, Ny).
+        """
+        # 1) Get raw pixel coordinates
+        if isinstance(self.pixel_coordinates, cp.ndarray):
+            coords = self.pixel_coordinates.get()
+        else:
+            coords = self.pixel_coordinates
+        # 2) Convert if needed
+        if system == "angular":
+            coords = self.coordinate_conversion(coords, output_system="angular", units=units)
+        elif system != "cartesian":
+            raise ValueError(f"Unknown system '{system}'. Use 'cartesian' or 'angular'.")
+        # 3) Reshape from (3, Nx*Ny) -> (3, Nx, Ny), matching 2D pixel_data shape
+        coords_reshaped = coords.reshape(3, self.shape[1], self.shape[0])
+        # 4) If 'axis' is given, return only that slice; else return full (3, Nx, Ny)
+        if axis is not None:
+            return coords_reshaped[axis]
+        else:
+            return coords_reshaped
+
+        
+    def plot_detector(self,type="Intensity",scaling="linear",limits=np.array([0,1]),figsize=(8, 6)):
         import matplotlib.pyplot as plt
         import matplotlib.colors as pltcolor
         if type == "Intensity":
@@ -269,7 +343,7 @@ class detector:
             plot_val = np.log(plot_val)
         
         detector_extent = self._shape*self._pixel_size/2
-        fig = plt.figure(figsize=(8, 8))
+        fig = plt.figure(figsize=figsize)
         ax1 = fig.add_subplot(1, 1, 1)
         im = ax1.imshow(
             plot_val,
@@ -284,7 +358,7 @@ class detector:
         # fig.show()
         return fig, ax1
     
-    def plot_detector_angles(self, type="Intensity", scaling="linear", degrees=True, use_gpu=True):
+    def plot_detector_angles(self, type="Intensity", scaling="linear", degrees=True, figsize=(8, 6), use_gpu=True):
         """
         Compute and plot each pixel's value in diffraction-angle coordinates:
         - x-axis: eta
@@ -335,12 +409,12 @@ class detector:
         y = coords[1]
         z = coords[2]
         two_theta_pixels = np.arctan2(np.sqrt(y**2 + z**2), x)
-        eta_pixels        = np.arctan2(y, z) 
+        eta_pixels = np.arctan2(y, z) 
         if degrees:
             two_theta_pixels = np.degrees(two_theta_pixels)
             eta_pixels        = np.degrees(eta_pixels)
             
-        fig, ax = plt.subplots(figsize=(8, 6))
+        fig, ax = plt.subplots(figsize=figsize)
         sc = ax.scatter(
             eta_pixels,
             two_theta_pixels,
@@ -357,9 +431,9 @@ class detector:
         ax.axis('scaled')
         return fig, ax
 
-    def plot_detector_position(self,elev=0,azim=90):
+    def plot_detector_position(self,elev=0,azim=90,figsize=(8, 8)):
         import matplotlib.pyplot as plt
-        fig = plt.figure(figsize=(8, 8))
+        fig = plt.figure(figsize=figsize)
         ax1 = fig.add_subplot(1, 1, 1, projection='3d')
         ax1.scatter(
                 0,
@@ -402,7 +476,7 @@ class detector:
     @property
     def pixel_coordinates(self):
         """
-        Returns the detector pixel locations.
+        Returns the detector pixel locations in either cartesian coordinates.
         """
         if self._pixel_coordinates is None:
             print("self._pixel_coordinates has not been initialized yet")
@@ -423,7 +497,7 @@ class detector:
         Returns the pixel phase values.
         """
         if self._pixel_phase is None:
-            print("self._pixel_phase has not been initialized yet")
+            self._pixel_phase = np.angle(self.pixel_values)
         return self._pixel_phase
     
     @property
@@ -432,7 +506,7 @@ class detector:
         Returns the pixel amplitude values.
         """
         if self._pixel_amplitude is None:
-            print("self._pixel_amplitude has not been initialized yet")
+            self._pixel_amplitude = np.abs(self.pixel_values)
         return self._pixel_amplitude
     
     @property
@@ -441,7 +515,7 @@ class detector:
         Returns the pixel intensity values.
         """
         if self._pixel_intensity is None:
-            print("self._pixel_intensity has not been initialized yet")
+            self._pixel_intensity = np.abs(self.pixel_values)**2
         return self._pixel_intensity
     
     @property
