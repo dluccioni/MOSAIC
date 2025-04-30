@@ -783,3 +783,5 @@ class beam:
 
         if offset is not None:
             detector.input_pixel_values(final_field - offset)
+        else:
+            detector.input_pixel_values(final_field)
