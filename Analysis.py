@@ -20,6 +20,15 @@ class analysis:
     # -----------------------------------------------------------------------------
     ## Initialization
     def __init__(self,directory=os.getcwd()):
+        """
+        Initialize the analysis object.
+
+        Parameters
+        ----------
+        directory : str, optional
+            Path to the directory where analysis results will be stored.
+            Defaults to the current working directory.
+        """
         self.directory = directory
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
@@ -27,7 +36,35 @@ class analysis:
     # Static Function
     @staticmethod
     def surf_plot(X,Y,Z,title,xlabel="Frequency (1/px)",ylabel="Distance",zlabel="FFT Amplitude",figsize=(12, 12)):
-        # Now create the 3D surface plot for fig1
+        """
+        Generate a 3D surface plot of Z as a function of X and Y.
+
+        Parameters
+        ----------
+        X : ndarray
+            2D array of x-coordinates.
+        Y : ndarray
+            2D array of y-coordinates.
+        Z : ndarray
+            2D array of z-values (the surface height).
+        title : str
+            Title for the plot.
+        xlabel : str, optional
+            Label for the X-axis. Default is "Frequency (1/px)".
+        ylabel : str, optional
+            Label for the Y-axis. Default is "Distance".
+        zlabel : str, optional
+            Label for the Z-axis. Default is "FFT Amplitude".
+        figsize : tuple, optional
+            Figure size. Default is (12, 12).
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The created figure.
+        ax : matplotlib.axes._subplots.Axes3DSubplot
+            The 3D axes containing the surface plot.
+        """
         fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(111, projection='3d')
         ax.set_proj_type('ortho')
@@ -52,7 +89,31 @@ class analysis:
     
     @staticmethod
     def line_plot(x,y,title,xlabel="Detector X",ylabel="Pixel Value",figsize=(12, 12)):
-         # Now create the 3D surface plot for fig1
+        """
+        Generate a 2D line plot of y vs x.
+
+        Parameters
+        ----------
+        x : ndarray
+            1D array for the X-axis.
+        y : ndarray
+            1D array for the Y-axis.
+        title : str
+            Title for the plot.
+        xlabel : str, optional
+            Label for the X-axis. Default is "Detector X".
+        ylabel : str, optional
+            Label for the Y-axis. Default is "Pixel Value".
+        figsize : tuple, optional
+            Figure size. Default is (12, 12).
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The created figure.
+        ax : matplotlib.axes._subplots.AxesSubplot
+            The 2D axes containing the line plot.
+        """
         fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(111)
         ax.set_title(title)
@@ -65,8 +126,39 @@ class analysis:
     ## Main Functions
     def distance_fft_dependance(self, sample, beam, detector, distance_array, plot_prefix="Test"):
         """
-        Computes amplitude/phase summations and their FFTs at various detector
-        distances, plots them, and saves all generated figures to self.directory.
+        Compute amplitude/phase summations and their FFTs at various detector
+        distances, plot them, and save all generated figures.
+
+        Parameters
+        ----------
+        sample : object
+            The sample object containing atomic position data.
+        beam : object
+            The beam object handling scattering computation.
+        detector : object
+            The detector object with pixel arrays and geometry.
+        distance_array : ndarray
+            A 1D array of distances at which to place the detector.
+        plot_prefix : str, optional
+            Prefix for the saved plot filenames. Default is "Test".
+
+        Returns
+        -------
+        X : ndarray
+            2D array of frequency mesh (from np.meshgrid).
+        Y : ndarray
+            2D array of distance mesh (from np.meshgrid).
+        Z_amp : ndarray
+            2D array of log(|FFT(Amplitude)|) for each distance/frequency.
+        Z_pha : ndarray
+            2D array of log(|FFT(Phase)|) for each distance/frequency.
+
+        Notes
+        -----
+        Each distance in distance_array is used to reposition the detector,
+        compute scattering, and then plot or save intermediate 2D images
+        (Intensity, Phase, Amplitude) and 1D line plots (real-space, FFT).
+        Finally, 3D surface plots of the combined FFT amplitude/phase are saved.
         """
         freq_array = None
         fft_amplitude_list = []
