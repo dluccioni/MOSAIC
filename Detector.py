@@ -175,6 +175,57 @@ class detector:
         with open(metadata_filename, "w") as f:
             json.dump(detector_metadata, f, indent=4)
         print(f"Detector metadata written to {metadata_filename} in JSON format.")
+        
+    def write_Efield_values(self, filename="Efield_values.npy", override_directory=None):
+        """
+        Saves the detector's complex pixel values as a .npy file.
+        
+        Parameters
+        ----------
+        filename : str, optional
+            Name of the output file. Default: "Efield_values.npy"
+        override_directory : str, optional
+            If provided, saves to this directory instead of self.directory.
+        """
+        if self._pixel_values is None:
+            raise ValueError("Pixel values are not initialized; cannot save them.")
+        pxvals = self._pixel_values
+        if cp is not None and isinstance(pxvals, cp.ndarray):
+            pxvals = pxvals.get()
+        if override_directory is not None:
+            outfile = os.path.join(override_directory, filename)
+        else:
+            outfile = os.path.join(self.directory, filename)
+        np.save(outfile, pxvals)
+        print(f"Detector pixel values saved to {outfile}.")
+        
+    def read_Efield_values(self, filename="Efield_values.npy", override_directory=None, use_gpu=True):
+        """
+        Loads the detector's complex pixel values from a .npy file and assigns them
+        to self._pixel_values.
+        
+        Parameters
+        ----------
+        filename : str, optional
+            Name of the .npy file to load. Default: "Efield_values.npy"
+        override_directory : str, optional
+            If provided, loads from this directory instead of self.directory.
+         use_gpu : bool, optional
+            If True, loads to GPU memory.
+        """
+        if override_directory is not None:
+            infile = os.path.join(override_directory, filename)
+        else:
+            infile = os.path.join(self.directory, filename)
+        if not os.path.isfile(infile):
+            raise FileNotFoundError(f"No .npy file found at {infile}")
+        if use_gpu == True:
+            loaded_values = cp.load(infile)
+        else:
+            loaded_values = np.load(infile)
+        self._pixel_values = loaded_values
+        self.input_pixel_values(self.pixel_values)
+        print(f"Detector pixel values loaded from {infile}.")
     
     ## Static Functions
     @staticmethod
