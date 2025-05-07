@@ -21,9 +21,14 @@ class stage:
     ## Initialization
     def __init__(self, directory=os.getcwd()):
         """
-        Initializes the stage object with rotation and translation properties set to None.
-        The user must call create_stage(...) to define the stage convention and
+        Initializes the stage object.
+
+        The user must call `create_stage()` to define the stage convention and
         initialize the angles/translations.
+
+        Args:
+            directory (str, optional): Directory where metadata may be saved/loaded.
+                Defaults to the current working directory.
         """
         self.directory = directory
         self._name = None
@@ -40,8 +45,24 @@ class stage:
     
     def create_stage(self, name=['goniometer'], motor_name=['mu','phi','chi','omega','x','y','z'], motor_type=['R','R','R','R','T','T','T'], motor_coupling=[[None],[0],[0],[0,1,2],[0,1,2,3],[0,1,2,3],[0,1,2,3]], motor_axis=[[0.0,-1.0,0.0],[0.0,-1.0,0.0],[-1.0,0.0,0.0],[0.0,0.0,-1.0],[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]], motor_value=[0.0,0.0,0.0,0.0,0.0,0.0,0.0], motor_resolution=[0.0,0.0,0.0,0.0,0.0,0.0,0.0]):
         """
-        Create the stage with a specified mode/convention (e.g. 'goniometer').
-        This will initialize all angles to zero and translation to [0,0,0].
+        Creates the stage with a specified mode/convention.
+
+        This method initializes all angles to zero and the translation to [0,0,0].
+
+        Args:
+            name (list of str, optional): Mode identifier(s). Defaults to ['goniometer'].
+            motor_name (list of str, optional): Names of the motors. 
+                Defaults to ['mu','phi','chi','omega','x','y','z'].
+            motor_type (list of str, optional): Motor types ('R' for rotation, 'T' for translation).
+                Defaults to ['R','R','R','R','T','T','T'].
+            motor_coupling (list of list, optional): Coupling relationships between motors. Defaults to [[None],[0],[0],[0,1,2],[0,1,2,3],[0,1,2,3],[0,1,2,3]].
+            motor_axis (list of list, optional): Axes (x,y,z) for each motor. Defaults to 
+                [[0.0,-1.0,0.0],[0.0,-1.0,0.0],[-1.0,0.0,0.0],[0.0,0.0,-1.0],[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]].
+            motor_value (list of float, optional): Initial motor positions. Defaults to [0.0,0.0,0.0,0.0,0.0,0.0,0.0].
+            motor_resolution (list of float, optional): Resolution for each motor. Defaults to [0.0,0.0,0.0,0.0,0.0,0.0,0.0].
+
+        Returns:
+            None
         """
         self._name = name
         self._motor_name = np.array(motor_name)
@@ -58,6 +79,12 @@ class stage:
         """
         Reads the stage metadata JSON file from disk and restores
         this stage object's state.
+
+        Raises:
+            FileNotFoundError: If the JSON file does not exist in the specified directory.
+
+        Returns:
+            None
         """
         metadata_filename = os.path.join(self.directory, "stage_metadata.json")
         if not os.path.isfile(metadata_filename):
@@ -87,8 +114,14 @@ class stage:
     ## Data Handling Functions
     def write_stage_metadata(self, override_directory=None):
         """
-        Serializes the stage object's critical fields to disk
-        as human-readable JSON so that the state can be restored later.
+        Serializes the stage object's critical fields to disk as human-readable JSON.
+
+        Args:
+            override_directory (str, optional): If provided, JSON file is written to this directory 
+                instead of the default `self.directory`.
+
+        Returns:
+            None
         """
         # Convert NumPy arrays to Python lists so JSON can handle them
         stage_metadata = {
@@ -114,6 +147,12 @@ class stage:
     ## Static Functions
     @staticmethod
     def get_unit_corners():
+        """
+        Returns a set of 8 unit-cube corners.
+
+        Returns:
+            numpy.ndarray: An 8x3 array containing unit-cube corner coordinates.
+        """
         unit_corners = np.array([
             [0, 0, 0],
             [1, 0, 0],
@@ -128,8 +167,14 @@ class stage:
     @staticmethod
     def get_axis_rotation(axis, angle):
         """
-        Return the 3x3 rotation matrix for rotation by 'angle' radians
-        around the (normalized) 'axis'.
+        Returns the 3x3 rotation matrix for rotation around a (normalized) axis.
+
+        Args:
+            axis (numpy.ndarray): A 1D array representing the axis of rotation, shape (3,).
+            angle (float): Angle in radians for the rotation.
+
+        Returns:
+            numpy.ndarray: A 3x3 rotation matrix (float32).
         """
         axis = axis / np.linalg.norm(axis)
         c = np.cos(angle)
@@ -143,7 +188,13 @@ class stage:
     ## Main Functions
     def get_motor_axis(self,motor_idx):
         """
-        Return the motion axis for a given motor given the coupling and motor values provided.
+        Returns the motion axis for a given motor, accounting for couplings.
+
+        Args:
+            motor_idx (int): Index of the motor in the array.
+
+        Returns:
+            numpy.ndarray: A 1D array (length 3) representing the final rotation or translation axis.
         """
         motor_axis_arr = self._motor_axis.copy()
         for coupled in self._motor_coupling[motor_idx]:
@@ -156,7 +207,13 @@ class stage:
 
     def get_rotation(self):
         """
-        Return the 3x3 rotation matrix given the coupling and motor values provided.
+        Returns the 3x3 rotation matrix given the current motor values.
+
+        The calculation accounts for any rotational couplings defined in
+        `motor_coupling`.
+
+        Returns:
+            numpy.ndarray: A 3x3 rotation matrix.
         """
         motor_mask = (self._motor_type == "R")
         rotation_matrix = np.eye(3, dtype=np.float32)
@@ -167,7 +224,13 @@ class stage:
     
     def get_translation(self):
         """
-        Return the 3x1 translation array given the coupling and motor values provided.
+        Returns the 3x1 translation vector given the current motor values.
+
+        The calculation accounts for any translational couplings defined in
+        `motor_coupling`.
+
+        Returns:
+            numpy.ndarray: A 1D array (length 3) representing translation along x, y, z.
         """
         motor_mask = (self._motor_type == "T")
         translation_arr = np.zeros(3, dtype=np.float32)
@@ -177,6 +240,18 @@ class stage:
         return self._translation
         
     def set_motor_value_relative(self, motor_value_rel=[0.0,0.0,0.0,0.0,0.0,0.0,0.0], degrees=True):
+        """
+        Adjusts (adds) the motor values relative to their current setting.
+
+        Args:
+            motor_value_rel (list of float, optional): Relative changes for each motor. 
+                Defaults to [0.0,0.0,0.0,0.0,0.0,0.0,0.0].
+            degrees (bool, optional): If True, interprets the relative values for rotational 
+                motors as degrees; otherwise uses radians. Defaults to True.
+
+        Returns:
+            None
+        """
         motor_value_rel = np.array(motor_value_rel)
         if degrees is True:
             motor_mask = (self._motor_type == "R")
@@ -190,6 +265,18 @@ class stage:
         self.display_motor_values(degrees=degrees)
     
     def set_motor_value_absolute(self, motor_value_abs=[0.0,0.0,0.0,0.0,0.0,0.0,0.0], degrees=True):
+        """
+        Sets the motor values absolutely, replacing the existing values.
+
+        Args:
+            motor_value_abs (list of float, optional): New absolute settings for each motor.
+                Defaults to [0.0,0.0,0.0,0.0,0.0,0.0,0.0].
+            degrees (bool, optional): If True, interprets the values for rotational 
+                motors as degrees; otherwise uses radians. Defaults to True.
+
+        Returns:
+            None
+        """
         motor_value_abs = np.array(motor_value_abs)
         if degrees is True:
             motor_mask = (self._motor_type == "R")
@@ -204,6 +291,16 @@ class stage:
     
     def set_single_motor_value_relative(self, name, value, degrees=True):
         """
+        Adjusts (adds) a single motor value relative to its current setting.
+
+        Args:
+            name (str): Name of the target motor.
+            value (float): Relative change for the motor.
+            degrees (bool, optional): If True, interprets `value` for a rotational motor as 
+                degrees; otherwise radians. Defaults to True.
+
+        Returns:
+            None
         """
         motor_mask = (self._motor_name == name)
         if self._motor_type[motor_mask] == "R" and degrees is True:
@@ -216,6 +313,16 @@ class stage:
         
     def set_single_motor_value_absolute(self, name, value, degrees=True):
         """
+        Sets a single motor value absolutely, replacing the existing value.
+
+        Args:
+            name (str): Name of the target motor.
+            value (float): New absolute setting for the motor.
+            degrees (bool, optional): If True, interprets `value` for a rotational motor 
+                as degrees; otherwise radians. Defaults to True.
+
+        Returns:
+            None
         """
         motor_mask = (self._motor_name == name)
         if self._motor_type[motor_mask] == "R" and degrees is True:
@@ -228,14 +335,23 @@ class stage:
     
     def clip_motor_value(self):
         """
-        Clips motor values according to resolution.
+        Clips motor values according to their resolution.
+
+        If `_motor_resolution` is nonzero for a particular motor, that motor's value
+        is quantized to an integer multiple of its resolution.
+
+        Returns:
+            None
         """
         motor_mask = (self._motor_resolution is not None) & (self._motor_resolution != 0)
         self._motor_value[motor_mask] = self._motor_resolution[motor_mask]*int(self._motor_value[motor_mask]/self._motor_resolution[motor_mask])
 
     def zero_stage(self):
         """
-        Reset all motor values to zero.
+        Resets all motor values to zero, effectively removing any rotation or translation.
+
+        Returns:
+            None
         """
         self._motor_value *= 0
         self._rotation = np.eye(3, dtype=np.float32)
@@ -243,6 +359,16 @@ class stage:
         print("Stage angles and translation have been zeroed.")
         
     def display_motor_values(self,degrees=True):
+        """
+        Prints a DataFrame of the current motor values.
+
+        Args:
+            degrees (bool, optional): If True, displays rotational motors in degrees;
+                otherwise displays them in radians. Defaults to True.
+
+        Returns:
+            None
+        """
         if degrees is True:
             motor_mask = (self._motor_type == "R")
             output = self._motor_value.copy()
@@ -256,18 +382,26 @@ class stage:
     
     def plot_stage(self, elev=30, azim=45):
         """
-        Plots a centered unit cube (edges from -0.5 to +0.5 in each axis) after
-        applying the stage's rotation and translation. Also plots red lines along
-        the X, Y, and Z axes originating from [0,0,0].
+        Plots a centered unit cube representing the stage and its orientation.
+
+        The cube is defined from -0.5 to +0.5 in each axis, then transformed 
+        by the current rotation and translation. Additionally, X, Y, Z axes 
+        are shown in red, green, and blue respectively.
+
+        Args:
+            elev (float, optional): Elevation angle for the 3D plot. Defaults to 30.
+            azim (float, optional): Azimuth angle for the 3D plot. Defaults to 45.
+
+        Returns:
+            tuple: (matplotlib.figure.Figure, matplotlib.axes._subplots.Axes3DSubplot)
+            The figure and 3D axes for the plot.
         """
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d import Axes3D
         fig = plt.figure(figsize=(8, 8))
         ax = fig.add_subplot(111, projection='3d')
-
         # Get the cube corners
         corners_local = self.get_unit_corners() - 0.5
-
         # Apply rotation + translation to each corner
         corners_lab = (corners_local @ self.get_rotation()) + self.get_translation()
         edges = [
@@ -277,14 +411,12 @@ class stage:
             (3,5), (3,6),
             (4,7), (5,7), (6,7)
         ]
-
         # Plot each edge of the cube as a black line
         for (i1, i2) in edges:
             x_vals = [corners_lab[i1, 0], corners_lab[i2, 0]]
             y_vals = [corners_lab[i1, 1], corners_lab[i2, 1]]
             z_vals = [corners_lab[i1, 2], corners_lab[i2, 2]]
             ax.plot(x_vals, y_vals, z_vals, 'k-',linewidth=3)
-
         # Plot red lines for the coordinate axes from origin
         ax.plot([0, 2], [0, 0], [0, 0], 'r-')
         ax.plot([0, 0], [0, 2], [0, 0], 'g-')
@@ -292,14 +424,12 @@ class stage:
         ax.plot([0, -2], [0, 0], [0, 0], 'r--')
         ax.plot([0, 0], [0, -2], [0, 0], 'g--')
         ax.plot([0, 0], [0, 0], [0, -2], 'b--')
-
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
         ax.view_init(elev=elev, azim=azim)
         ax.set_proj_type('ortho')
         ax.axis('equal')
-
         plt.tight_layout()
         plt.show()
         return fig, ax
@@ -308,7 +438,9 @@ class stage:
     @property
     def motor_value(self):
         """
-        Returns the motor values.
+        numpy.ndarray: The current motor values.
+
+        If not initialized, prints a message asking the user to call `create_stage()`.
         """
         if self._motor_value is None:
             print("Stage motors not initialized. Please call create_stage(...) first.")
@@ -317,7 +449,9 @@ class stage:
     @property
     def translation(self):
         """
-        Returns the stage translation vector [x, y, z].
+        numpy.ndarray: The current stage translation vector [x, y, z].
+
+        If not initialized, prints a message asking the user to call `create_stage()`.
         """
         if self._translation is None:
             print("Stage translation not initialized. Please call create_stage(...) first.")
@@ -326,7 +460,9 @@ class stage:
     @property
     def rotation(self):
         """
-        Returns the stage rotation matrix (3x3).
+        numpy.ndarray: The current stage rotation matrix (3x3).
+
+        If not initialized, prints a message asking the user to call `create_stage()`.
         """
         if self._rotation is None:
             print("Stage rotation not initialized. Please call create_stage(...) first.")
