@@ -2,6 +2,7 @@
 # Modules
 # -----------------------------------------------------------------------------
 import numpy as np
+import pandas as pd
 try:
     import cupy as cp
 except ImportError:
@@ -25,29 +26,33 @@ class stage:
         initialize the angles/translations.
         """
         self.directory = directory
-        self._omega = None
-        self._phi   = None
-        self._chi   = None
-        self._mu    = None
-        self._translation = None
+        self._name = None
+        self._motor_name = None
+        self._motor_type = None
+        self._motor_coupling = None
+        self._motor_axis = None
+        self._motor_value = None
+        self._motor_resolution = None
         self._rotation = None
-        self._mode = None
+        self._translation = None
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
     
-    def create_stage(self, mode="goniometer"):
+    def create_stage(self, name=['goniometer'], motor_name=['mu','phi','chi','omega','x','y','z'], motor_type=['R','R','R','R','T','T','T'], motor_coupling=[[None],[0],[0],[0,1,2],[0,1,2,3],[0,1,2,3],[0,1,2,3]], motor_axis=[[0.0,-1.0,0.0],[0.0,-1.0,0.0],[-1.0,0.0,0.0],[0.0,0.0,-1.0],[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]], motor_value=[0.0,0.0,0.0,0.0,0.0,0.0,0.0], motor_resolution=[0.0,0.0,0.0,0.0,0.0,0.0,0.0]):
         """
         Create the stage with a specified mode/convention (e.g. 'goniometer').
         This will initialize all angles to zero and translation to [0,0,0].
         """
-        self._mode = mode
-        self._omega = 0.0
-        self._phi   = 0.0
-        self._chi   = 0.0
-        self._mu    = 0.0
+        self._name = name
+        self._motor_name = np.array(motor_name)
+        self._motor_type = np.array(motor_type)
+        self._motor_coupling = motor_coupling
+        self._motor_axis = np.array(motor_axis)
+        self._motor_value = np.array(motor_value)
+        self._motor_resolution = np.array(motor_resolution)
         self._rotation = np.eye(3, dtype=np.float32)
         self._translation = np.zeros(3, dtype=np.float32)
-        print(f"Stage created with mode '{self._mode}' and all angles, translations set to 0.")
+        print(f"{name} stage created with all angles and translations set to 0.")
 
     def read_stage_metadata(self):
         """
@@ -57,20 +62,25 @@ class stage:
         metadata_filename = os.path.join(self.directory, "stage_metadata.json")
         if not os.path.isfile(metadata_filename):
             raise FileNotFoundError(f"No JSON metadata file found at {metadata_filename}")
-
         with open(metadata_filename, "r") as f:
             stage_metadata = json.load(f)
-
-        if stage_metadata["mode"] is not None:
-            self._mode = stage_metadata["mode"]
-        if stage_metadata["omega"] is not None:
-            self._omega = float(stage_metadata["omega"])
-        if stage_metadata["phi"] is not None:
-            self._phi = float(stage_metadata["phi"])
-        if stage_metadata["chi"] is not None:
-            self._chi = float(stage_metadata["chi"])
-        if stage_metadata["mu"] is not None:
-            self._mu = float(stage_metadata["mu"])
+        # Convert lists back to NumPy arrays (and normal Python objects where needed)
+        if stage_metadata["name"] is not None:
+            self._name = stage_metadata["name"]
+        if stage_metadata["motor_name"] is not None:
+            self._motor_name = np.array(stage_metadata["motor_name"])
+        if stage_metadata["motor_type"] is not None:
+            self._motor_type = np.array(stage_metadata["motor_type"])
+        if stage_metadata["motor_coupling"] is not None:
+            self._motor_coupling = stage_metadata["motor_coupling"]
+        if stage_metadata["motor_axis"] is not None:
+            self._motor_axis = np.array(stage_metadata["motor_axis"], dtype=np.float32)
+        if stage_metadata["motor_value"] is not None:
+            self._motor_value = np.array(stage_metadata["motor_value"], dtype=np.float32)
+        if stage_metadata["motor_resolution"] is not None:
+            self._motor_resolution = np.array(stage_metadata["motor_resolution"], dtype=np.float32)
+        if stage_metadata["rotation"] is not None:
+            self._rotation = np.array(stage_metadata["rotation"], dtype=np.float32)
         if stage_metadata["translation"] is not None:
             self._translation = np.array(stage_metadata["translation"], dtype=np.float32)
             
@@ -80,26 +90,23 @@ class stage:
         Serializes the stage object's critical fields to disk
         as human-readable JSON so that the state can be restored later.
         """
-        # Convert the translation array to a Python list for JSON
-        if self._translation is not None:
-            translation_list = self._translation.tolist()
-        else:
-            translation_list = None
-        
+        # Convert NumPy arrays to Python lists so JSON can handle them
         stage_metadata = {
-            "mode": self._mode,
-            "omega": self._omega,
-            "phi": self._phi,
-            "chi": self._chi,
-            "mu": self._mu,
-            "translation": translation_list,
+            "name": self._name if self._name is not None else None,
+            "motor_name": self._motor_name.tolist() if self._motor_name is not None else None,
+            "motor_type": self._motor_type.tolist() if self._motor_type is not None else None,
+            "motor_coupling": self._motor_coupling if self._motor_coupling is not None else None,
+            "motor_axis": self._motor_axis.tolist() if self._motor_axis is not None else None,
+            "motor_value": self._motor_value.tolist() if self._motor_value is not None else None,
+            "motor_resolution": self._motor_resolution.tolist() if self._motor_resolution is not None else None,
+            "rotation": self._rotation.tolist() if self._rotation is not None else None,
+            "translation": self._translation.tolist() if self._translation is not None else None
         }
-        
         if override_directory is not None:
             metadata_filename = os.path.join(override_directory, "stage_metadata.json")
         else:
             metadata_filename = os.path.join(self.directory, "stage_metadata.json")
-
+        # Write as nicely formatted JSON
         with open(metadata_filename, "w") as f:
             json.dump(stage_metadata, f, indent=4)
         print(f"Metadata written to {metadata_filename} in JSON format.")
@@ -133,112 +140,119 @@ class stage:
                          [d*y*x + z*s,   c + d*y*y,     d*y*z - x*s],
                          [d*z*x - y*s,   d*z*y + x*s,   c + d*z*z]], dtype=np.float32)
     
-    def get_rotation(self, omega, phi, chi, mu, mode=None, degrees=True):
-        """
-        Return the 3x3 rotation matrix corresponding to (omega, phi, chi, mu)
-        under the specified stage convention (defaults to self._mode if not given).
-        
-        Example: 'goniometer' mode uses four consecutive rotations about
-                 axes defined by the sequence of transforms:
-                 - mu rotation about [0,-1,0]
-                 - omega rotation about (mu-rotated) [0,0,-1]
-                 - phi rotation about (mu-rotated) [0,-1,0]
-                 - chi rotation about (mu-rotated) [-1,0,0]
-        """
-        if mode is None:
-            mode = self._mode
-        if degrees:
-            omega = np.deg2rad(omega)
-            phi   = np.deg2rad(phi)
-            chi   = np.deg2rad(chi)
-            mu    = np.deg2rad(mu)
-        
-        if mode == "goniometer":
-            # 1) mu rotation
-            mu_matrix = self.get_axis_rotation(np.array([0.0, -1.0, 0.0], dtype=np.float32), mu)
-            # 2) omega rotation
-            omega_axis = mu_matrix @ np.array([0.0, 0.0, -1.0], dtype=np.float32)
-            omega_matrix = self.get_axis_rotation(omega_axis, omega)
-            # 3) phi rotation
-            phi_axis = mu_matrix @ np.array([0.0, -1.0, 0.0], dtype=np.float32)
-            phi_matrix = self.get_axis_rotation(phi_axis, phi)
-            # 4) chi rotation
-            chi_axis = mu_matrix @ np.array([-1.0, 0.0, 0.0], dtype=np.float32)
-            chi_matrix = self.get_axis_rotation(chi_axis, chi)
-            return mu_matrix @ omega_matrix @ chi_matrix @ phi_matrix
-        else:
-            return np.eye(3, dtype=np.float32)
-    
     ## Main Functions
-    def set_rotation_stage_absolute(self, omega=0, phi=0, chi=0, mu=0, degrees=True):
+    def get_motor_axis(self,motor_idx):
         """
-        Set the stage rotation to absolute angles (omega, phi, chi, mu).
-        Overwrites any existing angles. Resets the stage to these angles.
+        Return the motion axis for a given motor given the coupling and motor values provided.
         """
-        if self._mode is None:
-            raise ValueError("Stage mode not set. Please call create_stage(...) before using this function.")
-        
-        # Overwrite internal angles
-        self._omega = float(omega)
-        self._phi   = float(phi)
-        self._chi   = float(chi)
-        self._mu    = float(mu)
-        
-        self._rotation = self.get_rotation(self._omega,self._phi,self._chi,self._mu,degrees=degrees)
-        
-        print(f"Stage rotation set ABSOLUTE to: omega={omega}, phi={phi}, chi={chi}, mu={mu} (degrees={degrees}).")
+        motor_axis_arr = self._motor_axis.copy()
+        for coupled in self._motor_coupling[motor_idx]:
+            print(f"Motor ID:{motor_idx} axis array = {motor_axis_arr[motor_idx]}")
+            if coupled is None:
+                break
+            else:
+                motor_axis_arr[motor_idx] = self.get_axis_rotation(self.get_motor_axis(coupled),self._motor_value[coupled]) @ motor_axis_arr[motor_idx]
+        return motor_axis_arr[motor_idx]    
+
+    def get_rotation(self):
+        """
+        Return the 3x3 rotation matrix given the coupling and motor values provided.
+        """
+        motor_mask = (self._motor_type == "R")
+        rotation_matrix = np.eye(3, dtype=np.float32)
+        for motor_idx in np.where(motor_mask)[0]:
+            rotation_matrix = self.get_axis_rotation(self.get_motor_axis(motor_idx), self._motor_value[motor_idx]) @ rotation_matrix
+        self._rotation = rotation_matrix
+        return self._rotation
     
-    def set_rotation_stage_relative(self, domega=0, dphi=0, dchi=0, dmu=0, degrees=True):
+    def get_translation(self):
         """
-        Rotate the stage by angles (domega, dphi, dchi, dmu) relative to current angles.
+        Return the 3x1 translation array given the coupling and motor values provided.
         """
-        if self._mode is None:
-            raise ValueError("Stage mode not set. Please call create_stage(...) before using this function.")
+        motor_mask = (self._motor_type == "T")
+        translation_arr = np.zeros(3, dtype=np.float32)
+        for motor_idx in np.where(motor_mask)[0]:
+            translation_arr += self.get_motor_axis(motor_idx)*self._motor_value[motor_idx]
+        self._translation = translation_arr
+        return self._translation
         
-        # Update angles
-        self._omega += domega
-        self._phi   += dphi
-        self._chi   += dchi
-        self._mu    += dmu
+    def set_motor_value_relative(self, motor_value_rel=[0.0,0.0,0.0,0.0,0.0,0.0,0.0], degrees=True):
+        motor_value_rel = np.array(motor_value_rel)
+        if degrees is True:
+            motor_mask = (self._motor_type == "R")
+            motor_value_rel[motor_mask] = np.deg2rad(motor_value_rel[motor_mask])
+            self._motor_value += motor_value_rel
+        else:
+            self._motor_value += motor_value_rel
+        self.clip_motor_value()
+        self.get_rotation()
+        self.get_translation()
+        self.display_motor_values(degrees=degrees)
+    
+    def set_motor_value_absolute(self, motor_value_abs=[0.0,0.0,0.0,0.0,0.0,0.0,0.0], degrees=True):
+        motor_value_abs = np.array(motor_value_abs)
+        if degrees is True:
+            motor_mask = (self._motor_type == "R")
+            motor_value_abs[motor_mask] = np.deg2rad(motor_value_abs[motor_mask])
+            self._motor_value = motor_value_abs
+        else:
+            self._motor_value = motor_value_abs
+        self.clip_motor_value()
+        self.get_rotation()
+        self.get_translation()
+        self.display_motor_values(degrees=degrees)
+    
+    def set_single_motor_value_relative(self, name, value, degrees=True):
+        """
+        """
+        motor_mask = (self._motor_name == name)
+        if self._motor_type[motor_mask] == "R" and degrees is True:
+            value = np.deg2rad(value)
+        self._motor_value[motor_mask] += value
+        self.clip_motor_value()
+        self.get_rotation()
+        self.get_translation()
+        self.display_motor_values(degrees=degrees)
         
-        self._rotation = self.get_rotation(self._omega,self._phi,self._chi,self._mu,degrees=degrees)
-        
-        print(f"Stage rotation set RELATIVE by: domega={domega}, dphi={dphi}, dchi={dchi}, dmu={dmu} (degrees={degrees}).")
+    def set_single_motor_value_absolute(self, name, value, degrees=True):
+        """
+        """
+        motor_mask = (self._motor_name == name)
+        if self._motor_type[motor_mask] == "R" and degrees is True:
+            value = np.deg2rad(value)
+        self._motor_value[motor_mask] = value
+        self.clip_motor_value()
+        self.get_rotation()
+        self.get_translation()
+        self.display_motor_values(degrees=degrees)
     
-    def set_translation_stage_absolute(self, x=0, y=0, z=0):
+    def clip_motor_value(self):
         """
-        Set the stage translation to an absolute coordinate (x, y, z).
+        Clips motor values according to resolution.
         """
-        if self._translation is None:
-            raise ValueError("Stage translation not initialized. Please call create_stage(...) before using this function.")
-        self._translation = np.array([x, y, z], dtype=np.float32)
-        print(f"Stage translation set ABSOLUTE to: [{x}, {y}, {z}].")
-    
-    def set_translation_stage_relative(self, dx=0, dy=0, dz=0):
-        """
-        Move the stage by a relative vector (dx, dy, dz) from the current translation.
-        """
-        if self._translation is None:
-            raise ValueError("Stage translation not initialized. Please call create_stage(...) before using this function.")
-        self._translation += np.array([dx, dy, dz], dtype=np.float32)
-        print(f"Stage translation set RELATIVE by: [{dx}, {dy}, {dz}].")
-    
+        motor_mask = (self._motor_resolution is not None) & (self._motor_resolution != 0)
+        self._motor_value[motor_mask] = self._motor_resolution[motor_mask]*int(self._motor_value[motor_mask]/self._motor_resolution[motor_mask])
+
     def zero_stage(self):
         """
-        Reset all angles (omega, phi, chi, mu) and translation to zero.
+        Reset all motor values to zero.
         """
-        if self._mode is None:
-            raise ValueError("Stage mode not set. Please call create_stage(...) before using this function.")
-        
-        self._omega = 0.0
-        self._phi   = 0.0
-        self._chi   = 0.0
-        self._mu    = 0.0
-        
+        self._motor_value *= 0
         self._rotation = np.eye(3, dtype=np.float32)
         self._translation = np.zeros(3, dtype=np.float32)
-        
         print("Stage angles and translation have been zeroed.")
+        
+    def display_motor_values(self,degrees=True):
+        if degrees is True:
+            motor_mask = (self._motor_type == "R")
+            output = self._motor_value.copy()
+            output[motor_mask] = np.rad2deg(self._motor_value[motor_mask])
+        else:
+            output = self._motor_value.copy()
+        print("Motor States:")
+        df = pd.DataFrame([output], columns=self._motor_name)
+        df.index = ['Values']
+        print(df)
     
     def plot_stage(self, elev=30, azim=45):
         """
@@ -255,7 +269,7 @@ class stage:
         corners_local = self.get_unit_corners() - 0.5
 
         # Apply rotation + translation to each corner
-        corners_lab = (corners_local @ self.rotation) + self.translation
+        corners_lab = (corners_local @ self.get_rotation()) + self.get_translation()
         edges = [
             (0,1), (0,2), (0,3),
             (1,4), (1,5),
@@ -292,40 +306,13 @@ class stage:
     
     ## Properties
     @property
-    def omega(self):
+    def motor_value(self):
         """
-        Returns the stage omega angle.
+        Returns the motor values.
         """
-        if self._omega is None:
-            print("Stage angles not initialized. Please call create_stage(...) first.")
-        return self._omega
-    
-    @property
-    def phi(self):
-        """
-        Returns the stage phi angle.
-        """
-        if self._phi is None:
-            print("Stage angles not initialized. Please call create_stage(...) first.")
-        return self._phi
-    
-    @property
-    def chi(self):
-        """
-        Returns the stage chi angle.
-        """
-        if self._chi is None:
-            print("Stage angles not initialized. Please call create_stage(...) first.")
-        return self._chi
-    
-    @property
-    def mu(self):
-        """
-        Returns the stage mu angle.
-        """
-        if self._mu is None:
-            print("Stage angles not initialized. Please call create_stage(...) first.")
-        return self._mu
+        if self._motor_value is None:
+            print("Stage motors not initialized. Please call create_stage(...) first.")
+        return self._motor_value
     
     @property
     def translation(self):
@@ -345,11 +332,4 @@ class stage:
             print("Stage rotation not initialized. Please call create_stage(...) first.")
         return self._rotation
     
-    @property
-    def mode(self):
-        """
-        Returns the stage mode (e.g. 'goniometer').
-        """
-        if self._mode is None:
-            print("Stage mode not initialized. Please call create_stage(...) first.")
-        return self._mode
+
