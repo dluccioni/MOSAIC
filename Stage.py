@@ -198,7 +198,7 @@ class stage:
         """
         motor_axis_arr = self._motor_axis.copy()
         for coupled in self._motor_coupling[motor_idx]:
-            print(f"Motor ID:{motor_idx} axis array = {motor_axis_arr[motor_idx]}")
+            # print(f"Motor ID:{motor_idx} axis array = {motor_axis_arr[motor_idx]}")
             if coupled is None:
                 break
             else:
@@ -344,7 +344,7 @@ class stage:
             None
         """
         motor_mask = (self._motor_resolution is not None) & (self._motor_resolution != 0)
-        self._motor_value[motor_mask] = self._motor_resolution[motor_mask]*int(self._motor_value[motor_mask]/self._motor_resolution[motor_mask])
+        self._motor_value[motor_mask] = self._motor_resolution[motor_mask]*(self._motor_value[motor_mask]/self._motor_resolution[motor_mask]).astype(int)
 
     def zero_stage(self):
         """
