@@ -234,102 +234,148 @@ class analysis:
         plt.close(fig_pha_surf)
         return X, Y, Z_amp, Z_pha
     
-    def integrate_axis(self, data, axis_data=None, integration_axis=0,title="Integrated Detector", xlabel="X-axis", ylabel="Y-axis",scaling="linear",figsize=(8, 6)):
+    def integrate_detector_along_axis(self,detector,data_type="Intensity",axis="x",system="cartesian",degrees=True,bins=200,aggregator="mean",plot=True,title="Integrated Detector Data",xlabel=None,ylabel="Integrated Value",figsize=(8, 6)):
         """
-        Integrates a detector data array (data is a 2D array with dimensions [Nx, Ny])
-        along a chosen axis and plots the resulting 1D line scan or 2D surface,
-        depending on the dimensionality of the result. If axis_data is provided
-        (and is consistent with data shape), those values are used for the plot axes;
-        otherwise integer indices are used.
-
-        Examples
-        --------
-        If data.shape = (Nx, Ny), and you set integration_axis=0:
-            -> integrated_data has shape (Ny,).
-            -> A 1D line plot is generated: integrated_data vs. Y-axis.
-
-        If you set integration_axis=1:
-            -> integrated_data has shape (Nx,).
-            -> A 1D line plot is generated: integrated_data vs. X-axis.
-
-        If you do not sum at all (not typical here, but if data is already 2D),
-        you would end up plotting a 2D surface. (But in this case, a single call to
-        np.sum(..., axis=integration_axis) always reduces one dimension for 2D data,
-        resulting in 1D.)
+        Integrate detector data along a chosen axis (x, y in Cartesian or
+        2theta, eta in angular coordinates) by binning and summation/averaging.
 
         Parameters
         ----------
-        data : ndarray, shape (Nx, Ny)
-            The 2D detector data to be integrated and plotted.
-        axis_data : None or tuple/list of arrays
-            Coordinate arrays for each dimension. For example:
-                axis_data[0] : x-coordinates, shape (Nx,)
-                axis_data[1] : y-coordinates, shape (Ny,)
-            If None, integer indices are used.
-        integration_axis : int
-            The axis along which to integrate (0 or 1). Defaults to 0.
-        title : str
-            Plot title.
-        xlabel : str
-            Label for the X-axis on the plot.
-        ylabel : str
-            Label for the Y-axis on the plot.
+        detector : detector
+            The detector object containing pixel data and geometry.
+        data_type : str, optional
+            Which detector quantity to integrate. Must be one of:
+            "Intensity", "Amplitude", or "Phase".
+        axis : str, optional
+            The axis along which to integrate. For `system="cartesian"`,
+            choose from ["x", "y", "z"]. For `system="angular"`,
+            choose from ["eta", "2theta"].
+            Default is "x".
+        system : str, optional
+            Coordinate system to use: "cartesian" or "angular".
+            If "angular", the returned angles can be in degrees or radians.
+            Default is "cartesian".
+        degrees : bool, optional
+            If `system="angular"`, whether to convert angles to degrees.
+            Default is True. If False, angles are in radians.
+        bins : int, optional
+            Number of bins for histogram integration. Default is 200.
+        aggregator : str, optional
+            How to combine pixel values within each bin:
+            "sum" or "mean". Default is "sum".
+        plot : bool, optional
+            If True, produce a line plot of the integrated data vs. the chosen axis.
+            Default is True.
+        title : str, optional
+            Plot title if `plot=True`.
+        xlabel : str, optional
+            X-axis label for the plot. If not provided, one is auto-generated.
+        ylabel : str, optional
+            Y-axis label for the plot. Default is "Integrated Value".
+        figsize : tuple, optional
+            Figure size for the plot. Default is (8, 6).
 
         Returns
         -------
-        integrated_data : ndarray
-            The 1D result of integrating `data` along `integration_axis`.
+        bin_centers : ndarray, shape (bins,)
+            The midpoints of each bin along the chosen axis.
+        integrated_vals : ndarray, shape (bins,)
+            The integrated or averaged detector data values corresponding
+            to each bin.
         """
-        # 1) Integrate data along the chosen axis.
-        integrated_data = np.mean(data, axis=integration_axis)
-        axis_data = np.mean(axis_data, axis=integration_axis)
-        if scaling == "log":
-            integrated_data = np.log10(integrated_data)
-        # 2) Figure out shapes for plotting. integrated_data is now 1D: shape (N,).
-        #    We'll do a line plot: x-axis vs. integrated_data.
-        if integrated_data.ndim == 1:
-            # If axis_data is given, pick the matching dimension
-            if axis_data is not None:
-                # If integration_axis=0 => we are left with dimension 1 => shape (Ny,).
-                # If integration_axis=1 => we are left with dimension 0 => shape (Nx,).
-                x_axis = axis_data
-            else:
-                # Fallback: integer indices
-                x_axis = np.arange(integrated_data.size)
+        import numpy as np
+        import matplotlib.pyplot as plt
 
-            # 1D line plot
-            fig, ax = self.line_plot(
-                x_axis,
-                integrated_data,
-                title=title,
-                xlabel=xlabel,
-                ylabel=ylabel,
-                figsize=figsize
-            )
-            plt.show()
-
+        # -------------------------------------------------------------------------
+        # 1) Get the requested pixel data (Intensity, Amplitude, or Phase).
+        # -------------------------------------------------------------------------
+        if data_type.lower() == "intensity":
+            data_array = detector.pixel_intensity
+        elif data_type.lower() == "amplitude":
+            data_array = detector.pixel_amplitude
+        elif data_type.lower() == "phase":
+            data_array = detector.pixel_phase
         else:
-            # If by design, you'd prefer no summation => data remains 2D => surface plot
-            # For standard usage in this docstring, we always get 1D after summation,
-            # but here's a fallback for a 2D plot if that case arises:
-            if axis_data is not None:
-                X_vals = axis_data[0]
-                Y_vals = axis_data[1]
-            else:
-                X_vals = np.arange(data.shape[0])
-                Y_vals = np.arange(data.shape[1])
+            raise ValueError(f"Unknown data_type '{data_type}'; choose from Intensity, Amplitude, Phase.")
 
-            Xmesh, Ymesh = np.meshgrid(X_vals, Y_vals, indexing='ij')
-            fig, ax = self.surf_plot(
-                Xmesh,
-                Ymesh,
-                integrated_data,
-                title=title,
-                xlabel=xlabel,
-                ylabel=ylabel,
-                zlabel="Integrated Intensity",
-                figsize=figsize
-            )
+        # Flatten into 1D
+        data_vals = data_array.ravel()
+
+        # -------------------------------------------------------------------------
+        # 2) Get the appropriate coordinate array: either cartesian or angular.
+        #    detector.get_detector_axis(...) returns shape = (3, Nx, Ny).
+        #       - "cartesian": coords = [ x, y, z ]
+        #       - "angular" : coords = [ eta, two_theta, distance ]  (in radians by default)
+        # -------------------------------------------------------------------------
+        if system.lower() not in ["cartesian", "angular"]:
+            raise ValueError(f"system must be 'cartesian' or 'angular', got '{system}'.")
+
+        coords_3xN = detector.get_detector_axis(system=system, units="deg" if degrees else "rad")
+        # coords_3xN is shape (3, Ny, Nx). Flatten to shape (3, Nx*Ny).
+        coords_3xN = coords_3xN.reshape(3, -1)
+
+        # Decide which row in coords_3xN is the "axis" dimension we care about.
+        if system.lower() == "cartesian":
+            axis = axis.lower()
+            if axis not in ["x", "y", "z"]:
+                raise ValueError("For system='cartesian', axis must be one of ['x', 'y', 'z'].")
+            axis_idx_map = {"x": 0, "y": 1, "z": 2}
+            coord_vals = coords_3xN[axis_idx_map[axis], :]
+            if xlabel is None:
+                xlabel = f"{axis.upper()} (mm or Å)"
+        else:
+            # 'angular' system
+            axis = axis.lower()
+            # coords_3xN: index 0=eta, 1=2theta, 2=distance
+            if axis == "eta":
+                coord_vals = coords_3xN[0, :]
+                if xlabel is None:
+                    xlabel = r"$\eta$ ({}{})".format("°" if degrees else "rad", "")
+            elif axis in ["2theta", "2θ"]:
+                coord_vals = coords_3xN[1, :]
+                if xlabel is None:
+                    xlabel = r"$2\theta$ ({}{})".format("°" if degrees else "rad", "")
+            else:
+                raise ValueError("For system='angular', axis must be one of ['eta', '2theta'].")
+
+        # Flatten coordinate array too
+        coord_vals = coord_vals.ravel()
+
+        # -------------------------------------------------------------------------
+        # 3) Bin and aggregate (sum or mean) across this axis.
+        # -------------------------------------------------------------------------
+        # Create the bin edges from min to max of the chosen coordinate.
+        # Using np.histogram with weights to accumulate sums,
+        # then dividing by counts for mean if aggregator='mean'.
+        bin_edges = np.linspace(coord_vals.min(), coord_vals.max(), bins + 1)
+
+        hist_sums, _ = np.histogram(coord_vals, bins=bin_edges, weights=data_vals)
+        hist_counts, _ = np.histogram(coord_vals, bins=bin_edges)
+
+        if aggregator.lower() == "sum":
+            integrated_vals = hist_sums
+        elif aggregator.lower() == "mean":
+            # Avoid divide-by-zero for empty bins
+            with np.errstate(divide='ignore', invalid='ignore'):
+                integrated_vals = np.where(hist_counts > 0, hist_sums / hist_counts, 0.0)
+        else:
+            raise ValueError(f"Unknown aggregator '{aggregator}'; choose 'sum' or 'mean'.")
+
+        # Compute bin centers for plotting
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+        # -------------------------------------------------------------------------
+        # 4) Optional: Plot the integrated curve
+        # -------------------------------------------------------------------------
+        if plot:
+            fig = plt.figure(figsize=figsize)
+            ax = fig.add_subplot(111)
+            ax.plot(bin_centers, integrated_vals, marker="o", linewidth=1)
+            ax.set_title(title)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.grid(True)
             plt.show()
 
-        return integrated_data
+        return bin_centers, integrated_vals
+
