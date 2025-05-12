@@ -601,6 +601,8 @@ class sample:
 
             # Return final positions to CPU
             atomic_positions_S = atomic_positions_S.get()
+            cp.get_default_memory_pool().free_all_blocks()
+            gc.collect()
             return atomic_positions_S, atomic_species
 
         else:
@@ -628,6 +630,7 @@ class sample:
             offset_np = self.offset.astype(np.float32)
             dim_half_np = (self.dimensions * 0.5).astype(np.float32)
             atomic_positions_S += (offset_np - dim_half_np)
+            gc.collect()
             return atomic_positions_S, atomic_species
 
     def generate_sample(self, material, flush_size=100000000, use_gpu=True):
