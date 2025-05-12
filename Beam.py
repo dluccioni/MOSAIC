@@ -648,93 +648,85 @@ class beam:
         return final_result
         
     def bin_atoms_in_pixels_cpu(self, sample, Nx, Ny, e1, e2,
-                                origin_u, origin_v, pixel_size_u, pixel_size_v,
-                                stage, kernel_radius=0):
+                                pixel_size_u, pixel_size_v,
+                                stage, atomic_radius=1.7, kernel_radius=0, detector=None):
         """
-        CPU approach that accounts for a ~2 Ang radius by shifting each atom
-        in a small grid of (dy, dz) offsets around +/-2 Ang. Then we deduplicate
-        so each (atom, pixel) is not double-counted.
+        CPU approach that accounts for a ~2 radius by shifting each atom 
+        around +/-2 Ang. Then it deduplicates so each (atom, pixel) is unique.
 
-        Each atom is weighted by [f0(0) + f1(energy)] in the real part
-        and [f2(energy)] in the imaginary part.
-
-        After constructing the Nx-by-Ny complex map, we apply a 2D **Gaussian**
-        convolution of size (2*kernel_radius+1) x (2*kernel_radius+1), if
-        kernel_radius > 0.
+        Now we get the *actual* pixel centers from 'detector.pixel_coordinates' 
+        and still use 'pixel_size_u, pixel_size_v' for binning widths.
 
         Returns
         -------
-        final_map : np.ndarray of shape (Ny, Nx), dtype=np.complex64
-            The binned real+imag amplitudes, convolved with a Gaussian.
+        final_map : (Ny, Nx) complex64
+            Real + imag sum in each pixel (after optional Gaussian).
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import multiprocessing
         
-        # -------------------------------------------------------------------
-        # Build + normalize a 2D Gaussian kernel of integer "kernel_radius".
-        # We'll define sigma = radius/2 for demonstration.
-        # -------------------------------------------------------------------
+        # 1) Retrieve pixel centers from detector
+        #    shape=(3, Nx*Ny)
+        pix_coords = detector.pixel_coordinates
+        if cp is not None and isinstance(pix_coords, cp.ndarray):
+            pix_coords = pix_coords.get()  # Bring to CPU
+        # Project each pixel center onto (e1, e2)
+        px = pix_coords[0]
+        py = pix_coords[1]
+        pz = pix_coords[2]
+        pixel_u = px*e1[0] + py*e1[1] + pz*e1[2]
+        pixel_v = px*e2[0] + py*e2[1] + pz*e2[2]
+        min_u = pixel_u.min()
+        min_v = pixel_v.min()
+
+        # 2) Optionally build a 2D Gaussian kernel for smoothing
         def _make_gaussian_kernel_cpu(radius):
             if radius < 1:
                 return None
             diam = 2*radius + 1
-            sigma = radius / 2.0
+            sigma = radius/2.0
             y, x = np.ogrid[-radius:radius+1, -radius:radius+1]
-            # standard 2D Gaussian
-            g = np.exp(-(x*x + y*y)/(2.0*sigma*sigma))
-            g = g.astype(np.float32)
+            g = np.exp(-(x*x + y*y)/(2.0*sigma*sigma)).astype(np.float32)
             g /= g.sum()
             return g
 
-        # -------------------------------------------------------------------
-        # 2D convolution of real or imag by the same kernel using FFT.
-        # -------------------------------------------------------------------
         def _fft_convolve2d_cpu(data2d, kernel):
             if kernel is None:
                 return data2d
             s1, s2 = data2d.shape
             k1, k2 = kernel.shape
-
             fft_shape = (s1 + k1 - 1, s2 + k2 - 1)
-            Fdata   = np.fft.fft2(data2d,   s=fft_shape)
-            Fkernel = np.fft.fft2(kernel,   s=fft_shape)
+            Fdata   = np.fft.fft2(data2d, s=fft_shape)
+            Fkernel = np.fft.fft2(kernel, s=fft_shape)
             Fout    = Fdata * Fkernel
             conved  = np.fft.ifft2(Fout)
-
-            # extract the "same" region
-            start_x = (k1 - 1) // 2
-            start_y = (k2 - 1) // 2
+            start_x = (k1 - 1)//2
+            start_y = (k2 - 1)//2
             conved  = conved[start_x:start_x+s1, start_y:start_y+s2]
             return conved.real.astype(data2d.dtype)
 
-        # -------------------------------------------------------------------
-        # The rest is identical to your existing binning logic, except we
-        # call _make_gaussian_kernel_cpu(...) at the end and do the FFT conv.
-        # -------------------------------------------------------------------
+        # 3) Pre‐load scattering DB
         db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
         db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
         f0_zero_dict     = self._build_f0_zero_dict(db_dict_f0_all)
 
-        # Offsets in local (y,z) plane ~2 Ang
-        radius_2ang = 2.0
+        radius = atomic_radius
         offsets = np.array([
-            [-radius_2ang*np.sqrt(2), -radius_2ang*np.sqrt(2)],
-            [-radius_2ang,   0    ],
-            [-radius_2ang*np.sqrt(2),  radius_2ang*np.sqrt(2)],
-            [   0   , -radius_2ang],
-            [   0   ,   0    ],
-            [   0   ,  radius_2ang],
-            [ radius_2ang*np.sqrt(2), -radius_2ang*np.sqrt(2)],
-            [ radius_2ang,   0    ],
-            [ radius_2ang*np.sqrt(2),  radius_2ang*np.sqrt(2)]
+            [-radius*np.sqrt(2), -radius*np.sqrt(2)],
+            [-radius,            0.0],
+            [-radius*np.sqrt(2), +radius*np.sqrt(2)],
+            [           0.0,         -radius],
+            [           0.0,          0.0],
+            [           0.0,         +radius],
+            [+radius*np.sqrt(2), -radius*np.sqrt(2)],
+            [+radius,            0.0],
+            [+radius*np.sqrt(2), +radius*np.sqrt(2)]
         ], dtype=np.float32)
         oy = offsets[:,0]
         oz = offsets[:,1]
-        n_offsets = oy.size
 
         final_map_real = np.zeros((Ny, Nx), dtype=np.float32)
         final_map_imag = np.zeros((Ny, Nx), dtype=np.float32)
-        
         chunk_total = sample.chunk_total
         if chunk_total == 0:
             return (final_map_real + 1j*final_map_imag).astype(np.complex64)
@@ -742,27 +734,27 @@ class beam:
         max_threads = min(chunk_total, multiprocessing.cpu_count())
 
         def worker(chunk_id):
-            positions = sample.load_chunk_positions(chunk_id, use_gpu=False)
-            species   = sample.load_chunk_species(chunk_id, use_gpu=False)
-            nAtoms    = positions.shape[0]
+            pos = sample.load_chunk_positions(chunk_id, use_gpu=False)
+            spc = sample.load_chunk_species(chunk_id,  use_gpu=False)
+            nAtoms = pos.shape[0]
             if nAtoms == 0:
-                return (np.zeros((Ny, Nx), dtype=np.float32),
-                        np.zeros((Ny, Nx), dtype=np.float32))
+                return (np.zeros((Ny, Nx), np.float32),
+                        np.zeros((Ny, Nx), np.float32))
             
             # stage transform
-            positions = positions @ stage.rotation
-            positions += stage.translation
-            
-            # build scattering array real/imag
+            pos = pos @ stage.rotation
+            pos += stage.translation
+
+            # build scattering real, imag
             scattering_real = np.zeros(nAtoms, dtype=np.float32)
             scattering_imag = np.zeros(nAtoms, dtype=np.float32)
-            unique_elements = pd.unique(species)
-            for el in unique_elements:
-                mask = (species == el)
+            unique_els = pd.unique(spc)
+            for el in unique_els:
+                mask = (spc == el)
                 if el not in f0_zero_dict:
                     continue
                 f0_0 = f0_zero_dict[el]
-                table = db_dict_f1f2_all.get(el, None)
+                table = db_dict_f1f2_all.get(el)
                 if table is not None:
                     cplx = self.get_f1f2_from_params(self._energy, table)
                     f1_val = cplx.real
@@ -770,26 +762,27 @@ class beam:
                 else:
                     f1_val = 0.0
                     f2_val = 0.0
-
                 scattering_real[mask] = f0_0 + f1_val
                 scattering_imag[mask] = f2_val
-            
-            # project
-            u = positions[:,0]*e1[0] + positions[:,1]*e1[1] + positions[:,2]*e1[2] - origin_u
-            v = positions[:,0]*e2[0] + positions[:,1]*e2[1] + positions[:,2]*e2[2] - origin_v
 
-            # expand offsets
-            expanded_u = (u[:,None] + oy[None,:]).ravel()
-            expanded_v = (v[:,None] + oz[None,:]).ravel()
-            atom_ids   = np.repeat(np.arange(nAtoms, dtype=np.uint64), n_offsets)
+            # project atoms onto e1,e2
+            atom_u = (pos[:,0]*e1[0] + pos[:,1]*e1[1] + pos[:,2]*e1[2])
+            atom_v = (pos[:,0]*e2[0] + pos[:,1]*e2[1] + pos[:,2]*e2[2])
 
-            i = np.floor(expanded_u / pixel_size_u).astype(np.int32)
-            j = np.floor(expanded_v / pixel_size_v).astype(np.int32)
+            # expand for offsets
+            expanded_u = (atom_u[:,None] + oy[None,:]).ravel()
+            expanded_v = (atom_v[:,None] + oz[None,:]).ravel()
+            atom_ids   = np.repeat(np.arange(nAtoms, dtype=np.uint64), offsets.shape[0])
 
-            mask_in = (i >= 0)&(i < Nx)&(j >= 0)&(j < Ny)
+            # bin i,j
+            i = np.floor((expanded_u - min_u)/pixel_size_u).astype(np.int32)
+            j = np.floor((expanded_v - min_v)/pixel_size_v).astype(np.int32)
+
+            # clip
+            mask_in = (i>=0)&(i<Nx)&(j>=0)&(j<Ny)
             if not mask_in.any():
-                return (np.zeros((Ny, Nx), dtype=np.float32),
-                        np.zeros((Ny, Nx), dtype=np.float32))
+                return (np.zeros((Ny, Nx), np.float32),
+                        np.zeros((Ny, Nx), np.float32))
 
             i_valid = i[mask_in]
             j_valid = j[mask_in]
@@ -798,10 +791,10 @@ class beam:
             bin_idx = (j_valid.astype(np.uint64)*Nx + i_valid.astype(np.uint64))
             encoded = (atom_ids_valid << 32) | bin_idx
 
-            sort_idx = np.argsort(encoded)
-            encoded_sorted = encoded[sort_idx]
-            bin_idx_sorted = bin_idx[sort_idx]
-            atom_sorted    = atom_ids_valid[sort_idx]
+            sidx = np.argsort(encoded)
+            encoded_sorted = encoded[sidx]
+            bin_idx_sorted = bin_idx[sidx]
+            atom_sorted    = atom_ids_valid[sidx]
 
             keep = np.ones(encoded_sorted.size, dtype=bool)
             if encoded_sorted.size > 1:
@@ -820,16 +813,16 @@ class beam:
             return (partial_hist_real.reshape((Ny, Nx)),
                     partial_hist_imag.reshape((Ny, Nx)))
 
-        # multi-thread
-        chunk_ids = range(1, chunk_total + 1)
+        from concurrent.futures import ThreadPoolExecutor
+        chunk_ids = range(1, chunk_total+1)
         with ThreadPoolExecutor(max_workers=max_threads) as exe:
             futs = {exe.submit(worker, cid): cid for cid in chunk_ids}
-            for f in as_completed(futs):
-                r_part, i_part = f.result()
-                final_map_real += r_part
-                final_map_imag += i_part
+            for fut in as_completed(futs):
+                rpart, ipart = fut.result()
+                final_map_real += rpart
+                final_map_imag += ipart
 
-        # 2D Gaussian convolution
+        # Convolve if needed
         kernel = _make_gaussian_kernel_cpu(kernel_radius)
         conv_real = _fft_convolve2d_cpu(final_map_real, kernel)
         conv_imag = _fft_convolve2d_cpu(final_map_imag, kernel)
@@ -1005,134 +998,124 @@ class beam:
         return final_result
     
     def bin_atoms_in_pixels_gpu(self, sample, Nx, Ny, e1, e2,
-                                origin_u, origin_v, pixel_size_u, pixel_size_v,
-                                stage, kernel_radius=0):
+                                pixel_size_u, pixel_size_v,
+                                stage, atomic_radius=1.7, kernel_radius=0, detector=None):
         """
-        GPU approach that accounts for ~2 Ang radius offsets for each atom, then
-        does a 2D **Gaussian** convolution of radius 'kernel_radius' on real+imag.
+        GPU approach that accounts for offsets, deduplicates, and
+        then does 2D Gaussian convolution if requested.
 
-        Returns
-        -------
-        final_map : np.ndarray (Ny, Nx), dtype=complex64
-            The binned real+imag map, convolved with a Gaussian of size
-            (2*kernel_radius+1) x (2*kernel_radius+1).
+        We now read the pixel centers from 'detector.pixel_coordinates'
+        on the GPU to define the bounding box for binning.
         """
-
         if cp is None:
             print("[beam] Cupy not installed, fallback to CPU.")
             return self.bin_atoms_in_pixels_cpu(sample, Nx, Ny, e1, e2,
-                                                origin_u, origin_v,
                                                 pixel_size_u, pixel_size_v,
-                                                stage,
-                                                kernel_radius=kernel_radius)
+                                                stage,atomic_radius=atomic_radius,
+                                                kernel_radius=kernel_radius,
+                                                detector=detector)
 
         n_gpus = cp.cuda.runtime.getDeviceCount()
         if n_gpus < 1:
             print("[beam] No GPUs found, fallback to CPU.")
             return self.bin_atoms_in_pixels_cpu(sample, Nx, Ny, e1, e2,
-                                                origin_u, origin_v,
                                                 pixel_size_u, pixel_size_v,
-                                                stage,
-                                                kernel_radius=kernel_radius)
+                                                stage,atomic_radius=atomic_radius,
+                                                kernel_radius=kernel_radius,
+                                                detector=detector)
 
         chunk_total = sample.chunk_total
         if chunk_total == 0:
             return np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # Build scattering DB
-        db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
-        db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
-        f0_zero_dict     = self._build_f0_zero_dict(db_dict_f0_all)
+        # 1) Project pixel centers to (u,v) on GPU
+        pix_coords = detector.pixel_coordinates
+        if not isinstance(pix_coords, cp.ndarray):
+            pix_coords = cp.asarray(pix_coords, dtype=cp.float32)
+        e1_gpu = cp.asarray(e1, dtype=cp.float32)
+        e2_gpu = cp.asarray(e2, dtype=cp.float32)
 
-        # stage, e1,e2
-        R_stage_gpu     = cp.asarray(stage.rotation,    dtype=cp.float32)
-        trans_stage_gpu = cp.asarray(stage.translation, dtype=cp.float32)
-        e1_gpu          = cp.asarray(e1, dtype=cp.float32)
-        e2_gpu          = cp.asarray(e2, dtype=cp.float32)
+        px = pix_coords[0]
+        py = pix_coords[1]
+        pz = pix_coords[2]
+        pixel_u = px*e1_gpu[0] + py*e1_gpu[1] + pz*e1_gpu[2]
+        pixel_v = px*e2_gpu[0] + py*e2_gpu[1] + pz*e2_gpu[2]
+        min_u_gpu = pixel_u.min()
+        min_v_gpu = pixel_v.min()
 
-        origin_u_f     = cp.float32(origin_u)
-        origin_v_f     = cp.float32(origin_v)
-        pixel_size_u_f = cp.float32(pixel_size_u)
-        pixel_size_v_f = cp.float32(pixel_size_v)
-
-        radius_2ang = 1.7
-        offsets = np.array([
-            [-radius_2ang*np.sqrt(2), -radius_2ang*np.sqrt(2)],
-            [-radius_2ang,   0    ],
-            [-radius_2ang*np.sqrt(2),  radius_2ang*np.sqrt(2)],
-            [   0   , -radius_2ang],
-            [   0   ,   0    ],
-            [   0   ,  radius_2ang],
-            [ radius_2ang*np.sqrt(2), -radius_2ang*np.sqrt(2)],
-            [ radius_2ang,   0    ],
-            [ radius_2ang*np.sqrt(2),  radius_2ang*np.sqrt(2)]
-        ], dtype=np.float32)
-        offsets_cp = cp.asarray(offsets, dtype=cp.float32)
-        oy = offsets_cp[:,0]
-        oz = offsets_cp[:,1]
-        n_offsets = oy.size
-
-        # ---------------------------------------------------------------------
-        # Build a 2D Gaussian kernel on GPU with radius => diameter = 2*radius+1
-        # We'll define sigma=radius/2. Then do normalized sum=1.
-        # ---------------------------------------------------------------------
+        # 2) Build GPU Gaussian kernel if needed
         def _make_gaussian_kernel_gpu(radius):
             if radius < 1:
                 return None
             diam = 2*radius + 1
-            sigma = radius / 2.0
+            sigma = radius/2.0
             y = cp.arange(-radius, radius+1, dtype=cp.float32)[:, None]
             x = cp.arange(-radius, radius+1, dtype=cp.float32)[None, :]
-            # Gaussian
             g = cp.exp(-(x*x + y*y)/(2.0*sigma*sigma))
             g = g.astype(cp.float32)
             g /= cp.sum(g)
             return g
 
-        # ---------------------------------------------------------------------
-        # Convolution on GPU via cupy.fft
-        # ---------------------------------------------------------------------
         def _fft_convolve2d_gpu(data2d_gpu, kernel_gpu):
             if kernel_gpu is None:
                 return data2d_gpu
             s1, s2 = data2d_gpu.shape
             k1, k2 = kernel_gpu.shape
-
-            fft_shape = (s1 + k1 - 1, s2 + k2 - 1)
-            Fdata   = cp.fft.fft2(data2d_gpu, s=fft_shape)
-            Fkernel = cp.fft.fft2(kernel_gpu, s=fft_shape)
+            Fdata   = cp.fft.fft2(data2d_gpu, s=(s1+k1-1, s2+k2-1))
+            Fkernel = cp.fft.fft2(kernel_gpu, s=(s1+k1-1, s2+k2-1))
             Fout    = Fdata * Fkernel
             conved  = cp.fft.ifft2(Fout)
-
-            start_x = (k1 - 1)//2
-            start_y = (k2 - 1)//2
-            conved  = conved[start_x:start_x+s1, start_y:start_y+s2]
+            sx = (k1-1)//2
+            sy = (k2-1)//2
+            conved  = conved[sx:sx+s1, sy:sy+s2]
             return conved.real.astype(data2d_gpu.dtype)
 
-        # multi-GPU accumulation
-        import threading
+        db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
+        db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
+        f0_zero_dict     = self._build_f0_zero_dict(db_dict_f0_all)
+
+        # stage transforms on GPU
+        R_stage_gpu     = cp.asarray(stage.rotation, dtype=cp.float32)
+        trans_stage_gpu = cp.asarray(stage.translation, dtype=cp.float32)
+
+        radius = atomic_radius
+        offsets_cpu = np.array([
+            [-radius*np.sqrt(2), -radius*np.sqrt(2)],
+            [-radius,  0.0],
+            [-radius*np.sqrt(2), +radius*np.sqrt(2)],
+            [ 0.0, -radius],
+            [ 0.0,  0.0],
+            [ 0.0, +radius],
+            [+radius*np.sqrt(2), -radius*np.sqrt(2)],
+            [+radius,  0.0],
+            [+radius*np.sqrt(2), +radius*np.sqrt(2)]
+        ], dtype=np.float32)
+        offsets_gpu = cp.asarray(offsets_cpu)
+        oy_gpu = offsets_gpu[:,0]
+        oz_gpu = offsets_gpu[:,1]
+
         partial_results = [None] * n_gpus
         chunks_per_gpu = chunk_total // n_gpus
         remainder = chunk_total % n_gpus
 
         def gpu_worker(gpu_id, chunk_indices, out_idx):
             cp.cuda.Device(gpu_id).use()
-            out_map_r_gpu = cp.zeros((Ny, Nx), dtype=cp.float32)
-            out_map_i_gpu = cp.zeros((Ny, Nx), dtype=cp.float32)
+            out_r = cp.zeros((Ny, Nx), dtype=cp.float32)
+            out_i = cp.zeros((Ny, Nx), dtype=cp.float32)
 
             for cid in chunk_indices:
                 pos_cpu = sample.load_chunk_positions(cid, use_gpu=False)
-                sp_cpu  = sample.load_chunk_species(cid, use_gpu=False)
+                spc_cpu = sample.load_chunk_species(cid,  use_gpu=False)
                 nAtoms  = pos_cpu.shape[0]
                 if nAtoms == 0:
                     continue
 
-                # build scattering (real, imag)
+                # scattering arrays
                 scattering_real = np.zeros(nAtoms, dtype=np.float32)
                 scattering_imag = np.zeros(nAtoms, dtype=np.float32)
-                unique_els = pd.unique(sp_cpu)
+                unique_els = pd.unique(spc_cpu)
                 for el in unique_els:
-                    mask = (sp_cpu == el)
+                    mask = (spc_cpu == el)
                     if el not in f0_zero_dict:
                         continue
                     f0_0 = f0_zero_dict[el]
@@ -1147,7 +1130,7 @@ class beam:
                     scattering_real[mask] = f0_0 + f1_val
                     scattering_imag[mask] = f2_val
 
-                # GPU
+                # Move to GPU
                 pos_gpu = cp.asarray(pos_cpu, dtype=cp.float32)
                 real_gpu = cp.asarray(scattering_real, dtype=cp.float32)
                 imag_gpu = cp.asarray(scattering_imag, dtype=cp.float32)
@@ -1156,70 +1139,69 @@ class beam:
                 pos_gpu = pos_gpu @ R_stage_gpu
                 pos_gpu += trans_stage_gpu
 
-                # project
-                u = pos_gpu[:,0]*e1_gpu[0] + pos_gpu[:,1]*e1_gpu[1] + pos_gpu[:,2]*e1_gpu[2] - origin_u_f
-                v = pos_gpu[:,0]*e2_gpu[0] + pos_gpu[:,1]*e2_gpu[1] + pos_gpu[:,2]*e2_gpu[2] - origin_v_f
+                ax = pos_gpu[:,0]
+                ay = pos_gpu[:,1]
+                az = pos_gpu[:,2]
+                au = ax*e1_gpu[0] + ay*e1_gpu[1] + az*e1_gpu[2]
+                av = ax*e2_gpu[0] + ay*e2_gpu[1] + az*e2_gpu[2]
 
-                u_expanded = (u[:,None] + oy[None,:]).ravel()
-                v_expanded = (v[:,None] + oz[None,:]).ravel()
+                # expand offsets
+                au_exp = (au[:,None] + oy_gpu[None,:]).ravel()
+                av_exp = (av[:,None] + oz_gpu[None,:]).ravel()
+                atom_ids = cp.repeat(cp.arange(nAtoms, dtype=cp.uint64), offsets_gpu.shape[0])
 
-                atom_ids = cp.arange(nAtoms, dtype=cp.uint64)
-                atom_ids_expanded = cp.repeat(atom_ids, n_offsets)
+                # bin i, j
+                i_gpu = cp.floor((au_exp - min_u_gpu)/pixel_size_u).astype(cp.int32)
+                j_gpu = cp.floor((av_exp - min_v_gpu)/pixel_size_v).astype(cp.int32)
 
-                i = cp.floor(u_expanded / pixel_size_u_f).astype(cp.int32)
-                j = cp.floor(v_expanded / pixel_size_v_f).astype(cp.int32)
-
-                mask_in = (i>=0)&(i<Nx)&(j>=0)&(j<Ny)
+                mask_in = (i_gpu>=0)&(i_gpu<Nx)&(j_gpu>=0)&(j_gpu<Ny)
                 if not mask_in.any():
                     continue
 
-                i_valid = i[mask_in]
-                j_valid = j[mask_in]
-                atoms_valid = atom_ids_expanded[mask_in]
+                i_valid = i_gpu[mask_in]
+                j_valid = j_gpu[mask_in]
+                atoms_valid = atom_ids[mask_in]
 
                 bin_idx = (j_valid.astype(cp.uint64)*Nx + i_valid.astype(cp.uint64))
                 encoded = (atoms_valid << 32) | bin_idx
 
-                sort_idx = cp.argsort(encoded)
-                encoded_sorted = encoded[sort_idx]
-                bin_idx_sorted = bin_idx[sort_idx]
-                atom_sorted    = atoms_valid[sort_idx]
+                sidx = cp.argsort(encoded)
+                enc_sort = encoded[sidx]
+                bin_sort = bin_idx[sidx]
+                atom_sort= atoms_valid[sidx]
 
-                keep = cp.ones(encoded_sorted.size, dtype=cp.bool_)
-                if encoded_sorted.size > 1:
-                    diff = (encoded_sorted[1:] != encoded_sorted[:-1])
-                    keep[1:] = diff
+                keep = cp.ones(enc_sort.size, dtype=cp.bool_)
+                if enc_sort.size > 1:
+                    diffs = (enc_sort[1:] != enc_sort[:-1])
+                    keep[1:] = diffs
 
-                bin_idx_unique  = bin_idx_sorted[keep]
-                atom_ids_unique = atom_sorted[keep]
+                bin_uniq  = bin_sort[keep]
+                atom_uniq = atom_sort[keep]
 
-                w_real = real_gpu[atom_ids_unique]
-                w_imag = imag_gpu[atom_ids_unique]
+                w_real = real_gpu[atom_uniq]
+                w_imag = imag_gpu[atom_uniq]
 
-                hist_r = cp.bincount(bin_idx_unique, weights=w_real, minlength=Nx*Ny)
-                hist_i = cp.bincount(bin_idx_unique, weights=w_imag, minlength=Nx*Ny)
-                out_map_r_gpu += hist_r.reshape(Ny, Nx)
-                out_map_i_gpu += hist_i.reshape(Ny, Nx)
+                hist_r = cp.bincount(bin_uniq, weights=w_real, minlength=Nx*Ny)
+                hist_i = cp.bincount(bin_uniq, weights=w_imag, minlength=Nx*Ny)
+                out_r += hist_r.reshape(Ny, Nx)
+                out_i += hist_i.reshape(Ny, Nx)
 
                 # cleanup
-                del pos_gpu, real_gpu, imag_gpu, i, j, mask_in
-                del atom_ids, atom_ids_expanded
-                del encoded, sort_idx, encoded_sorted
-                del bin_idx, bin_idx_sorted, atom_sorted
-                del bin_idx_unique, atom_ids_unique, hist_r, hist_i
+                del pos_gpu, real_gpu, imag_gpu
+                del i_gpu, j_gpu, mask_in, atom_ids
+                del encoded, sidx, enc_sort, bin_sort, atom_sort
+                del bin_uniq, atom_uniq, hist_r, hist_i
                 cp.get_default_memory_pool().free_all_blocks()
 
-            partial_results[out_idx] = (out_map_r_gpu, out_map_i_gpu)
+            partial_results[out_idx] = (out_r, out_i)
 
-        # threads
         threads = []
         start_chunk = 1
         for gpu_id in range(n_gpus):
             my_count = chunks_per_gpu + (1 if gpu_id < remainder else 0)
             end_chunk = start_chunk + my_count
-            chunk_indices = list(range(start_chunk, end_chunk))
+            chunk_indices = range(start_chunk, end_chunk)
             start_chunk = end_chunk
-
             t = threading.Thread(target=gpu_worker, args=(gpu_id, chunk_indices, gpu_id))
             t.start()
             threads.append(t)
@@ -1227,7 +1209,7 @@ class beam:
         for t in threads:
             t.join()
 
-        # sum partial results on GPU0
+        # Sum partial on device 0
         cp.cuda.Device(0).use()
         final_r_gpu = cp.zeros((Ny, Nx), dtype=cp.float32)
         final_i_gpu = cp.zeros((Ny, Nx), dtype=cp.float32)
@@ -1237,15 +1219,15 @@ class beam:
                 final_r_gpu += r_gpu
                 final_i_gpu += i_gpu
 
-        # 2D Gaussian convolution if kernel_radius>0
+        # Convolve if needed
         kernel_gpu = _make_gaussian_kernel_gpu(kernel_radius)
         final_r_gpu = _fft_convolve2d_gpu(final_r_gpu, kernel_gpu)
         final_i_gpu = _fft_convolve2d_gpu(final_i_gpu, kernel_gpu)
 
-        # Move back to CPU as complex64
-        return (final_r_gpu.get() + 1j*final_i_gpu.get()).astype(np.complex64)
+        out_cpu = final_r_gpu.get() + 1j*final_i_gpu.get()
+        return out_cpu.astype(np.complex64)
     
-    def count_atoms_in_pixels(self, sample, detector, stage, use_gpu=True, kernel_radius=0):
+    def count_atoms_in_pixels(self, sample, detector, stage, use_gpu=True, atomic_radius=1.7, kernel_radius=0):
         """
         Bins atoms into each detector pixel, weighting each atom by
         f0(0) + f1 + i*f2. Then applies a 2D circular convolution (if kernel_radius>0)
@@ -1256,7 +1238,7 @@ class beam:
         f0_complex_map : np.ndarray of shape (Ny, Nx), dtype=complex64
             The convolved complex sum in each pixel.
         """
-        Nx, Ny = detector.shape
+        Ny, Nx = detector.shape
         pixel_size_u, pixel_size_v = detector.pixel_size
         size_y = pixel_size_u * Nx
         size_z = pixel_size_v * Ny # in Angstrom
@@ -1267,35 +1249,31 @@ class beam:
         # Build orthonormal basis
         e1, e2 = self._make_orthonormal_basis(self._direction)
 
-        origin_u = -0.5 * size_y
-        origin_v = -0.5 * size_z
-
         if use_gpu and (cp is not None):
             f0_map_complex = self.bin_atoms_in_pixels_gpu(
                 sample, Nx, Ny, e1, e2,
-                origin_u, origin_v,
                 pixel_size_u, pixel_size_v,
-                stage,
-                kernel_radius=kernel_radius
+                stage, atomic_radius=atomic_radius, 
+                kernel_radius=kernel_radius,
+                detector=detector
             )
         else:
             f0_map_complex = self.bin_atoms_in_pixels_cpu(
                 sample, Nx, Ny, e1, e2,
-                origin_u, origin_v,
                 pixel_size_u, pixel_size_v,
-                stage,
-                kernel_radius=kernel_radius
+                stage, atomic_radius=atomic_radius,
+                kernel_radius=kernel_radius,
+                detector=detector
             )
             
         # final_map = -f0_map_complex + f0_map_complex.flat[np.abs(f0_map_complex).argmax()]
         # print(f0_map_complex.flat[np.abs(f0_map_complex).argmax()])
         final_map = -f0_map_complex.real + np.max(f0_map_complex.real)
         final_map = prefactor*final_map/(size_y*size_z)
-        # Return transposed, as in the original code
         return final_map.T
 
     # Main API
-    def atomic_direct_scattering(self, sample, detector, stage, offset=None, transmission=False, kernel_radius=0, use_gpu=True):
+    def atomic_direct_scattering(self, sample, detector, stage, offset=None, transmission=False, atomic_radius=0, kernel_radius=0, use_gpu=True):
         """
         High-level entry point for beam-sample scattering.
         Now includes a 'stage' argument to apply its rotation+translation.
@@ -1324,7 +1302,7 @@ class beam:
                 print("[beam] Cupy not installed, running CPU mode.")
             final_field = self.interact_beam_cpu(sample, measurement_positions, (Nx, Ny), stage)
         if transmission is True:
-            final_field += self.count_atoms_in_pixels(sample, detector, stage, use_gpu=use_gpu, kernel_radius=kernel_radius)
+            final_field += self.count_atoms_in_pixels(sample, detector, stage, use_gpu=use_gpu, atomic_radius=atomic_radius, kernel_radius=kernel_radius)
             
         if offset is not None:
             detector.input_pixel_values(final_field - offset)
