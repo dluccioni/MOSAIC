@@ -26,6 +26,13 @@ class beam:
     # -----------------------------------------------------------------------------
     ## Initialization    
     def __init__(self, directory=os.getcwd()):
+        """
+        Initialize a new `beam` object with default or user-specified directory.
+
+        Args:
+            directory (str, optional): The file path to store/read beam-related
+                metadata. Defaults to the current working directory.
+        """
         self.directory = directory
         self._direction = None
         self._energy = None
@@ -46,16 +53,17 @@ class beam:
         Create a beam of specified energy and direction, with a user-specified
         cross-section shape and dimensions (in Angstroms).
 
-        Parameters
-        ----------
-        energy : float
-            Beam energy in eV by default (use eV=False to interpret in Joules).
-        direction : np.ndarray of shape (3,)
-            Propagation direction of the beam (assume collimated).
-        beam_shape : str
-            "rectangular", "circular", etc.  (Currently only "rectangular" used in binning.)
-        beam_size : tuple of float
-            (size_y, size_z) in Angstroms for the cross-section.
+        Args:
+            energy (float): Beam energy value.
+            eV (bool, optional): If True, interpret `energy` in eV; otherwise,
+                interpret in Joules. Defaults to True.
+            direction (np.ndarray, optional): A 3-element array specifying the
+                beam's propagation direction. Defaults to [1.0, 0.0, 0.0].
+            beam_shape (str, optional): Shape of the beam cross-section. Current
+                valid options include "rectangular" and "circular", though only
+                "rectangular" is used in binning. Defaults to "rectangular".
+            beam_size (tuple of float, optional): A 2D size tuple (size_y, size_z)
+                in Angstroms for the cross-section. Defaults to (1000.0, 1000.0).
         """
         self._direction = direction
         if not eV:
@@ -67,8 +75,11 @@ class beam:
         
     def read_beam_metadata(self):
         """
-        Reads the metadata JSON file from disk and restores
-        this beam object's state.
+        Read beam metadata from a JSON file in the current directory, restoring
+        the beam's internal state (energy, wavelength, direction, shape, and size).
+
+        Raises:
+            FileNotFoundError: If the metadata JSON file does not exist.
         """
         metadata_filename = os.path.join(self.directory, "beam_metadata.json")
         if not os.path.isfile(metadata_filename):
@@ -92,8 +103,12 @@ class beam:
     ## Data Handling Functions    
     def write_beam_metadata(self, override_directory=None):
         """
-        Serializes the beam object's critical internal fields to disk 
-        as human-readable JSON so that the state can be restored later.
+        Serialize the beam's internal state to a JSON file for future restoration.
+
+        Args:
+            override_directory (str, optional): If provided, this directory is used
+                to store the JSON file. Otherwise, the directory specified during
+                initialization (self.directory) is used.
         """
         beam_metadata = {
             "direction"   : self._direction.tolist() if self._direction is not None else None,
@@ -118,9 +133,14 @@ class beam:
     @staticmethod
     def make_orthonormal_basis(direction):
         """
-        Given a 3D direction vector (beam direction),
-        return two 3D vectors e1, e2 which are orthonormal
-        to each other and to 'direction'.
+        Generate two orthonormal vectors e1, e2 that are orthogonal to the input direction.
+
+        Args:
+            direction (np.ndarray): A 3-element array representing a beam direction.
+
+        Returns:
+            tuple of np.ndarray: Two 3-element arrays e1, e2 that are orthonormal
+            to each other and to `direction`.
         """
         d = direction / np.linalg.norm(direction)
 
@@ -142,8 +162,16 @@ class beam:
     
     def allocate_pinned_array(shape, dtype=np.float32):
         """
-        Allocate a pinned (page-locked) CPU array for faster host<->device transfers.
-        Returns a NumPy array whose underlying memory is pinned by CuPy.
+        Allocate a pinned (page-locked) CPU memory array for faster host-to-device
+        data transfers if CuPy is available. Otherwise, fallback to a regular NumPy array.
+
+        Args:
+            shape (tuple of int): Shape of the desired array.
+            dtype (np.dtype, optional): Data type for the array. Defaults to np.float32.
+
+        Returns:
+            np.ndarray: A NumPy array allocated in pinned memory (if CuPy is available)
+            or a standard NumPy array (fallback).
         """
         if cp is None:
             # fallback: just allocate a normal NumPy array
@@ -160,8 +188,15 @@ class beam:
     @staticmethod
     def parse_f0_db_all(database_name='f0_WaasKirf.dat'):
         """
-        Loads the entire f0 database for all elements in the file.
-        Returns a dict: { "H": [a1,a2,a3,a4,a5,c,b1,b2,b3,b4,b5], ... }
+        Load f0 scattering form factor parameters for all elements from the specified database.
+
+        Args:
+            database_name (str, optional): Name of the resource file in `databases.scattering`
+                containing the Waasmaier-Kirfel f0 parameters. Defaults to 'f0_WaasKirf.dat'.
+
+        Returns:
+            dict: A dictionary mapping element symbols to an array of 11 parameters
+            [a1, a2, a3, a4, a5, c, b1, b2, b3, b4, b5].
         """
         db_dict = {}
         db_file = pkg_resources.open_text(databases.scattering, database_name)
@@ -178,8 +213,15 @@ class beam:
     @staticmethod
     def parse_f1f2_db_all(database_name='f1f2_CromerLiberman.dat'):
         """
-        Loads the entire f1f2 database for all elements.
-        Returns a dict: { "H": array([[E1,f1_1,f2_1],[E2,f1_2,f2_2],...]), ... }
+        Load anomalous scattering factors f1, f2 for all elements from the specified database.
+
+        Args:
+            database_name (str, optional): Name of the resource file in `databases.scattering`
+                containing the Cromer-Liberman f1, f2 data. Defaults to 'f1f2_CromerLiberman.dat'.
+
+        Returns:
+            dict: A dictionary mapping element symbols to a NumPy array of shape (N, 3)
+            with columns [Energy(eV), f1, f2], for each element.
         """
         f1f2_dict = {}
         db_file = pkg_resources.open_text(databases.scattering, database_name)
@@ -202,9 +244,14 @@ class beam:
     @staticmethod
     def get_f1f2_from_params(energy, f1f2_table):
         """
-        Given an energy (float) and the full f1,f2 table for an element
-        (shape [N,3], columns: E, f1, f2), returns (f1 + i*f2)
-        by linear interpolation near the requested energy.
+        Interpolate f1 + i*f2 at a given energy using a table of [E, f1, f2].
+
+        Args:
+            energy (float): The energy (in eV) at which to interpolate.
+            f1f2_table (np.ndarray): A (N, 3) array of [E, f1, f2] values.
+
+        Returns:
+            complex: The complex anomalous scattering factor (f1 + i*f2) at the given energy.
         """
         E = energy
         energies = f1f2_table[:, 0]
@@ -226,9 +273,14 @@ class beam:
     @staticmethod
     def _build_f0_zero_dict(db_dict_f0_all):
         """
-        Given the dictionary of Waasmaier-Kirfel params for each element,
-        compute f0(0) = c + sum_{i=1..5}(a_i) for each element.
-        Returns a dict {element_name: f0_zero_value}.
+        Compute f0(0) for each element from the Waasmaier-Kirfel parameters.
+
+        Args:
+            db_dict_f0_all (dict): Dictionary mapping element symbols to f0 parameters
+                [a1, a2, a3, a4, a5, c, b1, b2, b3, b4, b5].
+
+        Returns:
+            dict: A dictionary {element_symbol: f0(0) value}.
         """
         f0_0_dict = {}
         for el, params in db_dict_f0_all.items():
@@ -245,9 +297,11 @@ class beam:
     @staticmethod
     def compile_compute_scattering_cffi():
         """
-        Builds (or caches) a CFFI module that implements the scattering for CPU
-        in C, providing a function compute_scattering_cffi(...) to do the loops.
-        Returns (ffi_obj, C_mod).
+        Compile or verify a CFFI module for CPU-based scattering calculations.
+
+        Returns:
+            tuple: (ffi_obj, C_mod), where ffi_obj is the CFFI FFI object and
+            C_mod is the compiled C module offering `compute_scattering_cffi(...)`.
         """
         c_source = r'''
         #include <math.h>
@@ -366,8 +420,12 @@ class beam:
     @staticmethod
     def build_interaction_kernel():
         """
-        Returns the precompiled CuPy RawKernel object for computing scattering
-        with a shared-memory approach. Only invoked if `cp` is not None.
+        Create a CuPy RawKernel for performing GPU-based scattering calculations
+        using a shared-memory approach.
+
+        Returns:
+            cupy.core.RawKernel: A compiled CUDA kernel function for computing
+            scattering contributions from atoms to detector pixels.
         """
         _cuda_source_memtile = r'''
         #define CHUNK_SIZE 128
@@ -540,9 +598,13 @@ class beam:
     @staticmethod
     def build_intra_neighbor_search_kernel():
         """
-        ### MODIFICATION 1 of 4:
-        Store not only distance but also the neighbor 'j' index in 'neighbor_index_buffer[write_idx]'.
-        This is necessary for cross-chunk filtering to remove i->i or j->j neighbors.
+        Build a CuPy RawKernel for intra-chunk neighbor search (atom i -> atom i
+        within the same chunk). This kernel writes nearest-neighbor phase and
+        scattering data into output buffers.
+
+        Returns:
+            cupy.core.RawKernel: The compiled CUDA kernel function for intra-chunk
+            neighbor searches.
         """
         _intra_neighbor_search_kernel = r'''
         #include <math.h>
@@ -659,8 +721,7 @@ class beam:
                             float dist = sqrtf(dist2);
 
                             // Phase = k_val * mod(distance + x_neighbor, wavelength)
-                            float sum_val = dist + qx; 
-                            float mod_val = fmodf(sum_val, wavelength);
+                            float mod_val = fmodf(dist, wavelength);
                             float phase_val = k_val * mod_val;
 
                             // Q_val = k_val * sqrt(2*(1 - dx/dist)) (like atomic_direct_scattering)
@@ -700,9 +761,17 @@ class beam:
     
     @staticmethod
     def build_inter_neighbor_search_kernel():
+        """
+        Build a CuPy RawKernel for inter-chunk neighbor search (between
+        two distinct boundary sets). The kernel excludes i->i and j->j
+        neighbors based on their global indices.
+
+        Returns:
+            cupy.core.RawKernel: The compiled CUDA kernel function for
+            inter-chunk neighbor searches.
+        """
         _inter_neighbor_search_kernel = r'''
         #include <math.h>
-
         __device__ __forceinline__
         float get_f0_value(float Q_val, const float* params)
         {
@@ -807,8 +876,7 @@ class beam:
                     if(dist2 <= r_cut*r_cut){
                         if(neighbor_count < max_neighbors_per_atom){
                             float dist = sqrtf(dist2);
-                            float sum_val = dist + qx;
-                            float mod_val = fmodf(sum_val, wavelength);
+                            float mod_val = fmodf(dist, wavelength);
                             float phase_val = k_val*mod_val;
 
                             float rdx = dx / dist;
@@ -851,10 +919,28 @@ class beam:
                                db_dict_f0_all, db_dict_f1f2_all, k_val,
                                stage):
         """
-        Use CFFI for a single chunk scattering. Return (Ny, Nx) complex64 array.
-        
-        NOTE: We apply the stage rotation + translation to the positions
-              before converting to meters.
+        Compute scattering contributions for a single chunk on CPU using
+        a CFFI-based routine.
+
+        Args:
+            complied_code: The verified CFFI module containing the compiled C function.
+            ffi_obj (FFI): The CFFI FFI object associated with `complied_code`.
+            chunk_id (int): The chunk index to process.
+            sample: The sample object providing methods like
+                `load_chunk_positions(...)` and `load_chunk_species(...)`.
+            Nx (int): The number of pixels along the x-dimension of the detector.
+            Ny (int): The number of pixels along the y-dimension of the detector.
+            coords_x_m (np.ndarray): x-coordinates of the detector pixels in meters.
+            coords_y_m (np.ndarray): y-coordinates of the detector pixels in meters.
+            coords_z_m (np.ndarray): z-coordinates of the detector pixels in meters.
+            db_dict_f0_all (dict): f0 database for all elements.
+            db_dict_f1f2_all (dict): f1f2 database for all elements.
+            k_val (float): Wave number (2π / wavelength).
+            stage: A stage object with rotation (3x3) and translation (3,) to apply to positions.
+
+        Returns:
+            np.ndarray: A (Ny, Nx) array of complex64 representing the partial
+            scattering field from this chunk.
         """
         species_chunk_np = sample.load_chunk_species(chunk_id, use_gpu=False)
         atom_count = species_chunk_np.shape[0]
@@ -927,9 +1013,17 @@ class beam:
 
     def interact_beam_cpu(self, sample, measurement_positions, measurement_shape, stage):
         """
-        Multi-threaded CPU approach. Splits sample chunks among threads,
-        accumulates partial fields. Uses CFFI for numeric loops,
-        applying stage transformations to each chunk.
+        Perform multi-threaded CPU scattering computation for all chunks in a sample.
+
+        Args:
+            sample: The sample object with methods to load species and positions by chunk.
+            measurement_positions (np.ndarray or cp.ndarray): (3, Nx*Ny) array of
+                detector pixel coordinates in Angstrom.
+            measurement_shape (tuple of int): (Nx, Ny) specifying detector dimensions.
+            stage: A stage object with rotation (3x3) and translation (3,) to apply to positions.
+
+        Returns:
+            np.ndarray: A (Ny, Nx) array of complex64 containing the summed scattering field.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         Nx, Ny = measurement_shape
@@ -980,10 +1074,20 @@ class beam:
 
     def interact_beam_gpu(self, sample, measurement_positions, measurement_shape, stage):
         """
-        Perform beam-sample interaction using all available GPUs in parallel,
-        chunk-based. Each GPU gets a subset of chunks. Summation on CPU.
-        
-        We also apply the stage rotation+translation on GPU before dividing by 1e10.
+        Perform GPU-based scattering computation for all chunks in a sample.
+
+        Distributes chunk processing across multiple GPUs (if available) and
+        aggregates the partial fields on the CPU at the end.
+
+        Args:
+            sample: The sample object with methods to load species and positions by chunk.
+            measurement_positions (np.ndarray or cp.ndarray): (3, Nx*Ny) array of
+                detector pixel coordinates in Angstrom.
+            measurement_shape (tuple of int): (Nx, Ny) specifying detector dimensions.
+            stage: A stage object with rotation (3x3) and translation (3,) to apply to positions.
+
+        Returns:
+            np.ndarray: A (Ny, Nx) complex64 array of the total scattering field.
         """
         if cp is None:
             # If somehow called without cupy installed, fallback to CPU
@@ -1146,21 +1250,21 @@ class beam:
 
         return final_result
     
-    def atomic_direct_scattering(self, sample, detector, stage, offset=None, transmission=False, atomic_radius=0, kernel_radius=0, use_gpu=True):
+    def atomic_scattering_kinematic(self, sample, detector, stage, offset=None, use_gpu=True):
         """
-        High-level entry point for beam-sample scattering.
-        Now includes a 'stage' argument to apply its rotation+translation.
-        
-        Parameters
-        ----------
-        sample : object with 'chunk_total', 'load_chunk_species(i)', 'load_chunk_positions(i)'
-        detector : object with 'pixel_coordinates' (3, Nx*Ny), 'shape' -> (Nx, Ny),
-                   and 'input_pixel_values(...)'
-        stage : stage object that provides rotation angles and translation
-        offset : float
-            Offset subtracted from final result
-        use_gpu : bool
-            If True and cupy installed with GPU(s), use GPU. Else use CPU.
+        Compute kinematic scattering of a beam from a sample onto a detector.
+
+        Args:
+            sample: The sample object containing chunked atomic data.
+            detector: The detector object with `pixel_coordinates` (3, Nx*Ny) and `shape` (Nx, Ny).
+            stage: A stage object specifying rotation (3x3) and translation (3,).
+            offset (float, optional): If provided, this constant is subtracted from the final
+                scattering field. Defaults to None.
+            use_gpu (bool, optional): If True and GPUs are available, use GPU-based methods;
+                otherwise, use a CPU fallback. Defaults to True.
+
+        Returns:
+            np.ndarray: A (Ny, Nx) array of complex scattering amplitudes.
         """
         measurement_positions = detector.pixel_coordinates
         Nx, Ny = detector.shape
@@ -1174,13 +1278,11 @@ class beam:
             if cp is None and use_gpu:
                 print("[beam] Cupy not installed, running CPU mode.")
             final_field = self.interact_beam_cpu(sample, measurement_positions, (Nx, Ny), stage)
-        if transmission is True:
-            final_field += self.count_atoms_in_pixels(sample, detector, stage, use_gpu=use_gpu, atomic_radius=atomic_radius, kernel_radius=kernel_radius)
             
         if offset is not None:
-            detector.input_pixel_values(final_field - offset)
+            return final_field - offset
         else:
-            detector.input_pixel_values(final_field)
+            return final_field
     # -------------------------------------
         
     # -------------------------------------
@@ -1189,16 +1291,28 @@ class beam:
                                 pixel_size_u, pixel_size_v,
                                 stage, atomic_radius=1.7, kernel_radius=0, detector=None):
         """
-        CPU approach that accounts for a ~2 radius by shifting each atom 
-        around +/-2 Ang. Then it deduplicates so each (atom, pixel) is unique.
+        Map atoms to detector pixels on CPU. Each atom is projected onto the basis (e1, e2),
+        binned into the 2D plane, and optionally convolved with a Gaussian kernel.
 
-        Now we get the *actual* pixel centers from 'detector.pixel_coordinates' 
-        and still use 'pixel_size_u, pixel_size_v' for binning widths.
+        Args:
+            sample: The sample object providing chunked atomic data.
+            Nx (int): Number of pixels in the x-direction.
+            Ny (int): Number of pixels in the y-direction.
+            e1 (np.ndarray): A 3-element array representing the first in-plane basis vector.
+            e2 (np.ndarray): A 3-element array representing the second in-plane basis vector.
+            pixel_size_u (float): Size of a pixel along e1 in Angstroms.
+            pixel_size_v (float): Size of a pixel along e2 in Angstroms.
+            stage: A stage object with rotation (3x3) and translation (3,).
+            atomic_radius (float, optional): Approximate atomic radius in Angstroms
+                to expand each atom's binning. Defaults to 1.7.
+            kernel_radius (int, optional): The radius of the Gaussian kernel for
+                2D convolution. If 0, no smoothing is applied. Defaults to 0.
+            detector (object, optional): A detector object providing
+                `pixel_coordinates`. Defaults to None.
 
-        Returns
-        -------
-        final_map : (Ny, Nx) complex64
-            Real + imag sum in each pixel (after optional Gaussian).
+        Returns:
+            np.ndarray: A (Ny, Nx) array of complex64 indicating the real + i*imag
+            form factor sums in each pixel (after optional smoothing).
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import multiprocessing
@@ -1371,11 +1485,28 @@ class beam:
                                 pixel_size_u, pixel_size_v,
                                 stage, atomic_radius=1.7, kernel_radius=0, detector=None):
         """
-        GPU approach that accounts for offsets, deduplicates, and
-        then does 2D Gaussian convolution if requested.
+        GPU-based version of binning atoms into detector pixels. Applies an optional
+        Gaussian convolution for atomic finite size.
 
-        We now read the pixel centers from 'detector.pixel_coordinates'
-        on the GPU to define the bounding box for binning.
+        Args:
+            sample: The sample object providing chunked atomic data.
+            Nx (int): Number of pixels in the x-direction.
+            Ny (int): Number of pixels in the y-direction.
+            e1 (np.ndarray): A 3-element array representing the first in-plane basis vector.
+            e2 (np.ndarray): A 3-element array representing the second in-plane basis vector.
+            pixel_size_u (float): Size of a pixel along e1 in Angstroms.
+            pixel_size_v (float): Size of a pixel along e2 in Angstroms.
+            stage: A stage object with rotation (3x3) and translation (3,).
+            atomic_radius (float, optional): Approximate atomic radius in Angstroms.
+            kernel_radius (int, optional): The radius of the Gaussian kernel for
+                smoothing. If 0, no smoothing is applied.
+            detector (object, optional): A detector object providing
+                `pixel_coordinates`. Defaults to None.
+
+        Returns:
+            cupy.ndarray or np.ndarray: A (Ny, Nx) complex array of the binned
+            form factor contributions. GPU array if CuPy is available and used,
+            otherwise CPU array.
         """
         if cp is None:
             print("[beam] Cupy not installed, fallback to CPU.")
@@ -1595,16 +1726,26 @@ class beam:
         out_gpu = final_r_gpu + 1j*final_i_gpu
         return out_gpu.astype(cp.complex64)
     
-    def count_atoms_in_pixels(self, sample, detector, stage, use_gpu=True, atomic_radius=1.7, kernel_radius=0):
+    def atomic_transmission(self, sample, detector, stage, use_gpu=True, atomic_radius=1.7, kernel_radius=0):
         """
-        Bins atoms into each detector pixel, weighting each atom by
-        f0(0) + f1 + i*f2. Then applies a 2D circular convolution (if kernel_radius>0)
-        to the real and imaginary parts.
+        Compute a projection-based transmission map by summing the atoms' form factors
+        (f0(0) + f1 + i*f2) in each detector pixel, optionally convolving with a
+        Gaussian kernel to account for finite atomic radii.
 
-        Returns
-        -------
-        f0_complex_map : np.ndarray of shape (Ny, Nx), dtype=complex64
-            The convolved complex sum in each pixel.
+        Args:
+            sample: The sample object holding atomic data in chunks.
+            detector: The detector object with `shape` -> (Ny, Nx),
+                `pixel_coordinates` (3, Nx*Ny), and `pixel_size` -> (pixel_size_u, pixel_size_v).
+            stage: A stage object with rotation (3x3) and translation (3,).
+            use_gpu (bool, optional): If True and GPUs are available, computation is
+                performed on the GPU. Defaults to True.
+            atomic_radius (float, optional): Approximate atomic radius in Angstroms. Defaults to 1.7.
+            kernel_radius (int, optional): Radius of the Gaussian kernel for 2D smoothing.
+                Defaults to 0.
+
+        Returns:
+            np.ndarray: A 2D array (Nx, Ny) of the real part of the map after summation
+            and convolution, transposed to match the detector's indexing.
         """
         Ny, Nx = detector.shape
         pixel_size_u, pixel_size_v = detector.pixel_size
@@ -1634,7 +1775,6 @@ class beam:
             final_map = f0_map_complex.real/((pixel_size_u*pixel_size_v)*(1+atomic_radius))
             final_map -= np.min(final_map)
 
-        print(np.max(final_map)-np.min(final_map))
         return final_map.T
     # -------------------------------------
     
@@ -1650,13 +1790,24 @@ class beam:
         max_neighbors_per_atom=32
     ):
         """
-        1) Build cell list, reorder everything
-        2) neighbor_search_scatter_kernel => (phase, scatterReal, scatterImag, neighbor_idx)
-        3) Re-sort back to original indices
-        Returns: a list of length N, where each entry is:
-            (phase_array, scatter_2D, neighbor_idx_array)
-        with shape(phase_array)=(num_neighbors,), shape(scatter_2D)=(num_neighbors,2),
-        shape(neighbor_idx_array)=(num_neighbors,).
+        Perform an intra-chunk nearest neighbor search on GPU, computing
+        scattering phase and amplitude contributions within a single chunk.
+
+        Args:
+            sample: The sample object for building the cell list.
+            positions (cp.ndarray): A (N, 3) CuPy array of atomic positions in Angstroms.
+            f0_params_np (np.ndarray): A (N, 11) array of CPU Waasmaier-Kirfel parameters.
+            anom_np (np.ndarray): A (N,) CPU array of complex scattering factors (f1 + i*f2).
+            r_cut (float, optional): The cutoff distance for neighbor searching in Angstroms.
+                Defaults to 5.0.
+            max_neighbors_per_atom (int, optional): Maximum number of neighbors to store
+                per atom. Defaults to 32.
+
+        Returns:
+            list of tuple: A list of length N. Each element corresponds to an atom and
+            is a tuple (phase_array, scatter_2D, neighbor_idx_array) where
+            phase_array is (num_neighbors,), scatter_2D is (num_neighbors, 2) for real+imag,
+            and neighbor_idx_array is (num_neighbors,) with indices into the original chunk.
         """
         N = positions.shape[0]
         if N == 0:
@@ -1759,11 +1910,23 @@ class beam:
                                         pos_j, f0_j, anom_j,
                                         r_cut, max_neighbors_per_atom=32):
         """
-        Combine boundary sets i and j, run cross_neighbor_search_kernel
-        which automatically discards i->i or j->j neighbors.
-        Return a list of shape (N_i+N_j) => [ (phase, scatter2d), ...].
-        The first N_i entries correspond to chunk i boundary atoms,
-        the last N_j to chunk j boundary atoms.
+        Perform a cross-chunk neighbor search on GPU between two boundary sets
+        (i->j, j->i), ignoring i->i and j->j neighbors.
+
+        Args:
+            sample: The sample object providing cell-list construction utilities.
+            pos_i (cp.ndarray): Positions for chunk i in Angstroms.
+            f0_i (np.ndarray): f0 parameters for chunk i on CPU (N_i, 11).
+            anom_i (np.ndarray): Complex scattering factors for chunk i (N_i,).
+            pos_j (cp.ndarray): Positions for chunk j in Angstroms.
+            f0_j (np.ndarray): f0 parameters for chunk j on CPU (N_j, 11).
+            anom_j (np.ndarray): Complex scattering factors for chunk j (N_j,).
+            r_cut (float): The distance cutoff in Angstroms.
+            max_neighbors_per_atom (int, optional): Max neighbors stored per atom. Defaults to 32.
+
+        Returns:
+            list: A list of length N_i+N_j with (phase_array, scatter2D).
+            The first N_i entries correspond to chunk i, the last N_j to chunk j.
         """
         N_i = pos_i.shape[0]
         N_j = pos_j.shape[0]
@@ -1861,13 +2024,20 @@ class beam:
     def compute_nearest_neighbor_distances_passA(self, sample, db_dict_f0_all, db_dict_f1f2_all,
                                                 r_cut, max_neighbors_per_atom):
         """
-        Pass A:
-        * For each chunk => do local (intra-chunk) neighbor search (i->i).
-        * Build boundary arrays (positions, species, f0_params, anom).
-        * Save partial results to disk.
+        Pass A: Intra-chunk neighbor searches for all chunks. Identify boundary atoms,
+        compute partial neighbor data, and write results to disk.
+
+        Args:
+            sample: The sample object with chunked atomic data and I/O methods.
+            db_dict_f0_all (dict): f0 parameters for all elements.
+            db_dict_f1f2_all (dict): f1,f2 tables for all elements.
+            r_cut (float): The cutoff distance in Angstroms.
+            max_neighbors_per_atom (int): Maximum neighbors to store per atom.
+
         Returns:
-        boundary_dict : { chunk_id : { "positions":..., "f0_params":..., "anom":..., "indices":..., "species":... } }
-        all_data_memory : { chunk_id : list of (phase_arr, scatter2D, neighbor_idx) for each atom }
+            tuple:
+                boundary_dict (dict): {chunk_id: {"positions":..., "indices":..., "species":..., "f0_params":..., "anom":...}}
+                all_data_memory (dict): {chunk_id: list of (phase_array, scatter_2D, neighbor_idx)}
         """
         boundary_dict   = {}
         all_data_memory = {}
@@ -1959,11 +2129,18 @@ class beam:
     def compute_nearest_neighbor_distances_passB(self, sample, boundary_dict, all_data_memory,
                                                 r_cut, max_neighbors_per_atom):
         """
-        Pass B:
-        * For each pair (i<j), combine boundary sets i, j
-        * Launch cross_neighbor_search_kernel => skip i->i or j->j in GPU
-        * Append cross neighbors to all_data_memory[i], all_data_memory[j].
-        Returns the updated all_data_memory
+        Pass B: Inter-chunk neighbor searches among boundary atoms of different chunks.
+
+        Args:
+            sample: The sample object for cell-list building.
+            boundary_dict (dict): Contains boundary data for each chunk.
+            all_data_memory (dict): Intra-chunk data from Pass A.
+            r_cut (float): The cutoff distance in Angstroms.
+            max_neighbors_per_atom (int): Maximum neighbors to store per atom.
+
+        Returns:
+            dict: The updated `all_data_memory` that now includes cross-chunk
+            neighbor data.
         """
         # Build bounding boxes for boundary sets
         chunk_bounds = {}
@@ -2046,10 +2223,25 @@ class beam:
 
     def compute_nearest_neighbor_distances(self, sample, r_cut=5.0, use_gpu=True, max_neighbors_per_atom=32):
         """
-        The master function that orchestrates:
-        Pass A -> local merges + boundary caching
-        Pass B -> cross merges (skip i->i, j->j in GPU)
-        Pass C -> final re-save
+        Orchestrate the computation of nearest neighbors (intra-chunk and inter-chunk)
+        for all atoms in the sample using a specified distance cutoff.
+
+        Pass A: Compute intra-chunk neighbors, store partial results, identify boundary atoms.
+        Pass B: Compute cross-chunk neighbors among boundary atoms. Merge results.
+        Pass C: Save final data.
+
+        Args:
+            sample: The sample object with chunked data and neighbor I/O methods.
+            r_cut (float, optional): The cutoff distance in Angstroms. Defaults to 5.0.
+            use_gpu (bool, optional): Whether to use GPU-based methods. Defaults to True.
+            max_neighbors_per_atom (int, optional): Maximum neighbors to store for any
+                given atom. Defaults to 32.
+
+        Raises:
+            ValueError: If `use_gpu` is True but CuPy is not available, or no chunks found.
+
+        Returns:
+            None
         """
         if (not use_gpu) or (cp is None):
             raise ValueError("GPU usage required, but CuPy is not available or use_gpu=False.")
@@ -2085,9 +2277,55 @@ class beam:
     # -------------------------------------
     
     # -------------------------------------
-    # Field propagation
-    def field_propagate(self, detector, optics):
+    # Atomic master
+    def atomic_direct_interaction(self, sample, detector, stage, scattering=True, scattering_params=[None], transmission=True, transmission_params=[0.0,0.0], use_gpu=True):
         """
-        Propagate the beam through a freespace/optical stack
+        High-level method to compute both scattering and/or transmission from
+        an atomic sample onto a detector.
+
+        Args:
+            sample: The sample object containing chunked atomic data.
+            detector: The detector object with methods like `pixel_coordinates`,
+                `shape`, and `input_pixel_values(...)`.
+            stage: A stage object specifying rotation and translation transforms.
+            scattering (bool, optional): If True, compute the scattering field.
+            scattering_params (list, optional): A list that may include an offset
+                value [offset, ...]. Defaults to [None].
+            transmission (bool, optional): If True, compute the atomic transmission.
+            transmission_params (list, optional): [atomic_radius, kernel_radius].
+                Defaults to [0.0, 0.0].
+            use_gpu (bool, optional): Whether to use GPU if available. Defaults to True.
+
+        Returns:
+            None
+        """
+        Nx, Ny = detector.shape
+        final_field = np.zeros((Ny,Nx)).astype(np.complex128)
+        
+        # Check if we can run GPU
+        if use_gpu and (cp is not None):
+            # Attempt GPU path
+            if scattering is True:
+                final_field += self.atomic_scattering_kinematic(sample, detector, stage, offset=scattering_params[0], use_gpu=use_gpu)
+            if transmission is True:
+                final_field += self.atomic_transmission(sample, detector, stage, use_gpu=use_gpu, atomic_radius=transmission_params[0], kernel_radius=transmission_params[0])
+        else:
+            # CPU fallback
+            if cp is None and use_gpu:
+                print("[beam] Cupy not installed, running CPU mode.")
+            if scattering is True:
+                final_field += self.atomic_scattering_kinematic(sample, detector, stage, offset=scattering_params[0], use_gpu=use_gpu)
+            if transmission is True:
+                final_field += self.atomic_transmission(sample, detector, stage, use_gpu=use_gpu, atomic_radius=transmission_params[0], kernel_radius=transmission_params[0])
+
+        detector.input_pixel_values(final_field)
+    # -------------------------------------
+    
+    # -------------------------------------
+    # Wavefield propagation
+    def wavefield_propagate(self, detector, optics):
+        """
+        Propagate the beam through a freespace/optical stack.
         """
     # -------------------------------------
+    
