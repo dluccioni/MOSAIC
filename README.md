@@ -1,6 +1,6 @@
 ---
 
-# Xray‑Simulator – Wave Optics Forward Simulation (Production Release 2025‑05)
+# Xray‑Simulator – Wave Optics Forward Simulation
 
 This repository provides a Python toolkit for forward simulation of X‑ray (and electron) diffraction,
 including crystal generation, defect insertion, beam–sample interaction, detector modelling, optics propagation and experimental
