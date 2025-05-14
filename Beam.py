@@ -116,7 +116,7 @@ class beam:
     # -------------------------------------
     # General
     @staticmethod
-    def _make_orthonormal_basis(direction):
+    def make_orthonormal_basis(direction):
         """
         Given a 3D direction vector (beam direction),
         return two 3D vectors e1, e2 which are orthonormal
@@ -139,6 +139,23 @@ class beam:
         e2 /= np.linalg.norm(e2)
 
         return e1.astype(np.float32), e2.astype(np.float32)
+    
+    def allocate_pinned_array(shape, dtype=np.float32):
+        """
+        Allocate a pinned (page-locked) CPU array for faster host<->device transfers.
+        Returns a NumPy array whose underlying memory is pinned by CuPy.
+        """
+        if cp is None:
+            # fallback: just allocate a normal NumPy array
+            return np.zeros(shape, dtype=dtype)
+        n_elems = 1
+        for s in shape:
+            n_elems *= s
+        # allocate pinned block
+        memptr = cp.cuda.alloc_pinned_memory(int(n_elems * np.dtype(dtype).itemsize))
+        # create a NumPy array around it
+        arr = np.ndarray(shape=shape, dtype=dtype, buffer=memptr)
+        return arr
     
     @staticmethod
     def parse_f0_db_all(database_name='f0_WaasKirf.dat'):
@@ -393,6 +410,7 @@ class beam:
         )
         {
             const float PI_F = 3.14159265358979323846f;
+            const float rE_F = 2.81794092e-5f;
             float wavelength_m = (2.0f * PI_F) / k;
             // Determine which pixel this thread processes
             int pxid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -490,8 +508,8 @@ class beam:
                         val.x = s_tot.x * cph - s_tot.y * sph;
                         val.y = s_tot.x * sph + s_tot.y * cph;
 
-                        sum_val.x += val.x;
-                        sum_val.y += val.y;
+                        sum_val.x += val.x * rE_F;
+                        sum_val.y += val.y * rE_F;
                     }
                 }
                 __syncthreads();  // Ensure all threads finish this tile
@@ -1323,12 +1341,13 @@ class beam:
             bin_idx_unique  = bin_idx_sorted[keep]
             atom_ids_unique = atom_sorted[keep]
 
+            r_e = 2.81794092e-5 # in Angstrom
             w_real = scattering_real[atom_ids_unique]
             partial_hist_real = np.bincount(bin_idx_unique.astype(np.int64),
-                                            weights=w_real, minlength=Nx*Ny)
+                                            weights=(r_e*w_real-1), minlength=Nx*Ny)
             w_imag = scattering_imag[atom_ids_unique]
             partial_hist_imag = np.bincount(bin_idx_unique.astype(np.int64),
-                                            weights=w_imag, minlength=Nx*Ny)
+                                            weights=(r_e*w_imag-1), minlength=Nx*Ny)
 
             return (partial_hist_real.reshape((Ny, Nx)),
                     partial_hist_imag.reshape((Ny, Nx)))
@@ -1532,8 +1551,9 @@ class beam:
                 w_real = real_gpu[atom_uniq]
                 w_imag = imag_gpu[atom_uniq]
 
-                hist_r = cp.bincount(bin_uniq, weights=w_real, minlength=Nx*Ny)
-                hist_i = cp.bincount(bin_uniq, weights=w_imag, minlength=Nx*Ny)
+                r_e = 2.81794092e-5 # in Angstrom
+                hist_r = cp.bincount(bin_uniq, weights=(r_e*w_real-1), minlength=Nx*Ny)
+                hist_i = cp.bincount(bin_uniq, weights=(r_e*w_imag-1), minlength=Nx*Ny)
                 out_r += hist_r.reshape(Ny, Nx)
                 out_i += hist_i.reshape(Ny, Nx)
 
@@ -1574,8 +1594,8 @@ class beam:
         final_r_gpu = _fft_convolve2d_gpu(final_r_gpu, kernel_gpu)
         final_i_gpu = _fft_convolve2d_gpu(final_i_gpu, kernel_gpu)
 
-        out_cpu = final_r_gpu.get() + 1j*final_i_gpu.get()
-        return out_cpu.astype(np.complex64)
+        out_gpu = final_r_gpu + 1j*final_i_gpu
+        return out_gpu.astype(cp.complex64)
     
     def count_atoms_in_pixels(self, sample, detector, stage, use_gpu=True, atomic_radius=1.7, kernel_radius=0):
         """
@@ -1592,12 +1612,10 @@ class beam:
         pixel_size_u, pixel_size_v = detector.pixel_size
         size_y = pixel_size_u * Nx
         size_z = pixel_size_v * Ny # in Angstrom
-        
-        r_e = 2.81794e-5 # in Angstrom
-        prefactor = 1/r_e**2
+        r_e = 2.81794092e-5 # in Angstrom
         
         # Build orthonormal basis
-        e1, e2 = self._make_orthonormal_basis(self._direction)
+        e1, e2 = self.make_orthonormal_basis(self._direction)
 
         if use_gpu and (cp is not None):
             f0_map_complex = self.bin_atoms_in_pixels_gpu(
@@ -1607,6 +1625,9 @@ class beam:
                 kernel_radius=kernel_radius,
                 detector=detector
             )
+            final_map = f0_map_complex*cp.sqrt((size_y*size_z))*r_e/(2*cp.pi)
+            final_map -= cp.min(final_map)
+            final_map = cp.asnumpy(final_map)
         else:
             f0_map_complex = self.bin_atoms_in_pixels_cpu(
                 sample, Nx, Ny, e1, e2,
@@ -1615,11 +1636,9 @@ class beam:
                 kernel_radius=kernel_radius,
                 detector=detector
             )
+            final_map = f0_map_complex*np.sqrt((size_y*size_z))*r_e/(2*np.pi)
+            final_map -= np.min(final_map)
             
-        # final_map = -f0_map_complex + f0_map_complex.flat[np.abs(f0_map_complex).argmax()]
-        # print(f0_map_complex.flat[np.abs(f0_map_complex).argmax()])
-        final_map = -f0_map_complex.real + np.max(f0_map_complex.real)
-        final_map = prefactor*final_map/(size_y*size_z)
         return final_map.T
     # -------------------------------------
     
