@@ -1221,7 +1221,6 @@ class beam:
         def _make_gaussian_kernel_cpu(radius):
             if radius < 1:
                 return None
-            diam = 2*radius + 1
             sigma = radius/2.0
             y, x = np.ogrid[-radius:radius+1, -radius:radius+1]
             g = np.exp(-(x*x + y*y)/(2.0*sigma*sigma)).astype(np.float32)
@@ -1418,7 +1417,6 @@ class beam:
         def _make_gaussian_kernel_gpu(radius):
             if radius < 1:
                 return None
-            diam = 2*radius + 1
             sigma = radius/2.0
             y = cp.arange(-radius, radius+1, dtype=cp.float32)[:, None]
             x = cp.arange(-radius, radius+1, dtype=cp.float32)[None, :]
@@ -1610,9 +1608,6 @@ class beam:
         """
         Ny, Nx = detector.shape
         pixel_size_u, pixel_size_v = detector.pixel_size
-        size_y = pixel_size_u * Nx
-        size_z = pixel_size_v * Ny # in Angstrom
-        r_e = 2.81794092e-5 # in Angstrom
         
         # Build orthonormal basis
         e1, e2 = self.make_orthonormal_basis(self._direction)
@@ -1625,7 +1620,7 @@ class beam:
                 kernel_radius=kernel_radius,
                 detector=detector
             )
-            final_map = f0_map_complex*cp.sqrt((size_y*size_z))*r_e/(2*cp.pi)
+            final_map = f0_map_complex.real/((pixel_size_u*pixel_size_v)*(1+atomic_radius)) # Factor to account for additional ampltude absorption from finite atom size
             final_map -= cp.min(final_map)
             final_map = cp.asnumpy(final_map)
         else:
@@ -1636,9 +1631,10 @@ class beam:
                 kernel_radius=kernel_radius,
                 detector=detector
             )
-            final_map = f0_map_complex*np.sqrt((size_y*size_z))*r_e/(2*np.pi)
+            final_map = f0_map_complex.real/((pixel_size_u*pixel_size_v)*(1+atomic_radius))
             final_map -= np.min(final_map)
-            
+
+        print(np.max(final_map)-np.min(final_map))
         return final_map.T
     # -------------------------------------
     
@@ -1769,7 +1765,6 @@ class beam:
         The first N_i entries correspond to chunk i boundary atoms,
         the last N_j to chunk j boundary atoms.
         """
-        import cupy as cp
         N_i = pos_i.shape[0]
         N_j = pos_j.shape[0]
         if N_i==0 or N_j==0:
@@ -1874,9 +1869,6 @@ class beam:
         boundary_dict : { chunk_id : { "positions":..., "f0_params":..., "anom":..., "indices":..., "species":... } }
         all_data_memory : { chunk_id : list of (phase_arr, scatter2D, neighbor_idx) for each atom }
         """
-        import cupy as cp
-        from cupy import _default_memory_pool
-
         boundary_dict   = {}
         all_data_memory = {}
 
@@ -1960,7 +1952,7 @@ class beam:
             }
 
             del chunk_positions
-            _default_memory_pool.free_all_blocks()
+            cp.get_default_memory_pool().free_all_blocks()
 
         return boundary_dict, all_data_memory
     
@@ -1973,9 +1965,6 @@ class beam:
         * Append cross neighbors to all_data_memory[i], all_data_memory[j].
         Returns the updated all_data_memory
         """
-        import cupy as cp
-        from cupy import _default_memory_pool
-
         # Build bounding boxes for boundary sets
         chunk_bounds = {}
         for cid in range(1, sample.chunk_total+1):
@@ -2051,7 +2040,7 @@ class beam:
                         )
 
                 del cross_list
-                _default_memory_pool.free_all_blocks()
+                cp.get_default_memory_pool().free_all_blocks()
 
         return all_data_memory
 
@@ -2062,8 +2051,6 @@ class beam:
         Pass B -> cross merges (skip i->i, j->j in GPU)
         Pass C -> final re-save
         """
-        import cupy as cp
-
         if (not use_gpu) or (cp is None):
             raise ValueError("GPU usage required, but CuPy is not available or use_gpu=False.")
         if sample.chunk_total is None:
