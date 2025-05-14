@@ -29,6 +29,8 @@ class sample:
         self._chunk_total = None 
         self._matrix = None
         self._corners = None
+        self.enable_temp = False
+        self.temp_params = ['gaussian',0.25,1,40]
         self._default_filenames = np.array([
             "atomic_positions.npy",
             "atomic_species.npy",
@@ -120,9 +122,13 @@ class sample:
         positions_filename = f"{base}_{chunk_number}{ext}"
         full_path = os.path.join(self.directory, positions_filename)
         if use_gpu and (cp is not None):
-            return cp.load(full_path)
+            positions = cp.load(full_path)
         else:
-            return np.load(full_path)
+            positions = np.load(full_path)
+        if self.enable_temp is True:
+            positions = self.apply_temperature(positions,distribution=self.temp_params[0],sigma=self.temp_params[1],max_displacement=self.temp_params[2],seed=self.temp_params[3])
+        return positions
+        
 
     def load_chunk_species(self, chunk_number, use_gpu=True):
         """
@@ -407,6 +413,79 @@ class sample:
             )
             flat_grid = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
             return flat_grid
+        
+    @staticmethod
+    def apply_temperature(positions,distribution='gaussian',sigma=0.25,max_displacement=1,seed=40):
+        """
+        Randomly displace atomic positions according to a chosen probability distribution,
+        supporting either CPU (NumPy) or GPU (CuPy) arrays.
+
+        Parameters
+        ----------
+        positions : np.ndarray or cp.ndarray, shape (N, 3)
+            Array of atomic positions. Can be CPU or GPU array.
+        distribution : str or callable
+            Distribution type or a custom function that returns a random sample 
+            of shape (N, 3). Defaults to 'gaussian'.
+            - If 'gaussian', uses xp.random.normal(0, sigma, positions.shape)
+            - If a callable, it should accept a 'size' argument (tuple) and 
+              return a NumPy or CuPy array of shape (N, 3).
+        sigma : float
+            Standard deviation for the Gaussian displacement. 
+            Ignored if distribution is a custom callable.
+        max_displacement : float, optional
+            Maximum displacement allowed per coordinate. If None, no clipping 
+            is performed. If set, each coordinate is clipped to
+            [-max_displacement, max_displacement].
+        seed : int, optional
+            Random seed for reproducible random sampling. If using CuPy arrays 
+            and CuPy is available, sets cp.random.seed(); if using NumPy arrays, 
+            sets np.random.seed().
+
+        Returns
+        -------
+        displaced_positions : same type as 'positions' (NumPy or CuPy), shape (N, 3)
+            Positions after applying random displacements.
+        """
+        # Determine if positions is on CPU or GPU
+        if cp is not None and isinstance(positions, cp.ndarray):
+            xp = cp  # We'll use CuPy
+            if seed is not None:
+                cp.random.seed(seed)
+        else:
+            # Fallback to CPU (NumPy)
+            xp = np
+            if seed is not None:
+                np.random.seed(seed)
+
+        # Generate random displacements
+        if isinstance(distribution, str):
+            if distribution.lower() == 'gaussian':
+                displacements = xp.random.normal(
+                    loc=0.0, scale=sigma, size=positions.shape
+                )
+            else:
+                raise ValueError(f"Unknown distribution: {distribution}")
+        elif callable(distribution):
+            # Call the user-supplied distribution function
+            displacements = distribution(size=positions.shape)
+            # Ensure types match (if distribution returns NumPy but we want CuPy, or vice versa)
+            if isinstance(displacements, np.ndarray) and xp is cp:
+                displacements = cp.asarray(displacements)
+            elif cp is not None and isinstance(displacements, cp.ndarray) and xp is np:
+                displacements = displacements.get()
+        else:
+            raise ValueError("distribution must be either a string or a callable")
+
+        # Optionally clip each coordinate to a maximum magnitude
+        if (max_displacement is not None) and (max_displacement > 0.0):
+            xp.clip(displacements,
+                    a_min=-max_displacement,
+                    a_max= max_displacement,
+                    out=displacements)
+
+        # Return positions + displacements, preserving the array type
+        return positions + displacements
     # -------------------------------------
         
     # -------------------------------------
