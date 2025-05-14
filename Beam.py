@@ -520,13 +520,13 @@ class beam:
     # -------------------------------------
     # Dynamical
     @staticmethod
-    def build_neighbor_search_kernel():
+    def build_intra_neighbor_search_kernel():
         """
         ### MODIFICATION 1 of 4:
         Store not only distance but also the neighbor 'j' index in 'neighbor_index_buffer[write_idx]'.
         This is necessary for cross-chunk filtering to remove i->i or j->j neighbors.
         """
-        _neighbor_search_kernel = r'''
+        _intra_neighbor_search_kernel = r'''
         #include <math.h>
         __device__ __forceinline__
         float get_f0_value(float Q_val, const float* params)
@@ -548,7 +548,7 @@ class beam:
         }
 
         extern "C" __global__
-        void neighbor_search_kernel(
+        void intra_neighbor_search_kernel(
             // Sorted atom data
             const float*  __restrict__ sorted_positions,   // (N,3)
             const int*    __restrict__ sorted_indices,     // (N,)
@@ -674,16 +674,160 @@ class beam:
         }
         '''
         kernel_module = cp.RawModule(
-            code=_neighbor_search_kernel,
+            code=_intra_neighbor_search_kernel,
             backend='nvcc',
             options=('--gpu-architecture=sm_89','-O3','--ftz=true','--fmad=true')
         )
-        return kernel_module.get_function('neighbor_search_kernel')
+        return kernel_module.get_function('intra_neighbor_search_kernel')
+    
+    @staticmethod
+    def build_inter_neighbor_search_kernel():
+        _inter_neighbor_search_kernel = r'''
+        #include <math.h>
+
+        __device__ __forceinline__
+        float get_f0_value(float Q_val, const float* params)
+        {
+            const float PI_F = 3.14159265358979323846f;
+            float k = 0.25f * Q_val * 1.0e-10f / PI_F;
+            float k2 = k*k;
+            float f0_val = params[5];
+            #pragma unroll
+            for(int i=0; i<5; i++){
+                float ai = params[i];
+                float bi = params[6 + i];
+                f0_val += ai * __expf(-bi*k2);
+            }
+            return f0_val;
+        }
+
+        extern "C" __global__
+        void inter_neighbor_search_kernel(
+            const float*  positions,
+            const float*  f0_params,
+            const float2* anom,
+            const int     N_i,
+            const int     N_total,
+
+            const int*  cell_start,
+            const int*  cell_end,
+            const int   nx,
+            const int   ny,
+            const int   nz,
+
+            const float  r_cut,
+            const float* bounding_box_min,
+            const float  cell_size,
+            const int    max_neighbors_per_atom,
+
+            const float  k_val,
+            const float  wavelength,
+
+            float* phase_buffer,
+            float* scatter_real_buffer,
+            float* scatter_imag_buffer,
+            int*   neighbor_counts
+        )
+        {
+            const int neighbor_delta[27][3] = {
+            {-1,-1,-1}, {-1,-1, 0}, {-1,-1, 1},
+            {-1, 0,-1}, {-1, 0, 0}, {-1, 0, 1},
+            {-1, 1,-1}, {-1, 1, 0}, {-1, 1, 1},
+            { 0,-1,-1}, { 0,-1, 0}, { 0,-1, 1},
+            { 0, 0,-1}, { 0, 0, 0}, { 0, 0, 1},
+            { 0, 1,-1}, { 0, 1, 0}, { 0, 1, 1},
+            { 1,-1,-1}, { 1,-1, 0}, { 1,-1, 1},
+            { 1, 0,-1}, { 1, 0, 0}, { 1, 0, 1},
+            { 1, 1,-1}, { 1, 1, 0}, { 1, 1, 1}
+            };
+
+            int idx = blockDim.x*blockIdx.x + threadIdx.x;
+            if(idx >= N_total) return;
+
+            float px = positions[3*idx+0];
+            float py = positions[3*idx+1];
+            float pz = positions[3*idx+2];
+
+            float fx = (px - bounding_box_min[0]) / cell_size;
+            float fy = (py - bounding_box_min[1]) / cell_size;
+            float fz = (pz - bounding_box_min[2]) / cell_size;
+
+            int cx = (int)floorf(fx);
+            int cy = (int)floorf(fy);
+            int cz = (int)floorf(fz);
+
+            bool is_in_i = (idx < N_i);
+            int neighbor_count = 0;
+
+            for(int n=0; n<27; n++){
+                int ncx = cx + neighbor_delta[n][0];
+                int ncy = cy + neighbor_delta[n][1];
+                int ncz = cz + neighbor_delta[n][2];
+                if(ncx<0||ncx>=nx) continue;
+                if(ncy<0||ncy>=ny) continue;
+                if(ncz<0||ncz>=nz) continue;
+
+                int cell_id = ncz*(nx*ny) + ncy*nx + ncx;
+                int start = cell_start[cell_id];
+                int end   = cell_end[cell_id];
+
+                for(int j=start; j<end; j++){
+                    if(j == idx) continue;
+                    bool neighbor_in_i = (j < N_i);
+                    // skip i->i or j->j
+                    if(is_in_i == neighbor_in_i){
+                        continue;
+                    }
+                    float qx = positions[3*j+0];
+                    float qy = positions[3*j+1];
+                    float qz = positions[3*j+2];
+
+                    float dx = qx - px;
+                    float dy = qy - py;
+                    float dz = qz - pz;
+                    float dist2 = dx*dx + dy*dy + dz*dz;
+                    if(dist2 <= r_cut*r_cut){
+                        if(neighbor_count < max_neighbors_per_atom){
+                            float dist = sqrtf(dist2);
+                            float sum_val = dist + qx;
+                            float mod_val = fmodf(sum_val, wavelength);
+                            float phase_val = k_val*mod_val;
+
+                            float rdx = dx / dist;
+                            float tmp = 2.f*(1.f - rdx);
+                            if(tmp<0.f) tmp=0.f;
+                            float Q_val = k_val*sqrtf(tmp);
+
+                            const float* f0p = &f0_params[j*11];
+                            float f0_val = get_f0_value(Q_val, f0p);
+                            float2 an = anom[j];
+                            float real_tot = f0_val + an.x;
+                            float imag_tot = an.y;
+
+                            int widx = idx*max_neighbors_per_atom + neighbor_count;
+                            phase_buffer[widx] = phase_val;
+                            scatter_real_buffer[widx] = real_tot;
+                            scatter_imag_buffer[widx] = imag_tot;
+                        }
+                        neighbor_count++;
+                    }
+                }
+            }
+            neighbor_counts[idx] = neighbor_count;
+        }
+        ''';
+
+        kernel_module = cp.RawModule(
+            code=_inter_neighbor_search_kernel,
+            backend='nvcc',
+            options=('--gpu-architecture=sm_89','-O3','--ftz=true','--fmad=true')
+        )
+        return kernel_module.get_function('inter_neighbor_search_kernel')
     # -------------------------------------
 
     ## Main Functions
     # -------------------------------------
-    # Direct Scattering
+    # Kinematic scattering
     def cpu_scatter_chunk_cffi(self, complied_code, ffi_obj, chunk_id, sample,
                                Nx, Ny, coords_x_m, coords_y_m, coords_z_m,
                                db_dict_f0_all, db_dict_f1f2_all, k_val,
@@ -1022,7 +1166,7 @@ class beam:
     # -------------------------------------
         
     # -------------------------------------
-    # Transmission
+    # Direct transmission
     def bin_atoms_in_pixels_cpu(self, sample, Nx, Ny, e1, e2,
                                 pixel_size_u, pixel_size_v,
                                 stage, atomic_radius=1.7, kernel_radius=0, detector=None):
@@ -1480,8 +1624,8 @@ class beam:
     # -------------------------------------
     
     # -------------------------------------
-    # Dynamical
-    def compute_neighbors_gpu(
+    # Dynamical scattering
+    def compute_intra_chunk_neighbors_gpu(
         self,                 # 'beam' instance
         sample,               # 'sample' instance
         positions,            # cp.ndarray (N,3)
@@ -1533,7 +1677,7 @@ class beam:
         wavelength_angs = self._wavelength  # Angstrom
         k_val = (2.0 * np.pi) / wavelength_angs
 
-        kernel = self.build_neighbor_search_kernel()
+        kernel = self.build_intra_neighbor_search_kernel()
         threads_per_block = 256
         blocks = (N + threads_per_block - 1)//threads_per_block
 
@@ -1594,47 +1738,152 @@ class beam:
             output[orig_i] = (phase_arr, scatter2D, neigh_idx)
 
         return output
-
-    def compute_nearest_neighbor_distances(self, sample, r_cut=5.0, use_gpu=True, max_neighbors_per_atom=32):
+    
+    def compute_inter_chunk_neighbors_gpu(self, sample,
+                                        pos_i, f0_i, anom_i,
+                                        pos_j, f0_j, anom_j,
+                                        r_cut, max_neighbors_per_atom=32):
         """
-        Optimized to store boundary-atom species in Pass A, so we don't need to
-        reload chunk species in Pass B.
+        Combine boundary sets i and j, run cross_neighbor_search_kernel
+        which automatically discards i->i or j->j neighbors.
+        Return a list of shape (N_i+N_j) => [ (phase, scatter2d), ...].
+        The first N_i entries correspond to chunk i boundary atoms,
+        the last N_j to chunk j boundary atoms.
         """
-        if (not use_gpu) or (cp is None):
-            raise ValueError("GPU usage required, but CuPy is not available or use_gpu=False.")
-        if sample.chunk_total is None:
-            raise ValueError("No chunks found in sample; import or generate sample first.")
+        import cupy as cp
+        N_i = pos_i.shape[0]
+        N_j = pos_j.shape[0]
+        if N_i==0 or N_j==0:
+            return [ (np.array([],dtype=np.float32),np.zeros((0,2),dtype=np.float32))
+                    for _ in range(N_i+N_j) ]
 
-        # 1) Pre-load scattering DB
-        db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
-        db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
+        # combine positions on GPU
+        pos_comb = cp.concatenate([pos_i, pos_j], axis=0)
+        N_total  = N_i + N_j
 
+        # combine CPU f0, anom
+        f0_comb_np   = np.concatenate([f0_i, f0_j], axis=0)
+        anom_comb_np = np.concatenate([anom_i, anom_j], axis=0)
+
+        # Build cell list
+        (sorted_positions,
+        sorted_indices,
+        cell_start,
+        cell_end,
+        box_min,
+        cell_size,
+        nx, ny, nz) = sample.build_cell_list_gpu(pos_comb, r_cut)
+
+        f0_comb_gpu   = cp.asarray(f0_comb_np,   dtype=cp.float32)
+        anom_comb_gpu = cp.asarray(anom_comb_np, dtype=cp.complex64)
+        sorted_f0   = f0_comb_gpu[sorted_indices]
+        sorted_anom = anom_comb_gpu[sorted_indices]
+
+        phase_buf  = cp.zeros((N_total*max_neighbors_per_atom,), dtype=cp.float32)
+        real_buf   = cp.zeros((N_total*max_neighbors_per_atom,), dtype=cp.float32)
+        imag_buf   = cp.zeros((N_total*max_neighbors_per_atom,), dtype=cp.float32)
+        counts_buf = cp.zeros((N_total,), dtype=cp.int32)
+
+        wave_angs = self._wavelength
+        k_val     = (2.0*np.pi)/wave_angs
+
+        kernel = self.build_inter_neighbor_search_kernel()
+        threads_per_block=256
+        blocks = (N_total + threads_per_block-1)//threads_per_block
+
+        kernel(
+            (blocks,), (threads_per_block,),
+            (
+                sorted_positions,
+                sorted_f0.reshape(-1),
+                sorted_anom.view(cp.float32),
+                np.int32(N_i),
+                np.int32(N_total),
+
+                cell_start,
+                cell_end,
+                np.int32(nx),
+                np.int32(ny),
+                np.int32(nz),
+
+                cp.float32(r_cut),
+                box_min,
+                cp.float32(cell_size),
+                np.int32(max_neighbors_per_atom),
+
+                cp.float32(k_val),
+                cp.float32(wave_angs),
+
+                phase_buf,
+                real_buf,
+                imag_buf,
+                counts_buf
+            )
+        )
+
+        phase_buf = phase_buf.reshape(N_total, max_neighbors_per_atom).get()
+        real_buf  = real_buf.reshape(N_total, max_neighbors_per_atom).get()
+        imag_buf  = imag_buf.reshape(N_total, max_neighbors_per_atom).get()
+        counts    = counts_buf.get()
+        sorted_idx= sorted_indices.get()
+
+        out_list = [None]*(N_total)
+        for sorted_i in range(N_total):
+            orig_i = sorted_idx[sorted_i]
+            used_count = counts[sorted_i]
+            used = min(used_count, max_neighbors_per_atom)
+            if used <= 0:
+                out_list[orig_i] = (np.array([],dtype=np.float32),
+                                    np.zeros((0,2),dtype=np.float32))
+                continue
+            ph_arr = phase_buf[sorted_i,:used]
+            r_arr  = real_buf[sorted_i,:used]
+            i_arr  = imag_buf[sorted_i,:used]
+            sc_2d  = np.stack([r_arr, i_arr], axis=1)
+            out_list[orig_i] = (ph_arr, sc_2d)
+
+        return out_list
+    
+    def compute_nearest_neighbor_distances_passA(self, sample, db_dict_f0_all, db_dict_f1f2_all,
+                                                r_cut, max_neighbors_per_atom):
+        """
+        Pass A:
+        * For each chunk => do local (intra-chunk) neighbor search (i->i).
+        * Build boundary arrays (positions, species, f0_params, anom).
+        * Save partial results to disk.
+        Returns:
+        boundary_dict : { chunk_id : { "positions":..., "f0_params":..., "anom":..., "indices":..., "species":... } }
+        all_data_memory : { chunk_id : list of (phase_arr, scatter2D, neighbor_idx) for each atom }
+        """
+        import cupy as cp
         from cupy import _default_memory_pool
 
-        margin = r_cut
-        boundary_atoms = {} 
-        # all_data_memory[chunk_id] -> list of (phase_arr, scatter2D, neigh_idx_arr) for each atom
+        boundary_dict   = {}
         all_data_memory = {}
 
-        # ---------- PASS A: Intra-chunk neighbors -----------
-        for chunk_id in range(1, sample.chunk_total + 1):
-            chunk_positions = sample.load_chunk_positions(chunk_id, use_gpu=True)
-            chunk_species   = sample.load_chunk_species(chunk_id, use_gpu=False)  # CPU array
+        for cid in range(1, sample.chunk_total+1):
+            chunk_positions = sample.load_chunk_positions(cid, use_gpu=True)
+            chunk_species   = sample.load_chunk_species(cid, use_gpu=False)
             n_atoms = chunk_positions.shape[0]
+
             if n_atoms == 0:
-                # Empty chunk -> trivial
-                sample.write_chunk_nn_phase([], chunk_id)
-                sample.write_chunk_nn_scatter([], chunk_id)
-                boundary_atoms[chunk_id] = (cp.zeros((0,3), dtype=cp.float32),
-                                            cp.zeros((0,), dtype=cp.int32),
-                                            np.array([], dtype=chunk_species.dtype))  # store empty species
-                all_data_memory[chunk_id] = []
+                # trivial chunk
+                sample.write_chunk_nn_phase([], cid)
+                sample.write_chunk_nn_scatter([], cid)
+                boundary_dict[cid] = {
+                    "positions": cp.zeros((0,3), dtype=cp.float32),
+                    "indices":   cp.zeros((0,),  dtype=cp.int32),
+                    "species":   np.array([], dtype=chunk_species.dtype),
+                    "f0_params": np.zeros((0,11), dtype=np.float32),
+                    "anom":      np.zeros((0,),    dtype=np.complex64)
+                }
+                all_data_memory[cid] = []
                 continue
 
-            # Build f0_params and (f1,f2) arrays on CPU
+            # Build CPU arrays for scattering
             f0_params_np = np.zeros((n_atoms, 11), dtype=np.float32)
             anom_np      = np.zeros((n_atoms,),     dtype=np.complex64)
-            unique_els = pd.unique(chunk_species)
+            unique_els   = pd.unique(chunk_species)
             for el in unique_els:
                 if el not in db_dict_f0_all:
                     continue
@@ -1645,8 +1894,8 @@ class beam:
                     cplx = self.get_f1f2_from_params(self._energy, table)
                     anom_np[mask] = cplx
 
-            # GPU neighbor call => (phase_arr, scatter2D, neigh_idx_arr)
-            results_intra = self.compute_neighbors_gpu(
+            # Intra-chunk i->i neighbors
+            results_intra = self.compute_intra_chunk_neighbors_gpu(
                 sample,
                 chunk_positions,
                 f0_params_np,
@@ -1655,42 +1904,63 @@ class beam:
                 max_neighbors_per_atom=max_neighbors_per_atom
             )
 
-            # Identify boundary atoms
+            # Identify boundary
             min_val = cp.min(chunk_positions, axis=0)
             max_val = cp.max(chunk_positions, axis=0)
-            cond_min = cp.any((chunk_positions - min_val) < margin, axis=1)
-            cond_max = cp.any((max_val - chunk_positions) < margin, axis=1)
-            boundary_mask = cond_min | cond_max
-
+            margin  = r_cut
+            cond_min= cp.any((chunk_positions - min_val)<margin, axis=1)
+            cond_max= cp.any((max_val - chunk_positions)<margin, axis=1)
+            boundary_mask = (cond_min | cond_max)
             boundary_positions = chunk_positions[boundary_mask]
             boundary_indices   = cp.arange(n_atoms, dtype=cp.int32)[boundary_mask]
+            boundary_mask_cpu  = boundary_mask.get()
 
-            # NEW: also store boundary_species here
-            boundary_species   = chunk_species[ boundary_mask.get() ] 
-            # ^ boundary_mask is a cp.ndarray (bool),
-            #   so do boundary_mask.get() => CPU bool array => index chunk_species
+            boundary_species   = chunk_species[ boundary_mask_cpu ]
+            boundary_f0_params = f0_params_np[ boundary_mask_cpu ]
+            boundary_anom      = anom_np[ boundary_mask_cpu ]
 
-            # store them together
-            boundary_atoms[chunk_id] = (boundary_positions, boundary_indices, boundary_species)
-
-            all_data_memory[chunk_id] = results_intra
-
-            # Write partial .npz files
-            phase_list   = []
+            # Write partial .npz
+            phase_list = []
             scatter_list = []
-            for (ph_arr, sc2d, _) in results_intra:
-                phase_list.append(ph_arr)
-                scatter_list.append(sc2d)
-            sample.write_chunk_nn_phase(phase_list, chunk_id)
-            sample.write_chunk_nn_scatter(scatter_list, chunk_id)
+            for (ph, sc2d, _) in results_intra:
+                phase_list.append(ph.astype(np.float32))
+                scatter_list.append(sc2d.astype(np.float32))
+            sample.write_chunk_nn_phase(phase_list, cid)
+            sample.write_chunk_nn_scatter(scatter_list, cid)
+
+            # Save to all_data_memory
+            all_data_memory[cid] = results_intra
+
+            # Save boundary
+            boundary_dict[cid] = {
+                "positions": boundary_positions,
+                "indices":   boundary_indices,
+                "species":   boundary_species,
+                "f0_params": boundary_f0_params,
+                "anom":      boundary_anom
+            }
 
             del chunk_positions
             _default_memory_pool.free_all_blocks()
 
-        # ---------- PASS B: Cross-chunk merges -----------
+        return boundary_dict, all_data_memory
+    
+    def compute_nearest_neighbor_distances_passB(self, sample, boundary_dict, all_data_memory,
+                                                r_cut, max_neighbors_per_atom):
+        """
+        Pass B:
+        * For each pair (i<j), combine boundary sets i, j
+        * Launch cross_neighbor_search_kernel => skip i->i or j->j in GPU
+        * Append cross neighbors to all_data_memory[i], all_data_memory[j].
+        Returns the updated all_data_memory
+        """
+        import cupy as cp
+        from cupy import _default_memory_pool
+
+        # Build bounding boxes for boundary sets
         chunk_bounds = {}
-        for cid in range(1, sample.chunk_total + 1):
-            posB, _, spcB = boundary_atoms[cid]
+        for cid in range(1, sample.chunk_total+1):
+            posB = boundary_dict[cid]["positions"]
             if posB.size == 0:
                 chunk_bounds[cid] = (None, None)
                 continue
@@ -1698,109 +1968,114 @@ class beam:
             max_bb = cp.max(posB, axis=0)
             chunk_bounds[cid] = (min_bb, max_bb)
 
-        for i in range(1, sample.chunk_total + 1):
-            pos_i, idx_i, spc_i = boundary_atoms[i]
-            data_i = all_data_memory[i]
-            if pos_i.size == 0:
+        for i in range(1, sample.chunk_total+1):
+            i_bd   = boundary_dict[i]
+            i_data = all_data_memory[i]
+            pos_i  = i_bd["positions"]
+            f0_i   = i_bd["f0_params"]
+            anom_i = i_bd["anom"]
+            idx_i  = i_bd["indices"]
+            if pos_i.size==0:
                 continue
-            min_i, max_i = chunk_bounds[i]
             N_i = pos_i.shape[0]
+            min_i, max_i = chunk_bounds[i]
 
-            for j in range(i+1, sample.chunk_total + 1):
-                pos_j, idx_j, spc_j = boundary_atoms[j]
-                data_j = all_data_memory[j]
-                if pos_j.size == 0:
+            for j in range(i+1, sample.chunk_total+1):
+                j_bd   = boundary_dict[j]
+                j_data = all_data_memory[j]
+                pos_j  = j_bd["positions"]
+                f0_j   = j_bd["f0_params"]
+                anom_j = j_bd["anom"]
+                idx_j  = j_bd["indices"]
+                if pos_j.size==0:
                     continue
-                min_j, max_j = chunk_bounds[j]
                 N_j = pos_j.shape[0]
+                min_j,max_j = chunk_bounds[j]
 
-                # bounding box check
-                if cp.any((max_i + r_cut) < (min_j - r_cut)) or cp.any((max_j + r_cut) < (min_i - r_cut)):
+                # bounding-box check
+                if cp.any((max_i + r_cut)<(min_j - r_cut)) or cp.any((max_j + r_cut)<(min_i - r_cut)):
                     continue
 
-                # 1) Combine boundary positions
-                combo_positions = cp.concatenate([pos_i, pos_j], axis=0)
-
-                # 2) Combine boundary species => build partial f0_params, anom
-                combo_species = np.concatenate([spc_i, spc_j], axis=0)
-
-                f0_params_combo = np.zeros((N_i+N_j, 11), dtype=np.float32)
-                anom_combo      = np.zeros((N_i+N_j,),     dtype=np.complex64)
-                unique_els2 = pd.unique(combo_species)
-                for el in unique_els2:
-                    if el not in db_dict_f0_all:
-                        continue
-                    mask2 = (combo_species == el)
-                    f0_params_combo[mask2] = db_dict_f0_all[el]
-                    table2 = db_dict_f1f2_all.get(el,None)
-                    if table2 is not None:
-                        cplx2 = self.get_f1f2_from_params(self._energy, table2)
-                        anom_combo[mask2] = cplx2
-
-                # 3) Re-run GPU neighbor search
-                cross_results = self.compute_neighbors_gpu(
+                # do cross-chunk merges
+                cross_list = self.compute_inter_chunk_neighbors_gpu(
                     sample,
-                    combo_positions,
-                    f0_params_combo,
-                    anom_combo,
+                    pos_i, f0_i, anom_i,
+                    pos_j, f0_j, anom_j,
                     r_cut=r_cut,
                     max_neighbors_per_atom=max_neighbors_per_atom
                 )
-                # cross_results[k] = (phase_arr, scatter2d, neigh_idx_arr)
-
-                # 4) Merge cross neighbors back into data_i, data_j
                 idx_i_cpu = idx_i.get()
                 idx_j_cpu = idx_j.get()
 
-                for local_idx in range(N_i):
-                    (ph_arr, sc2d, nidx_arr) = cross_results[local_idx]
-                    if ph_arr.size == 0:
-                        continue
-                    keep_mask = (nidx_arr >= N_i)  # i->j cross neighbors
-                    if not np.any(keep_mask):
-                        continue
-                    ph_cross = ph_arr[keep_mask]
-                    sc_cross = sc2d[keep_mask]
-                    global_i = idx_i_cpu[local_idx]
-                    old_phase, old_scat, old_neigh = data_i[global_i]
-                    new_phase = np.concatenate([old_phase, ph_cross])
-                    new_scat  = np.concatenate([old_scat,  sc_cross])
-                    # For neighbor indices, we do not strictly need them in final .npz
-                    new_neigh = np.concatenate([old_neigh, np.full(ph_cross.shape, -999, dtype=np.int32)])
-                    data_i[global_i] = (new_phase, new_scat, new_neigh)
+                # first N_i => chunk i
+                for local_i in range(N_i):
+                    (ph_new, sc2d_new) = cross_list[local_i]
+                    if ph_new.size>0:
+                        global_i = idx_i_cpu[local_i]
+                        (ph_old, scat_old, old_idx) = i_data[global_i]
+                        i_data[global_i] = (
+                            np.concatenate([ph_old, ph_new]),
+                            np.concatenate([scat_old, sc2d_new]),
+                            old_idx
+                        )
 
-                for local_idx in range(N_i, N_i+N_j):
-                    (ph_arr, sc2d, nidx_arr) = cross_results[local_idx]
-                    offset_local = local_idx - N_i
-                    if ph_arr.size == 0:
-                        continue
-                    keep_mask = (nidx_arr < N_i)  # j->i cross neighbors
-                    if not np.any(keep_mask):
-                        continue
-                    ph_cross = ph_arr[keep_mask]
-                    sc_cross = sc2d[keep_mask]
-                    global_j = idx_j_cpu[offset_local]
-                    old_phase, old_scat, old_neigh = data_j[global_j]
-                    new_phase = np.concatenate([old_phase, ph_cross])
-                    new_scat  = np.concatenate([old_scat,  sc_cross])
-                    new_neigh = np.concatenate([old_neigh, np.full(ph_cross.shape, -999, dtype=np.int32)])
-                    data_j[global_j] = (new_phase, new_scat, new_neigh)
+                # last N_j => chunk j
+                for local_j in range(N_j):
+                    (ph_new, sc2d_new) = cross_list[N_i + local_j]
+                    if ph_new.size>0:
+                        global_j = idx_j_cpu[local_j]
+                        (ph_old, scat_old, old_idx) = j_data[global_j]
+                        j_data[global_j] = (
+                            np.concatenate([ph_old, ph_new]),
+                            np.concatenate([scat_old, sc2d_new]),
+                            old_idx
+                        )
 
-                del combo_positions, combo_species, f0_params_combo, anom_combo
+                del cross_list
                 _default_memory_pool.free_all_blocks()
 
-        # ---------- PASS C: Final re-save -----------
-        for cid in range(1, sample.chunk_total + 1):
-            final_list = all_data_memory[cid]  # list of (phase, scatter2D, neigh_idx)
+        return all_data_memory
+
+    def compute_nearest_neighbor_distances(self, sample, r_cut=5.0, use_gpu=True, max_neighbors_per_atom=32):
+        """
+        The master function that orchestrates:
+        Pass A -> local merges + boundary caching
+        Pass B -> cross merges (skip i->i, j->j in GPU)
+        Pass C -> final re-save
+        """
+        import cupy as cp
+
+        if (not use_gpu) or (cp is None):
+            raise ValueError("GPU usage required, but CuPy is not available or use_gpu=False.")
+        if sample.chunk_total is None:
+            raise ValueError("No chunks found; import or generate sample first.")
+
+        # Pre-load scattering DB
+        db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
+        db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
+
+        # Pass A
+        boundary_dict, all_data_memory = self.compute_nearest_neighbor_distances_passA(
+            sample, db_dict_f0_all, db_dict_f1f2_all, r_cut, max_neighbors_per_atom
+        )
+
+        # Pass B
+        all_data_memory = self.compute_nearest_neighbor_distances_passB(
+            sample, boundary_dict, all_data_memory, r_cut, max_neighbors_per_atom
+        )
+
+        # Pass C: re-save final arrays
+        for cid in range(1, sample.chunk_total+1):
+            final_list = all_data_memory[cid]  # list of (ph_arr, sc2d, idx_array)
             phase_list   = []
             scatter_list = []
             for (ph_arr, sc2d, _) in final_list:
                 phase_list.append(ph_arr.astype(np.float32))
                 scatter_list.append(sc2d.astype(np.float32))
-            sample.write_chunk_nn_phase(phase_list, cid)
+            sample.write_chunk_nn_phase(phase_list,   cid)
             sample.write_chunk_nn_scatter(scatter_list, cid)
 
-        print(f"[beam] Completed nearest-neighbor calculation with cutoff={r_cut} for {sample.chunk_total} chunks.")
+        print(f"[beam] Completed nearest-neighbor calculation with cutoff={r_cut} for {sample.chunk_total} chunks (GPU).")
     # -------------------------------------
     
     # -------------------------------------
