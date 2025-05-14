@@ -70,6 +70,8 @@ class sample:
             self._chunk_total = int(sample_metadata["chunk_total"])
         
     ## Data Handling Functions
+    # -------------------------------------
+    # Generate sample
     def write_chunk_positions(self, data, chunk_num, override_directory=None):
         base, ext = os.path.splitext(self._default_filenames[0])
         chunk_filename = f"{base}_{chunk_num}{ext}"
@@ -108,7 +110,7 @@ class sample:
         with open(metadata_filename, "w") as f:
             json.dump(sample_metadata, f, indent=4)
         print(f"Metadata written to {metadata_filename} in JSON format.")
-
+    
     def load_chunk_positions(self, chunk_number, use_gpu=True):
         """
         Load positions from disk. If use_gpu=True and cupy is available, return a cp.ndarray.
@@ -134,7 +136,157 @@ class sample:
             return cp.load(full_path)
         else:
             return np.load(full_path)
+    # -------------------------------------
+    
+    # -------------------------------------
+    # KNN search
+    def write_chunk_nn_phase(self, phase_list, chunk_num, override_directory=None):
+        """
+        Similar to write_chunk_nn_distances but for the 'phase' ragged data.
+        'phase_list' is a list of np.ndarray(float32), one array per atom.
+        Each array has shape (num_neighbors,) containing the phases for that atom.
+        """
+        base_name = "nearest_neighbors_phase"
+        filename = f"{base_name}_{chunk_num}.npz"
+        if override_directory is not None:
+            save_path = os.path.join(override_directory, filename)
+        else:
+            save_path = os.path.join(self.directory, filename)
         
+        n_atoms = len(phase_list)
+        offsets = np.zeros(n_atoms + 1, dtype=np.int64)
+        total_size = 0
+        for i, arr in enumerate(phase_list):
+            length_i = arr.size
+            total_size += length_i
+            offsets[i+1] = total_size
+
+        flat_phase = np.zeros(total_size, dtype=np.float32)
+        for i, arr in enumerate(phase_list):
+            start = offsets[i]
+            end   = offsets[i+1]
+            flat_phase[start:end] = arr
+        
+        np.savez(save_path, flat_phase=flat_phase, offsets=offsets)
+        
+    def write_chunk_nn_scatter(self, scatter_list, chunk_num, override_directory=None):
+        """
+        Write a ragged list of complex scattering factors. We'll store
+        two parallel float arrays: 'flat_real' and 'flat_imag', plus 'offsets'.
+        scatter_list is a list of arrays of shape (N_neighbors, 2), storing [real, imag].
+        """
+        base_name = "nearest_neighbors_scatter"
+        filename = f"{base_name}_{chunk_num}.npz"
+        if override_directory is not None:
+            save_path = os.path.join(override_directory, filename)
+        else:
+            save_path = os.path.join(self.directory, filename)
+
+        n_atoms = len(scatter_list)
+        offsets = np.zeros(n_atoms + 1, dtype=np.int64)
+        total_size = 0
+        for i, arr2d in enumerate(scatter_list):
+            length_i = arr2d.shape[0]  # number of neighbors
+            total_size += length_i
+            offsets[i+1] = total_size
+
+        flat_real = np.zeros(total_size, dtype=np.float32)
+        flat_imag = np.zeros(total_size, dtype=np.float32)
+        idx_cursor = 0
+        for arr2d in scatter_list:
+            length_i = arr2d.shape[0]
+            if length_i > 0:
+                # arr2d[:, 0] = real parts, arr2d[:, 1] = imag parts
+                flat_real[idx_cursor : idx_cursor+length_i] = arr2d[:, 0]
+                flat_imag[idx_cursor : idx_cursor+length_i] = arr2d[:, 1]
+            idx_cursor += length_i
+
+        np.savez(save_path, flat_real=flat_real, flat_imag=flat_imag, offsets=offsets)
+        
+    def load_chunk_nn_phase(self, chunk_num, use_gpu=True):
+        """
+        Load the ragged nearest-neighbor 'phase' arrays for each atom in a chunk.
+        
+        If use_gpu=True and cupy is installed, each sub-array in the list 
+        will be a cp.ndarray. Otherwise, they will be np.ndarray.
+
+        Returns
+        -------
+        phase_list : list of 1D arrays
+            phase_list[i] has shape (num_neighbors_i,) for atom i.
+        """
+        base_name = "nearest_neighbors_phase"
+        filename = f"{base_name}_{chunk_num}.npz"
+        full_path = os.path.join(self.directory, filename)
+        if not os.path.isfile(full_path):
+            raise FileNotFoundError(f"NN phase file not found: {full_path}")
+        
+        with np.load(full_path) as data:
+            flat_phase = data['flat_phase']  # shape (total_size,)
+            offsets = data['offsets']        # shape (n_atoms+1,)
+
+        n_atoms = offsets.size - 1
+        phase_list = []
+        for i in range(n_atoms):
+            start = offsets[i]
+            end = offsets[i+1]
+            # Each sub-array is 1D (num_neighbors,)
+            sub_arr = flat_phase[start:end]
+            phase_list.append(sub_arr)
+
+        if use_gpu and (cp is not None):
+            # Convert each sub-array to cp.ndarray
+            phase_list = [cp.asarray(arr) for arr in phase_list]
+
+        return phase_list
+    
+    def load_chunk_nn_scatter(self, chunk_num, use_gpu=True):
+        """
+        Load the ragged nearest-neighbor scattering arrays for each atom in a chunk.
+        The stored file has 'flat_real', 'flat_imag', and 'offsets'. We reconstruct
+        one 2D array [N_neighbors, 2] per atom, with [:,0] = real parts, [:,1] = imag parts.
+        
+        If use_gpu=True and cupy is installed, each sub-array in the list 
+        will be a cp.ndarray. Otherwise, they will be np.ndarray.
+
+        Returns
+        -------
+        scatter_list : list of 2D arrays
+            scatter_list[i] has shape (num_neighbors_i, 2). 
+            The second dimension holds [real, imag] scattering factors.
+        """
+        base_name = "nearest_neighbors_scatter"
+        filename = f"{base_name}_{chunk_num}.npz"
+        full_path = os.path.join(self.directory, filename)
+        if not os.path.isfile(full_path):
+            raise FileNotFoundError(f"NN scatter file not found: {full_path}")
+
+        with np.load(full_path) as data:
+            flat_real = data['flat_real']  # shape (total_size,)
+            flat_imag = data['flat_imag']  # shape (total_size,)
+            offsets = data['offsets']      # shape (n_atoms+1,)
+
+        n_atoms = offsets.size - 1
+        scatter_list = []
+        for i in range(n_atoms):
+            start = offsets[i]
+            end = offsets[i+1]
+            length_i = end - start
+            # Rebuild shape (length_i, 2): [:,0]=real, [:,1]=imag
+            sub_arr = np.zeros((length_i, 2), dtype=np.float32)
+            sub_arr[:, 0] = flat_real[start:end]
+            sub_arr[:, 1] = flat_imag[start:end]
+            scatter_list.append(sub_arr)
+
+        if use_gpu and (cp is not None):
+            # Convert each sub-array to cp.ndarray
+            scatter_list = [cp.asarray(arr) for arr in scatter_list]
+
+        return scatter_list
+    # -------------------------------------
+
+    # -------------------------------------
+    # MD sample   
     def import_atomic_data(self, import_file, element_list, header_lines=9, ID_column=1, position_columns=[2,3,4], scale=1e-10, flush_size=100000000, override_directory=None):
         """
         Reads the atoms from a large text file, skipping the first 9 lines, and
@@ -194,8 +346,11 @@ class sample:
                                 (y_min + y_max) / 2.0,
                                 (z_min + z_max) / 2.0], dtype=np.float32)
         self._rotation = np.eye(3)
+    # -------------------------------------
 
     ## Static Functions
+    # -------------------------------------
+    # General
     @staticmethod
     def get_unit_corners():
         unit_corners = np.array([
@@ -252,7 +407,10 @@ class sample:
             )
             flat_grid = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
             return flat_grid
-    
+    # -------------------------------------
+        
+    # -------------------------------------
+    # Sample generation
     @staticmethod    
     def compile_parallelepipeds_intersect_batch_cffi():
         '''
@@ -448,8 +606,222 @@ class sample:
         """)
         C_mod = ffi_obj.verify(c_source, extra_compile_args=["-O3"], libraries=[])
         return ffi_obj, C_mod
+    # -------------------------------------
+    
+    # -------------------------------------
+    # KNN search
+    @staticmethod
+    def build_cell_list_count_kernel():
+        '''
+        '''
+        _cell_list_count_kernel = r'''
+        extern "C" __global__
+        void cell_list_count_kernel(const float* __restrict__ positions,
+                                    const float* __restrict__ bounding_box_min,
+                                    const float* __restrict__ inv_cell_size,
+                                    const int nx, const int ny, const int nz,
+                                    int* __restrict__ cell_indices_out,
+                                    int* __restrict__ cell_counts,
+                                    const int N)
+        {
+            int idx = blockDim.x * blockIdx.x + threadIdx.x;
+            if (idx >= N) return;
+
+            // Read particle position
+            float px = positions[3*idx + 0];
+            float py = positions[3*idx + 1];
+            float pz = positions[3*idx + 2];
+
+            // Shift relative to bounding_box_min
+            px -= bounding_box_min[0];
+            py -= bounding_box_min[1];
+            pz -= bounding_box_min[2];
+
+            // Compute cell indices in each dimension
+            int cx = (int)floorf(px * inv_cell_size[0]);
+            int cy = (int)floorf(py * inv_cell_size[1]);
+            int cz = (int)floorf(pz * inv_cell_size[2]);
+
+            // Clamp to valid cell range just in case of numeric issues
+            if (cx < 0) cx = 0; else if (cx >= nx) cx = nx - 1;
+            if (cy < 0) cy = 0; else if (cy >= ny) cy = ny - 1;
+            if (cz < 0) cz = 0; else if (cz >= nz) cz = nz - 1;
+
+            // 1D cell index
+            int cell_id = cz * (nx * ny) + cy * nx + cx;
+
+            cell_indices_out[idx] = cell_id;
+
+            // Use atomicAdd to increment cell_counts
+            atomicAdd(&cell_counts[cell_id], 1);
+        }
+        '''
+        # Build raw module
+        kernel_module = cp.RawModule(
+            code=_cell_list_count_kernel,
+            backend='nvcc',
+            options=('--gpu-architecture=sm_89', '-O3', '--ftz=true', '--fmad=true')
+        )
+        return kernel_module.get_function('cell_list_count_kernel')
+
+    @staticmethod
+    def build_cell_list_fill_kernel():
+        _cell_list_fill_kernel = r'''
+        extern "C" __global__
+        void cell_list_fill_kernel(const float* __restrict__ positions,
+                                const int* __restrict__ cell_indices,
+                                const int* __restrict__ cell_offsets,
+                                float* __restrict__ sorted_positions,
+                                int* __restrict__ sorted_indices,
+                                const int N)
+        {
+            int idx = blockDim.x * blockIdx.x + threadIdx.x;
+            if (idx >= N) return;
+
+            int cell_id = cell_indices[idx];
+
+            // The offset for this cell is cell_offsets[cell_id].
+            // We then use an atomicAdd to find the correct slot.
+            int pos = atomicAdd((int*)&cell_offsets[cell_id], 1);
+
+            sorted_positions[3*pos + 0] = positions[3*idx + 0];
+            sorted_positions[3*pos + 1] = positions[3*idx + 1];
+            sorted_positions[3*pos + 2] = positions[3*idx + 2];
+            sorted_indices[pos] = idx;  // keep track of original (unsorted) index
+        }
+        '''
+        # Build raw module
+        kernel_module = cp.RawModule(
+            code=_cell_list_fill_kernel,
+            backend='nvcc',
+            options=('--gpu-architecture=sm_89', '-O3', '--ftz=true', '--fmad=true')
+        )
+        return kernel_module.get_function('cell_list_fill_kernel')
+    # -------------------------------------
         
     ## Main Functions
+    # -------------------------------------
+    # General
+    def zero_sample_position(self, use_gpu=True):
+        """
+        Re-loads each chunk of atomic positions, subtracts the current self.offset
+        from every position (centering them), and writes them back out.
+        Finally sets self.offset to [0,0,0].
+        """
+        if self._offset is None:
+            raise ValueError("Offset is not initialized. Please set self._offset or load metadata first.")
+
+        if self._chunk_total is None:
+            raise ValueError("Chunk total is not initialized. Please generate sample or import atoms first.")
+        
+        offset_np = self.offset.astype(np.float32)
+
+        for i in range(self.chunk_total):
+            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
+            
+            if cp is not None and isinstance(positions_chunk, cp.ndarray):
+                positions_chunk -= cp.array(offset_np)
+                positions_chunk_cpu = positions_chunk.get()
+                self.write_chunk_positions(positions_chunk_cpu, i + 1)
+            else:
+                positions_chunk -= offset_np
+                self.write_chunk_positions(positions_chunk, i + 1)
+
+        self._offset = np.zeros(3, dtype=np.float32)
+        print("All atomic positions re-centered. Offset is now [0, 0, 0].")
+        
+    def zero_sample_rotation(self, use_gpu=True):
+        """
+        Re-loads each chunk of atomic positions, rotates all chunks by the inverse
+        of the current self._rotation, and writes them back out.
+        Finally sets self._rotation to the 3x3 identity matrix.
+        """
+        if self._rotation is None:
+            raise ValueError("No sample rotation matrix is set. Please initialize or load it first.")
+        
+        R_inv = self._rotation.T.astype(np.float32)
+        
+        if self._chunk_total is None:
+            raise ValueError("Chunk total is not initialized. Please generate or import sample data first.")
+        
+        for i in range(self.chunk_total):
+            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
+            
+            if cp is not None and isinstance(positions_chunk, cp.ndarray):
+                R_inv_cp = cp.asarray(R_inv)
+                positions_chunk = positions_chunk @ R_inv_cp
+                positions_chunk_cpu = positions_chunk.get()
+                self.write_chunk_positions(positions_chunk_cpu, i + 1)
+            else:
+                positions_chunk = positions_chunk @ R_inv
+                self.write_chunk_positions(positions_chunk, i + 1)
+        
+        self._rotation = np.eye(3, dtype=np.float32)
+        print("All atomic positions de-rotated. Sample rotation is now the identity matrix.")
+        
+    def zero_sample(self, use_gpu=True):
+        self.zero_sample_position(use_gpu=use_gpu)
+        self.zero_sample_rotation(use_gpu=use_gpu)
+        
+    def rotate_sample_relative(self, axis, dangle, degrees=True, use_gpu=True):
+        """
+        Re-loads each chunk of atomic positions, rotates it according to self.get_rotation(axis, dangle),
+        writes them back out, and then updates self._rotation by left-multiplying with the new rotation.
+        """
+        if degrees:
+            dangle = np.deg2rad(dangle)
+        
+        R = self.get_rotation(axis, dangle).astype(np.float32)
+        
+        if self._chunk_total is None:
+            raise ValueError("Chunk total is not initialized. Please generate or import sample data first.")
+        
+        for i in range(self.chunk_total):
+            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
+            if cp is not None and isinstance(positions_chunk, cp.ndarray):
+                R_cp = cp.asarray(R)
+                positions_chunk = positions_chunk @ R_cp
+                positions_chunk_cpu = positions_chunk.get()
+                self.write_chunk_positions(positions_chunk_cpu, i + 1)
+            else:
+                positions_chunk = positions_chunk @ R
+                self.write_chunk_positions(positions_chunk, i + 1)
+        
+        self._rotation = R @ self._rotation
+        print(f"Sample rotated by {dangle:.4f} radians about axis {axis}. "
+              f"Updated sample rotation matrix:\n{self._rotation}")
+
+    def translate_sample_relative(self, offset_vector, use_gpu=True): # update this to use dx, dy, dz
+        """
+        Re-loads each chunk of atomic positions, adds the offset_vector to every position,
+        and writes them back out.
+        Finally adds offset_vector to self._offset.
+        """
+        if self._chunk_total is None:
+            raise ValueError("Chunk total is not initialized. Please generate or import sample data first.")
+        
+        offset_np = np.array(offset_vector, dtype=np.float32)
+        
+        for i in range(self.chunk_total):
+            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
+            if cp is not None and isinstance(positions_chunk, cp.ndarray):
+                positions_chunk += cp.asarray(offset_np)
+                positions_chunk_cpu = positions_chunk.get()
+                self.write_chunk_positions(positions_chunk_cpu, i + 1)
+            else:
+                positions_chunk += offset_np
+                self.write_chunk_positions(positions_chunk, i + 1)
+        
+        if self._offset is None:
+            self._offset = offset_np
+        else:
+            self._offset += offset_np
+        
+        print(f"Sample translated by {offset_vector}. New offset is {self._offset}.")
+    # -------------------------------------
+    
+    # -------------------------------------
+    # Sample generation
     def get_chunk_positions(self, material):
         '''
         Gets the list of clipped chunk positions in real space the and chunk dimensions in unit cell lengths
@@ -718,124 +1090,110 @@ class sample:
         
         self._chunk_total = file_chunk_index
         return
+    # -------------------------------------
     
-    def zero_sample_position(self, use_gpu=True):
+    # -------------------------------------
+    # KNN search
+    def build_cell_list_gpu(self, positions, r_cut):
         """
-        Re-loads each chunk of atomic positions, subtracts the current self.offset
-        from every position (centering them), and writes them back out.
-        Finally sets self.offset to [0,0,0].
+        Build a cell list on GPU for the given positions and cutoff r_cut.
+        Returns:
+        sorted_positions (N, 3) [cp.float32]
+        sorted_indices   (N,)    [cp.int32]
+        cell_start       (num_cells,) [cp.int32]
+        cell_end         (num_cells,) [cp.int32]
+        bounding_box_min (3,)    [cp.float32]
+        cell_size        (float)
+        nx, ny, nz       (int)   # number of cells in each dimension
         """
-        if self._offset is None:
-            raise ValueError("Offset is not initialized. Please set self._offset or load metadata first.")
+        N = positions.shape[0]
+        if N == 0:
+            # Return trivial arrays for an empty set
+            return (cp.zeros((0,3), dtype=cp.float32),
+                    cp.zeros((0,), dtype=cp.int32),
+                    cp.zeros((0,), dtype=cp.int32),
+                    cp.zeros((0,), dtype=cp.int32),
+                    cp.array([0,0,0], dtype=cp.float32),
+                    1.0, 0, 0, 0)
 
-        if self._chunk_total is None:
-            raise ValueError("Chunk total is not initialized. Please generate sample or import atoms first.")
-        
-        offset_np = self.offset.astype(np.float32)
+        # 1) Compute bounding box on GPU
+        min_corner = cp.min(positions, axis=0)
+        max_corner = cp.max(positions, axis=0)
+        box_size = max_corner - min_corner
 
-        for i in range(self.chunk_total):
-            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
-            
-            if cp is not None and isinstance(positions_chunk, cp.ndarray):
-                positions_chunk -= cp.array(offset_np)
-                positions_chunk_cpu = positions_chunk.get()
-                self.write_chunk_positions(positions_chunk_cpu, i + 1)
-            else:
-                positions_chunk -= offset_np
-                self.write_chunk_positions(positions_chunk, i + 1)
+        # 2) Decide cell size = r_cut (cube cells)
+        cell_size = max(r_cut, 1.0)
 
-        self._offset = np.zeros(3, dtype=np.float32)
-        print("All atomic positions re-centered. Offset is now [0, 0, 0].")
-        
-    def zero_sample_rotation(self, use_gpu=True):
-        """
-        Re-loads each chunk of atomic positions, rotates all chunks by the inverse
-        of the current self._rotation, and writes them back out.
-        Finally sets self._rotation to the 3x3 identity matrix.
-        """
-        if self._rotation is None:
-            raise ValueError("No sample rotation matrix is set. Please initialize or load it first.")
-        
-        R_inv = self._rotation.T.astype(np.float32)
-        
-        if self._chunk_total is None:
-            raise ValueError("Chunk total is not initialized. Please generate or import sample data first.")
-        
-        for i in range(self.chunk_total):
-            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
-            
-            if cp is not None and isinstance(positions_chunk, cp.ndarray):
-                R_inv_cp = cp.asarray(R_inv)
-                positions_chunk = positions_chunk @ R_inv_cp
-                positions_chunk_cpu = positions_chunk.get()
-                self.write_chunk_positions(positions_chunk_cpu, i + 1)
-            else:
-                positions_chunk = positions_chunk @ R_inv
-                self.write_chunk_positions(positions_chunk, i + 1)
-        
-        self._rotation = np.eye(3, dtype=np.float32)
-        print("All atomic positions de-rotated. Sample rotation is now the identity matrix.")
-        
-    def zero_sample(self, use_gpu=True):
-        self.zero_sample_position(use_gpu=use_gpu)
-        self.zero_sample_rotation(use_gpu=use_gpu)
-        
-    def rotate_sample_relative(self, axis, dangle, degrees=True, use_gpu=True):
-        """
-        Re-loads each chunk of atomic positions, rotates it according to self.get_rotation(axis, dangle),
-        writes them back out, and then updates self._rotation by left-multiplying with the new rotation.
-        """
-        if degrees:
-            dangle = np.deg2rad(dangle)
-        
-        R = self.get_rotation(axis, dangle).astype(np.float32)
-        
-        if self._chunk_total is None:
-            raise ValueError("Chunk total is not initialized. Please generate or import sample data first.")
-        
-        for i in range(self.chunk_total):
-            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
-            if cp is not None and isinstance(positions_chunk, cp.ndarray):
-                R_cp = cp.asarray(R)
-                positions_chunk = positions_chunk @ R_cp
-                positions_chunk_cpu = positions_chunk.get()
-                self.write_chunk_positions(positions_chunk_cpu, i + 1)
-            else:
-                positions_chunk = positions_chunk @ R
-                self.write_chunk_positions(positions_chunk, i + 1)
-        
-        self._rotation = R @ self._rotation
-        print(f"Sample rotated by {dangle:.4f} radians about axis {axis}. "
-              f"Updated sample rotation matrix:\n{self._rotation}")
+        # 3) Number of cells in each dimension
+        nx = int(cp.ceil(box_size[0] / cell_size)) if box_size[0] > 0 else 1
+        ny = int(cp.ceil(box_size[1] / cell_size)) if box_size[1] > 0 else 1
+        nz = int(cp.ceil(box_size[2] / cell_size)) if box_size[2] > 0 else 1
+        num_cells = nx*ny*nz
 
-    def translate_sample_relative(self, offset_vector, use_gpu=True): # update this to use dx, dy, dz
-        """
-        Re-loads each chunk of atomic positions, adds the offset_vector to every position,
-        and writes them back out.
-        Finally adds offset_vector to self._offset.
-        """
-        if self._chunk_total is None:
-            raise ValueError("Chunk total is not initialized. Please generate or import sample data first.")
-        
-        offset_np = np.array(offset_vector, dtype=np.float32)
-        
-        for i in range(self.chunk_total):
-            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
-            if cp is not None and isinstance(positions_chunk, cp.ndarray):
-                positions_chunk += cp.asarray(offset_np)
-                positions_chunk_cpu = positions_chunk.get()
-                self.write_chunk_positions(positions_chunk_cpu, i + 1)
-            else:
-                positions_chunk += offset_np
-                self.write_chunk_positions(positions_chunk, i + 1)
-        
-        if self._offset is None:
-            self._offset = offset_np
-        else:
-            self._offset += offset_np
-        
-        print(f"Sample translated by {offset_vector}. New offset is {self._offset}.")
+        # 4) Prepare arrays
+        cell_indices = cp.zeros((N,), dtype=cp.int32)
+        cell_counts  = cp.zeros((num_cells,), dtype=cp.int32)
 
+        # We'll need a 3-element array for inv_cell_size
+        inv_cell_size = cp.array([1.0/cell_size, 1.0/cell_size, 1.0/cell_size], dtype=cp.float32)
+
+        threads_per_block = 256
+        blocks = (N + threads_per_block - 1) // threads_per_block
+
+        # 5) First pass: count how many points go into each cell
+        cell_list_count_kernel = self.build_cell_list_count_kernel()
+        cell_list_count_kernel(
+            (blocks,), (threads_per_block,),
+            (
+                positions,
+                min_corner,
+                inv_cell_size,   # Must be a pointer of length 3
+                nx, ny, nz,
+                cell_indices,
+                cell_counts,
+                N
+            )
+        )
+
+        # 6) Compute prefix sum (exclusive scan) of cell_counts
+        cell_offsets = cp.cumsum(cell_counts, dtype=cp.int32)
+        # shift right by 1 so cell_start[i] is the start of cell i
+        cell_start = cp.zeros_like(cell_offsets)
+        cell_start[1:] = cell_offsets[:-1]
+        cell_start[0]  = 0
+        cell_end = cell_offsets  # end = exclusive offset
+
+        # 7) Create arrays for the sorted output
+        sorted_positions = cp.zeros_like(positions)
+        sorted_indices   = cp.zeros((N,), dtype=cp.int32)
+
+        # 8) We'll do a second pass to fill sorted_positions using an atomicAdd on cell_offsets_copy
+        cell_offsets_copy = cp.array(cell_start, copy=True)
+
+        cell_list_fill_kernel = self.build_cell_list_fill_kernel()
+        cell_list_fill_kernel(
+            (blocks,), (threads_per_block,),
+            (
+                positions,
+                cell_indices,
+                cell_offsets_copy,
+                sorted_positions,
+                sorted_indices,
+                N
+            )
+        )
+
+        return (sorted_positions,
+                sorted_indices,
+                cell_start,
+                cell_end,
+                min_corner,
+                cell_size,
+                nx, ny, nz)
+    # -------------------------------------
+        
+    # -------------------------------------
+    # Plotting
     def plot_sample(self, elev=0, azim=0):
         import matplotlib.pyplot as plt
         fig = plt.figure(figsize=(8, 8))
@@ -857,6 +1215,7 @@ class sample:
                 c='b', marker='.'
             )
         return fig, ax1
+    # -------------------------------------
     
     ## Properties
     @property

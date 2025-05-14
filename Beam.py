@@ -113,6 +113,8 @@ class beam:
         print(f"Beam metadata written to {metadata_filename} in JSON format.")
 
     ## Static Functions
+    # -------------------------------------
+    # General
     @staticmethod
     def _make_orthonormal_basis(direction):
         """
@@ -138,7 +140,91 @@ class beam:
 
         return e1.astype(np.float32), e2.astype(np.float32)
     
-    # CPU kernel
+    @staticmethod
+    def parse_f0_db_all(database_name='f0_WaasKirf.dat'):
+        """
+        Loads the entire f0 database for all elements in the file.
+        Returns a dict: { "H": [a1,a2,a3,a4,a5,c,b1,b2,b3,b4,b5], ... }
+        """
+        db_dict = {}
+        db_file = pkg_resources.open_text(databases.scattering, database_name)
+        element = None
+        for line in db_file:
+            if line.startswith('#S'):
+                element = line.split()[2].strip()
+            elif (not line.startswith('#')) and element is not None:
+                params = np.fromiter((float(x) for x in line.split()), dtype=np.float32)
+                if params.size == 11:
+                    db_dict[element] = params
+        return db_dict
+
+    @staticmethod
+    def parse_f1f2_db_all(database_name='f1f2_CromerLiberman.dat'):
+        """
+        Loads the entire f1f2 database for all elements.
+        Returns a dict: { "H": array([[E1,f1_1,f2_1],[E2,f1_2,f2_2],...]), ... }
+        """
+        f1f2_dict = {}
+        db_file = pkg_resources.open_text(databases.scattering, database_name)
+        element = None
+        param_list = []
+        for line in db_file:
+            if line.startswith('#S'):
+                if element is not None and len(param_list) > 0:
+                    f1f2_dict[element] = np.array(param_list, dtype=np.float32)
+                element = line.split()[2].strip()
+                param_list = []
+            elif not line.startswith('#') and element is not None:
+                row_vals = [float(val) for val in line.split()]
+                if len(row_vals) == 3:
+                    param_list.append(row_vals)
+        if element is not None and len(param_list) > 0:
+            f1f2_dict[element] = np.array(param_list, dtype=np.float32)
+        return f1f2_dict
+
+    @staticmethod
+    def get_f1f2_from_params(energy, f1f2_table):
+        """
+        Given an energy (float) and the full f1,f2 table for an element
+        (shape [N,3], columns: E, f1, f2), returns (f1 + i*f2)
+        by linear interpolation near the requested energy.
+        """
+        E = energy
+        energies = f1f2_table[:, 0]
+        idx = np.searchsorted(energies, E)
+        if idx >= len(energies):
+            idx = len(energies) - 1
+        if idx == 0:
+            idx = 1
+
+        E0, f10, f20 = energies[idx - 1], f1f2_table[idx - 1, 1], f1f2_table[idx - 1, 2]
+        E1, f11, f21 = energies[idx], f1f2_table[idx, 1], f1f2_table[idx, 2]
+        denom = (E1 - E0) if (E1 > E0) else 1e-20
+
+        w = (E - E0) / denom
+        f1 = f10 + (f11 - f10)*w
+        f2 = f20 + (f21 - f20)*w
+        return f1 + 1j*f2
+    
+    @staticmethod
+    def _build_f0_zero_dict(db_dict_f0_all):
+        """
+        Given the dictionary of Waasmaier-Kirfel params for each element,
+        compute f0(0) = c + sum_{i=1..5}(a_i) for each element.
+        Returns a dict {element_name: f0_zero_value}.
+        """
+        f0_0_dict = {}
+        for el, params in db_dict_f0_all.items():
+            # params layout = [a1, a2, a3, a4, a5, c, b1, b2, b3, b4, b5]
+            a1, a2, a3, a4, a5, c = params[0], params[1], params[2], params[3], params[4], params[5]
+            # f0(0) = c + sum(a1..a5)
+            val = float(c + a1 + a2 + a3 + a4 + a5)
+            f0_0_dict[el] = val
+        return f0_0_dict
+    # -------------------------------------
+    
+    # -------------------------------------
+    # Direct Scattering
     @staticmethod
     def compile_compute_scattering_cffi():
         """
@@ -260,7 +346,6 @@ class beam:
         C_mod = ffi_obj.verify(c_source, extra_compile_args=['-O3'])
         return ffi_obj, C_mod
     
-    # GPU kernel
     @staticmethod
     def build_interaction_kernel():
         """
@@ -430,91 +515,175 @@ class beam:
             options=('--gpu-architecture=sm_89', '-O3', '--ftz=true', '--fmad=true')
         )
         return kernel_module.get_function('interaction_kernal')
-
-    @staticmethod
-    def parse_f0_db_all(database_name='f0_WaasKirf.dat'):
-        """
-        Loads the entire f0 database for all elements in the file.
-        Returns a dict: { "H": [a1,a2,a3,a4,a5,c,b1,b2,b3,b4,b5], ... }
-        """
-        db_dict = {}
-        db_file = pkg_resources.open_text(databases.scattering, database_name)
-        element = None
-        for line in db_file:
-            if line.startswith('#S'):
-                element = line.split()[2].strip()
-            elif (not line.startswith('#')) and element is not None:
-                params = np.fromiter((float(x) for x in line.split()), dtype=np.float32)
-                if params.size == 11:
-                    db_dict[element] = params
-        return db_dict
-
-    @staticmethod
-    def parse_f1f2_db_all(database_name='f1f2_CromerLiberman.dat'):
-        """
-        Loads the entire f1f2 database for all elements.
-        Returns a dict: { "H": array([[E1,f1_1,f2_1],[E2,f1_2,f2_2],...]), ... }
-        """
-        f1f2_dict = {}
-        db_file = pkg_resources.open_text(databases.scattering, database_name)
-        element = None
-        param_list = []
-        for line in db_file:
-            if line.startswith('#S'):
-                if element is not None and len(param_list) > 0:
-                    f1f2_dict[element] = np.array(param_list, dtype=np.float32)
-                element = line.split()[2].strip()
-                param_list = []
-            elif not line.startswith('#') and element is not None:
-                row_vals = [float(val) for val in line.split()]
-                if len(row_vals) == 3:
-                    param_list.append(row_vals)
-        if element is not None and len(param_list) > 0:
-            f1f2_dict[element] = np.array(param_list, dtype=np.float32)
-        return f1f2_dict
-
-    @staticmethod
-    def get_f1f2_from_params(energy, f1f2_table):
-        """
-        Given an energy (float) and the full f1,f2 table for an element
-        (shape [N,3], columns: E, f1, f2), returns (f1 + i*f2)
-        by linear interpolation near the requested energy.
-        """
-        E = energy
-        energies = f1f2_table[:, 0]
-        idx = np.searchsorted(energies, E)
-        if idx >= len(energies):
-            idx = len(energies) - 1
-        if idx == 0:
-            idx = 1
-
-        E0, f10, f20 = energies[idx - 1], f1f2_table[idx - 1, 1], f1f2_table[idx - 1, 2]
-        E1, f11, f21 = energies[idx], f1f2_table[idx, 1], f1f2_table[idx, 2]
-        denom = (E1 - E0) if (E1 > E0) else 1e-20
-
-        w = (E - E0) / denom
-        f1 = f10 + (f11 - f10)*w
-        f2 = f20 + (f21 - f20)*w
-        return f1 + 1j*f2
+    # -------------------------------------
     
+    # -------------------------------------
+    # Dynamical
     @staticmethod
-    def _build_f0_zero_dict(db_dict_f0_all):
+    def build_neighbor_search_kernel():
         """
-        Given the dictionary of Waasmaier-Kirfel params for each element,
-        compute f0(0) = c + sum_{i=1..5}(a_i) for each element.
-        Returns a dict {element_name: f0_zero_value}.
+        ### MODIFICATION 1 of 4:
+        Store not only distance but also the neighbor 'j' index in 'neighbor_index_buffer[write_idx]'.
+        This is necessary for cross-chunk filtering to remove i->i or j->j neighbors.
         """
-        f0_0_dict = {}
-        for el, params in db_dict_f0_all.items():
-            # params layout = [a1, a2, a3, a4, a5, c, b1, b2, b3, b4, b5]
-            a1, a2, a3, a4, a5, c = params[0], params[1], params[2], params[3], params[4], params[5]
-            # f0(0) = c + sum(a1..a5)
-            val = float(c + a1 + a2 + a3 + a4 + a5)
-            f0_0_dict[el] = val
-        return f0_0_dict
+        _neighbor_search_kernel = r'''
+        #include <math.h>
+        __device__ __forceinline__
+        float get_f0_value(float Q_val, const float* params)
+        {
+            // params layout = [a1,a2,a3,a4,a5, c, b1,b2,b3,b4,b5].
+            // f0(Q) = c + sum( a_i * exp(-b_i * k^2) ), k=0.25*Q_val*1e-10/pi
+            const float PI_F = 3.14159265358979323846f;
+            float k = 0.25f * Q_val * 1.0e-10f / PI_F;  
+            float k2 = k*k;
+
+            float f0_val = params[5]; // c
+            #pragma unroll
+            for(int i=0; i<5; i++){
+                float ai = params[i];
+                float bi = params[6 + i];
+                f0_val += ai * __expf(-bi*k2);
+            }
+            return f0_val;
+        }
+
+        extern "C" __global__
+        void neighbor_search_kernel(
+            // Sorted atom data
+            const float*  __restrict__ sorted_positions,   // (N,3)
+            const int*    __restrict__ sorted_indices,     // (N,)
+            const float*  __restrict__ sorted_f0_params,   // (N,11) per atom
+            const float2* __restrict__ sorted_anom,        // (N,) each = (f1,f2)
+
+            // Cell list data
+            const int*  __restrict__ cell_start,
+            const int*  __restrict__ cell_end,
+            const int   nx, 
+            const int   ny, 
+            const int   nz,
+
+            // neighbor search
+            const float  r_cut,
+            const float* __restrict__ bounding_box_min,
+            const float  cell_size,
+            const int    max_neighbors_per_atom,
+
+            // beam constants
+            const float  k_val,
+            const float  wavelength,
+
+            // outputs
+            float* __restrict__ phase_buffer,         // (N*max_neighbors_per_atom)
+            float* __restrict__ scatter_real_buffer,  // (N*max_neighbors_per_atom)
+            float* __restrict__ scatter_imag_buffer,  // (N*max_neighbors_per_atom)
+            int*   __restrict__ neighbor_idx_buffer,  // (N*max_neighbors_per_atom)
+            int*   __restrict__ neighbor_counts,      // (N,)
+
+            // total
+            const int    N
+        )
+        {
+            // 27 neighbor cell offsets
+            const int neighbor_delta[27][3] = {
+            {-1,-1,-1}, {-1,-1, 0}, {-1,-1, 1},
+            {-1, 0,-1}, {-1, 0, 0}, {-1, 0, 1},
+            {-1, 1,-1}, {-1, 1, 0}, {-1, 1, 1},
+            { 0,-1,-1}, { 0,-1, 0}, { 0,-1, 1},
+            { 0, 0,-1}, { 0, 0, 0}, { 0, 0, 1},
+            { 0, 1,-1}, { 0, 1, 0}, { 0, 1, 1},
+            { 1,-1,-1}, { 1,-1, 0}, { 1,-1, 1},
+            { 1, 0,-1}, { 1, 0, 0}, { 1, 0, 1},
+            { 1, 1,-1}, { 1, 1, 0}, { 1, 1, 1}
+            };
+
+            int i = blockDim.x * blockIdx.x + threadIdx.x;
+            if(i >= N) return;
+
+            float px = sorted_positions[3*i + 0];
+            float py = sorted_positions[3*i + 1];
+            float pz = sorted_positions[3*i + 2];
+
+            float fx = (px - bounding_box_min[0]) / cell_size;
+            float fy = (py - bounding_box_min[1]) / cell_size;
+            float fz = (pz - bounding_box_min[2]) / cell_size;
+
+            int cx = (int)floorf(fx);
+            int cy = (int)floorf(fy);
+            int cz = (int)floorf(fz);
+
+            int neighbor_count = 0;
+
+            for(int n=0; n<27; n++){
+                int ncx = cx + neighbor_delta[n][0];
+                int ncy = cy + neighbor_delta[n][1];
+                int ncz = cz + neighbor_delta[n][2];
+
+                if(ncx<0 || ncx>=nx) continue;
+                if(ncy<0 || ncy>=ny) continue;
+                if(ncz<0 || ncz>=nz) continue;
+
+                int cell_id = ncz*(nx*ny) + ncy*nx + ncx;
+                int start = cell_start[cell_id];
+                int end   = cell_end[cell_id];
+
+                for(int j=start; j<end; j++){
+                    if(j == i) continue;
+                    float qx = sorted_positions[3*j + 0];
+                    float qy = sorted_positions[3*j + 1];
+                    float qz = sorted_positions[3*j + 2];
+
+                    float dx = qx - px;
+                    float dy = qy - py;
+                    float dz = qz - pz;
+                    float dist2 = dx*dx + dy*dy + dz*dz;
+                    if(dist2 <= r_cut*r_cut){
+                        if(neighbor_count < max_neighbors_per_atom){
+                            float dist = sqrtf(dist2);
+
+                            // Phase = k_val * mod(distance + x_neighbor, wavelength)
+                            float sum_val = dist + qx; 
+                            float mod_val = fmodf(sum_val, wavelength);
+                            float phase_val = k_val * mod_val;
+
+                            // Q_val = k_val * sqrt(2*(1 - dx/dist)) (like atomic_direct_scattering)
+                            float rdx = dx / dist;
+                            float tmp = 2.f*(1.f - rdx);
+                            if(tmp<0.f) tmp=0.f;
+                            float Q_val = k_val*sqrtf(tmp);
+
+                            // f0
+                            const float* f0p = &sorted_f0_params[j*11];
+                            float f0_val = get_f0_value(Q_val, f0p);
+
+                            // anomalous
+                            float2 an = sorted_anom[j];
+                            float real_tot = f0_val + an.x;
+                            float imag_tot = an.y;
+
+                            int widx = i*max_neighbors_per_atom + neighbor_count;
+                            phase_buffer[widx]        = phase_val;
+                            scatter_real_buffer[widx] = real_tot;
+                            scatter_imag_buffer[widx] = imag_tot;
+                            neighbor_idx_buffer[widx] = j;
+                        }
+                        neighbor_count++;
+                    }
+                }
+            }
+            neighbor_counts[i] = neighbor_count;
+        }
+        '''
+        kernel_module = cp.RawModule(
+            code=_neighbor_search_kernel,
+            backend='nvcc',
+            options=('--gpu-architecture=sm_89','-O3','--ftz=true','--fmad=true')
+        )
+        return kernel_module.get_function('neighbor_search_kernel')
+    # -------------------------------------
 
     ## Main Functions
-    # CPU function
+    # -------------------------------------
+    # Direct Scattering
     def cpu_scatter_chunk_cffi(self, complied_code, ffi_obj, chunk_id, sample,
                                Nx, Ny, coords_x_m, coords_y_m, coords_z_m,
                                db_dict_f0_all, db_dict_f1f2_all, k_val,
@@ -646,188 +815,6 @@ class beam:
                 final_result += partial_2d
 
         return final_result
-        
-    def bin_atoms_in_pixels_cpu(self, sample, Nx, Ny, e1, e2,
-                                pixel_size_u, pixel_size_v,
-                                stage, atomic_radius=1.7, kernel_radius=0, detector=None):
-        """
-        CPU approach that accounts for a ~2 radius by shifting each atom 
-        around +/-2 Ang. Then it deduplicates so each (atom, pixel) is unique.
-
-        Now we get the *actual* pixel centers from 'detector.pixel_coordinates' 
-        and still use 'pixel_size_u, pixel_size_v' for binning widths.
-
-        Returns
-        -------
-        final_map : (Ny, Nx) complex64
-            Real + imag sum in each pixel (after optional Gaussian).
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import multiprocessing
-        
-        # 1) Retrieve pixel centers from detector
-        #    shape=(3, Nx*Ny)
-        pix_coords = detector.pixel_coordinates
-        if cp is not None and isinstance(pix_coords, cp.ndarray):
-            pix_coords = pix_coords.get()  # Bring to CPU
-        # Project each pixel center onto (e1, e2)
-        px = pix_coords[0]
-        py = pix_coords[1]
-        pz = pix_coords[2]
-        pixel_u = px*e1[0] + py*e1[1] + pz*e1[2]
-        pixel_v = px*e2[0] + py*e2[1] + pz*e2[2]
-        min_u = pixel_u.min()
-        min_v = pixel_v.min()
-
-        # 2) Optionally build a 2D Gaussian kernel for smoothing
-        def _make_gaussian_kernel_cpu(radius):
-            if radius < 1:
-                return None
-            diam = 2*radius + 1
-            sigma = radius/2.0
-            y, x = np.ogrid[-radius:radius+1, -radius:radius+1]
-            g = np.exp(-(x*x + y*y)/(2.0*sigma*sigma)).astype(np.float32)
-            g /= g.sum()
-            return g
-
-        def _fft_convolve2d_cpu(data2d, kernel):
-            if kernel is None:
-                return data2d
-            s1, s2 = data2d.shape
-            k1, k2 = kernel.shape
-            fft_shape = (s1 + k1 - 1, s2 + k2 - 1)
-            Fdata   = np.fft.fft2(data2d, s=fft_shape)
-            Fkernel = np.fft.fft2(kernel, s=fft_shape)
-            Fout    = Fdata * Fkernel
-            conved  = np.fft.ifft2(Fout)
-            start_x = (k1 - 1)//2
-            start_y = (k2 - 1)//2
-            conved  = conved[start_x:start_x+s1, start_y:start_y+s2]
-            return conved.real.astype(data2d.dtype)
-
-        # 3) Pre‐load scattering DB
-        db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
-        db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
-        f0_zero_dict     = self._build_f0_zero_dict(db_dict_f0_all)
-
-        radius = atomic_radius
-        offsets = np.array([
-            [-radius*np.sqrt(2), -radius*np.sqrt(2)],
-            [-radius,            0.0],
-            [-radius*np.sqrt(2), +radius*np.sqrt(2)],
-            [           0.0,         -radius],
-            [           0.0,          0.0],
-            [           0.0,         +radius],
-            [+radius*np.sqrt(2), -radius*np.sqrt(2)],
-            [+radius,            0.0],
-            [+radius*np.sqrt(2), +radius*np.sqrt(2)]
-        ], dtype=np.float32)
-        oy = offsets[:,0]
-        oz = offsets[:,1]
-
-        final_map_real = np.zeros((Ny, Nx), dtype=np.float32)
-        final_map_imag = np.zeros((Ny, Nx), dtype=np.float32)
-        chunk_total = sample.chunk_total
-        if chunk_total == 0:
-            return (final_map_real + 1j*final_map_imag).astype(np.complex64)
-
-        max_threads = min(chunk_total, multiprocessing.cpu_count())
-
-        def worker(chunk_id):
-            pos = sample.load_chunk_positions(chunk_id, use_gpu=False)
-            spc = sample.load_chunk_species(chunk_id,  use_gpu=False)
-            nAtoms = pos.shape[0]
-            if nAtoms == 0:
-                return (np.zeros((Ny, Nx), np.float32),
-                        np.zeros((Ny, Nx), np.float32))
-            
-            # stage transform
-            pos = pos @ stage.rotation
-            pos += stage.translation
-
-            # build scattering real, imag
-            scattering_real = np.zeros(nAtoms, dtype=np.float32)
-            scattering_imag = np.zeros(nAtoms, dtype=np.float32)
-            unique_els = pd.unique(spc)
-            for el in unique_els:
-                mask = (spc == el)
-                if el not in f0_zero_dict:
-                    continue
-                f0_0 = f0_zero_dict[el]
-                table = db_dict_f1f2_all.get(el)
-                if table is not None:
-                    cplx = self.get_f1f2_from_params(self._energy, table)
-                    f1_val = cplx.real
-                    f2_val = cplx.imag
-                else:
-                    f1_val = 0.0
-                    f2_val = 0.0
-                scattering_real[mask] = f0_0 + f1_val
-                scattering_imag[mask] = f2_val
-
-            # project atoms onto e1,e2
-            atom_u = (pos[:,0]*e1[0] + pos[:,1]*e1[1] + pos[:,2]*e1[2])
-            atom_v = (pos[:,0]*e2[0] + pos[:,1]*e2[1] + pos[:,2]*e2[2])
-
-            # expand for offsets
-            expanded_u = (atom_u[:,None] + oy[None,:]).ravel()
-            expanded_v = (atom_v[:,None] + oz[None,:]).ravel()
-            atom_ids   = np.repeat(np.arange(nAtoms, dtype=np.uint64), offsets.shape[0])
-
-            # bin i,j
-            i = np.floor((expanded_u - min_u)/pixel_size_u).astype(np.int32)
-            j = np.floor((expanded_v - min_v)/pixel_size_v).astype(np.int32)
-
-            # clip
-            mask_in = (i>=0)&(i<Nx)&(j>=0)&(j<Ny)
-            if not mask_in.any():
-                return (np.zeros((Ny, Nx), np.float32),
-                        np.zeros((Ny, Nx), np.float32))
-
-            i_valid = i[mask_in]
-            j_valid = j[mask_in]
-            atom_ids_valid = atom_ids[mask_in]
-
-            bin_idx = (j_valid.astype(np.uint64)*Nx + i_valid.astype(np.uint64))
-            encoded = (atom_ids_valid << 32) | bin_idx
-
-            sidx = np.argsort(encoded)
-            encoded_sorted = encoded[sidx]
-            bin_idx_sorted = bin_idx[sidx]
-            atom_sorted    = atom_ids_valid[sidx]
-
-            keep = np.ones(encoded_sorted.size, dtype=bool)
-            if encoded_sorted.size > 1:
-                keep[1:] = (encoded_sorted[1:] != encoded_sorted[:-1])
-
-            bin_idx_unique  = bin_idx_sorted[keep]
-            atom_ids_unique = atom_sorted[keep]
-
-            w_real = scattering_real[atom_ids_unique]
-            partial_hist_real = np.bincount(bin_idx_unique.astype(np.int64),
-                                            weights=w_real, minlength=Nx*Ny)
-            w_imag = scattering_imag[atom_ids_unique]
-            partial_hist_imag = np.bincount(bin_idx_unique.astype(np.int64),
-                                            weights=w_imag, minlength=Nx*Ny)
-
-            return (partial_hist_real.reshape((Ny, Nx)),
-                    partial_hist_imag.reshape((Ny, Nx)))
-
-        from concurrent.futures import ThreadPoolExecutor
-        chunk_ids = range(1, chunk_total+1)
-        with ThreadPoolExecutor(max_workers=max_threads) as exe:
-            futs = {exe.submit(worker, cid): cid for cid in chunk_ids}
-            for fut in as_completed(futs):
-                rpart, ipart = fut.result()
-                final_map_real += rpart
-                final_map_imag += ipart
-
-        # Convolve if needed
-        kernel = _make_gaussian_kernel_cpu(kernel_radius)
-        conv_real = _fft_convolve2d_cpu(final_map_real, kernel)
-        conv_imag = _fft_convolve2d_cpu(final_map_imag, kernel)
-
-        return (conv_real + 1j*conv_imag).astype(np.complex64)
 
     def interact_beam_gpu(self, sample, measurement_positions, measurement_shape, stage):
         """
@@ -997,6 +984,227 @@ class beam:
 
         return final_result
     
+    def atomic_direct_scattering(self, sample, detector, stage, offset=None, transmission=False, atomic_radius=0, kernel_radius=0, use_gpu=True):
+        """
+        High-level entry point for beam-sample scattering.
+        Now includes a 'stage' argument to apply its rotation+translation.
+        
+        Parameters
+        ----------
+        sample : object with 'chunk_total', 'load_chunk_species(i)', 'load_chunk_positions(i)'
+        detector : object with 'pixel_coordinates' (3, Nx*Ny), 'shape' -> (Nx, Ny),
+                   and 'input_pixel_values(...)'
+        stage : stage object that provides rotation angles and translation
+        offset : float
+            Offset subtracted from final result
+        use_gpu : bool
+            If True and cupy installed with GPU(s), use GPU. Else use CPU.
+        """
+        measurement_positions = detector.pixel_coordinates
+        Nx, Ny = detector.shape
+
+        # Check if we can run GPU
+        if use_gpu and (cp is not None):
+            # Attempt GPU path
+            final_field = self.interact_beam_gpu(sample, measurement_positions, (Nx, Ny), stage)
+        else:
+            # CPU fallback
+            if cp is None and use_gpu:
+                print("[beam] Cupy not installed, running CPU mode.")
+            final_field = self.interact_beam_cpu(sample, measurement_positions, (Nx, Ny), stage)
+        if transmission is True:
+            final_field += self.count_atoms_in_pixels(sample, detector, stage, use_gpu=use_gpu, atomic_radius=atomic_radius, kernel_radius=kernel_radius)
+            
+        if offset is not None:
+            detector.input_pixel_values(final_field - offset)
+        else:
+            detector.input_pixel_values(final_field)
+    # -------------------------------------
+        
+    # -------------------------------------
+    # Transmission
+    def bin_atoms_in_pixels_cpu(self, sample, Nx, Ny, e1, e2,
+                                pixel_size_u, pixel_size_v,
+                                stage, atomic_radius=1.7, kernel_radius=0, detector=None):
+        """
+        CPU approach that accounts for a ~2 radius by shifting each atom 
+        around +/-2 Ang. Then it deduplicates so each (atom, pixel) is unique.
+
+        Now we get the *actual* pixel centers from 'detector.pixel_coordinates' 
+        and still use 'pixel_size_u, pixel_size_v' for binning widths.
+
+        Returns
+        -------
+        final_map : (Ny, Nx) complex64
+            Real + imag sum in each pixel (after optional Gaussian).
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import multiprocessing
+        
+        # Retrieve pixel centers from detector
+        #    shape=(3, Nx*Ny)
+        pix_coords = detector.pixel_coordinates
+        if cp is not None and isinstance(pix_coords, cp.ndarray):
+            pix_coords = pix_coords.get()  # Bring to CPU
+        # Project each pixel center onto (e1, e2)
+        px = pix_coords[0]
+        py = pix_coords[1]
+        pz = pix_coords[2]
+        pixel_u = px*e1[0] + py*e1[1] + pz*e1[2]
+        pixel_v = px*e2[0] + py*e2[1] + pz*e2[2]
+        min_u = pixel_u.min()
+        min_v = pixel_v.min()
+
+        # Build a 2D Gaussian kernel for smoothing
+        def _make_gaussian_kernel_cpu(radius):
+            if radius < 1:
+                return None
+            diam = 2*radius + 1
+            sigma = radius/2.0
+            y, x = np.ogrid[-radius:radius+1, -radius:radius+1]
+            g = np.exp(-(x*x + y*y)/(2.0*sigma*sigma)).astype(np.float32)
+            g /= g.sum()
+            return g
+
+        def _fft_convolve2d_cpu(data2d, kernel):
+            if kernel is None:
+                return data2d
+            s1, s2 = data2d.shape
+            k1, k2 = kernel.shape
+            fft_shape = (s1 + k1 - 1, s2 + k2 - 1)
+            Fdata   = np.fft.fft2(data2d, s=fft_shape)
+            Fkernel = np.fft.fft2(kernel, s=fft_shape)
+            Fout    = Fdata * Fkernel
+            conved  = np.fft.ifft2(Fout)
+            start_x = (k1 - 1)//2
+            start_y = (k2 - 1)//2
+            conved  = conved[start_x:start_x+s1, start_y:start_y+s2]
+            return conved.real.astype(data2d.dtype)
+
+        # Pre‐load scattering DB
+        db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
+        db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
+        f0_zero_dict     = self._build_f0_zero_dict(db_dict_f0_all)
+
+        radius = atomic_radius
+        offsets = np.array([
+            [-radius*np.sqrt(2), -radius*np.sqrt(2)],
+            [-radius,            0.0],
+            [-radius*np.sqrt(2), +radius*np.sqrt(2)],
+            [           0.0,         -radius],
+            [           0.0,          0.0],
+            [           0.0,         +radius],
+            [+radius*np.sqrt(2), -radius*np.sqrt(2)],
+            [+radius,            0.0],
+            [+radius*np.sqrt(2), +radius*np.sqrt(2)]
+        ], dtype=np.float32)
+        oy = offsets[:,0]
+        oz = offsets[:,1]
+
+        final_map_real = np.zeros((Ny, Nx), dtype=np.float32)
+        final_map_imag = np.zeros((Ny, Nx), dtype=np.float32)
+        chunk_total = sample.chunk_total
+        if chunk_total == 0:
+            return (final_map_real + 1j*final_map_imag).astype(np.complex64)
+
+        max_threads = min(chunk_total, multiprocessing.cpu_count())
+
+        def worker(chunk_id):
+            pos = sample.load_chunk_positions(chunk_id, use_gpu=False)
+            spc = sample.load_chunk_species(chunk_id,  use_gpu=False)
+            nAtoms = pos.shape[0]
+            if nAtoms == 0:
+                return (np.zeros((Ny, Nx), np.float32),
+                        np.zeros((Ny, Nx), np.float32))
+            
+            # stage transform
+            pos = pos @ stage.rotation
+            pos += stage.translation
+
+            # build scattering real, imag
+            scattering_real = np.zeros(nAtoms, dtype=np.float32)
+            scattering_imag = np.zeros(nAtoms, dtype=np.float32)
+            unique_els = pd.unique(spc)
+            for el in unique_els:
+                mask = (spc == el)
+                if el not in f0_zero_dict:
+                    continue
+                f0_0 = f0_zero_dict[el]
+                table = db_dict_f1f2_all.get(el)
+                if table is not None:
+                    cplx = self.get_f1f2_from_params(self._energy, table)
+                    f1_val = cplx.real
+                    f2_val = cplx.imag
+                else:
+                    f1_val = 0.0
+                    f2_val = 0.0
+                scattering_real[mask] = f0_0 + f1_val
+                scattering_imag[mask] = f2_val
+
+            # project atoms onto e1,e2
+            atom_u = (pos[:,0]*e1[0] + pos[:,1]*e1[1] + pos[:,2]*e1[2])
+            atom_v = (pos[:,0]*e2[0] + pos[:,1]*e2[1] + pos[:,2]*e2[2])
+
+            # expand for offsets
+            expanded_u = (atom_u[:,None] + oy[None,:]).ravel()
+            expanded_v = (atom_v[:,None] + oz[None,:]).ravel()
+            atom_ids   = np.repeat(np.arange(nAtoms, dtype=np.uint64), offsets.shape[0])
+
+            # bin i,j
+            i = np.floor((expanded_u - min_u)/pixel_size_u).astype(np.int32)
+            j = np.floor((expanded_v - min_v)/pixel_size_v).astype(np.int32)
+
+            # clip
+            mask_in = (i>=0)&(i<Nx)&(j>=0)&(j<Ny)
+            if not mask_in.any():
+                return (np.zeros((Ny, Nx), np.float32),
+                        np.zeros((Ny, Nx), np.float32))
+
+            i_valid = i[mask_in]
+            j_valid = j[mask_in]
+            atom_ids_valid = atom_ids[mask_in]
+
+            bin_idx = (j_valid.astype(np.uint64)*Nx + i_valid.astype(np.uint64))
+            encoded = (atom_ids_valid << 32) | bin_idx
+
+            sidx = np.argsort(encoded)
+            encoded_sorted = encoded[sidx]
+            bin_idx_sorted = bin_idx[sidx]
+            atom_sorted    = atom_ids_valid[sidx]
+
+            keep = np.ones(encoded_sorted.size, dtype=bool)
+            if encoded_sorted.size > 1:
+                keep[1:] = (encoded_sorted[1:] != encoded_sorted[:-1])
+
+            bin_idx_unique  = bin_idx_sorted[keep]
+            atom_ids_unique = atom_sorted[keep]
+
+            w_real = scattering_real[atom_ids_unique]
+            partial_hist_real = np.bincount(bin_idx_unique.astype(np.int64),
+                                            weights=w_real, minlength=Nx*Ny)
+            w_imag = scattering_imag[atom_ids_unique]
+            partial_hist_imag = np.bincount(bin_idx_unique.astype(np.int64),
+                                            weights=w_imag, minlength=Nx*Ny)
+
+            return (partial_hist_real.reshape((Ny, Nx)),
+                    partial_hist_imag.reshape((Ny, Nx)))
+
+        from concurrent.futures import ThreadPoolExecutor
+        chunk_ids = range(1, chunk_total+1)
+        with ThreadPoolExecutor(max_workers=max_threads) as exe:
+            futs = {exe.submit(worker, cid): cid for cid in chunk_ids}
+            for fut in as_completed(futs):
+                rpart, ipart = fut.result()
+                final_map_real += rpart
+                final_map_imag += ipart
+
+        # Convolve
+        kernel = _make_gaussian_kernel_cpu(kernel_radius)
+        conv_real = _fft_convolve2d_cpu(final_map_real, kernel)
+        conv_imag = _fft_convolve2d_cpu(final_map_imag, kernel)
+
+        return (conv_real + 1j*conv_imag).astype(np.complex64)
+    
     def bin_atoms_in_pixels_gpu(self, sample, Nx, Ny, e1, e2,
                                 pixel_size_u, pixel_size_v,
                                 stage, atomic_radius=1.7, kernel_radius=0, detector=None):
@@ -1028,7 +1236,7 @@ class beam:
         if chunk_total == 0:
             return np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # 1) Project pixel centers to (u,v) on GPU
+        # Project pixel centers to (u,v) on GPU
         pix_coords = detector.pixel_coordinates
         if not isinstance(pix_coords, cp.ndarray):
             pix_coords = cp.asarray(pix_coords, dtype=cp.float32)
@@ -1043,7 +1251,7 @@ class beam:
         min_u_gpu = pixel_u.min()
         min_v_gpu = pixel_v.min()
 
-        # 2) Build GPU Gaussian kernel if needed
+        # Build GPU Gaussian kernel
         def _make_gaussian_kernel_gpu(radius):
             if radius < 1:
                 return None
@@ -1130,7 +1338,6 @@ class beam:
                     scattering_real[mask] = f0_0 + f1_val
                     scattering_imag[mask] = f2_val
 
-                # Move to GPU
                 pos_gpu = cp.asarray(pos_cpu, dtype=cp.float32)
                 real_gpu = cp.asarray(scattering_real, dtype=cp.float32)
                 imag_gpu = cp.asarray(scattering_imag, dtype=cp.float32)
@@ -1186,7 +1393,6 @@ class beam:
                 out_r += hist_r.reshape(Ny, Nx)
                 out_i += hist_i.reshape(Ny, Nx)
 
-                # cleanup
                 del pos_gpu, real_gpu, imag_gpu
                 del i_gpu, j_gpu, mask_in, atom_ids
                 del encoded, sidx, enc_sort, bin_sort, atom_sort
@@ -1219,7 +1425,7 @@ class beam:
                 final_r_gpu += r_gpu
                 final_i_gpu += i_gpu
 
-        # Convolve if needed
+        # Convolve
         kernel_gpu = _make_gaussian_kernel_gpu(kernel_radius)
         final_r_gpu = _fft_convolve2d_gpu(final_r_gpu, kernel_gpu)
         final_i_gpu = _fft_convolve2d_gpu(final_i_gpu, kernel_gpu)
@@ -1271,45 +1477,336 @@ class beam:
         final_map = -f0_map_complex.real + np.max(f0_map_complex.real)
         final_map = prefactor*final_map/(size_y*size_z)
         return final_map.T
-
-    # Main API
-    def atomic_direct_scattering(self, sample, detector, stage, offset=None, transmission=False, atomic_radius=0, kernel_radius=0, use_gpu=True):
+    # -------------------------------------
+    
+    # -------------------------------------
+    # Dynamical
+    def compute_neighbors_gpu(
+        self,                 # 'beam' instance
+        sample,               # 'sample' instance
+        positions,            # cp.ndarray (N,3)
+        f0_params_np,         # np.ndarray (N,11) on CPU
+        anom_np,              # np.ndarray (N,) complex64 on CPU
+        r_cut=5.0,
+        max_neighbors_per_atom=32
+    ):
         """
-        High-level entry point for beam-sample scattering.
-        Now includes a 'stage' argument to apply its rotation+translation.
+        1) Build cell list, reorder everything
+        2) neighbor_search_scatter_kernel => (phase, scatterReal, scatterImag, neighbor_idx)
+        3) Re-sort back to original indices
+        Returns: a list of length N, where each entry is:
+            (phase_array, scatter_2D, neighbor_idx_array)
+        with shape(phase_array)=(num_neighbors,), shape(scatter_2D)=(num_neighbors,2),
+        shape(neighbor_idx_array)=(num_neighbors,).
+        """
+        N = positions.shape[0]
+        if N == 0:
+            return [ (np.array([],dtype=np.float32),
+                    np.zeros((0,2), dtype=np.float32),
+                    np.array([],dtype=np.int32)
+                    ) for _ in range(N) ]
         
-        Parameters
-        ----------
-        sample : object with 'chunk_total', 'load_chunk_species(i)', 'load_chunk_positions(i)'
-        detector : object with 'pixel_coordinates' (3, Nx*Ny), 'shape' -> (Nx, Ny),
-                   and 'input_pixel_values(...)'
-        stage : stage object that provides rotation angles and translation
-        offset : float
-            Offset subtracted from final result
-        use_gpu : bool
-            If True and cupy installed with GPU(s), use GPU. Else use CPU.
-        """
-        measurement_positions = detector.pixel_coordinates
-        Nx, Ny = detector.shape
+        # 1) Build cell list => sorted_positions, sorted_indices
+        (sorted_positions,
+        sorted_indices,
+        cell_start,
+        cell_end,
+        box_min,
+        cell_size,
+        nx, ny, nz) = sample.build_cell_list_gpu(positions, r_cut)
 
-        # Check if we can run GPU
-        if use_gpu and (cp is not None):
-            # Attempt GPU path
-            final_field = self.interact_beam_gpu(sample, measurement_positions, (Nx, Ny), stage)
-        else:
-            # CPU fallback
-            if cp is None and use_gpu:
-                print("[beam] Cupy not installed, running CPU mode.")
-            final_field = self.interact_beam_cpu(sample, measurement_positions, (Nx, Ny), stage)
-        if transmission is True:
-            final_field += self.count_atoms_in_pixels(sample, detector, stage, use_gpu=use_gpu, atomic_radius=atomic_radius, kernel_radius=kernel_radius)
-            
-        if offset is not None:
-            detector.input_pixel_values(final_field - offset)
-        else:
-            detector.input_pixel_values(final_field)
-            
+        # 2) Reorder f0_params, anom to match sorted order
+        f0_params_gpu = cp.asarray(f0_params_np, dtype=cp.float32)  # (N,11)
+        anom_gpu      = cp.asarray(anom_np,       dtype=cp.complex64)
+        sorted_f0_params = f0_params_gpu[sorted_indices]
+        sorted_anom      = anom_gpu[sorted_indices]
+
+        # 3) Prepare output buffers
+        phase_gpu        = cp.zeros((N*max_neighbors_per_atom,), dtype=cp.float32)
+        scatter_real_gpu = cp.zeros((N*max_neighbors_per_atom,), dtype=cp.float32)
+        scatter_imag_gpu = cp.zeros((N*max_neighbors_per_atom,), dtype=cp.float32)
+        neighbor_idx_gpu = cp.zeros((N*max_neighbors_per_atom,), dtype=cp.int32)
+        neighbor_counts  = cp.zeros((N,), dtype=cp.int32)
+
+        # 4) Launch kernel
+        # wave number k_val = 2*pi / wavelength
+        wavelength_angs = self._wavelength  # Angstrom
+        k_val = (2.0 * np.pi) / wavelength_angs
+
+        kernel = self.build_neighbor_search_kernel()
+        threads_per_block = 256
+        blocks = (N + threads_per_block - 1)//threads_per_block
+
+        kernel(
+            (blocks,), (threads_per_block,),
+            (
+                sorted_positions,
+                sorted_indices,
+                sorted_f0_params.reshape(-1),
+                sorted_anom.view(cp.float32),  # pass float2 to the kernel
+                cell_start,
+                cell_end,
+                np.int32(nx),
+                np.int32(ny),
+                np.int32(nz),
+                cp.float32(r_cut),
+                box_min,
+                cp.float32(cell_size),
+                np.int32(max_neighbors_per_atom),
+                cp.float32(k_val),
+                cp.float32(wavelength_angs),
+                phase_gpu,
+                scatter_real_gpu,
+                scatter_imag_gpu,
+                neighbor_idx_gpu,
+                neighbor_counts,
+                np.int32(N)
+            )
+        )
+
+        # 5) Move data to CPU
+        phase_gpu        = phase_gpu.reshape(N, max_neighbors_per_atom).get()
+        scatter_real_gpu = scatter_real_gpu.reshape(N, max_neighbors_per_atom).get()
+        scatter_imag_gpu = scatter_imag_gpu.reshape(N, max_neighbors_per_atom).get()
+        neighbor_idx_cpu = neighbor_idx_gpu.reshape(N, max_neighbors_per_atom).get()
+        counts_cpu       = neighbor_counts.get()
+        sorted_idx_cpu   = sorted_indices.get()
+
+        # 6) Rebuild ragged lists of (phase, scatter, neighbor_idx) in original order
+        output = [None]*N
+        for sorted_i in range(N):
+            orig_i = sorted_idx_cpu[sorted_i]
+            used_count = counts_cpu[sorted_i]
+            used = min(used_count, max_neighbors_per_atom)
+            if used <= 0:
+                output[orig_i] = (
+                    np.array([],dtype=np.float32),
+                    np.zeros((0,2), dtype=np.float32),
+                    np.array([],dtype=np.int32)
+                )
+                continue
+            phase_arr = phase_gpu[sorted_i, :used]
+            real_arr  = scatter_real_gpu[sorted_i, :used]
+            imag_arr  = scatter_imag_gpu[sorted_i, :used]
+            neigh_idx = neighbor_idx_cpu[sorted_i, :used]
+            # scatter2D = Nx2 => [ [real, imag], ... ]
+            scatter2D = np.stack([real_arr, imag_arr], axis=1)
+            output[orig_i] = (phase_arr, scatter2D, neigh_idx)
+
+        return output
+
+    def compute_nearest_neighbor_distances(self, sample, r_cut=5.0, use_gpu=True, max_neighbors_per_atom=32):
+        """
+        Optimized to store boundary-atom species in Pass A, so we don't need to
+        reload chunk species in Pass B.
+        """
+        if (not use_gpu) or (cp is None):
+            raise ValueError("GPU usage required, but CuPy is not available or use_gpu=False.")
+        if sample.chunk_total is None:
+            raise ValueError("No chunks found in sample; import or generate sample first.")
+
+        # 1) Pre-load scattering DB
+        db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
+        db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
+
+        from cupy import _default_memory_pool
+
+        margin = r_cut
+        boundary_atoms = {} 
+        # all_data_memory[chunk_id] -> list of (phase_arr, scatter2D, neigh_idx_arr) for each atom
+        all_data_memory = {}
+
+        # ---------- PASS A: Intra-chunk neighbors -----------
+        for chunk_id in range(1, sample.chunk_total + 1):
+            chunk_positions = sample.load_chunk_positions(chunk_id, use_gpu=True)
+            chunk_species   = sample.load_chunk_species(chunk_id, use_gpu=False)  # CPU array
+            n_atoms = chunk_positions.shape[0]
+            if n_atoms == 0:
+                # Empty chunk -> trivial
+                sample.write_chunk_nn_phase([], chunk_id)
+                sample.write_chunk_nn_scatter([], chunk_id)
+                boundary_atoms[chunk_id] = (cp.zeros((0,3), dtype=cp.float32),
+                                            cp.zeros((0,), dtype=cp.int32),
+                                            np.array([], dtype=chunk_species.dtype))  # store empty species
+                all_data_memory[chunk_id] = []
+                continue
+
+            # Build f0_params and (f1,f2) arrays on CPU
+            f0_params_np = np.zeros((n_atoms, 11), dtype=np.float32)
+            anom_np      = np.zeros((n_atoms,),     dtype=np.complex64)
+            unique_els = pd.unique(chunk_species)
+            for el in unique_els:
+                if el not in db_dict_f0_all:
+                    continue
+                mask = (chunk_species == el)
+                f0_params_np[mask] = db_dict_f0_all[el]
+                table = db_dict_f1f2_all.get(el, None)
+                if table is not None:
+                    cplx = self.get_f1f2_from_params(self._energy, table)
+                    anom_np[mask] = cplx
+
+            # GPU neighbor call => (phase_arr, scatter2D, neigh_idx_arr)
+            results_intra = self.compute_neighbors_gpu(
+                sample,
+                chunk_positions,
+                f0_params_np,
+                anom_np,
+                r_cut=r_cut,
+                max_neighbors_per_atom=max_neighbors_per_atom
+            )
+
+            # Identify boundary atoms
+            min_val = cp.min(chunk_positions, axis=0)
+            max_val = cp.max(chunk_positions, axis=0)
+            cond_min = cp.any((chunk_positions - min_val) < margin, axis=1)
+            cond_max = cp.any((max_val - chunk_positions) < margin, axis=1)
+            boundary_mask = cond_min | cond_max
+
+            boundary_positions = chunk_positions[boundary_mask]
+            boundary_indices   = cp.arange(n_atoms, dtype=cp.int32)[boundary_mask]
+
+            # NEW: also store boundary_species here
+            boundary_species   = chunk_species[ boundary_mask.get() ] 
+            # ^ boundary_mask is a cp.ndarray (bool),
+            #   so do boundary_mask.get() => CPU bool array => index chunk_species
+
+            # store them together
+            boundary_atoms[chunk_id] = (boundary_positions, boundary_indices, boundary_species)
+
+            all_data_memory[chunk_id] = results_intra
+
+            # Write partial .npz files
+            phase_list   = []
+            scatter_list = []
+            for (ph_arr, sc2d, _) in results_intra:
+                phase_list.append(ph_arr)
+                scatter_list.append(sc2d)
+            sample.write_chunk_nn_phase(phase_list, chunk_id)
+            sample.write_chunk_nn_scatter(scatter_list, chunk_id)
+
+            del chunk_positions
+            _default_memory_pool.free_all_blocks()
+
+        # ---------- PASS B: Cross-chunk merges -----------
+        chunk_bounds = {}
+        for cid in range(1, sample.chunk_total + 1):
+            posB, _, spcB = boundary_atoms[cid]
+            if posB.size == 0:
+                chunk_bounds[cid] = (None, None)
+                continue
+            min_bb = cp.min(posB, axis=0)
+            max_bb = cp.max(posB, axis=0)
+            chunk_bounds[cid] = (min_bb, max_bb)
+
+        for i in range(1, sample.chunk_total + 1):
+            pos_i, idx_i, spc_i = boundary_atoms[i]
+            data_i = all_data_memory[i]
+            if pos_i.size == 0:
+                continue
+            min_i, max_i = chunk_bounds[i]
+            N_i = pos_i.shape[0]
+
+            for j in range(i+1, sample.chunk_total + 1):
+                pos_j, idx_j, spc_j = boundary_atoms[j]
+                data_j = all_data_memory[j]
+                if pos_j.size == 0:
+                    continue
+                min_j, max_j = chunk_bounds[j]
+                N_j = pos_j.shape[0]
+
+                # bounding box check
+                if cp.any((max_i + r_cut) < (min_j - r_cut)) or cp.any((max_j + r_cut) < (min_i - r_cut)):
+                    continue
+
+                # 1) Combine boundary positions
+                combo_positions = cp.concatenate([pos_i, pos_j], axis=0)
+
+                # 2) Combine boundary species => build partial f0_params, anom
+                combo_species = np.concatenate([spc_i, spc_j], axis=0)
+
+                f0_params_combo = np.zeros((N_i+N_j, 11), dtype=np.float32)
+                anom_combo      = np.zeros((N_i+N_j,),     dtype=np.complex64)
+                unique_els2 = pd.unique(combo_species)
+                for el in unique_els2:
+                    if el not in db_dict_f0_all:
+                        continue
+                    mask2 = (combo_species == el)
+                    f0_params_combo[mask2] = db_dict_f0_all[el]
+                    table2 = db_dict_f1f2_all.get(el,None)
+                    if table2 is not None:
+                        cplx2 = self.get_f1f2_from_params(self._energy, table2)
+                        anom_combo[mask2] = cplx2
+
+                # 3) Re-run GPU neighbor search
+                cross_results = self.compute_neighbors_gpu(
+                    sample,
+                    combo_positions,
+                    f0_params_combo,
+                    anom_combo,
+                    r_cut=r_cut,
+                    max_neighbors_per_atom=max_neighbors_per_atom
+                )
+                # cross_results[k] = (phase_arr, scatter2d, neigh_idx_arr)
+
+                # 4) Merge cross neighbors back into data_i, data_j
+                idx_i_cpu = idx_i.get()
+                idx_j_cpu = idx_j.get()
+
+                for local_idx in range(N_i):
+                    (ph_arr, sc2d, nidx_arr) = cross_results[local_idx]
+                    if ph_arr.size == 0:
+                        continue
+                    keep_mask = (nidx_arr >= N_i)  # i->j cross neighbors
+                    if not np.any(keep_mask):
+                        continue
+                    ph_cross = ph_arr[keep_mask]
+                    sc_cross = sc2d[keep_mask]
+                    global_i = idx_i_cpu[local_idx]
+                    old_phase, old_scat, old_neigh = data_i[global_i]
+                    new_phase = np.concatenate([old_phase, ph_cross])
+                    new_scat  = np.concatenate([old_scat,  sc_cross])
+                    # For neighbor indices, we do not strictly need them in final .npz
+                    new_neigh = np.concatenate([old_neigh, np.full(ph_cross.shape, -999, dtype=np.int32)])
+                    data_i[global_i] = (new_phase, new_scat, new_neigh)
+
+                for local_idx in range(N_i, N_i+N_j):
+                    (ph_arr, sc2d, nidx_arr) = cross_results[local_idx]
+                    offset_local = local_idx - N_i
+                    if ph_arr.size == 0:
+                        continue
+                    keep_mask = (nidx_arr < N_i)  # j->i cross neighbors
+                    if not np.any(keep_mask):
+                        continue
+                    ph_cross = ph_arr[keep_mask]
+                    sc_cross = sc2d[keep_mask]
+                    global_j = idx_j_cpu[offset_local]
+                    old_phase, old_scat, old_neigh = data_j[global_j]
+                    new_phase = np.concatenate([old_phase, ph_cross])
+                    new_scat  = np.concatenate([old_scat,  sc_cross])
+                    new_neigh = np.concatenate([old_neigh, np.full(ph_cross.shape, -999, dtype=np.int32)])
+                    data_j[global_j] = (new_phase, new_scat, new_neigh)
+
+                del combo_positions, combo_species, f0_params_combo, anom_combo
+                _default_memory_pool.free_all_blocks()
+
+        # ---------- PASS C: Final re-save -----------
+        for cid in range(1, sample.chunk_total + 1):
+            final_list = all_data_memory[cid]  # list of (phase, scatter2D, neigh_idx)
+            phase_list   = []
+            scatter_list = []
+            for (ph_arr, sc2d, _) in final_list:
+                phase_list.append(ph_arr.astype(np.float32))
+                scatter_list.append(sc2d.astype(np.float32))
+            sample.write_chunk_nn_phase(phase_list, cid)
+            sample.write_chunk_nn_scatter(scatter_list, cid)
+
+        print(f"[beam] Completed nearest-neighbor calculation with cutoff={r_cut} for {sample.chunk_total} chunks.")
+    # -------------------------------------
+    
+    # -------------------------------------
+    # Field propagation
     def field_propagate(self, detector, optics):
         """
         Propagate the beam through a freespace/optical stack
         """
+    # -------------------------------------
