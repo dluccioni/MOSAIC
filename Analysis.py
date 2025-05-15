@@ -124,7 +124,7 @@ class analysis:
         return fig,ax
 
     ## Main Functions
-    def distance_fft_dependance(self, sample, beam, detector, distance_array, plot_prefix="Test"):
+    def distance_fft_dependance(self, sample, stage, beam, detector, distance_array, plot_prefix="Test"):
         """
         Compute amplitude/phase summations and their FFTs at various detector
         distances, plot them, and save all generated figures.
@@ -168,7 +168,7 @@ class analysis:
             print(f"Processing distance: {d} || {idx+1}/{distance_array.size}")
             # Move detector to new distance and compute scattering
             detector.position_detector_absolute(d, detector.two_theta, detector.nu)
-            beam.atomic_direct_scattering(sample, detector)
+            beam.atomic_direct_interaction(sample,detector,stage,scattering=True, scattering_params=[None], transmission=True, transmission_params=[1.7,1.0], use_gpu=True)
             # 1) Plot Intensity
             fig_int, ax_int = detector.plot_detector(type="Intensity")
             fig_int.savefig(os.path.join(self.directory,plot_prefix + f"_Intensity_2D_Real_Distance_{d}.png"))
