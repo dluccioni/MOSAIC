@@ -176,7 +176,7 @@ class detector:
             json.dump(detector_metadata, f, indent=4)
         print(f"Detector metadata written to {metadata_filename} in JSON format.")
         
-    def write_Efield_values(self, filename="Efield_values.npy", override_directory=None):
+    def write_Efield_values(self, field=None, filename="Efield_values.npy", override_directory=None):
         """
         Saves the detector's complex pixel values as a .npy file.
         
@@ -187,19 +187,23 @@ class detector:
         override_directory : str, optional
             If provided, saves to this directory instead of self.directory.
         """
-        if self._pixel_values is None:
-            raise ValueError("Pixel values are not initialized; cannot save them.")
-        pxvals = self._pixel_values
+        if field == None:
+            if self._pixel_values is None:
+                raise ValueError("Pixel values are not initialized; cannot save them.")
+            pxvals = self._pixel_values
+            print(f"Detector pixel values saved to {outfile}.")
+        else:
+            pxvals = field
+            print(f"Field values saved to {outfile}.")
         if cp is not None and isinstance(pxvals, cp.ndarray):
             pxvals = pxvals.get()
         if override_directory is not None:
             outfile = os.path.join(override_directory, filename)
         else:
             outfile = os.path.join(self.directory, filename)
-        np.save(outfile, pxvals)
-        print(f"Detector pixel values saved to {outfile}.")
+        np.save(outfile, pxvals) 
         
-    def read_Efield_values(self, filename="Efield_values.npy", override_directory=None, use_gpu=True):
+    def read_Efield_values(self, internal=True, filename="Efield_values.npy", override_directory=None, use_gpu=True):
         """
         Loads the detector's complex pixel values from a .npy file and assigns them
         to self._pixel_values.
@@ -223,9 +227,13 @@ class detector:
             loaded_values = cp.load(infile)
         else:
             loaded_values = np.load(infile)
-        self._pixel_values = loaded_values
-        self.input_pixel_values(self.pixel_values)
-        print(f"Detector pixel values loaded from {infile}.")
+        if internal == True:
+            self.input_pixel_values(loaded_values)
+            print(f"Detector pixel values loaded from {infile}.")
+        else:
+            print(f"Field values loaded from {infile}.")
+            return loaded_values
+            
     
     ## Static Functions
     @staticmethod
@@ -375,23 +383,22 @@ class detector:
             return coords_reshaped[axis]
         else:
             return coords_reshaped
-
         
     def plot_detector(self,type="Intensity",scaling="linear",limits=np.array([0,1]),figsize=(8, 6)):
         import matplotlib.pyplot as plt
         import matplotlib.colors as pltcolor
         if type == "Intensity":
             plot_val = self.pixel_intensity
-            cmap = 'gist_yarg'
+            cmap = 'gist_gray'
         elif type == "Phase":
             plot_val = self.pixel_phase
             colors = ["white", "black", "white"]
             cmap=pltcolor.LinearSegmentedColormap.from_list("", colors)
         elif type == "Amplitude":
             plot_val = self.pixel_amplitude
-            cmap = 'gist_yarg'
+            cmap = 'gist_gray'
         if scaling == "log":
-            plot_val = np.log(plot_val)
+            plot_val = np.log10(plot_val)
         
         detector_extent = self._shape*self._pixel_size/2
         fig = plt.figure(figsize=figsize)
@@ -436,21 +443,21 @@ class detector:
         import matplotlib.colors as pltcolor
         if type == "Intensity":
             plot_val = self.pixel_intensity
-            cmap = 'gist_yarg'
+            cmap = 'gist_gray'
         elif type == "Phase":
             plot_val = self.pixel_phase
             colors = ["white", "black", "white"]
             cmap = pltcolor.LinearSegmentedColormap.from_list("", colors)
         elif type == "Amplitude":
             plot_val = self.pixel_amplitude
-            cmap = 'gist_yarg'
+            cmap = 'gist_gray'
         else:
             raise ValueError(f"Unknown plot type '{type}'. Choose from 'Intensity', 'Phase', or 'Amplitude'.")
         if plot_val is None:
             raise ValueError(f"Detector pixel values for '{type}' have not been initialized.")
         if scaling == "log":
             plot_val = np.where(plot_val <= 0, 1e-20, plot_val)  # avoid log(0)
-            plot_val = np.log(plot_val)
+            plot_val = np.log10(plot_val)
         coords = self.pixel_coordinates
         if coords is None:
             raise ValueError("Detector pixel coordinates are not initialized.")
@@ -505,6 +512,16 @@ class detector:
         ax1.set_ylabel("Y")
         ax1.set_zlabel("Z")
         return fig, ax1
+    
+    # Properties
+    @property
+    def center(self):
+        """
+        Returns the detector center position.
+        """
+        if self._center is None:
+            print("self._center has not been initialized yet")
+        return self._center
     
     @property
     def shape(self):
