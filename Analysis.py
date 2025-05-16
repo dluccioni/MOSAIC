@@ -124,51 +124,27 @@ class analysis:
         return fig,ax
 
     ## Main Functions
-    def distance_fft_dependance(self, sample, stage, beam, detector, distance_array, plot_prefix="Test"):
+    def distance_fft_dependance(self,sample,beam,stage,detector,distance_array,plot_prefix="Test",output_pixel_values=False,offset_list=None):
         """
-        Compute amplitude/phase summations and their FFTs at various detector
-        distances, plot them, and save all generated figures.
-
-        Parameters
-        ----------
-        sample : object
-            The sample object containing atomic position data.
-        beam : object
-            The beam object handling scattering computation.
-        detector : object
-            The detector object with pixel arrays and geometry.
-        distance_array : ndarray
-            A 1D array of distances at which to place the detector.
-        plot_prefix : str, optional
-            Prefix for the saved plot filenames. Default is "Test".
-
-        Returns
-        -------
-        X : ndarray
-            2D array of frequency mesh (from np.meshgrid).
-        Y : ndarray
-            2D array of distance mesh (from np.meshgrid).
-        Z_amp : ndarray
-            2D array of log(|FFT(Amplitude)|) for each distance/frequency.
-        Z_pha : ndarray
-            2D array of log(|FFT(Phase)|) for each distance/frequency.
-
-        Notes
-        -----
-        Each distance in distance_array is used to reposition the detector,
-        compute scattering, and then plot or save intermediate 2D images
-        (Intensity, Phase, Amplitude) and 1D line plots (real-space, FFT).
-        Finally, 3D surface plots of the combined FFT amplitude/phase are saved.
+        Computes amplitude/phase summations and their FFTs at various detector
+        distances, plots them, and saves all generated figures to self.directory.
         """
         freq_array = None
+        real_amplitude_list = []
+        real_phase_list = []
         fft_amplitude_list = []
         fft_phase_list = []
+        pixel_values_list = []
         
         for idx, d in enumerate(distance_array):
             print(f"Processing distance: {d} || {idx+1}/{distance_array.size}")
             # Move detector to new distance and compute scattering
-            detector.position_detector_absolute(d, detector.two_theta, detector.nu)
-            beam.atomic_direct_interaction(sample,detector,stage,scattering=True, scattering_params=[None], transmission=True, transmission_params=[1.7,1.0], use_gpu=True)
+            detector.position_detector_absolute(d,detector.two_theta,detector.eta)
+            beam.atomic_direct_interaction(sample,detector,stage,scattering=True, scattering_params=[None], transmission=False, transmission_params=[1.7,1.0], use_gpu=True)
+            if output_pixel_values:
+                pixel_values_list.append(detector.pixel_values)
+            if offset_list != None:
+                detector.input_pixel_values(detector.pixel_values-offset_list[idx])
             # 1) Plot Intensity
             fig_int, ax_int = detector.plot_detector(type="Intensity")
             fig_int.savefig(os.path.join(self.directory,plot_prefix + f"_Intensity_2D_Real_Distance_{d}.png"))
@@ -185,12 +161,16 @@ class analysis:
             # Summed amplitude & phase -> compute FFT
             # -------------------------------------------------------------------
             # Amplitude
-            summed_amplitude = np.sum(detector.pixel_amplitude, axis=0)
-            fft_values_amplitude = np.log(np.abs(np.fft.fft(summed_amplitude)[1:summed_amplitude.size // 2]) + 1e-6)
+            summed_amplitude = np.mean(detector.pixel_amplitude, axis=0)
+            fft_values_amplitude = np.abs(np.fft.fft(summed_amplitude)[1:summed_amplitude.size // 2])
+            # fft_values_amplitude /= np.max(fft_values_amplitude)
+            real_amplitude_list.append(summed_amplitude)
             fft_amplitude_list.append(fft_values_amplitude)
             # Phase
-            summed_phase = np.sum(detector.pixel_phase, axis=0)
-            fft_values_phase = np.log(np.abs(np.fft.fft(summed_phase)[1:summed_phase.size // 2]) + 1e-6)
+            summed_phase = np.mean(detector.pixel_phase, axis=0)
+            fft_values_phase = np.abs(np.fft.fft(summed_phase)[1:summed_phase.size // 2])
+            # fft_values_phase /= np.max(fft_values_phase)
+            real_phase_list.append(summed_phase)
             fft_phase_list.append(fft_values_phase)
             # Compute frequency array only once
             if freq_array is None:
@@ -198,8 +178,8 @@ class analysis:
             # -------------------------------------------------------------------
             # Create the line plots and save them
             # -------------------------------------------------------------------
-            x_pos = np.linspace(-detector.shape[0]*detector.pixel_size[0],
-                                detector.shape[0]*detector.pixel_size[0],
+            x_pos = np.linspace(-detector.shape[0]/2*detector.pixel_size[0],
+                                detector.shape[0]/2*detector.pixel_size[0],
                                 detector.shape[0])
             # Amplitude trace
             fig_amp_line, ax_amp_line = self.line_plot(x_pos,summed_amplitude,title=f"Amplitude Trace Plot (Distance = {d})",xlabel="Detector X (mm)",ylabel="Summed Amplitude")
@@ -220,19 +200,34 @@ class analysis:
         # -----------------------------------------------------------------------
         # After the loop, create 3D surface plots for amplitude and phase
         # -----------------------------------------------------------------------
-        Z_amp = np.array(fft_amplitude_list)
-        Z_pha = np.array(fft_phase_list)
+        Z_fft_amp = np.array(fft_amplitude_list)
+        Z_fft_pha = np.array(fft_phase_list)
+        Z_real_amp = np.array(real_amplitude_list)
+        Z_real_pha = np.array(real_phase_list)
         # Make X,Y array
-        X, Y = np.meshgrid(freq_array, distance_array)
+        X_fft, Y_fft = np.meshgrid(freq_array, distance_array)
+        detector_x = np.linspace(-detector.shape[0]/2*detector.pixel_size[0],detector.shape[0]/2*detector.pixel_size[0],detector.shape[0])
+        X_real, Y_real = np.meshgrid(detector_x, distance_array)
         # Combined Amplitude FFT Surface
-        fig_amp_surf, ax_amp_surf = self.surf_plot(X, Y, Z_amp,"Combined Amplitude FFT Surface Plot",xlabel="Frequency (1/px)",ylabel="Distance",zlabel="Log(|FFT(Amplitude)|)")
-        fig_amp_surf.savefig(os.path.join(self.directory,plot_prefix + f"_Combined_Amplitude_FFT_Surface_Distance_{d}.png"))
-        plt.close(fig_amp_surf)
+        fig_fft_amp_surf, ax_fft_amp_surf = self.surf_plot(X_fft, Y_fft, Z_fft_amp,"Combined Amplitude FFT Surface Plot",xlabel="Frequency (1/px)",ylabel="Distance",zlabel="Log(|FFT(Amplitude)|)")
+        fig_fft_amp_surf.savefig(os.path.join(self.directory,plot_prefix + f"_Combined_Amplitude_FFT_Surface.png"))
+        plt.close(fig_fft_amp_surf)
         # Combined Phase FFT Surface
-        fig_pha_surf, ax_pha_surf = self.surf_plot(X, Y, Z_pha,"Combined Phase FFT Surface Plot",xlabel="Frequency (1/px)",ylabel="Distance",zlabel="Log(|FFT(Phase)|)")
-        fig_pha_surf.savefig(os.path.join(self.directory,plot_prefix + f"Combined_Phase_FFT_Surface_Distance_{d}.png"))
-        plt.close(fig_pha_surf)
-        return X, Y, Z_amp, Z_pha
+        fig_fft_pha_surf, ax_fft_pha_surf = self.surf_plot(X_fft, Y_fft, Z_fft_pha,"Combined Phase FFT Surface Plot",xlabel="Frequency (1/px)",ylabel="Distance",zlabel="Log(|FFT(Phase)|)")
+        fig_fft_pha_surf.savefig(os.path.join(self.directory,plot_prefix + f"_Combined_Phase_FFT_Surface.png"))
+        plt.close(fig_fft_pha_surf)
+        # Combined Amplitude Real Surface
+        fig_real_amp_surf, ax_real_amp_surf = self.surf_plot(X_real, Y_real, Z_real_amp,"Combined Amplitude Real Surface Plot",xlabel="Detector X",ylabel="Distance",zlabel="Amplitude",cmap='gist_yarg',log=False)
+        fig_real_amp_surf.savefig(os.path.join(self.directory,plot_prefix + f"_Combined_Amplitude_Real_Surface.png"))
+        plt.close(fig_real_amp_surf)
+        # Combined Phase Real Surface
+        fig_real_pha_surf, ax_real_pha_surf = self.surf_plot(X_real, Y_real, Z_real_pha,"Combined Phase Real Surface Plot",xlabel="Detector X",ylabel="Distance",zlabel="Phase",cmap='gist_yarg',log=False)
+        fig_real_pha_surf.savefig(os.path.join(self.directory,plot_prefix + f"_Combined_Phase_Real_Surface.png"))
+        plt.close(fig_real_pha_surf)
+        
+        if output_pixel_values:
+            return X_fft, Y_fft, Z_fft_amp, Z_fft_pha, pixel_values_list
+        return X_fft, Y_fft, Z_fft_amp, Z_fft_pha
     
     def integrate_detector_along_axis(self,detector,data_type="Intensity",axis="x",system="cartesian",degrees=True,bins=200,aggregator="mean",plot=True,title="Integrated Detector Data",xlabel=None,ylabel="Integrated Value",figsize=(8, 6)):
         """
