@@ -166,7 +166,7 @@ class defects:
             self._fault_orientation_cp = None
         
         ## Main Functions    
-        def generate_global_positions(self,sample,crystal,plotting=False,use_gpu=False):
+        def generate_global_positions(self,sample,crystal,plotting=False,use_gpu=True):
             # Calculates the position of stacking faults
             self.rotated_fault_normal = (crystal.lattice_matrix_conventional/crystal.lattice_lengths_conventional[:,None])@self.fault_normal
             self.rotated_burgers_vector = (crystal.lattice_matrix_conventional/crystal.lattice_lengths_conventional[:,None])@self.burgers_vector
@@ -376,7 +376,7 @@ class defects:
                 sample.write_chunk_species(species_chunk_np,i+1,override_directory=self.directory)
             sample.write_sample_metadata(override_directory=self.directory)
 
-        def apply_crack_chunk(self, positions_chunk, species_chunk_np, use_gpu=False):
+        def apply_crack_chunk(self, positions_chunk, species_chunk_np, use_gpu=True):
             """
             Removes all positions inside the convex hull by checking the half-space inequalities from self.hull_equations.
             """

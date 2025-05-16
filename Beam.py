@@ -160,30 +160,31 @@ class beam:
 
         return e1.astype(np.float32), e2.astype(np.float32)
     
-    def allocate_pinned_array(shape, dtype=np.float32):
+    @staticmethod
+    def allocate_pinned_array(np_array, dtype=np.float32):
         """
-        Allocate a pinned (page-locked) CPU memory array for faster host-to-device
-        data transfers if CuPy is available. Otherwise, fallback to a regular NumPy array.
+        Allocate pinned (page-locked) host memory of the same shape as 'np_array'
+        and copy its contents.
 
-        Args:
-            shape (tuple of int): Shape of the desired array.
-            dtype (np.dtype, optional): Data type for the array. Defaults to np.float32.
-
-        Returns:
-            np.ndarray: A NumPy array allocated in pinned memory (if CuPy is available)
-            or a standard NumPy array (fallback).
+        Returns
+        -------
+        pinned_arr : np.ndarray
+            A NumPy array backed by pinned memory. Safe to pass to cp.array(...).
         """
-        if cp is None:
-            # fallback: just allocate a normal NumPy array
-            return np.zeros(shape, dtype=dtype)
-        n_elems = 1
-        for s in shape:
-            n_elems *= s
-        # allocate pinned block
-        memptr = cp.cuda.alloc_pinned_memory(int(n_elems * np.dtype(dtype).itemsize))
-        # create a NumPy array around it
-        arr = np.ndarray(shape=shape, dtype=dtype, buffer=memptr)
-        return arr
+        if dtype is None:
+            dtype = np_array.dtype
+        shape = np_array.shape
+        n_elems = np.prod(shape)
+        
+        # Allocate pinned block using CuPy
+        memptr = cp.cuda.alloc_pinned_memory(
+            n_elems * np.dtype(dtype).itemsize
+        )
+        # Build a NumPy array around that pinned memory
+        pinned_arr = np.ndarray(shape=shape, dtype=dtype, buffer=memptr)
+        # Copy data into pinned array
+        pinned_arr[...] = np_array
+        return pinned_arr
     
     @staticmethod
     def parse_f0_db_all(database_name='f0_WaasKirf.dat'):
@@ -1106,18 +1107,14 @@ class beam:
         Nx, Ny = measurement_shape
         k_val = np.float32(2.0 * np.pi / self._wavelength)
 
-        if isinstance(measurement_positions, np.ndarray):
-            measurement_positions = cp.asarray(measurement_positions, dtype=cp.float32)
-        x_coords_gpu = cp.ascontiguousarray(measurement_positions[0, :].astype(cp.float32) / 1e10)
-        y_coords_gpu = cp.ascontiguousarray(measurement_positions[1, :].astype(cp.float32) / 1e10)
-        z_coords_gpu = cp.ascontiguousarray(measurement_positions[2, :].astype(cp.float32) / 1e10)
+        x_coords = self.allocate_pinned_array(measurement_positions[0, :].astype(np.float32) / 1e10)
+        y_coords = self.allocate_pinned_array(measurement_positions[1, :].astype(np.float32) / 1e10)
+        z_coords = self.allocate_pinned_array(measurement_positions[2, :].astype(np.float32) / 1e10)
+        stage_rotation = self.allocate_pinned_array(stage.rotation)
+        stage_translation = self.allocate_pinned_array(stage.translation)
         
         chunk_total = sample.chunk_total
         print(f"[beam] Total of {chunk_total} chunk(s) to process.")
-
-        # Create Stage variables 
-        R_stage_gpu = cp.asarray(stage.rotation, dtype=cp.float32)
-        trans_stage_gpu = cp.asarray(stage.translation, dtype=cp.float32)
 
         # Divide chunk indices among GPUs
         chunks_per_gpu = chunk_total // n_gpus
@@ -1126,11 +1123,19 @@ class beam:
         # A place to store partial results
         partial_results = [None] * n_gpus
 
-        def gpu_worker(gpu_id, x_coords_gpu, y_coords_gpu, z_coords_gpu, chunk_indices, result_index):
+        def gpu_worker(gpu_id, x_coords, y_coords, z_coords, chunk_indices, result_index):
             """One thread per GPU."""
             cp.cuda.Device(gpu_id).use()
             interaction_kernel = self.build_interaction_kernel()
-
+            
+            # Create Stage variables 
+            R_stage_gpu = cp.asarray(stage_rotation, dtype=cp.float32)
+            trans_stage_gpu = cp.asarray(stage_translation, dtype=cp.float32)
+            
+            # Create detector variables
+            x_coords_gpu = cp.asarray(x_coords)
+            y_coords_gpu = cp.asarray(y_coords)
+            z_coords_gpu = cp.asarray(z_coords)
             detector_field_gpu = cp.zeros((Nx * Ny,), dtype=cp.complex64)
 
             # Use streams for concurrency on that GPU
@@ -1233,7 +1238,7 @@ class beam:
             start_chunk = end_chunk
             t = threading.Thread(target=gpu_worker,
                                  args=(gpu_id,
-                                       x_coords_gpu, y_coords_gpu, z_coords_gpu,
+                                       x_coords, y_coords, z_coords,
                                        chunk_indices, gpu_id))
             t.start()
             threads.append(t)
@@ -1528,21 +1533,13 @@ class beam:
         chunk_total = sample.chunk_total
         if chunk_total == 0:
             return np.zeros((Ny, Nx), dtype=np.complex64)
-
-        # Project pixel centers to (u,v) on GPU
-        pix_coords = detector.pixel_coordinates
-        if not isinstance(pix_coords, cp.ndarray):
-            pix_coords = cp.asarray(pix_coords, dtype=cp.float32)
-        e1_gpu = cp.asarray(e1, dtype=cp.float32)
-        e2_gpu = cp.asarray(e2, dtype=cp.float32)
-
-        px = pix_coords[0]
-        py = pix_coords[1]
-        pz = pix_coords[2]
-        pixel_u = px*e1_gpu[0] + py*e1_gpu[1] + pz*e1_gpu[2]
-        pixel_v = px*e2_gpu[0] + py*e2_gpu[1] + pz*e2_gpu[2]
-        min_u_gpu = pixel_u.min()
-        min_v_gpu = pixel_v.min()
+        
+        # Convert or ensure pixel coordinates are pinned
+        pix_coords = self.allocate_pinned_array(detector.pixel_coordinates)
+        e1 = self.allocate_pinned_array(e1)
+        e2 = self.allocate_pinned_array(e2)
+        stage_rotation = self.allocate_pinned_array(stage.rotation)
+        stage_translation = self.allocate_pinned_array(stage.translation)
 
         # Build GPU Gaussian kernel
         def _make_gaussian_kernel_gpu(radius):
@@ -1574,10 +1571,6 @@ class beam:
         db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
         f0_zero_dict     = self._build_f0_zero_dict(db_dict_f0_all)
 
-        # stage transforms on GPU
-        R_stage_gpu     = cp.asarray(stage.rotation, dtype=cp.float32)
-        trans_stage_gpu = cp.asarray(stage.translation, dtype=cp.float32)
-
         radius = atomic_radius
         offsets_cpu = np.array([
             [-radius*np.sqrt(2), -radius*np.sqrt(2)],
@@ -1590,9 +1583,7 @@ class beam:
             [+radius,  0.0],
             [+radius*np.sqrt(2), +radius*np.sqrt(2)]
         ], dtype=np.float32)
-        offsets_gpu = cp.asarray(offsets_cpu)
-        oy_gpu = offsets_gpu[:,0]
-        oz_gpu = offsets_gpu[:,1]
+        offsets_cpu = self.allocate_pinned_array(offsets_cpu)
 
         partial_results = [None] * n_gpus
         chunks_per_gpu = chunk_total // n_gpus
@@ -1600,8 +1591,29 @@ class beam:
 
         def gpu_worker(gpu_id, chunk_indices, out_idx):
             cp.cuda.Device(gpu_id).use()
+            
+            offsets_gpu = cp.asarray(offsets_cpu)
+            oy_gpu = offsets_gpu[:, 0]
+            oz_gpu = offsets_gpu[:, 1]
             out_r = cp.zeros((Ny, Nx), dtype=cp.float32)
             out_i = cp.zeros((Ny, Nx), dtype=cp.float32)
+            
+            # Convert e1, e2, stage transforms to GPU arrays
+            e1_gpu = cp.asarray(e1, dtype=cp.float32)
+            e2_gpu = cp.asarray(e2, dtype=cp.float32)
+            R_stage_gpu = cp.asarray(stage_rotation, dtype=cp.float32)
+            trans_stage_gpu = cp.asarray(stage_translation, dtype=cp.float32)
+
+            # Project pixel centers onto (u,v) basis
+            px = cp.asarray(pix_coords[0])
+            py = cp.asarray(pix_coords[1])
+            pz = cp.asarray(pix_coords[2])
+            pixel_u = px*e1_gpu[0] + py*e1_gpu[1] + pz*e1_gpu[2]
+            pixel_v = px*e2_gpu[0] + py*e2_gpu[1] + pz*e2_gpu[2]
+
+            # Compute min_u and min_v on GPU
+            min_u_gpu = pixel_u.min()
+            min_v_gpu = pixel_v.min()
 
             for cid in chunk_indices:
                 pos_cpu = sample.load_chunk_positions(cid, use_gpu=False)
@@ -1708,22 +1720,24 @@ class beam:
         for t in threads:
             t.join()
 
-        # Sum partial on device 0
-        cp.cuda.Device(0).use()
-        final_r_gpu = cp.zeros((Ny, Nx), dtype=cp.float32)
-        final_i_gpu = cp.zeros((Ny, Nx), dtype=cp.float32)
+        # Sum partials
+        final_real = np.zeros((Ny, Nx), dtype=np.float32)
+        final_imag = np.zeros((Ny, Nx), dtype=np.float32)
         for pr in partial_results:
             if pr is not None:
-                r_gpu, i_gpu = pr
-                final_r_gpu += r_gpu
-                final_i_gpu += i_gpu
+                real, imag = pr
+                final_real += real.get()
+                final_imag += imag.get()
 
         # Convolve
+        cp.cuda.Device(0).use()
+        final_real_gpu = cp.asarray(final_real)
+        final_imag_gpu = cp.asarray(final_imag)
         kernel_gpu = _make_gaussian_kernel_gpu(kernel_radius)
-        final_r_gpu = _fft_convolve2d_gpu(final_r_gpu, kernel_gpu)
-        final_i_gpu = _fft_convolve2d_gpu(final_i_gpu, kernel_gpu)
+        final_real_gpu = _fft_convolve2d_gpu(final_real_gpu, kernel_gpu)
+        final_imag_gpu = _fft_convolve2d_gpu(final_imag_gpu, kernel_gpu)
 
-        out_gpu = final_r_gpu + 1j*final_i_gpu
+        out_gpu = final_real_gpu + 1j*final_imag_gpu
         return out_gpu.astype(cp.complex64)
     
     def atomic_transmission(self, sample, detector, stage, use_gpu=True, atomic_radius=1.7, kernel_radius=0):

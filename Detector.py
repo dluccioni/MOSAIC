@@ -36,7 +36,7 @@ class detector:
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
         
-    def create_detector(self, shape, pixel_size, geometry='rectangular', use_gpu=True):
+    def create_detector(self, shape, pixel_size, geometry='rectangular'):
         """
         Create detector pixels in either a rectangular or ring geometry on the YZ-plane.
 
@@ -50,8 +50,6 @@ class detector:
             or (dTwoTheta, dEta) for ring).
         geometry : str
             'rectangular' (default) or 'ring'.
-        use_gpu : bool
-            Whether to use cupy (GPU) if available.
         """
         self._shape = shape
         self._pixel_size = pixel_size
@@ -62,26 +60,15 @@ class detector:
         self._distance = 0
         self._geometry = geometry.lower()
         if geometry.lower() == 'rectangular':
-            if cp is None or not use_gpu:
-                y_lin = np.linspace(-(self.shape[0]/2)*self.pixel_size[0],
-                                    +(self.shape[0]/2)*self.pixel_size[0],
-                                    self.shape[0], dtype=np.float32)
-                z_lin = np.linspace(-(self.shape[1]/2)*self.pixel_size[1],
-                                    +(self.shape[1]/2)*self.pixel_size[1],
-                                    self.shape[1], dtype=np.float32)
-                Y, Z = np.meshgrid(y_lin, z_lin)
-                X = np.full_like(Y, 0)
-                self._pixel_coordinates = np.vstack((X.ravel(), Y.ravel(), Z.ravel()))
-            else:
-                y_lin = cp.linspace(-(self.shape[0]/2)*self.pixel_size[0],
-                                    +(self.shape[0]/2)*self.pixel_size[0],
-                                    self.shape[0], dtype=cp.float32)
-                z_lin = cp.linspace(-(self.shape[1]/2)*self.pixel_size[1],
-                                    +(self.shape[1]/2)*self.pixel_size[1],
-                                    self.shape[1], dtype=cp.float32)
-                Y, Z = cp.meshgrid(y_lin, z_lin)
-                X = cp.full_like(Y, 0)
-                self._pixel_coordinates = cp.vstack((X.ravel(), Y.ravel(), Z.ravel()))
+            y_lin = np.linspace(-(self.shape[0]/2)*self.pixel_size[0],
+                                +(self.shape[0]/2)*self.pixel_size[0],
+                                self.shape[0], dtype=np.float32)
+            z_lin = np.linspace(-(self.shape[1]/2)*self.pixel_size[1],
+                                +(self.shape[1]/2)*self.pixel_size[1],
+                                self.shape[1], dtype=np.float32)
+            Y, Z = np.meshgrid(y_lin, z_lin)
+            X = np.full_like(Y, 0)
+            self._pixel_coordinates = np.vstack((X.ravel(), Y.ravel(), Z.ravel()))
         elif geometry.lower() == 'ring':
             # Inner radius so that circumference matches (Neta * pixel_size_eta)
             r_in = (self.shape[1] * self.pixel_size[1]) / (2 * np.pi)
@@ -89,27 +76,15 @@ class detector:
             r_out = r_in + self.shape[0] * self.pixel_size[0]
             # shape[0] = number of pixels in two_theta direction
             # shape[1] = number of pixels in eta direction
-            if cp is None or not use_gpu:
-                i_lin = np.arange(self.shape[0], dtype=np.float32)
-                j_lin = np.arange(self.shape[1], dtype=np.float32)
-                r_lin = r_in + (i_lin + 0.5) * self.pixel_size[0]
-                phi_lin = 2.0 * np.pi * (j_lin + 0.5) / self.shape[1]
-                PHI, R = np.meshgrid(phi_lin, r_lin, indexing='xy')
-                Y = R * np.cos(PHI)
-                Z = R * np.sin(PHI)
-                X = np.zeros_like(Y)
-                self._pixel_coordinates = np.vstack((X.ravel(), Y.ravel(), Z.ravel()))
-
-            else:
-                i_lin = cp.arange(self.shape[0], dtype=cp.float32)
-                j_lin = cp.arange(self.shape[1], dtype=cp.float32)
-                r_lin = r_in + (i_lin + 0.5) * self.pixel_size[0]
-                phi_lin = 2.0 * cp.pi * (j_lin + 0.5) / self.shape[1]
-                PHI, R = cp.meshgrid(phi_lin, r_lin, indexing='xy')
-                Y = R * cp.cos(PHI)
-                Z = R * cp.sin(PHI)
-                X = cp.zeros_like(Y)
-                self._pixel_coordinates = cp.vstack((X.ravel(), Y.ravel(), Z.ravel()))
+            i_lin = np.arange(self.shape[0], dtype=np.float32)
+            j_lin = np.arange(self.shape[1], dtype=np.float32)
+            r_lin = r_in + (i_lin + 0.5) * self.pixel_size[0]
+            phi_lin = 2.0 * np.pi * (j_lin + 0.5) / self.shape[1]
+            PHI, R = np.meshgrid(phi_lin, r_lin, indexing='xy')
+            Y = R * np.cos(PHI)
+            Z = R * np.sin(PHI)
+            X = np.zeros_like(Y)
+            self._pixel_coordinates = np.vstack((X.ravel(), Y.ravel(), Z.ravel()))
         else:
             raise ValueError(f"Unknown geometry '{geometry}'. Choose 'rectangular' or 'ring'.")
         
@@ -203,7 +178,7 @@ class detector:
             outfile = os.path.join(self.directory, filename)
         np.save(outfile, pxvals) 
         
-    def read_Efield_values(self, internal=True, filename="Efield_values.npy", override_directory=None, use_gpu=True):
+    def read_Efield_values(self, internal=True, filename="Efield_values.npy", override_directory=None):
         """
         Loads the detector's complex pixel values from a .npy file and assigns them
         to self._pixel_values.
@@ -214,8 +189,6 @@ class detector:
             Name of the .npy file to load. Default: "Efield_values.npy"
         override_directory : str, optional
             If provided, loads from this directory instead of self.directory.
-         use_gpu : bool, optional
-            If True, loads to GPU memory.
         """
         if override_directory is not None:
             infile = os.path.join(override_directory, filename)
@@ -223,10 +196,7 @@ class detector:
             infile = os.path.join(self.directory, filename)
         if not os.path.isfile(infile):
             raise FileNotFoundError(f"No .npy file found at {infile}")
-        if use_gpu == True:
-            loaded_values = cp.load(infile)
-        else:
-            loaded_values = np.load(infile)
+        loaded_values = np.load(infile)
         if internal == True:
             self.input_pixel_values(loaded_values)
             print(f"Detector pixel values loaded from {infile}.")
@@ -252,7 +222,7 @@ class detector:
                          [d*z*x - y*s,   d*z*y + x*s,   c + d*z*z]])
         
     ## Main Functions     
-    def position_detector_relative(self, distance, two_theta, eta, degrees=True, use_gpu=True):
+    def position_detector_relative(self, distance, two_theta, eta, degrees=True):
         if degrees:
             two_theta = np.deg2rad(two_theta)
             eta = np.deg2rad(eta)
@@ -266,14 +236,10 @@ class detector:
             np.sin(self._two_theta) * np.sin(self._eta),
             np.sin(self._two_theta) * np.cos(self._eta)
         ])
-        if cp is None or not use_gpu:
-            self._pixel_coordinates = detector_rotation_np @ self._pixel_coordinates + self._center[:, None]
-        else:
-            detector_rotation_cp = cp.asarray(detector_rotation_np)
-            self._pixel_coordinates = detector_rotation_cp @ self._pixel_coordinates + cp.asarray(self._center[:, None])
+        self._pixel_coordinates = detector_rotation_np @ self._pixel_coordinates + self._center[:, None]
         
-    def position_detector_absolute(self, distance, two_theta, eta, degrees=True, use_gpu=True):
-        self.create_detector(self.shape, self.pixel_size, use_gpu=use_gpu)
+    def position_detector_absolute(self, distance, two_theta, eta, degrees=True):
+        self.create_detector(self.shape, self.pixel_size)
         if degrees:
             two_theta = np.deg2rad(two_theta)
             eta = np.deg2rad(eta)
@@ -287,11 +253,7 @@ class detector:
             np.sin(self._two_theta) * np.sin(self._eta),
             np.sin(self._two_theta) * np.cos(self._eta)
         ])
-        if cp is None or not use_gpu:
-            self._pixel_coordinates = detector_rotation_np @ self._pixel_coordinates + self._center[:, None]
-        else:
-            detector_rotation_cp = cp.asarray(detector_rotation_np)
-            self._pixel_coordinates = detector_rotation_cp @ self._pixel_coordinates + cp.asarray(self._center[:, None])
+        self._pixel_coordinates = detector_rotation_np @ self._pixel_coordinates + self._center[:, None]
         
     def get_rotation_detector(self, two_theta, eta):
         """
@@ -416,7 +378,7 @@ class detector:
         # fig.show()
         return fig, ax1
     
-    def plot_detector_angles(self, type="Intensity", scaling="linear", degrees=True, figsize=(8, 6), use_gpu=True):
+    def plot_detector_angles(self, type="Intensity", scaling="linear", degrees=True, figsize=(8, 6)):
         """
         Compute and plot each pixel's value in diffraction-angle coordinates:
         - x-axis: eta
@@ -430,9 +392,6 @@ class detector:
             Either "linear" or "log" scaling.
         degrees : bool
             If True, angles are plotted in degrees; if False, in radians.
-        use_gpu : bool
-            If True and cupy is available, then `self.pixel_coordinates` is on GPU
-            memory; we must bring it to CPU to plot.
         
         Returns
         -------
@@ -461,8 +420,6 @@ class detector:
         coords = self.pixel_coordinates
         if coords is None:
             raise ValueError("Detector pixel coordinates are not initialized.")
-        if cp is not None and use_gpu and isinstance(coords, cp.ndarray):
-            coords = coords.get()
         x = coords[0]
         y = coords[1]
         z = coords[2]
