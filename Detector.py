@@ -227,7 +227,7 @@ class detector:
             two_theta = np.deg2rad(two_theta)
             eta = np.deg2rad(eta)
         self._two_theta += two_theta
-        self._eta        += eta
+        self._eta += eta
         self._distance  += distance
         detector_rotation_np = self.get_rotation_detector(two_theta, eta)
         self._direction = detector_rotation_np @ self._direction
@@ -244,7 +244,7 @@ class detector:
             two_theta = np.deg2rad(two_theta)
             eta = np.deg2rad(eta)
         self._two_theta = two_theta
-        self._eta        = eta
+        self._eta = eta
         self._distance  = distance
         detector_rotation_np = self.get_rotation_detector(self._two_theta, self._eta)
         self._direction = detector_rotation_np @ self._direction
@@ -297,8 +297,11 @@ class detector:
         if input_system == output_system:
             return data
         elif output_system == "cartesian":
-            two_theta_pixels = data[0]
-            eta_pixels = data[1]
+            if units == "deg":
+                data[0] = np.deg2rad(data[0])
+                data[1] = np.deg2rad(data[1])
+            eta_pixels = data[0]
+            two_theta_pixels = data[1]
             distance = data[2]
             x = distance * np.cos(two_theta_pixels)
             y = distance * np.sin(two_theta_pixels) * np.sin(eta_pixels)
@@ -346,19 +349,19 @@ class detector:
         else:
             return coords_reshaped
         
-    def plot_detector(self,type="Intensity",scaling="linear",limits=np.array([0,1]),figsize=(8, 6)):
+    def plot_detector(self,type="Intensity",title=None,scaling="linear",limits=np.array([0,1]),figsize=(8, 6), cmap="gist_gray"):
         import matplotlib.pyplot as plt
         import matplotlib.colors as pltcolor
         if type == "Intensity":
             plot_val = self.pixel_intensity
-            cmap = 'gist_gray'
+            cmap = cmap
         elif type == "Phase":
             plot_val = self.pixel_phase
             colors = ["white", "black", "white"]
             cmap=pltcolor.LinearSegmentedColormap.from_list("", colors)
         elif type == "Amplitude":
             plot_val = self.pixel_amplitude
-            cmap = 'gist_gray'
+            cmap = cmap
         if scaling == "log":
             plot_val = np.log10(plot_val)
         
@@ -372,81 +375,108 @@ class detector:
         )
         ax1.set_xlabel("X")
         ax1.set_ylabel("Y")
-        ax1.set_title(type)
+        if title is None:
+            ax1.set_title(type)
+        else:
+            ax1.set_title(title)
         ax1.axis('scaled')
         fig.colorbar(im, ax=ax1)
         # fig.show()
         return fig, ax1
     
-    def plot_detector_angles(self, type="Intensity", scaling="linear", degrees=True, figsize=(8, 6)):
+    def plot_detector_angles(self,type="Intensity",title=None,scaling="linear",degrees=True,figsize=(8, 6),cmap="gist_gray",vmin=None,vmax=None,xlim=None,ylim=None,marker_size=2):
         """
-        Compute and plot each pixel's value in diffraction-angle coordinates:
-        - x-axis: eta
-        - y-axis: two_theta
-        
+        Compute and plot each pixel's value in diffraction‑angle coordinates
+        (η on x‑axis, 2θ on y‑axis).
+
         Parameters
         ----------
-        type : str
-            Quantity to plot: "Intensity", "Phase", or "Amplitude".
-        scaling : str
-            Either "linear" or "log" scaling.
+        type : {"Intensity", "Phase", "Amplitude"}
+            Quantity to plot.
+        scaling : {"linear", "log"}
+            Apply linear or log10 scaling to the plotted values.
         degrees : bool
-            If True, angles are plotted in degrees; if False, in radians.
-        
+            If True, angles are shown in degrees; otherwise in radians.
+        figsize : tuple
+            Size of the matplotlib figure.
+        cmap : str or matplotlib colormap
+            Colormap used for the scatter plot.
+        vmin, vmax : float or None
+            Lower and upper limits for the colourbar.  If left as None the
+            limits are determined automatically (default matplotlib behaviour).
+
         Returns
         -------
         fig : matplotlib.figure.Figure
-        ax  : matplotlib.axes._subplots.Axes3DSubplot (or 2D Axes)
+        ax  : matplotlib.axes.Axes
         """
         import matplotlib.pyplot as plt
         import matplotlib.colors as pltcolor
+
+        # ----- choose data and colormap -------------------------------------------------
         if type == "Intensity":
             plot_val = self.pixel_intensity
-            cmap = 'gist_gray'
         elif type == "Phase":
             plot_val = self.pixel_phase
-            colors = ["white", "black", "white"]
-            cmap = pltcolor.LinearSegmentedColormap.from_list("", colors)
+            cmap = pltcolor.LinearSegmentedColormap.from_list("", ["white", "black", "white"])
         elif type == "Amplitude":
             plot_val = self.pixel_amplitude
-            cmap = 'gist_gray'
         else:
-            raise ValueError(f"Unknown plot type '{type}'. Choose from 'Intensity', 'Phase', or 'Amplitude'.")
+            raise ValueError("Unknown plot type {!r}. Choose from 'Intensity', 'Phase', or 'Amplitude'.".format(type))
+
         if plot_val is None:
             raise ValueError(f"Detector pixel values for '{type}' have not been initialized.")
+
+        # ----- optional log scaling -----------------------------------------------------
         if scaling == "log":
             plot_val = np.where(plot_val <= 0, 1e-20, plot_val)  # avoid log(0)
             plot_val = np.log10(plot_val)
+
+        # ----- convert detector coordinates to angles -----------------------------------
         coords = self.pixel_coordinates
         if coords is None:
             raise ValueError("Detector pixel coordinates are not initialized.")
-        x = coords[0]
-        y = coords[1]
-        z = coords[2]
+
+        x, y, z = coords
         two_theta_pixels = np.arctan2(np.sqrt(y**2 + z**2), x)
-        eta_pixels = np.arctan2(y, z) 
+        eta_pixels       = np.arctan2(y, z)
+
         if degrees:
             two_theta_pixels = np.degrees(two_theta_pixels)
-            eta_pixels        = np.degrees(eta_pixels)
-            
+            eta_pixels       = np.degrees(eta_pixels)
+
+        # ----- plotting -----------------------------------------------------------------
         fig, ax = plt.subplots(figsize=figsize)
         sc = ax.scatter(
             eta_pixels,
             two_theta_pixels,
             c=plot_val.ravel(),
-            s=2,
+            s=marker_size,
             cmap=cmap,
-            marker='.'
+            marker='.',
+            vmin=vmin,
+            vmax=vmax
         )
-        cbar = plt.colorbar(sc, ax=ax)
+
+        # colourbar adopts the same limits automatically
+        cbar = fig.colorbar(sc, ax=ax)
+        cbar.set_label(type)
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        if ylim is not None:
+            ax.set_ylim(ylim)
+
         ax.set_xlabel(r"$\eta$" + (" (deg)" if degrees else " (rad)"))
         ax.set_ylabel(r"$2\theta$" + (" (deg)" if degrees else " (rad)"))
-        cbar.set_label(type)
-        ax.set_title(type)
-        ax.axis('scaled')
+        if title is None:
+            ax.set_title(type)
+        else:
+            ax.set_title(title)
+        # ax.axis('scaled')
+
         return fig, ax
 
-    def plot_detector_position(self,elev=0,azim=90,figsize=(8, 8)):
+    def plot_detector_position(self,elev=0,azim=90,figsize=(8, 8),title="Detector Position"):
         import matplotlib.pyplot as plt
         fig = plt.figure(figsize=figsize)
         ax1 = fig.add_subplot(1, 1, 1, projection='3d')
@@ -457,9 +487,9 @@ class detector:
                 c='r', marker='o'
             )
         ax1.scatter(
-                self.pixel_coordinates[0, :].get(),
-                self.pixel_coordinates[1, :].get(),
-                self.pixel_coordinates[2, :].get(),
+                self.pixel_coordinates[0, :],
+                self.pixel_coordinates[1, :],
+                self.pixel_coordinates[2, :],
                 c='b', marker='.'
             )
         ax1.view_init(elev=elev, azim=azim)
@@ -468,6 +498,7 @@ class detector:
         ax1.set_xlabel("X")
         ax1.set_ylabel("Y")
         ax1.set_zlabel("Z")
+        ax1.set_title(title)
         return fig, ax1
     
     # Properties
