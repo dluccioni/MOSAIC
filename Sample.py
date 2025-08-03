@@ -40,7 +40,7 @@ class sample:
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
             
-    def create_sample(self, dimensions, offset=[0,0,0], chunk_volume=(600*600*600)):
+    def create_sample(self, dimensions, offset=[0,0,0], chunk_volume=12500000):
         self._dimensions = np.array(dimensions, dtype=np.float32)
         self._offset = np.array(offset, dtype=np.float32)
         self._rotation = np.eye(3, dtype=np.float32)
@@ -146,11 +146,57 @@ class sample:
     
     # -------------------------------------
     # KNN search
+    def write_chunk_nn_indices(self, index_list, chunk_num, override_directory=None):
+        """
+        Write a ragged list of neighbor indices for each atom in a chunk.
+
+        Parameters
+        ----------
+        index_list : list of 1D arrays
+            index_list[i] has shape (num_neighbors_i,) storing integer neighbor indices for atom i.
+        chunk_num : int
+            The chunk number to write.
+        override_directory : str, optional
+            If provided, write to this directory instead of self.directory.
+        """
+        base_name = "nearest_neighbors_indices"
+        filename = f"{base_name}_{chunk_num}.npz"
+        if override_directory is not None:
+            save_path = os.path.join(override_directory, filename)
+        else:
+            save_path = os.path.join(self.directory, filename)
+
+        # Number of atoms = number of sub-arrays
+        n_atoms = len(index_list)
+
+        # (1) Compute lengths of each sub-array
+        lengths = [arr.size for arr in index_list]
+        # (2) Offsets array: size n_atoms + 1, with a cumsum
+        offsets = np.zeros(n_atoms + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(lengths)
+
+        # (3) Concatenate all the sub-arrays in a single pass
+        if n_atoms > 0:
+            flat_idx = np.concatenate(index_list)
+        else:
+            # Handle empty case
+            flat_idx = np.zeros(0, dtype=np.int32)
+
+        # (4) Write to NPZ
+        np.savez(save_path, flat_idx=flat_idx, offsets=offsets)
+        
     def write_chunk_nn_phase(self, phase_list, chunk_num, override_directory=None):
         """
-        Similar to write_chunk_nn_distances but for the 'phase' ragged data.
-        'phase_list' is a list of np.ndarray(float32), one array per atom.
-        Each array has shape (num_neighbors,) containing the phases for that atom.
+        Write a ragged list of float phases for each atom in a chunk.
+
+        Parameters
+        ----------
+        phase_list : list of 1D np.ndarray(float32)
+            phase_list[i] has shape (num_neighbors_i,) containing the phases for that atom.
+        chunk_num : int
+            The chunk number to write.
+        override_directory : str, optional
+            If provided, write to this directory instead of self.directory.
         """
         base_name = "nearest_neighbors_phase"
         filename = f"{base_name}_{chunk_num}.npz"
@@ -158,28 +204,32 @@ class sample:
             save_path = os.path.join(override_directory, filename)
         else:
             save_path = os.path.join(self.directory, filename)
-        
-        n_atoms = len(phase_list)
-        offsets = np.zeros(n_atoms + 1, dtype=np.int64)
-        total_size = 0
-        for i, arr in enumerate(phase_list):
-            length_i = arr.size
-            total_size += length_i
-            offsets[i+1] = total_size
 
-        flat_phase = np.zeros(total_size, dtype=np.float32)
-        for i, arr in enumerate(phase_list):
-            start = offsets[i]
-            end   = offsets[i+1]
-            flat_phase[start:end] = arr
-        
+        n_atoms = len(phase_list)
+        lengths = [arr.size for arr in phase_list]
+        offsets = np.zeros(n_atoms + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(lengths)
+
+        if n_atoms > 0:
+            flat_phase = np.concatenate(phase_list)
+        else:
+            flat_phase = np.zeros(0, dtype=np.float32)
+
         np.savez(save_path, flat_phase=flat_phase, offsets=offsets)
-        
+
     def write_chunk_nn_scatter(self, scatter_list, chunk_num, override_directory=None):
         """
-        Write a ragged list of complex scattering factors. We'll store
-        two parallel float arrays: 'flat_real' and 'flat_imag', plus 'offsets'.
-        scatter_list is a list of arrays of shape (N_neighbors, 2), storing [real, imag].
+        Write a ragged list of wavevectors (kx, ky, kz) for each atom in a chunk.
+        Each element in scatter_list is an array of shape (N_neighbors_i, 3).
+
+        Parameters
+        ----------
+        scatter_list : list of arrays
+            scatter_list[i] has shape (N_neighbors_i, 3), storing [kx, ky, kz].
+        chunk_num : int
+            The chunk number to write.
+        override_directory : str, optional
+            If provided, write to this directory instead of self.directory.
         """
         base_name = "nearest_neighbors_scatter"
         filename = f"{base_name}_{chunk_num}.npz"
@@ -189,77 +239,122 @@ class sample:
             save_path = os.path.join(self.directory, filename)
 
         n_atoms = len(scatter_list)
+        # Each element in scatter_list has shape (num_neighbors_i, 3)
+        lengths = [arr.shape[0] for arr in scatter_list]  # neighbors per atom
         offsets = np.zeros(n_atoms + 1, dtype=np.int64)
-        total_size = 0
-        for i, arr2d in enumerate(scatter_list):
-            length_i = arr2d.shape[0]  # number of neighbors
-            total_size += length_i
-            offsets[i+1] = total_size
+        offsets[1:] = np.cumsum(lengths)
 
-        flat_real = np.zeros(total_size, dtype=np.float32)
-        flat_imag = np.zeros(total_size, dtype=np.float32)
-        idx_cursor = 0
-        for arr2d in scatter_list:
-            length_i = arr2d.shape[0]
-            if length_i > 0:
-                # arr2d[:, 0] = real parts, arr2d[:, 1] = imag parts
-                flat_real[idx_cursor : idx_cursor+length_i] = arr2d[:, 0]
-                flat_imag[idx_cursor : idx_cursor+length_i] = arr2d[:, 1]
-            idx_cursor += length_i
+        if n_atoms > 0:
+            # Flatten kx, ky, kz parts
+            flat_kx = np.concatenate([arr[:, 0] for arr in scatter_list])
+            flat_ky = np.concatenate([arr[:, 1] for arr in scatter_list])
+            flat_kz = np.concatenate([arr[:, 2] for arr in scatter_list])
+        else:
+            flat_kx = np.zeros(0, dtype=np.float32)
+            flat_ky = np.zeros(0, dtype=np.float32)
+            flat_kz = np.zeros(0, dtype=np.float32)
 
-        np.savez(save_path, flat_real=flat_real, flat_imag=flat_imag, offsets=offsets)
+        # Save to NPZ
+        np.savez(save_path, flat_kx=flat_kx, flat_ky=flat_ky, flat_kz=flat_kz, offsets=offsets)
         
-    def load_chunk_nn_phase(self, chunk_num, use_gpu=True):
+    def write_chunk_nn_species(self, species_list, chunk_num, override_directory=None):
         """
-        Load the ragged nearest-neighbor 'phase' arrays for each atom in a chunk.
-        
-        If use_gpu=True and cupy is installed, each sub-array in the list 
-        will be a cp.ndarray. Otherwise, they will be np.ndarray.
+        Write a ragged list of neighbor species for each atom in a chunk.
 
-        Returns
-        -------
-        phase_list : list of 1D arrays
-            phase_list[i] has shape (num_neighbors_i,) for atom i.
+        This mirrors the pattern used by write_chunk_nn_phase / write_chunk_nn_scatter:
+        we flatten the species arrays into a single array and store an offsets array.
+
+        Parameters
+        ----------
+        species_list : list of 1D arrays (could be string dtype, int dtype, etc.)
+            species_list[i] has shape (num_neighbors_i,) storing the species of each neighbor
+            for atom i. The dtype can be anything numpy supports (str, int, object), but note
+            that some dtypes (e.g., object) may be less portable than numeric or fixed-length
+            string arrays.
+        chunk_num : int
+            The chunk number to write.
+        override_directory : str, optional
+            If provided, write to this directory instead of self.directory.
+        """
+        base_name = "nearest_neighbors_species"
+        filename = f"{base_name}_{chunk_num}.npz"
+        if override_directory is not None:
+            save_path = os.path.join(override_directory, filename)
+        else:
+            save_path = os.path.join(self.directory, filename)
+
+        n_atoms = len(species_list)
+        lengths = [arr.size for arr in species_list]
+        offsets = np.zeros(n_atoms + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(lengths)
+
+        # Concatenate all sub-arrays
+        if n_atoms > 0:
+            # Make sure they can be concatenated.  If they are strings or mixed types,
+            # you might want to ensure they share a compatible dtype.  We'll assume so:
+            flat_species = np.concatenate(species_list)
+        else:
+            # Handle empty case
+            flat_species = np.array([], dtype=species_list[0].dtype if n_atoms>0 else np.int32)
+
+        # Save to NPZ
+        np.savez(save_path, flat_species=flat_species, offsets=offsets)
+        
+    def load_chunk_nn_indices(self, chunk_num):
+        """
+        Load the flat nearest-neighbor index array and offsets for a chunk.
+        Returns (flat_idx, offsets).
+        """
+        base_name = "nearest_neighbors_indices"
+        filename = f"{base_name}_{chunk_num}.npz"
+        full_path = os.path.join(self.directory, filename)
+        if not os.path.isfile(full_path):
+            raise FileNotFoundError(f"NN indices file not found: {full_path}")
+
+        with np.load(full_path) as data:
+            flat_idx = data['flat_idx']  # shape (total_size,)
+            offsets = data['offsets']    # shape (n_atoms+1,)
+
+        return flat_idx, offsets
+
+
+    def load_chunk_nn_phase(self, chunk_num):
+        """
+        Load the flat nearest-neighbor phase array and offsets for a chunk.
+        Returns (flat_phase, offsets).
         """
         base_name = "nearest_neighbors_phase"
         filename = f"{base_name}_{chunk_num}.npz"
         full_path = os.path.join(self.directory, filename)
         if not os.path.isfile(full_path):
             raise FileNotFoundError(f"NN phase file not found: {full_path}")
-        
+
         with np.load(full_path) as data:
             flat_phase = data['flat_phase']  # shape (total_size,)
             offsets = data['offsets']        # shape (n_atoms+1,)
 
-        n_atoms = offsets.size - 1
-        phase_list = []
-        for i in range(n_atoms):
-            start = offsets[i]
-            end = offsets[i+1]
-            # Each sub-array is 1D (num_neighbors,)
-            sub_arr = flat_phase[start:end]
-            phase_list.append(sub_arr)
+        return flat_phase, offsets
 
-        if use_gpu and (cp is not None):
-            # Convert each sub-array to cp.ndarray
-            phase_list = [cp.asarray(arr) for arr in phase_list]
-
-        return phase_list
-    
-    def load_chunk_nn_scatter(self, chunk_num, use_gpu=True):
+    def load_chunk_nn_scatter(self, chunk_num):
         """
-        Load the ragged nearest-neighbor scattering arrays for each atom in a chunk.
-        The stored file has 'flat_real', 'flat_imag', and 'offsets'. We reconstruct
-        one 2D array [N_neighbors, 2] per atom, with [:,0] = real parts, [:,1] = imag parts.
-        
-        If use_gpu=True and cupy is installed, each sub-array in the list 
-        will be a cp.ndarray. Otherwise, they will be np.ndarray.
+        Load the flat nearest-neighbor wavevector arrays and offsets for a chunk.
+        Now stores kx, ky, kz in separate arrays.
+
+        Parameters
+        ----------
+        chunk_num : int
+            The chunk number to load.
 
         Returns
         -------
-        scatter_list : list of 2D arrays
-            scatter_list[i] has shape (num_neighbors_i, 2). 
-            The second dimension holds [real, imag] scattering factors.
+        flat_kx : np.ndarray
+            Concatenated kx values for all atoms' neighbors.
+        flat_ky : np.ndarray
+            Concatenated ky values for all atoms' neighbors.
+        flat_kz : np.ndarray
+            Concatenated kz values for all atoms' neighbors.
+        offsets : np.ndarray
+            The offsets array of shape (n_atoms+1,).
         """
         base_name = "nearest_neighbors_scatter"
         filename = f"{base_name}_{chunk_num}.npz"
@@ -268,27 +363,50 @@ class sample:
             raise FileNotFoundError(f"NN scatter file not found: {full_path}")
 
         with np.load(full_path) as data:
-            flat_real = data['flat_real']  # shape (total_size,)
-            flat_imag = data['flat_imag']  # shape (total_size,)
-            offsets = data['offsets']      # shape (n_atoms+1,)
+            flat_kx = data['flat_kx']
+            flat_ky = data['flat_ky']
+            flat_kz = data['flat_kz']
+            offsets = data['offsets']
 
-        n_atoms = offsets.size - 1
-        scatter_list = []
-        for i in range(n_atoms):
-            start = offsets[i]
-            end = offsets[i+1]
-            length_i = end - start
-            # Rebuild shape (length_i, 2): [:,0]=real, [:,1]=imag
-            sub_arr = np.zeros((length_i, 2), dtype=np.float32)
-            sub_arr[:, 0] = flat_real[start:end]
-            sub_arr[:, 1] = flat_imag[start:end]
-            scatter_list.append(sub_arr)
+        return flat_kx, flat_ky, flat_kz, offsets
+    
+    def load_chunk_nn_species(self, chunk_num):
+        """
+        Load the flat nearest-neighbor species array and offsets for a chunk.
+        Returns (flat_species, offsets).
 
-        if use_gpu and (cp is not None):
-            # Convert each sub-array to cp.ndarray
-            scatter_list = [cp.asarray(arr) for arr in scatter_list]
+        You can reconstruct the ragged species_list by something like:
 
-        return scatter_list
+            (flat_spc, offsets) = load_chunk_nn_species(...)
+            species_list = []
+            for i in range(offsets.size - 1):
+                start = offsets[i]
+                end   = offsets[i+1]
+                species_list.append(flat_spc[start:end])
+
+        Parameters
+        ----------
+        chunk_num : int
+            Which chunk to load.
+
+        Returns
+        -------
+        flat_species : np.ndarray
+            The concatenated neighbor species for all atoms in this chunk.
+        offsets : np.ndarray, shape (n_atoms+1,)
+            offsets[i] is the start index of the i-th atom's neighbor-species in flat_species.
+        """
+        base_name = "nearest_neighbors_species"
+        filename = f"{base_name}_{chunk_num}.npz"
+        full_path = os.path.join(self.directory, filename)
+        if not os.path.isfile(full_path):
+            raise FileNotFoundError(f"NN species file not found: {full_path}")
+
+        with np.load(full_path, allow_pickle=True) as data:
+            flat_species = data['flat_species']
+            offsets = data['offsets']
+
+        return flat_species, offsets
     # -------------------------------------
 
     # -------------------------------------
@@ -739,7 +857,7 @@ class sample:
         kernel_module = cp.RawModule(
             code=_cell_list_count_kernel,
             backend='nvcc',
-            options=('--gpu-architecture=sm_89', '-O3', '--ftz=true', '--fmad=true')
+            options=('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true')
         )
         return kernel_module.get_function('cell_list_count_kernel')
 
@@ -773,7 +891,7 @@ class sample:
         kernel_module = cp.RawModule(
             code=_cell_list_fill_kernel,
             backend='nvcc',
-            options=('--gpu-architecture=sm_89', '-O3', '--ftz=true', '--fmad=true')
+            options=('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true')
         )
         return kernel_module.get_function('cell_list_fill_kernel')
     # -------------------------------------
