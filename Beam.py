@@ -51,10 +51,12 @@ class beam:
                     beam_size=(1000.0, 1000.0),
                     beam_samples=(256, 256),
                     beam_profile="uniform",
-                    gaussian_waist=None):
+                    gaussian_waist=None,
+                    pol_perp_rate=0.5):
         """
         Initialize beam with direction hard-coded to +x for performance.
-        (User 'direction' is ignored.)
+        Adds: pol_perp_rate — fraction of incident intensity polarized
+        perpendicular to the scattering plane (ρ⊥). 0.5 = unpolarized.
         """
         # Force direction to +x
         self._direction = np.array([1.0, 0.0, 0.0], dtype=np.float32)
@@ -77,6 +79,9 @@ class beam:
         self._beam_samples = (int(beam_samples[0]), int(beam_samples[1]))
         self._beam_profile = str(beam_profile).lower()
         self._gauss_waist  = gaussian_waist
+
+        # polarization rate perpendicular to the scattering plane
+        self._pol_perp_rate = float(np.clip(pol_perp_rate, 0.0, 1.0))
 
         # transverse basis is exactly (ŷ, ẑ)
         self._beam_e1 = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -429,11 +434,10 @@ class beam:
     @staticmethod
     def compile_compute_scattering_cffi():
         """
-        CPU scattering routine (CFFI), now matching the GPU math:
-
-        - initial_amp is COMPLEX (passed as real & imag arrays)
-        - optional forward-component removal via f0(Q)-f0(0)
-        - includes classical electron radius scaling (r_e)
+        CPU scattering routine (CFFI), now with optional polarization:
+        - New args: (int apply_pol, float pol_perp_rate)
+        - Amplitude is multiplied by sqrt(P), with
+            P = rho_perp + (1 - rho_perp) * (cos(2θ))^2, cos(2θ)=dx/r
         """
         from cffi import FFI
 
@@ -443,7 +447,6 @@ class beam:
 
         static inline float get_f0_value(float Q_val, const float* params)
         {
-            // params: [a1 a2 a3 a4 a5 c b1 b2 b3 b4 b5]
             const float PI_F = 3.14159265358979323846f;
             const float K_SCALE_FACTOR = 0.25f * 1.0e-10f / PI_F;  // 0.25 * Å / π
             const float k   = K_SCALE_FACTOR * Q_val;
@@ -466,13 +469,15 @@ class beam:
             int remove_forward,           // 0/1
             const float *s_anom_real,     // (atom_count,)
             const float *s_anom_imag,     // (atom_count,)
-            const float *initial_amp_r,   // (atom_count,) REAL part of entrance amp
-            const float *initial_amp_i,   // (atom_count,) IMAG part of entrance amp
+            const float *initial_amp_r,   // (atom_count,)
+            const float *initial_amp_i,   // (atom_count,)
             int Nx, int Ny,
             const float *coords_x,        // (Nx*Ny) [m]
             const float *coords_y,
             const float *coords_z,
             float k_val,                  // 2π/λ  [rad/m]
+            int   apply_pol,              // 0/1
+            float pol_perp_rate,          // ρ⊥ ∈ [0,1]
             float *out_r, float *out_i    // (Nx*Ny)
         )
         {
@@ -503,19 +508,18 @@ class beam:
                     float r_det = sqrtf(dx*dx + dy*dy + dz*dz);
                     if (r_det == 0.0f) continue;
 
-                    float rdx = (dx / r_det);
-                    float tmp = 2.0f*(1.0f - rdx);
+                    float dotv = (dx / r_det);  // cos(2th) for +x incidence
+                    float tmp = 2.0f*(1.0f - dotv);
                     if (tmp < 0.0f) tmp = 0.0f;
                     float Q_val = k_val * sqrtf(tmp);
 
                     float f0_val = get_f0_value(Q_val, f0p);
                     if (remove_forward != 0) { f0_val -= f00; }
 
-                    // s_tot = f0 + s_anom (complex)
                     float s_re = (f0_val + sanr);
                     float s_im = (sani);
 
-                    // multiply by complex entrance amplitude: s_tot *= (amp_r + i*amp_i)
+                    // multiply by complex entrance amplitude
                     float t_re = amp_r * s_re - amp_i * s_im;
                     float t_im = amp_r * s_im + amp_i * s_re;
 
@@ -526,6 +530,16 @@ class beam:
 
                     float val_r = (t_re * cph - t_im * sph) * rE_F;
                     float val_i = (t_re * sph + t_im * cph) * rE_F;
+
+                    // polarization factor on amplitude
+                    if (apply_pol) {
+                        float P = pol_perp_rate + (1.0f - pol_perp_rate) * (dotv * dotv);
+                        if (P < 0.0f) P = 0.0f;
+                        if (P > 1.0f) P = 1.0f;
+                        float scale = sqrtf(P);
+                        val_r *= scale;
+                        val_i *= scale;
+                    }
 
                     out_r[p] += val_r;
                     out_i[p] += val_i;
@@ -551,6 +565,8 @@ class beam:
                 const float *coords_y,
                 const float *coords_z,
                 float k_val,
+                int   apply_pol,
+                float pol_perp_rate,
                 float *out_r, float *out_i
             );
         """)
@@ -560,11 +576,8 @@ class beam:
     @staticmethod
     def build_interaction_kernel():
         """
-        CUDA kernel specialized for +x beam:
-        - dotv = dx/r  (no dot-product)
-        - k_mag = |kx| (no sqrt)
-        - anomalous term is NOT zeroed when remove_forward==1
-        Signature stays the same; call sites unchanged.
+        CUDA kernel specialized for +x beam.
+        Adds: optional polarization factor via (apply_polarization, pol_perp_rate).
         """
         if cp is None:
             raise RuntimeError("CuPy is required for GPU scattering kernels.")
@@ -574,7 +587,6 @@ class beam:
         extern "C" {
         __device__ __forceinline__ float2 get_f0_from_params(float Q_val, const float* params)
         {
-            // f0(Q) = c + Σ a_i exp(-b_i * s^2), with s = Q/(4π) in Å^-1 (see CPU path)
             const float PI_F   = 3.14159265358979323846f;
             const float K_SCALE= 0.25f * 1.0e-10f / PI_F;  // Q[m^-1] -> s[Å^-1]
             float s  = K_SCALE * Q_val;
@@ -591,23 +603,25 @@ class beam:
 
         __global__ void interaction_kernal(
             const int   nAtoms,
-            const float* __restrict__ kx_atom,   // kept for signature; kx>0, ky=kz=0
-            const float* __restrict__ ky_atom,   // unused for +x specialization
-            const float* __restrict__ kz_atom,   // unused for +x specialization
-            const float* __restrict__ px,        // atom x [m]
-            const float* __restrict__ py,        // atom y [m]
-            const float* __restrict__ pz,        // atom z [m]
+            const float* __restrict__ kx_atom,
+            const float* __restrict__ ky_atom,
+            const float* __restrict__ kz_atom,
+            const float* __restrict__ px,
+            const float* __restrict__ py,
+            const float* __restrict__ pz,
             const float2* __restrict__ initial_amp,
             const float2* __restrict__ scattering_anom,
             const float*  __restrict__ f0_params,
             const float*  __restrict__ f0_zero,
-            const float* __restrict__ x_coords,  // detector coords [m]
+            const float* __restrict__ x_coords,
             const float* __restrict__ y_coords,
             const float* __restrict__ z_coords,
             float2*      __restrict__ detector_field,
             const int    Nx,
             const int    Ny,
-            const int    remove_forward)
+            const int    remove_forward,
+            const int    apply_polarization,
+            const float  pol_perp_rate)
         {
             const float PI_F = 3.14159265358979323846f;
             const float rE_F = 2.81794092e-15f;
@@ -644,8 +658,8 @@ class beam:
                     if (a < nAtoms) {
                         s_px[t] = px[a]; s_py[t] = py[a]; s_pz[t] = pz[a];
                         s_amp[t]= initial_amp[a];
-                        s_anom[t]=scattering_anom[a]; // DO NOT zero, even if remove_forward
-                        s_kx[t] = kx_atom[a];         // k along +x (>=0)
+                        s_anom[t]=scattering_anom[a];
+                        s_kx[t] = kx_atom[a];
                         s_f0z[t]= f0_zero[a];
                         #pragma unroll
                         for (int pi=0; pi<11; ++pi)
@@ -666,9 +680,8 @@ class beam:
                         float r_det = sqrtf(dx*dx + dy*dy + dz*dz);
                         if (r_det == 0.0f) continue;
 
-                        // +x specialization:
-                        float k_mag = fabsf(s_kx[j]);      // no sqrt
-                        float dotv  = dx / r_det;          // cos(theta)
+                        float k_mag = fabsf(s_kx[j]);
+                        float dotv  = dx / r_det;          // cos(2th) for +x incidence
 
                         float tmp = 2.0f*(1.0f - dotv);
                         if (tmp < 0.0f) tmp = 0.0f;
@@ -682,7 +695,6 @@ class beam:
 
                         float2 s_tot = make_float2(f0c.x + s_anom[j].x, f0c.y + s_anom[j].y);
 
-                        // phase uses only atom x (entrance) + path length
                         float wavelength_m = (2.0f * PI_F) / k_mag;
                         float ax_mod = fmodf(s_px[j], wavelength_m);
                         float rdet_mod = fmodf(r_det, wavelength_m);
@@ -698,6 +710,15 @@ class beam:
                         float2 val;
                         val.x = real_part * cph - imag_part * sph;
                         val.y = real_part * sph + imag_part * cph;
+
+                        // polarization factor on amplitude
+                        if (apply_polarization) {
+                            float P = pol_perp_rate + (1.0f - pol_perp_rate) * (dotv * dotv);
+                            P = fminf(1.0f, fmaxf(0.0f, P));
+                            float scale = sqrtf(P);
+                            val.x *= scale;
+                            val.y *= scale;
+                        }
 
                         sum_val.x += val.x * rE_F;
                         sum_val.y += val.y * rE_F;
@@ -1419,22 +1440,16 @@ class beam:
                             Nx, Ny, coords_x_m, coords_y_m, coords_z_m,
                             db_dict_f0_all, db_dict_f1f2_all, k_val,
                             stage, detector=None, remove_forward_component=False,
-                            initial_amp_complex=None):
+                            initial_amp_complex=None,
+                            apply_polarization=False):
         """
-        CPU scattering for a single chunk. Matches GPU path:
-
-        - Uses complex entrance amplitude per atom (initial_amp_complex).
-        If None, defaults to 1+0j (or your own attenuation model).
-        - Optional removal of forward component.
-        - Includes r_e scaling (handled inside C kernel).
+        CPU scattering for a single chunk. Added: apply_polarization flag.
         """
-        # Species & atom count
         species_chunk_np = sample.load_chunk_species(chunk_id, use_gpu=False)
         atom_count = int(species_chunk_np.shape[0])
         if atom_count == 0:
             return np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # Per-atom anomalous and f0 params + f0(0)
         scattering_anom_np_real = np.zeros(atom_count, dtype=np.float32)
         scattering_anom_np_imag = np.zeros(atom_count, dtype=np.float32)
         f0_params_np            = np.zeros((atom_count, 11), dtype=np.float32)
@@ -1447,7 +1462,6 @@ class beam:
             if el not in db_dict_f0_all:
                 continue
             mask = (species_chunk_np == el)
-            # anomalous (if not removing forward we still keep anom, same as GPU)
             table = db_dict_f1f2_all.get(el, None)
             if table is not None:
                 cplx = self.get_f1f2_from_params(self._energy, table)
@@ -1456,28 +1470,23 @@ class beam:
             f0_params_np[mask] = db_dict_f0_all[el]
             f0_zero_np[mask]   = float(f0_zero_dict.get(el, 0.0))
 
-        # Positions (Å) → stage → meters
         positions_chunk = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
         positions_chunk = positions_chunk @ stage.rotation
         positions_chunk += stage.translation
         positions_chunk_m = positions_chunk / 1e10
 
-        # Entrance amplitude
         if initial_amp_complex is None:
-            # default = 1+0j per atom (or use your attenuation model here)
             amp_r = np.ones((atom_count,), dtype=np.float32)
             amp_i = np.zeros((atom_count,), dtype=np.float32)
         else:
             amp_r = np.asarray(np.real(initial_amp_complex), dtype=np.float32, order='C')
             amp_i = np.asarray(np.imag(initial_amp_complex), dtype=np.float32, order='C')
             if amp_r.shape[0] != atom_count:
-                raise ValueError("initial_amp_complex size mismatch for chunk {}".format(chunk_id))
+                raise ValueError(f"initial_amp_complex size mismatch for chunk {chunk_id}")
 
-        # Output buffers
         out_r = np.zeros(Nx*Ny, dtype=np.float32)
         out_i = np.zeros(Nx*Ny, dtype=np.float32)
 
-        # Contiguous views
         positions_chunk_m = np.ascontiguousarray(positions_chunk_m)
         f0_params_np      = np.ascontiguousarray(f0_params_np)
         f0_zero_np        = np.ascontiguousarray(f0_zero_np)
@@ -1486,7 +1495,6 @@ class beam:
         amp_r             = np.ascontiguousarray(amp_r)
         amp_i             = np.ascontiguousarray(amp_i)
 
-        # C pointers
         positions_ptr = ffi_obj.cast("const float *", positions_chunk_m.ctypes.data)
         f0_params_ptr = ffi_obj.cast("const float *", f0_params_np.ctypes.data)
         f0_zero_ptr   = ffi_obj.cast("const float *", f0_zero_np.ctypes.data)
@@ -1500,7 +1508,6 @@ class beam:
         out_r_ptr     = ffi_obj.cast("float *", out_r.ctypes.data)
         out_i_ptr     = ffi_obj.cast("float *", out_i.ctypes.data)
 
-        # Call C
         complied_code.compute_scattering_cffi(
             atom_count,
             positions_ptr,
@@ -1514,6 +1521,8 @@ class beam:
             Nx, Ny,
             coords_x_ptr, coords_y_ptr, coords_z_ptr,
             k_val,
+            int(1 if apply_polarization else 0),
+            float(self._pol_perp_rate),
             out_r_ptr, out_i_ptr
         )
 
@@ -1529,26 +1538,20 @@ class beam:
         remove_forward_component=False,
         use_depth_ein=False,
         ein_cache_dir=None,
-        recompute_cache=False
+        recompute_cache=False,
+        apply_polarization=False
     ):
         """
-        CPU kinematic scattering to match the GPU path:
-
-        - Optional depth‑E_in per-atom entrance amplitude (complex), computed by
-        sampling E0(u,v) and A(u,v) on the beam grid with a global depth fraction.
-        - Optional forward component removal.
-        - Caching of E_in per chunk (same keying scheme as GPU).
+        CPU kinematic scattering; added apply_polarization toggle.
         """
         import hashlib, json
         Nx, Ny = measurement_shape
 
-        # DBs
         db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
         db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
 
         k_val = np.float32(2.0 * np.pi / self._wavelength)
 
-        # detector coords [m]
         if cp is not None and isinstance(measurement_positions, cp.ndarray):
             measurement_positions = measurement_positions.get()
         coords_x_m = np.ascontiguousarray(measurement_positions[0, :].astype(np.float32) / 1e10)
@@ -1559,14 +1562,12 @@ class beam:
         if chunk_total == 0:
             return np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # Precompute A(u,v) and global depth if requested
         A_beam_np = None
         s_min = s_max = None
         if use_depth_ein:
             A_beam_np = self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius=0)
             s_min, s_max = self._compute_global_depth_bounds(sample, stage)
 
-        # cache key & dir (shared with GPU path for consistency)
         if use_depth_ein:
             key_obj = dict(
                 E_eV=float(self._energy),
@@ -1589,7 +1590,6 @@ class beam:
             key_hash = None
             cache_dir = None
 
-        # Build an E_in sampler (CPU bilinear)
         if use_depth_ein:
             NyB, NzB = self._beam_Ny, self._beam_Nz
             du, dv = self._beam_du, self._beam_dv
@@ -1599,7 +1599,6 @@ class beam:
             E0_map = self._beam_E0_map.astype(np.complex64)
 
             def _ein_for_positions_cpu(pos_np):
-                # pos_np in Å after stage transform
                 au = pos_np[:, 0]*e1[0] + pos_np[:, 1]*e1[1] + pos_np[:, 2]*e1[2]
                 av = pos_np[:, 0]*e2[0] + pos_np[:, 1]*e2[1] + pos_np[:, 2]*e2[2]
                 iu = au / du + uc
@@ -1627,27 +1626,22 @@ class beam:
                         E0_10 * fu*(1.0 - fv) +
                         E0_11 * fu*fv).astype(np.complex64)
 
-                # global depth fraction
                 s = pos_np @ khat
                 f = np.clip((s - s_min) / (s_max - s_min + 1e-12), 0.0, 1.0).astype(np.float32)
 
-                # E_in = E0 * A^f   (robust pow; handle 0^0)
                 tiny = 1e-12
                 Ein = np.exp(np.log(A_s + 0j) * f) * E0_s
                 mask00 = (np.abs(A_s) < tiny) & (f < tiny)
                 Ein[mask00] = E0_s[mask00]
                 return Ein.astype(np.complex64)
 
-        # compile CPU CFFI kernel once
         ffi_obj, complied_code = self.compile_compute_scattering_cffi()
 
-        # multi-thread across chunks
         import multiprocessing
         from concurrent.futures import ThreadPoolExecutor, as_completed
         n_threads = min(chunk_total, multiprocessing.cpu_count())
 
         def worker(chunk_id):
-            # Positions after stage, for E_in and for scattering
             pos_A = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
             if pos_A.size == 0:
                 return np.zeros((Ny, Nx), dtype=np.complex64)
@@ -1657,7 +1651,8 @@ class beam:
 
             init_amp = None
             if use_depth_ein:
-                cache_path = os.path.join(cache_dir, f"ein_chunk_{chunk_id}_{key_hash}.npz")
+                cache_dir_local = ein_cache_dir or os.path.join(self.directory, "ein_cache")
+                cache_path = os.path.join(cache_dir_local, f"ein_chunk_{chunk_id}_{key_hash}.npz")
                 if (not recompute_cache) and os.path.isfile(cache_path):
                     try:
                         with np.load(cache_path) as npz:
@@ -1678,7 +1673,8 @@ class beam:
                 coords_x_m, coords_y_m, coords_z_m,
                 db_dict_f0_all, db_dict_f1f2_all, k_val, stage,
                 detector, remove_forward_component,
-                initial_amp_complex=init_amp
+                initial_amp_complex=init_amp,
+                apply_polarization=apply_polarization
             )
 
         final_result = np.zeros((Ny, Nx), dtype=np.complex64)
@@ -1697,22 +1693,32 @@ class beam:
         remove_forward: bool = False,
         use_depth_ein: bool = False,
         ein_cache_dir: str | None = None,
-        recompute_cache: bool = False
+        recompute_cache: bool = False,
+        apply_polarization: bool = False
     ):
         if cp is None:
             print("[beam] CuPy not installed, falling back to CPU.")
-            return self.interact_beam_cpu(sample, measurement_positions, measurement_shape, stage)
+            return self.interact_beam_cpu(sample, measurement_positions, measurement_shape, stage,
+                                        remove_forward_component=remove_forward,
+                                        use_depth_ein=use_depth_ein,
+                                        ein_cache_dir=ein_cache_dir,
+                                        recompute_cache=recompute_cache,
+                                        apply_polarization=apply_polarization)
 
         n_gpus = cp.cuda.runtime.getDeviceCount()
         if n_gpus < 1:
             print("[beam] No GPUs found, falling back to CPU.")
-            return self.interact_beam_cpu(sample, measurement_positions, measurement_shape, stage)
+            return self.interact_beam_cpu(sample, measurement_positions, measurement_shape, stage,
+                                        remove_forward_component=remove_forward,
+                                        use_depth_ein=use_depth_ein,
+                                        ein_cache_dir=ein_cache_dir,
+                                        recompute_cache=recompute_cache,
+                                        apply_polarization=apply_polarization)
 
         import hashlib, json
 
         print(f"[beam] Found {n_gpus} GPU(s).")
 
-        # DBs
         db_f0   = self.parse_f0_db_all('f0_WaasKirf.dat')
         db_f1f2 = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
         f0_zero = self._build_f0_zero_dict(db_f0)
@@ -1720,19 +1726,16 @@ class beam:
         Nx, Ny = measurement_shape
         final_result = np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # detector coords → meters (needed only for kernel geometry)
         x_coords = self.allocate_pinned_array(measurement_positions[0, :].astype(np.float32) / 1e10)
         y_coords = self.allocate_pinned_array(measurement_positions[1, :].astype(np.float32) / 1e10)
         z_coords = self.allocate_pinned_array(measurement_positions[2, :].astype(np.float32) / 1e10)
 
-        # stage
         R_pin = self.allocate_pinned_array(stage.rotation)
         T_pin = self.allocate_pinned_array(stage.translation)
 
         chunk_total = sample.chunk_total
         print(f"[beam] Total of {chunk_total} chunk(s) to process.")
 
-        # If depth-E_in: precompute beam-column A(u,v) once, and global depth bounds
         A_beam_np = None
         s_min = s_max = None
         if use_depth_ein:
@@ -1742,7 +1745,6 @@ class beam:
                 A_beam_np = self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius=0)
             s_min, s_max = self._compute_global_depth_bounds(sample, stage)
 
-        # cache key
         if use_depth_ein:
             key_obj = dict(
                 E_eV=float(self._energy),
@@ -1765,7 +1767,6 @@ class beam:
             key_hash = None
             cache_dir = None
 
-        # split chunks
         chunks_per_gpu = chunk_total // n_gpus
         remainder = chunk_total % n_gpus
         partial_results = [None] * n_gpus
@@ -1785,10 +1786,9 @@ class beam:
             grid  = ((Nx + block[0] - 1) // block[0],
                     (Ny + block[1] - 1) // block[1])
 
-            # move beam assets to device
             if use_depth_ein:
-                A_gpu = cp.asarray(A_beam_np)              # (NyB,NzB)
-                E0_gpu = cp.asarray(self._beam_E0_map)     # (NyB,NzB)
+                A_gpu = cp.asarray(A_beam_np)
+                E0_gpu = cp.asarray(self._beam_E0_map)
                 NyB, NzB = A_gpu.shape
                 du, dv = self._beam_du, self._beam_dv
                 uc, vc = self._beam_uc, self._beam_vc
@@ -1798,9 +1798,7 @@ class beam:
                 khat = cp.asarray(self._direction / np.linalg.norm(self._direction), dtype=cp.float32)
                 smin = cp.float32(s_min); smax = cp.float32(s_max)
 
-            # helper: sample E0 and A at atom positions, compute E_in with global depth f
             def _ein_for_positions(pos_g):
-                # (Å) positions already stage-transformed
                 au = pos_g[:, 0]*e1g[0] + pos_g[:, 1]*e1g[1] + pos_g[:, 2]*e1g[2]
                 av = pos_g[:, 0]*e2g[0] + pos_g[:, 1]*e2g[1] + pos_g[:, 2]*e2g[2]
                 iu = au / du_g + uc_g
@@ -1813,7 +1811,6 @@ class beam:
                 fu = (iu - i0).astype(cp.float32); fv = (iv - j0).astype(cp.float32)
                 one = cp.float32(1.0)
 
-                # bilinear sampling
                 r00 = (i0 * NzB + j0).astype(cp.int64); r01 = (i0 * NzB + j1).astype(cp.int64)
                 r10 = (i1 * NzB + j0).astype(cp.int64); r11 = (i1 * NzB + j1).astype(cp.int64)
 
@@ -1831,11 +1828,9 @@ class beam:
                         E0_10 * fu*(one - fv) +
                         E0_11 * fu*fv).astype(cp.complex64)
 
-                # global depth fraction f
                 s = pos_g[:, 0]*khat[0] + pos_g[:, 1]*khat[1] + pos_g[:, 2]*khat[2]
                 f = cp.clip((s - smin) / (smax - smin + cp.float32(1e-12)), 0.0, 1.0).astype(cp.float32)
 
-                # E_in = E0 * A^f  (robust log for complex; handle 0^0 → 1)
                 tiny = cp.float32(1e-12)
                 absA = cp.abs(A_s)
                 Ein = cp.exp(cp.log(A_s + 0j) * f) * E0_s
@@ -1852,7 +1847,6 @@ class beam:
                 pos = cp.array(sample.load_chunk_positions(cidx, use_gpu=True), dtype=cp.float32)
                 pos = pos @ Rg; pos += Tg
 
-                # per-atom scattering arrays
                 s_anom = np.zeros(nA, np.complex64)
                 f0p    = np.zeros((nA, 11), np.float32)
                 f0z    = np.zeros(nA, np.float32)
@@ -1862,12 +1856,10 @@ class beam:
                     m = (spc == el)
                     f0p[m] = db_f0[el]
                     f0z[m] = f0_zero.get(el, 0.0)
-                    # if not remove_forward: Old zeroing code
                     tbl = db_f1f2.get(el)
                     if tbl is not None:
                         s_anom[m] = self.get_f1f2_from_params(self._energy, tbl)
 
-                # per-atom initial amplitude
                 if use_depth_ein:
                     cache_path = os.path.join(cache_dir, f"ein_chunk_{cidx}_{key_hash}.npz")
                     initial_amp = None
@@ -1888,7 +1880,6 @@ class beam:
                 else:
                     initial_amp = cp.ones(nA, dtype=cp.complex64)
 
-                # positions to meters for kernel
                 px = pos[:, 0] / 1e10; py = pos[:, 1] / 1e10; pz = pos[:, 2] / 1e10
 
                 kx_cp = cp.full(nA, self._kx_scalar, dtype=cp.float32)
@@ -1913,7 +1904,9 @@ class beam:
                         dfield,
                         np.int32(Nx),
                         np.int32(Ny),
-                        np.int32(1 if remove_forward else 0)
+                        np.int32(1 if remove_forward else 0),
+                        np.int32(1 if apply_polarization else 0),
+                        np.float32(self._pol_perp_rate)
                     )
                 )
                 cp.get_default_memory_pool().free_all_blocks()
@@ -1923,7 +1916,6 @@ class beam:
             cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
 
-        # launch one thread per GPU
         threads = []
         start_chunk = 1
         for gid in range(n_gpus):
@@ -1953,7 +1945,8 @@ class beam:
         remove_forward: bool = False,
         use_depth_ein: bool = False,
         ein_cache_dir: str | None = None,
-        recompute_cache: bool = False
+        recompute_cache: bool = False,
+        apply_polarization: bool = False
     ):
         measurement_positions = detector.pixel_coordinates
         Nx, Ny = detector.shape
@@ -1967,7 +1960,8 @@ class beam:
                 remove_forward=remove_forward,
                 use_depth_ein=use_depth_ein,
                 ein_cache_dir=ein_cache_dir,
-                recompute_cache=recompute_cache
+                recompute_cache=recompute_cache,
+                apply_polarization=apply_polarization
             )
         else:
             if cp is None and use_gpu:
@@ -1981,7 +1975,8 @@ class beam:
                 remove_forward_component=remove_forward,
                 use_depth_ein=use_depth_ein,
                 ein_cache_dir=ein_cache_dir,
-                recompute_cache=recompute_cache
+                recompute_cache=recompute_cache,
+                apply_polarization=apply_polarization
             )
 
         return (final_field - offset) if (offset is not None) else final_field
@@ -2808,13 +2803,10 @@ class beam:
         
     def atomic_scattering_dynamical(self, sample, detector, stage,
                                     n_bounces=0, offset=None, use_gpu=True,
-                                    sub_chunk_size=100_000):
+                                    sub_chunk_size=100_000,
+                                    apply_polarization: bool = False):
         """
-        Multi-bounce GPU scattering with the following fixes:
-        • Expanded paths carry the NEIGHBOR atom position (meters).
-        • Each expansion multiplies by s0 ~= f0(0) + f1 + i f2 (small-angle).
-        • Neighbor species are int32 codes; a GPU LUT maps code->(f0 params, f0(0), anom).
-        • No Python per-path loops; everything is vectorized on GPU.
+        Multi-bounce GPU scattering. Added: apply_polarization toggle.
         """
         if (not use_gpu) or (cp is None):
             raise RuntimeError("GPU-based dynamical code requires CuPy and use_gpu=True.")
@@ -2833,7 +2825,6 @@ class beam:
         print(f"[beam] Using GPU dynamical scattering with up to {n_bounces} bounce(s).")
         print(f"[beam] Total of {chunk_total} chunk(s) to process.")
 
-        # DBs and a stable species codec (built by Pass A; fallback here if needed)
         db_f0   = self.parse_f0_db_all('f0_WaasKirf.dat')
         db_f1f2 = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
 
@@ -2842,16 +2833,13 @@ class beam:
             self._species_decode   = []
 
         def _ensure_codes_from(arr):
-            # encode to int32 codes; extend codec lazily
             out = np.empty(arr.shape, dtype=np.int32)
             for i, v in enumerate(arr):
                 if isinstance(v, (str, np.str_)):
                     sym = str(v)
                 elif hasattr(sample, "get_symbol_from_id"):
-                    try:
-                        sym = str(sample.get_symbol_from_id(int(v)))
-                    except Exception:
-                        sym = str(v)
+                    try: sym = str(sample.get_symbol_from_id(int(v)))
+                    except Exception: sym = str(v)
                 else:
                     sym = str(v)
                 code = self._species_code_map.get(sym)
@@ -2862,7 +2850,6 @@ class beam:
                 out[i] = code
             return out
 
-        # Build a per-code LUT once per process (on demand)
         n_codes = len(self._species_decode)
         code_to_f0_params = np.zeros((max(1, n_codes), 11), np.float32)
         code_to_f0_zero   = np.zeros((max(1, n_codes),),   np.float32)
@@ -2872,13 +2859,11 @@ class beam:
             f0p = db_f0.get(sym)
             if f0p is not None:
                 code_to_f0_params[code, :] = f0p
-                # f0(0) = c + sum(a_i)
                 code_to_f0_zero[code] = float(f0p[5] + f0p[0] + f0p[1] + f0p[2] + f0p[3] + f0p[4])
             tbl = db_f1f2.get(sym)
             if tbl is not None:
                 code_to_anom[code] = self.get_f1f2_from_params(self._energy, tbl)
 
-        # detector & stage (pinned → GPU)
         Nx, Ny = detector.shape
         final_result = np.zeros((Ny, Nx), dtype=np.complex64)
 
@@ -2901,12 +2886,10 @@ class beam:
         def gpu_worker(gpu_id, chunk_list, out_idx):
             cp.cuda.Device(gpu_id).use()
 
-            # stage & detector
             Rg = cp.asarray(R_stage_pin, dtype=cp.float32)
             Tg = cp.asarray(T_stage_pin, dtype=cp.float32)
             pxg = cp.asarray(px_pin); pyg = cp.asarray(py_pin); pzg = cp.asarray(pz_pin)
 
-            # per-code LUTs on GPU (vectorized gathers later)
             lut_f0p = cp.asarray(code_to_f0_params)
             lut_f0z = cp.asarray(code_to_f0_zero)
             lut_anm = cp.asarray(code_to_anom)
@@ -2918,30 +2901,26 @@ class beam:
             block1d = 256
 
             for cidx in chunk_list:
-                # atoms in this chunk
                 spc_host = sample.load_chunk_species(cidx, use_gpu=False)
                 nA = int(spc_host.shape[0])
                 if nA == 0:
                     continue
 
-                # encode per-atom species → codes
                 codes_host = _ensure_codes_from(spc_host)
                 codes_gpu  = cp.asarray(codes_host, dtype=cp.int32)
 
                 pos = cp.array(sample.load_chunk_positions(cidx, use_gpu=True), dtype=cp.float32)
                 pos = pos @ Rg; pos += Tg
 
-                # atom positions in meters for expansion outputs
                 px_at = (pos[:, 0] / 1e10).astype(cp.float32)
                 py_at = (pos[:, 1] / 1e10).astype(cp.float32)
                 pz_at = (pos[:, 2] / 1e10).astype(cp.float32)
 
-                # per-atom s0 ~= f0(0)+anom for expansion step (GPU gather)
                 f0z_gpu = lut_f0z[codes_gpu]
                 anm_gpu = lut_anm[codes_gpu]
                 s0_gpu  = (f0z_gpu + anm_gpu).astype(cp.complex64)
 
-                # bounce 0: direct scattering to detector (full Q on kernel)
+                # bounce 0
                 f0_params_gpu = lut_f0p[codes_gpu]
                 anom_gpu0     = anm_gpu
                 f0_zero_gpu   = f0z_gpu
@@ -2965,7 +2944,9 @@ class beam:
                         dfield_gpu,
                         np.int32(Nx),
                         np.int32(Ny),
-                        np.int32(remove_forward_flag)
+                        np.int32(remove_forward_flag),
+                        np.int32(1 if apply_polarization else 0),
+                        np.float32(self._pol_perp_rate)
                     )
                 )
                 cp.cuda.stream.get_current_stream().synchronize()
@@ -2974,11 +2955,10 @@ class beam:
                     cp.get_default_memory_pool().free_all_blocks()
                     continue
 
-                # Load precomputed neighbor data (phase, kvec, indices, species codes)
                 ph_flat,  offs_ph = sample.load_chunk_nn_phase(cidx)
                 kx_flat, ky_flat, kz_flat, offs_kv = sample.load_chunk_nn_scatter(cidx)
                 idx_flat, offs_ix = sample.load_chunk_nn_indices(cidx)
-                spc_flat, offs_sp = sample.load_chunk_nn_species(cidx)  # int32 codes expected
+                spc_flat, offs_sp = sample.load_chunk_nn_species(cidx)
 
                 neighborPhase_gpu = cp.asarray(ph_flat,  dtype=cp.float32)
                 neighborKx_gpu    = cp.asarray(kx_flat,  dtype=cp.float32)
@@ -2990,7 +2970,6 @@ class beam:
                 neighborStart_gpu = cp.asarray(offs_ph[:-1].astype(np.int32))
                 neighborCount_gpu = cp.asarray((offs_ph[1:] - offs_ph[:-1]).astype(np.int32))
 
-                # Inputs for first expansion step
                 cur_size   = nA
                 in_x_gpu   = px_at.copy()
                 in_y_gpu   = py_at.copy()
@@ -3003,13 +2982,11 @@ class beam:
 
                 expand_max = int(sub_chunk_size)
 
-                # helper: scatter a sub-batch to the detector (vectorized)
                 def process_subchunk(sbStart, sbEnd,
                                     out_x_gpu, out_y_gpu, out_z_gpu,
                                     out_kx_gpu, out_ky_gpu, out_kz_gpu,
                                     out_amp_gpu, out_idx_gpu, out_spc_gpu):
 
-                    # slice
                     sub_x  = out_x_gpu[sbStart:sbEnd]
                     sub_y  = out_y_gpu[sbStart:sbEnd]
                     sub_z  = out_z_gpu[sbStart:sbEnd]
@@ -3020,25 +2997,23 @@ class beam:
                     sub_idx= out_idx_gpu[sbStart:sbEnd]
                     sub_spc= out_spc_gpu[sbStart:sbEnd]
 
-                    # keep only valid (local) expansions
                     valid = (sub_idx >= 0) & (sub_idx < nA)
                     if not bool(valid.any()):
-                        return 0  # nothing to scatter
+                        return 0
 
                     sub_x   = sub_x[valid];   sub_y   = sub_y[valid];   sub_z   = sub_z[valid]
                     sub_kx  = sub_kx[valid];  sub_ky  = sub_ky[valid];  sub_kz  = sub_kz[valid]
                     sub_amp = sub_amp[valid]; sub_spc = sub_spc[valid]
 
-                    # per-path scattering arrays via LUT gather (GPU)
-                    f0p_paths = lut_f0p[sub_spc]          # (M, 11)
-                    f0z_paths = lut_f0z[sub_spc]          # (M,)
-                    anm_paths = lut_anm[sub_spc]          # (M,) complex
+                    f0p_paths = lut_f0p[sub_spc]
+                    f0z_paths = lut_f0z[sub_spc]
+                    anm_paths = lut_anm[sub_spc]
 
                     interaction_kernel(
                         grid2d, block2d,
                         (
                             np.int32(int(sub_x.size)),
-                            sub_kx, sub_ky, sub_kz,  # NOTE: kernel uses kx magnitude & dotv (+x specialization)
+                            sub_kx, sub_ky, sub_kz,
                             sub_x,  sub_y,  sub_z,
                             sub_amp,
                             anm_paths,
@@ -3048,7 +3023,9 @@ class beam:
                             dfield_gpu,
                             np.int32(Nx),
                             np.int32(Ny),
-                            np.int32(remove_forward_flag)
+                            np.int32(remove_forward_flag),
+                            np.int32(1 if apply_polarization else 0),
+                            np.float32(self._pol_perp_rate)
                         )
                     )
                     cp.cuda.stream.get_current_stream().synchronize()
@@ -3062,10 +3039,10 @@ class beam:
                     out_ky_gpu  = cp.empty((expand_max,), dtype=cp.float32)
                     out_kz_gpu  = cp.empty((expand_max,), dtype=cp.float32)
                     out_amp_gpu = cp.empty((expand_max,), dtype=cp.complex64)
-                    out_idx_gpu = cp.empty((expand_max + 1,), dtype=cp.int32)  # last slot is counter
+                    out_idx_gpu = cp.empty((expand_max + 1,), dtype=cp.int32)
                     out_spc_gpu = cp.empty((expand_max,), dtype=cp.int32)
 
-                    out_idx_gpu[expand_max] = 0  # reset counter
+                    out_idx_gpu[expand_max] = 0
 
                     nBlocks = (cur_size + block1d - 1) // block1d
                     expand_kernel(
@@ -3102,7 +3079,6 @@ class beam:
                     if expansions_written == 0:
                         break
 
-                    # scatter to detector in sub-batches (vectorized)
                     batchSize = expand_max
                     nSubBatches = (expansions_written + batchSize - 1) // batchSize
                     for sb in range(nSubBatches):
@@ -3113,7 +3089,6 @@ class beam:
                                             out_kx_gpu, out_ky_gpu, out_kz_gpu,
                                             out_amp_gpu, out_idx_gpu, out_spc_gpu)
 
-                    # Prepare next bounce inputs — keep only *local* expansions
                     if bounce_i < n_bounces:
                         valid_next = (out_idx_gpu[:expansions_written] >= 0) & \
                                     (out_idx_gpu[:expansions_written] < nA)
@@ -3135,13 +3110,11 @@ class beam:
 
                 cp.get_default_memory_pool().free_all_blocks()
 
-            # Save partial image
             partial_results[out_idx] = dfield_gpu.reshape((Ny, Nx)).get()
             del pxg, pyg, pzg, dfield_gpu
             cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
 
-        # Launch one worker per GPU
         threads = []
         start = 1
         for gid in range(n_gpus):
@@ -3154,7 +3127,6 @@ class beam:
         for t in threads:
             t.join()
 
-        # Reduce
         for part in partial_results:
             if part is not None:
                 final_result += part
