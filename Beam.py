@@ -2258,96 +2258,82 @@ class beam:
                 A_total *= p
         return A_total
     
-    def atomic_transmission(self, sample, detector, stage, use_gpu=True, kernel_radius=0):
+    def atomic_transmission(self, sample, detector, stage,
+                            use_gpu=True, kernel_radius=0,
+                            padding_mode: str = "edge",   # NEW
+                            pad_constant: float = 0.0):   # NEW
         """
         Compute transmitted field at the sample exit plane, optionally propagate to
         the detector plane if it is not coincident with the sample plane, then
         resample to detector pixels.
 
-        Steps:
-        1) A(u,v) on the beam grid via full-column TSC deposition (GPU/CPU).
-        2) E_exit(u,v) = E0(u,v) * A(u,v)   (sample *exit* plane at s_exit = s_max).
-        3) If detector plane is offset along the beam: propagate E_exit by Δz.
-        4) Resample the (possibly propagated) field to detector pixel centers.
+        New parameters
+        --------------
+        padding_mode : {"edge","constant"}, default "edge"
+        pad_constant : float, used when padding_mode="constant"
         """
-        # --- 1) full-column transmission A(u,v) on the beam grid -------------------
+        # 1) A(u,v) on the beam grid
         if use_gpu and (cp is not None):
             A_beam = self._compute_beam_column_A_map_gpu(sample, stage, kernel_radius)
         else:
             A_beam = self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius)
 
-        # 2) Exit field on the sample *exit* plane (downstream face)
-        E_plane = (self._beam_E0_map * A_beam).astype(np.complex64)  # (NyB,NzB)
+        # 2) Exit field on sample exit plane
+        E_plane = (self._beam_E0_map * A_beam).astype(np.complex64)
         NyB, NzB = E_plane.shape
-        du_A = float(self._beam_du)  # Å (u ≡ e1; rows)
-        dv_A = float(self._beam_dv)  # Å (v ≡ e2; cols)
+        du_A = float(self._beam_du)  # Å
+        dv_A = float(self._beam_dv)  # Å
 
-        # --- Geometry needed to decide if we must propagate ------------------------
-        # Beam direction and global sample depth bounds (Å)
+        # Geometry to detect plane offset
         k_hat = (self._direction / np.linalg.norm(self._direction)).astype(np.float32)
-        _, s_max = self._compute_global_depth_bounds(sample, stage)  # exit plane (Å)
-
-        # Detector pixel coordinates (Å) and their beam-parallel coordinate s_det (Å)
+        _, s_max = self._compute_global_depth_bounds(sample, stage)  # Å (exit plane)
         pix = detector.pixel_coordinates
-        # Ensure CPU array for planarity check; we'll convert later if needed
-        if cp is not None and isinstance(pix, cp.ndarray):
-            pix_cpu = pix.get()
-        else:
-            pix_cpu = np.asarray(pix)
+        pix_cpu = pix.get() if (cp is not None and isinstance(pix, cp.ndarray)) else np.asarray(pix)
         s_det = (pix_cpu[0, :] * k_hat[0] + pix_cpu[1, :] * k_hat[1] + pix_cpu[2, :] * k_hat[2]).astype(np.float64)
-
-        # Check planarity & offset of detector plane along the beam
-        s_det_min = float(np.min(s_det))
-        s_det_max = float(np.max(s_det))
+        s_det_min, s_det_max = float(np.min(s_det)), float(np.max(s_det))
         s_det_mean = float(np.mean(s_det))
         plane_span_A = s_det_max - s_det_min
-
-        # Tolerances (Å): treat detector as planar if its s-range is tiny compared to scene scale
-        # and skip propagation if detector coincides with exit plane within tol_off_A.
-        tol_plane_A = max(1e-3, 1e-6 * abs(s_det_mean))  # planarity tolerance
-        tol_off_A   = 1e-3                                # offset tolerance to decide Δz≈0
+        tol_plane_A = max(1e-3, 1e-6 * abs(s_det_mean))
+        tol_off_A   = 1e-3
 
         need_propagation = False
         dz_A = 0.0
         if plane_span_A <= tol_plane_A:
-            dz_A = s_det_mean - float(s_max)   # detector minus exit plane (Å)
+            dz_A = s_det_mean - float(s_max)
             need_propagation = (abs(dz_A) > tol_off_A)
         else:
-            # Non-planar/tilted detector: use mean distance (best effort) and warn once.
             dz_A = s_det_mean - float(s_max)
             if abs(dz_A) > tol_off_A:
                 need_propagation = True
                 print(f"[beam] atomic_transmission: detector appears non-planar (Δs range={plane_span_A:.3g} Å). "
                     f"Propagating by mean Δz={dz_A:.3g} Å.")
 
-        # --- 3) Propagate from exit plane to detector plane if needed --------------
+        # 3) Propagate if needed
         if need_propagation:
             dz_m = dz_A * 1e-10  # Å → m
-            # Map array axes to physical spacings: columns (Nx) ↔ v, rows (Ny) ↔ u
-            dx_m = dv_A * 1e-10  # along columns (v)
-            dy_m = du_A * 1e-10  # along rows    (u)
+            dx_m = dv_A * 1e-10  # columns (v)
+            dy_m = du_A * 1e-10  # rows    (u)
 
             if use_gpu and (cp is not None):
-                # GPU path
                 kernel = self.build_propagation_multiplier_kernel()
-                E_gpu = cp.asarray(E_plane)  # (NyB,NzB)
+                E_gpu = cp.asarray(E_plane)
                 E_gpu = self._angular_spectrum_propagate_gpu(
-                    field=E_gpu, dx=dx_m, dy=dy_m, z=dz_m, kernel=kernel
+                    field=E_gpu, dx=dx_m, dy=dy_m, z=dz_m, kernel=kernel,
+                    step_max=0.02, pad_factor=1.0,
+                    padding_mode=padding_mode, pad_constant=pad_constant
                 )
-                # keep on GPU for sampling to avoid extra transfers
-                E_plane = E_gpu  # cp.ndarray
+                E_plane = E_gpu
             else:
-                # CPU path
                 ffi, lib = self.compile_propagation_multiplier_cffi()
                 E_plane = self._angular_spectrum_propagate_cpu(
-                    field=E_plane, dx=dx_m, dy=dy_m, z=dz_m, lib=lib, ffi=ffi
+                    field=E_plane, dx=dx_m, dy=dy_m, z=dz_m, lib=lib, ffi=ffi,
+                    step_max=0.02, pad_factor=1.0,
+                    padding_mode=padding_mode, pad_constant=pad_constant
                 ).astype(np.complex64)
 
-        # --- 4) Resample the (possibly propagated) field to detector pixel centers --
+        # 4) Bilinear resampling to detector pixels (unchanged)
         NyD, NxD = detector.shape
-        # Project detector coords onto (u,v) basis
         if use_gpu and (cp is not None):
-            # Ensure everything is on GPU
             pix_g = pix if isinstance(pix, cp.ndarray) else cp.asarray(pix)
             e1g = cp.asarray(self._beam_e1); e2g = cp.asarray(self._beam_e2)
             u = pix_g[0]*e1g[0] + pix_g[1]*e1g[1] + pix_g[2]*e1g[2]
@@ -2362,16 +2348,16 @@ class beam:
             i0 = cp.clip(i0, 0, NyB - 1); i1 = cp.clip(i1, 0, NyB - 1)
             j0 = cp.clip(j0, 0, NzB - 1); j1 = cp.clip(j1, 0, NzB - 1)
 
-            # Field source (GPU or CPU)
             E_src = E_plane if isinstance(E_plane, cp.ndarray) else cp.asarray(E_plane)
-
             idx00 = (i0 * NzB + j0).astype(cp.int64)
             idx01 = (i0 * NzB + j1).astype(cp.int64)
             idx10 = (i1 * NzB + j0).astype(cp.int64)
             idx11 = (i1 * NzB + j1).astype(cp.int64)
 
-            E00 = E_src.ravel()[idx00]; E01 = E_src.ravel()[idx01]
-            E10 = E_src.ravel()[idx10]; E11 = E_src.ravel()[idx11]
+            E00 = E_src.ravel()[idx00]
+            E01 = E_src.ravel()[idx01]
+            E10 = E_src.ravel()[idx10]
+            E11 = E_src.ravel()[idx11]
 
             one = cp.float32(1.0)
             E_flat = (E00 * (one - fu)*(one - fv) +
@@ -2380,7 +2366,6 @@ class beam:
                     E11 * (fu)*fv).astype(cp.complex64)
             E_det = E_flat.reshape(NyD, NxD).get()
         else:
-            # CPU sampling
             e1 = self._beam_e1; e2 = self._beam_e2
             u = pix_cpu[0]*e1[0] + pix_cpu[1]*e1[1] + pix_cpu[2]*e1[2]
             v = pix_cpu[0]*e2[0] + pix_cpu[1]*e2[1] + pix_cpu[2]*e2[2]
@@ -2407,7 +2392,6 @@ class beam:
                     E11 * fu*fv).astype(np.complex64)
             E_det = E_flat.reshape(NyD, NxD)
 
-        # Return complex transmission map on detector (same convention as before)
         return E_det.astype(np.complex64)
     # -------------------------------------
     
@@ -3250,13 +3234,22 @@ class beam:
     # Wavefield propagation
     def _angular_spectrum_propagate_gpu(
             self, field, dx, dy, z, kernel,
-            step_max=0.02, pad_factor=1.0):
-
+            step_max=0.02, pad_factor=1.0,
+            padding_mode: str = "edge",
+            pad_constant: float = 0.0
+        ):
         """
         Band‑limited angular spectrum propagation on GPU with *symmetric*
-        zero‑padding sized from sampling and |z| so wrap‑around cannot occur.
-        Long distances are automatically broken into |z|<=step_max segments
-        (padding recomputed per sub‑step).
+        padding sized from sampling and |z|. Long distances are automatically
+        split into |z|<=step_max segments.
+
+        Parameters
+        ----------
+        padding_mode : {"edge","constant"}, default "edge"
+            "edge": replicate edge values into the padding.
+            "constant": fill padding with pad_constant.
+        pad_constant : float, default 0.0
+            Real constant used when padding_mode="constant".
         """
         if cp is None:
             raise RuntimeError('CuPy required for GPU propagation')
@@ -3268,8 +3261,11 @@ class beam:
             dz = z / n
             out = cp.asarray(field) if isinstance(field, cp.ndarray) else cp.asarray(field, dtype=cp.complex64)
             for _ in range(n):
-                out = self._angular_spectrum_propagate_gpu(out, dx, dy, dz, kernel,
-                                                        step_max=step_max, pad_factor=pad_factor)
+                out = self._angular_spectrum_propagate_gpu(
+                    out, dx, dy, dz, kernel,
+                    step_max=step_max, pad_factor=pad_factor,
+                    padding_mode=padding_mode, pad_constant=pad_constant
+                )
             return out
 
         # input sizes
@@ -3284,9 +3280,15 @@ class beam:
         y0 = (Ny2 - Ny) // 2
         x0 = (Nx2 - Nx) // 2
 
-        # embed symmetrically
-        Fp = cp.zeros((Ny2, Nx2), dtype=cp.complex64)
-        Fp[y0:y0+Ny, x0:x0+Nx] = F0
+        # --- NEW: configurable padding --------------------------------------------
+        pmode = (padding_mode or "edge").lower()
+        if pmode == "constant":
+            Fp = cp.full((Ny2, Nx2), complex(pad_constant), dtype=cp.complex64)
+            Fp[y0:y0+Ny, x0:x0+Nx] = F0
+        else:
+            # default to "edge"
+            pad_spec = ((y0, Ny2 - Ny - y0), (x0, Nx2 - Nx - x0))
+            Fp = cp.pad(F0, pad_spec, mode='edge')
 
         # k‑grids (rad/m), no shifts (fft2 uses non‑shifted ordering)
         k  = 2.0 * np.pi / float(self._wavelength)
@@ -3310,11 +3312,18 @@ class beam:
     
     def _angular_spectrum_propagate_cpu(
             self, field, dx, dy, z, lib, ffi,
-            step_max=0.02, pad_factor=1.0):
-
+            step_max=0.02, pad_factor=1.0,
+            padding_mode: str = "edge",
+            pad_constant: float = 0.0
+        ):
         """
         Band‑limited angular spectrum propagation on CPU with symmetric padding
         sized from sampling and |z|. Long distances are split into smaller steps.
+
+        Parameters
+        ----------
+        padding_mode : {"edge","constant"}, default "edge"
+        pad_constant : float, default 0.0 (used if padding_mode="constant")
         """
         z = float(z)
         if abs(z) > step_max:
@@ -3323,8 +3332,10 @@ class beam:
             out = field
             for _ in range(n):
                 out = self._angular_spectrum_propagate_cpu(
-                        out, dx, dy, dz, lib, ffi,
-                        step_max=step_max, pad_factor=pad_factor)
+                    out, dx, dy, dz, lib, ffi,
+                    step_max=step_max, pad_factor=pad_factor,
+                    padding_mode=padding_mode, pad_constant=pad_constant
+                )
             return out
 
         # input (Ny, Nx)
@@ -3338,9 +3349,14 @@ class beam:
         y0 = (Ny2 - Ny) // 2
         x0 = (Nx2 - Nx) // 2
 
-        # embed symmetrically
-        Fp = np.zeros((Ny2, Nx2), np.complex64)
-        Fp[y0:y0+Ny, x0:x0+Nx] = F0
+        # --- NEW: configurable padding --------------------------------------------
+        pmode = (padding_mode or "edge").lower()
+        if pmode == "constant":
+            Fp = np.full((Ny2, Nx2), pad_constant + 0j, dtype=np.complex64)
+            Fp[y0:y0+Ny, x0:x0+Nx] = F0
+        else:
+            pad_spec = ((y0, Ny2 - Ny - y0), (x0, Nx2 - Nx - x0))
+            Fp = np.pad(F0, pad_spec, mode='edge')
 
         # spectral axes (rad/m)
         k  = np.float32(2.0 * np.pi / float(self._wavelength))
@@ -3487,16 +3503,17 @@ class beam:
             return E_out
 
     def wavefield_propagation(self, detector, optics_stack,
-                            use_gpu=True, step_max=0.02, pad_factor=1.0):
+                            use_gpu=True, step_max=0.02, pad_factor=1.0,
+                            padding_mode: str = "edge",
+                            pad_constant: float = 0.0):
         """
         Propagate detector.wavefield through an optics stack using a
-        *band‑limited angular spectrum method*.
+        band‑limited angular spectrum method.
 
-        Key details:
-        - Symmetric zero‑padding sized from (dx,dy,λ,z) each step; avoids wrap‑around.
-        - Evanescent components decay as exp(-|z|·α); no numerical growth for z<0.
-        - Nyquist is respected automatically via the padding and sampling‑limited
-            angular bound sinθ_max = min(1, λ/(2·d)).
+        New parameters
+        --------------
+        padding_mode : {"edge","constant"}, default "edge"
+        pad_constant : float, used when padding_mode="constant"
         """
 
         # NOTE: detector.pixel_size is assumed (dy, dx) in Å; convert to meters.
@@ -3519,11 +3536,15 @@ class beam:
                 if use_gpu and cp is not None:
                     E = self._angular_spectrum_propagate_gpu(
                             E, dx, dy, z, kernel,
-                            step_max=step_max, pad_factor=pad_factor).get()
+                            step_max=step_max, pad_factor=pad_factor,
+                            padding_mode=padding_mode, pad_constant=pad_constant
+                        ).get()
                 else:
                     E = self._angular_spectrum_propagate_cpu(
                             E, dx, dy, z, lib, ffi,
-                            step_max=step_max, pad_factor=pad_factor)
+                            step_max=step_max, pad_factor=pad_factor,
+                            padding_mode=padding_mode, pad_constant=pad_constant
+                        )
 
             elif kind == 'lens box':
                 E = self._apply_thin_lens_box(E, dx, dy, elem, use_gpu and cp is not None)
