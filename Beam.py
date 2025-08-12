@@ -1817,10 +1817,10 @@ class beam:
                     m = (spc == el)
                     f0p[m] = db_f0[el]
                     f0z[m] = f0_zero.get(el, 0.0)
-                    if not remove_forward:
-                        tbl = db_f1f2.get(el)
-                        if tbl is not None:
-                            s_anom[m] = self.get_f1f2_from_params(self._energy, tbl)
+                    # if not remove_forward: Old zeroing code
+                    tbl = db_f1f2.get(el)
+                    if tbl is not None:
+                        s_anom[m] = self.get_f1f2_from_params(self._energy, tbl)
 
                 # per-atom initial amplitude
                 if use_depth_ein:
@@ -2146,7 +2146,7 @@ class beam:
                 # rows = u-index in [0..NyB-1], cols = v-index in [0..NzB-1]
                 def _push(ii, jj, fac, w_atom):
                     inb = (ii >= 0) & (ii < NyB) & (jj >= 0) & (jj < NzB) & (fac > 0.0)
-                    if not cp.any(inb):
+                    if not bool(cp.any(inb)):
                         return cp.empty((0,), cp.int64), cp.empty((0,), cp.float32)
                     rows = ii[inb]; cols = jj[inb]
                     idx = (rows * NzB + cols).astype(cp.int64)
