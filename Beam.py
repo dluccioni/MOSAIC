@@ -331,15 +331,15 @@ class beam:
             [a1, a2, a3, a4, a5, c, b1, b2, b3, b4, b5].
         """
         db_dict = {}
-        db_file = pkg_resources.open_text(databases.scattering, database_name)
-        element = None
-        for line in db_file:
-            if line.startswith('#S'):
-                element = line.split()[2].strip()
-            elif (not line.startswith('#')) and element is not None:
-                params = np.fromiter((float(x) for x in line.split()), dtype=np.float32)
-                if params.size == 11:
-                    db_dict[element] = params
+        with pkg_resources.open_text(databases.scattering, database_name) as db_file:
+            element = None
+            for line in db_file:
+                if line.startswith('#S'):
+                    element = line.split()[2].strip()
+                elif (not line.startswith('#')) and element is not None:
+                    params = np.fromiter((float(x) for x in line.split()), dtype=np.float32)
+                    if params.size == 11:
+                        db_dict[element] = params
         return db_dict
 
     @staticmethod
@@ -356,21 +356,21 @@ class beam:
             with columns [Energy(eV), f1, f2], for each element.
         """
         f1f2_dict = {}
-        db_file = pkg_resources.open_text(databases.scattering, database_name)
-        element = None
-        param_list = []
-        for line in db_file:
-            if line.startswith('#S'):
-                if element is not None and len(param_list) > 0:
-                    f1f2_dict[element] = np.array(param_list, dtype=np.float32)
-                element = line.split()[2].strip()
-                param_list = []
-            elif not line.startswith('#') and element is not None:
-                row_vals = [float(val) for val in line.split()]
-                if len(row_vals) == 3:
-                    param_list.append(row_vals)
-        if element is not None and len(param_list) > 0:
-            f1f2_dict[element] = np.array(param_list, dtype=np.float32)
+        with pkg_resources.open_text(databases.scattering, database_name) as db_file:
+            element = None
+            param_list = []
+            for line in db_file:
+                if line.startswith('#S'):
+                    if element is not None and len(param_list) > 0:
+                        f1f2_dict[element] = np.array(param_list, dtype=np.float32)
+                    element = line.split()[2].strip()
+                    param_list = []
+                elif not line.startswith('#') and element is not None:
+                    row_vals = [float(val) for val in line.split()]
+                    if len(row_vals) == 3:
+                        param_list.append(row_vals)
+            if element is not None and len(param_list) > 0:
+                f1f2_dict[element] = np.array(param_list, dtype=np.float32)
         return f1f2_dict
 
     @staticmethod
