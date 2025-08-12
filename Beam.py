@@ -2260,37 +2260,100 @@ class beam:
     
     def atomic_transmission(self, sample, detector, stage, use_gpu=True, kernel_radius=0):
         """
-        Compute transmitted field on the beam grid, then resample to detector pixels.
+        Compute transmitted field at the sample exit plane, optionally propagate to
+        the detector plane if it is not coincident with the sample plane, then
+        resample to detector pixels.
 
         Steps:
-        1) A(u,v) on beam grid via full-column TSC deposition (GPU/CPU).
-        2) E_exit(u,v) = E0(u,v) * A(u,v)   on the beam grid.
-        3) Resample E_exit(u,v) to detector pixel centers (bilinear), return (Ny_det,Nx_det).
+        1) A(u,v) on the beam grid via full-column TSC deposition (GPU/CPU).
+        2) E_exit(u,v) = E0(u,v) * A(u,v)   (sample *exit* plane at s_exit = s_max).
+        3) If detector plane is offset along the beam: propagate E_exit by Δz.
+        4) Resample the (possibly propagated) field to detector pixel centers.
         """
-        # 1) full-column transmission A(u,v)
+        # --- 1) full-column transmission A(u,v) on the beam grid -------------------
         if use_gpu and (cp is not None):
             A_beam = self._compute_beam_column_A_map_gpu(sample, stage, kernel_radius)
         else:
             A_beam = self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius)
 
-        # 2) Exit field on beam grid
-        E_beam = (self._beam_E0_map * A_beam).astype(np.complex64)  # (NyB,NzB)
-        NyB, NzB = E_beam.shape
-        du, dv = self._beam_du, self._beam_dv
-        uc, vc = self._beam_uc, self._beam_vc
+        # 2) Exit field on the sample *exit* plane (downstream face)
+        E_plane = (self._beam_E0_map * A_beam).astype(np.complex64)  # (NyB,NzB)
+        NyB, NzB = E_plane.shape
+        du_A = float(self._beam_du)  # Å (u ≡ e1; rows)
+        dv_A = float(self._beam_dv)  # Å (v ≡ e2; cols)
 
-        # 3) Resample to detector pixels
-        NyD, NxD = detector.shape
+        # --- Geometry needed to decide if we must propagate ------------------------
+        # Beam direction and global sample depth bounds (Å)
+        k_hat = (self._direction / np.linalg.norm(self._direction)).astype(np.float32)
+        _, s_max = self._compute_global_depth_bounds(sample, stage)  # exit plane (Å)
+
+        # Detector pixel coordinates (Å) and their beam-parallel coordinate s_det (Å)
         pix = detector.pixel_coordinates
-        if cp is not None and use_gpu:
-            # move to GPU
-            if not isinstance(pix, cp.ndarray):
-                pix = cp.asarray(pix)
+        # Ensure CPU array for planarity check; we'll convert later if needed
+        if cp is not None and isinstance(pix, cp.ndarray):
+            pix_cpu = pix.get()
+        else:
+            pix_cpu = np.asarray(pix)
+        s_det = (pix_cpu[0, :] * k_hat[0] + pix_cpu[1, :] * k_hat[1] + pix_cpu[2, :] * k_hat[2]).astype(np.float64)
+
+        # Check planarity & offset of detector plane along the beam
+        s_det_min = float(np.min(s_det))
+        s_det_max = float(np.max(s_det))
+        s_det_mean = float(np.mean(s_det))
+        plane_span_A = s_det_max - s_det_min
+
+        # Tolerances (Å): treat detector as planar if its s-range is tiny compared to scene scale
+        # and skip propagation if detector coincides with exit plane within tol_off_A.
+        tol_plane_A = max(1e-3, 1e-6 * abs(s_det_mean))  # planarity tolerance
+        tol_off_A   = 1e-3                                # offset tolerance to decide Δz≈0
+
+        need_propagation = False
+        dz_A = 0.0
+        if plane_span_A <= tol_plane_A:
+            dz_A = s_det_mean - float(s_max)   # detector minus exit plane (Å)
+            need_propagation = (abs(dz_A) > tol_off_A)
+        else:
+            # Non-planar/tilted detector: use mean distance (best effort) and warn once.
+            dz_A = s_det_mean - float(s_max)
+            if abs(dz_A) > tol_off_A:
+                need_propagation = True
+                print(f"[beam] atomic_transmission: detector appears non-planar (Δs range={plane_span_A:.3g} Å). "
+                    f"Propagating by mean Δz={dz_A:.3g} Å.")
+
+        # --- 3) Propagate from exit plane to detector plane if needed --------------
+        if need_propagation:
+            dz_m = dz_A * 1e-10  # Å → m
+            # Map array axes to physical spacings: columns (Nx) ↔ v, rows (Ny) ↔ u
+            dx_m = dv_A * 1e-10  # along columns (v)
+            dy_m = du_A * 1e-10  # along rows    (u)
+
+            if use_gpu and (cp is not None):
+                # GPU path
+                kernel = self.build_propagation_multiplier_kernel()
+                E_gpu = cp.asarray(E_plane)  # (NyB,NzB)
+                E_gpu = self._angular_spectrum_propagate_gpu(
+                    field=E_gpu, dx=dx_m, dy=dy_m, z=dz_m, kernel=kernel
+                )
+                # keep on GPU for sampling to avoid extra transfers
+                E_plane = E_gpu  # cp.ndarray
+            else:
+                # CPU path
+                ffi, lib = self.compile_propagation_multiplier_cffi()
+                E_plane = self._angular_spectrum_propagate_cpu(
+                    field=E_plane, dx=dx_m, dy=dy_m, z=dz_m, lib=lib, ffi=ffi
+                ).astype(np.complex64)
+
+        # --- 4) Resample the (possibly propagated) field to detector pixel centers --
+        NyD, NxD = detector.shape
+        # Project detector coords onto (u,v) basis
+        if use_gpu and (cp is not None):
+            # Ensure everything is on GPU
+            pix_g = pix if isinstance(pix, cp.ndarray) else cp.asarray(pix)
             e1g = cp.asarray(self._beam_e1); e2g = cp.asarray(self._beam_e2)
-            u = pix[0]*e1g[0] + pix[1]*e1g[1] + pix[2]*e1g[2]
-            v = pix[0]*e2g[0] + pix[1]*e2g[1] + pix[2]*e2g[2]
-            iu = u / du + uc
-            iv = v / dv + vc
+            u = pix_g[0]*e1g[0] + pix_g[1]*e1g[1] + pix_g[2]*e1g[2]
+            v = pix_g[0]*e2g[0] + pix_g[1]*e2g[1] + pix_g[2]*e2g[2]
+            iu = u / cp.float32(du_A) + cp.float32(self._beam_uc)
+            iv = v / cp.float32(dv_A) + cp.float32(self._beam_vc)
 
             i0 = cp.floor(iu).astype(cp.int64); j0 = cp.floor(iv).astype(cp.int64)
             i1 = i0 + 1; j1 = j0 + 1
@@ -2299,17 +2362,16 @@ class beam:
             i0 = cp.clip(i0, 0, NyB - 1); i1 = cp.clip(i1, 0, NyB - 1)
             j0 = cp.clip(j0, 0, NzB - 1); j1 = cp.clip(j1, 0, NzB - 1)
 
-            E_gpu = cp.asarray(E_beam)
+            # Field source (GPU or CPU)
+            E_src = E_plane if isinstance(E_plane, cp.ndarray) else cp.asarray(E_plane)
 
             idx00 = (i0 * NzB + j0).astype(cp.int64)
             idx01 = (i0 * NzB + j1).astype(cp.int64)
             idx10 = (i1 * NzB + j0).astype(cp.int64)
             idx11 = (i1 * NzB + j1).astype(cp.int64)
 
-            E00 = E_gpu.ravel()[idx00]
-            E01 = E_gpu.ravel()[idx01]
-            E10 = E_gpu.ravel()[idx10]
-            E11 = E_gpu.ravel()[idx11]
+            E00 = E_src.ravel()[idx00]; E01 = E_src.ravel()[idx01]
+            E10 = E_src.ravel()[idx10]; E11 = E_src.ravel()[idx11]
 
             one = cp.float32(1.0)
             E_flat = (E00 * (one - fu)*(one - fv) +
@@ -2318,12 +2380,12 @@ class beam:
                     E11 * (fu)*fv).astype(cp.complex64)
             E_det = E_flat.reshape(NyD, NxD).get()
         else:
-            pix = np.asarray(pix)
+            # CPU sampling
             e1 = self._beam_e1; e2 = self._beam_e2
-            u = pix[0]*e1[0] + pix[1]*e1[1] + pix[2]*e1[2]
-            v = pix[0]*e2[0] + pix[1]*e2[1] + pix[2]*e2[2]
-            iu = u / du + uc
-            iv = v / dv + vc
+            u = pix_cpu[0]*e1[0] + pix_cpu[1]*e1[1] + pix_cpu[2]*e1[2]
+            v = pix_cpu[0]*e2[0] + pix_cpu[1]*e2[1] + pix_cpu[2]*e2[2]
+            iu = u / du_A + self._beam_uc
+            iv = v / dv_A + self._beam_vc
 
             i0 = np.floor(iu).astype(np.int64); j0 = np.floor(iv).astype(np.int64)
             i1 = i0 + 1; j1 = j0 + 1
@@ -2332,7 +2394,7 @@ class beam:
             i0 = np.clip(i0, 0, NyB - 1); i1 = np.clip(i1, 0, NyB - 1)
             j0 = np.clip(j0, 0, NzB - 1); j1 = np.clip(j1, 0, NzB - 1)
 
-            Eb = E_beam.ravel()
+            Eb = (E_plane if isinstance(E_plane, np.ndarray) else np.asarray(E_plane)).ravel()
             idx00 = (i0 * NzB + j0).astype(np.int64)
             idx01 = (i0 * NzB + j1).astype(np.int64)
             idx10 = (i1 * NzB + j0).astype(np.int64)
