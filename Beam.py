@@ -2005,6 +2005,9 @@ class beam:
         phi = np.zeros((NyB, NzB), np.float32)
 
         f1f2_dict = self.parse_f1f2_db_all("f1f2_CromerLiberman.dat")
+        f0_params_dict = self.parse_f0_db_all('f0_WaasKirf.dat')
+        f0_zero_dict = self._build_f0_zero_dict(f0_params_dict)
+
         e1 = self._beam_e1; e2 = self._beam_e2
 
         def _tsc_w(d):
@@ -2025,16 +2028,20 @@ class beam:
             pos += stage.translation
 
             nA = pos.shape[0]
-            f1 = np.zeros(nA, np.float32)
-            f2 = np.zeros(nA, np.float32)
+            f1  = np.zeros(nA, np.float32)
+            f2  = np.zeros(nA, np.float32)
+            f0z = np.zeros(nA, np.float32)
+
+            # fill f0(0), f1, f2 by species
             for el in pd.unique(spc):
-                tbl = f1f2_dict.get(str(el))
-                if tbl is None:
-                    continue
-                cplx = self.get_f1f2_from_params(self._energy, tbl)
+                el_s = str(el)
                 m = (spc == el)
-                f1[m] = float(cplx.real)
-                f2[m] = float(cplx.imag)
+                f0z[m] = float(f0_zero_dict.get(el_s, 0.0))
+                tbl = f1f2_dict.get(el_s)
+                if tbl is not None:
+                    cplx = self.get_f1f2_from_params(self._energy, tbl)
+                    f1[m] = float(cplx.real)
+                    f2[m] = float(cplx.imag)
 
             au = pos[:, 0]*e1[0] + pos[:, 1]*e1[1] + pos[:, 2]*e1[2]
             av = pos[:, 0]*e2[0] + pos[:, 1]*e2[1] + pos[:, 2]*e2[2]
@@ -2049,9 +2056,9 @@ class beam:
 
             wu_m1, wu_0, wu_p1 = _tsc_w(du_m1), _tsc_w(du_0), _tsc_w(du_p1)
             wv_m1, wv_0, wv_p1 = _tsc_w(dv_m1), _tsc_w(dv_0), _tsc_w(dv_p1)
-
-            w_phi_atom = (-scale * f1).astype(np.float32)
-            w_tau_atom = ( scale * f2).astype(np.float32)
+            
+            w_phi_atom = (-scale * (f0z + f1)).astype(np.float32)
+            w_tau_atom = ( scale *  f2).astype(np.float32)
 
             idx_phi = []; w_phi = []
             idx_tau = []; w_tau = []
@@ -2095,8 +2102,7 @@ class beam:
 
     def _compute_beam_column_A_map_gpu(self, sample, stage, kernel_radius=0):
         """
-        Full-column transmission A(u,v)=exp(-tau + i*phi) on the beam grid (Ny_beam, Nz_beam).
-        High-throughput GPU (multi-GPU aware via chunk loop). Returns np.complex64 (Ny,Nz).
+        Full-column transmission A(u,v)=exp(-tau + i*phi) on the beam grid (Ny,Nz).
         """
         if cp is None:
             return self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius)
@@ -2118,6 +2124,8 @@ class beam:
         T_pin = self.allocate_pinned_array(stage.translation)
 
         f1f2_dict = self.parse_f1f2_db_all("f1f2_CromerLiberman.dat")
+        f0_params_dict = self.parse_f0_db_all('f0_WaasKirf.dat')
+        f0_zero_dict = self._build_f0_zero_dict(f0_params_dict)
 
         partial = [None] * n_gpus
         chunks_per_gpu = sample.chunk_total // n_gpus
@@ -2148,19 +2156,24 @@ class beam:
                 if nA == 0:
                     continue
 
-                # per-atom f1,f2
-                f1 = np.zeros(nA, np.float32)
-                f2 = np.zeros(nA, np.float32)
+                # build per-atom f0(0), f1, f2 on host
+                f1  = np.zeros(nA, np.float32)
+                f2  = np.zeros(nA, np.float32)
+                f0z = np.zeros(nA, np.float32)
                 for el in pd.unique(spc):
-                    tbl = f1f2_dict.get(str(el))
-                    if tbl is None:
-                        continue
-                    cplx = self.get_f1f2_from_params(self._energy, tbl)
+                    el_s = str(el)
                     m = (spc == el)
-                    f1[m] = float(cplx.real)
-                    f2[m] = float(cplx.imag)
+                    f0z[m] = float(f0_zero_dict.get(el_s, 0.0))
+                    # anomalous
+                    tbl = f1f2_dict.get(el_s)
+                    if tbl is not None:
+                        cplx = self.get_f1f2_from_params(self._energy, tbl)
+                        f1[m] = float(cplx.real)
+                        f2[m] = float(cplx.imag)
 
-                f1g = cp.asarray(f1); f2g = cp.asarray(f2)
+                f1g  = cp.asarray(f1);   f2g  = cp.asarray(f2)
+                f0zg = cp.asarray(f0z)
+
                 posg = cp.asarray(pos, dtype=cp.float32)
                 posg = posg @ Rg; posg += Tg
 
@@ -2182,8 +2195,8 @@ class beam:
                 wu_m1, wu_0, wu_p1 = _tsc_w(du_m1), _tsc_w(du_0), _tsc_w(du_p1)
                 wv_m1, wv_0, wv_p1 = _tsc_w(dv_m1), _tsc_w(dv_0), _tsc_w(dv_p1)
 
-                w_phi_atom = (-scale * f1g).astype(cp.float32)
-                w_tau_atom = ( scale * f2g).astype(cp.float32)
+                w_phi_atom = (-scale * (f0zg + f1g)).astype(cp.float32)
+                w_tau_atom = ( scale *  f2g).astype(cp.float32)
 
                 idx_phi = []; w_phi = []
                 idx_tau = []; w_tau = []
@@ -2243,11 +2256,11 @@ class beam:
             start = end
         for t in threads: t.join()
 
-        # reduce
+        # reduce multiplicatively across GPUs (chunks were disjoint)
         A_total = np.ones((self._beam_Ny, self._beam_Nz), np.complex64)
         for p in partial:
             if p is not None:
-                A_total *= p  # chunks are disjoint; summation is already combined via bincount
+                A_total *= p
         return A_total
     
     def atomic_transmission(self, sample, detector, stage, use_gpu=True, kernel_radius=0):
