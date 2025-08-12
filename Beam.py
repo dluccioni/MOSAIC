@@ -130,11 +130,13 @@ class beam:
         
     def read_beam_metadata(self):
         """
-        Read beam metadata from a JSON file in the current directory, restoring
-        the beam's internal state (energy, wavelength, direction, shape, and size).
-
-        Raises:
-            FileNotFoundError: If the metadata JSON file does not exist.
+        Read beam metadata from JSON and restore the beam including its transverse grid.
+        Rebuilds derived quantities:
+        - normalized direction
+        - k‑vector components (_kx_scalar, _ky_scalar, _kz_scalar)
+        - (u,v) orthonormal basis (self._beam_e1, self._beam_e2)
+        - beam grid (centers, spacings, E0 profile) via _init_beam_grid()
+        Backward compatible with older files that lack the beam‑grid fields.
         """
         metadata_filename = os.path.join(self.directory, "beam_metadata.json")
         if not os.path.isfile(metadata_filename):
@@ -143,34 +145,108 @@ class beam:
         with open(metadata_filename, "r") as f:
             beam_metadata = json.load(f)
 
-        # Convert lists back to NumPy arrays
-        if beam_metadata["direction"] is not None:
-            self._direction = np.array(beam_metadata["direction"], dtype=np.float32)
-        self._energy = beam_metadata["energy"]
-        self._wavelength = beam_metadata["wavelength"]
+        # --- core scalars --------------------------------------------------------
+        direction = beam_metadata.get("direction", None)
+        if direction is None:
+            direction = [1.0, 0.0, 0.0]
+        self._direction = np.array(direction, dtype=np.float32)
+        self._direction = self._direction / np.linalg.norm(self._direction)
 
-        # If older metadata, might not have shape/size; handle gracefully
-        self._beam_shape = beam_metadata.get("beam_shape", "rectangular")
-        self._beam_size  = tuple(beam_metadata.get("beam_size", (0.0, 0.0)))
+        self._energy     = float(beam_metadata.get("energy", self._energy if self._energy is not None else 1.0))
+        self._wavelength = float(beam_metadata.get("wavelength",
+                                                (self._hq * self._c / self._energy)))
+
+        # wavevector components (derived)
+        k = 2.0 * np.pi / self._wavelength
+        self._kx_scalar = float(self._direction[0] * k)
+        self._ky_scalar = float(self._direction[1] * k)
+        self._kz_scalar = float(self._direction[2] * k)
+
+        # --- beam‑grid primitives -----------------------------------------------
+        self._beam_shape = str(beam_metadata.get("beam_shape", "rectangular")).lower()
+
+        # ensure non‑degenerate default sizes (Å)
+        default_size = (1000.0, 1000.0)
+        size_list = beam_metadata.get("beam_size", default_size)
+        if size_list is None or len(size_list) != 2:
+            size_list = default_size
+        Sy = float(size_list[0]) if float(size_list[0]) > 0.0 else default_size[0]
+        Sz = float(size_list[1]) if float(size_list[1]) > 0.0 else default_size[1]
+        self._beam_size = (Sy, Sz)
+
+        # samples (Ny, Nz) – fall back to a sensible grid if missing
+        samples = beam_metadata.get("beam_samples", None)
+        if samples is None or (isinstance(samples, (list, tuple)) and len(samples) != 2):
+            samples = (256, 256)
+        Ny = int(samples[0]); Nz = int(samples[1])
+        Ny = max(1, Ny); Nz = max(1, Nz)
+        self._beam_samples = (Ny, Nz)
+
+        # profile
+        self._beam_profile = str(beam_metadata.get("beam_profile", "uniform")).lower()
+        gw = beam_metadata.get("gaussian_waist", None)
+        if gw is None:
+            # if profile is gaussian but waist was not provided, default to half‑size
+            if self._beam_profile == "gaussian":
+                self._gauss_waist = (0.5 * Sy, 0.5 * Sz)
+            else:
+                self._gauss_waist = None
+        else:
+            # accept list/tuple/float
+            if isinstance(gw, (list, tuple)) and len(gw) == 2:
+                self._gauss_waist = (float(gw[0]), float(gw[1]))
+            else:
+                # malformed -> safe default
+                self._gauss_waist = (0.5 * Sy, 0.5 * Sz) if self._beam_profile == "gaussian" else None
+
+        # --- transverse basis and grid ------------------------------------------
+        e1, e2 = self.make_orthonormal_basis(self._direction)
+        self._beam_e1 = e1.astype(np.float32)
+        self._beam_e2 = e2.astype(np.float32)
+
+        # Build the beam grid and E0(u,v) based on the loaded settings
+        if hasattr(self, "_init_beam_grid"):
+            self._init_beam_grid()
 
         print(f"Beam metadata loaded from {metadata_filename}.")
 
     ## Data Handling Functions    
     def write_beam_metadata(self, override_directory=None):
         """
-        Serialize the beam's internal state to a JSON file for future restoration.
+        Serialize the beam's internal state (including the beam‑grid definition)
+        to a JSON file for future restoration.
 
-        Args:
-            override_directory (str, optional): If provided, this directory is used
-                to store the JSON file. Otherwise, the directory specified during
-                initialization (self.directory) is used.
+        Newly saved fields:
+        - beam_samples    : [Ny, Nz] on the transverse (u,v) grid
+        - beam_profile    : "uniform" or "gaussian"
+        - gaussian_waist  : [wy, wz] in Å for Gaussian profile (1/e^2 radii) or null
+        - metadata_version: integer schema tag (>=2 when beam grid is present)
         """
+        # graceful fallbacks if older attributes aren't present
+        direction = self._direction.tolist() if getattr(self, "_direction", None) is not None else None
+        energy    = getattr(self, "_energy", None)
+        wavelength= getattr(self, "_wavelength", None)
+
+        beam_shape   = getattr(self, "_beam_shape", "rectangular")
+        beam_size    = list(getattr(self, "_beam_size", (1000.0, 1000.0)))     # Å
+        beam_samples = getattr(self, "_beam_samples", None)
+        if beam_samples is not None:
+            beam_samples = [int(beam_samples[0]), int(beam_samples[1])]
+        beam_profile = getattr(self, "_beam_profile", "uniform")
+        gauss_waist  = getattr(self, "_gauss_waist", None)
+        if gauss_waist is not None:
+            gauss_waist = [float(gauss_waist[0]), float(gauss_waist[1])]
+
         beam_metadata = {
-            "direction"   : self._direction.tolist() if self._direction is not None else None,
-            "energy"      : self._energy,
-            "wavelength"  : self._wavelength,
-            "beam_shape"  : self._beam_shape,
-            "beam_size"   : list(self._beam_size)
+            "metadata_version": 2,
+            "direction"       : direction,
+            "energy"          : energy,
+            "wavelength"      : wavelength,
+            "beam_shape"      : beam_shape,
+            "beam_size"       : beam_size,       # [size_u_Å, size_v_Å]
+            "beam_samples"    : beam_samples,    # [Ny, Nz]
+            "beam_profile"    : beam_profile,    # "uniform" | "gaussian"
+            "gaussian_waist"  : gauss_waist      # [wy_Å, wz_Å] or null
         }
 
         if override_directory is not None:
