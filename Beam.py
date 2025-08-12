@@ -1003,8 +1003,17 @@ class beam:
     @staticmethod
     def build_expand_paths_kernel():
         """
-        CUDA kernel to expand paths by adding neighbor-induced phase only.
-        Unused inputs k_in_mag and wavelength removed from the signature.
+        CUDA kernel to expand paths by adding neighbor-induced phase *and*
+        multiplying by a per-bounce scattering factor s0[j] ~= f0(0)+f1+i*f2.
+        It also writes the *neighbor atom position* (meters) into the outputs.
+
+        Notes
+        -----
+        - out_atomIndex[outPos] = j (neighbor index) if the neighbor is in the
+        *local* chunk [0..nAtomsLocal-1]; otherwise -1. This lets the host
+        filter expansions that cannot be further expanded on this chunk.
+        - neighbor positions are loaded from atom_x_m/y_m/z_m using j.
+        - neighbor wave-vector components (neighborKx/Ky/Kz) are passed through.
         """
         code = r'''
         #include <math.h>
@@ -1037,11 +1046,18 @@ class beam:
             const float*  neighborKx,
             const float*  neighborKy,
             const float*  neighborKz,
-            const int*    neighborIdxAtom,
-            const int*    neighborSpc,
+            const int*    neighborIdxAtom,  // j (may be out-of-chunk)
+            const int*    neighborSpc,      // int32 species code per neighbor
 
             // global size
             const int     numIncomingPaths,
+
+            // local-chunk per-atom lookups (positions in meters, s0 ~= f0(0)+anom)
+            const float*  atom_x_m,
+            const float*  atom_y_m,
+            const float*  atom_z_m,
+            const float2* s0_per_atom,      // length = nAtomsLocal
+            const int     nAtomsLocal,
 
             // outputs (capacity = maxPaths)
             float*  out_x,
@@ -1060,32 +1076,61 @@ class beam:
             int idx = blockDim.x * blockIdx.x + threadIdx.x;
             if (idx >= numIncomingPaths) return;
 
-            float2 samp = in_amp[idx];
-            int    sourceAtom = in_atomIndex[idx];
+            float2 AmpIn = in_amp[idx];
+            int    src   = in_atomIndex[idx];
 
-            int startN = neighborStart[sourceAtom];
-            int countN = neighborCount[sourceAtom];
+            int startN = neighborStart[src];
+            int countN = neighborCount[src];
 
             for (int n = 0; n < countN; ++n) {
                 int gN = startN + n;
 
-                float phase_ij = neighborPhase[gN];
-                float2 eip = cplx_expf(phase_ij);
-                float2 new_amp;
-                new_amp.x = samp.x * eip.x - samp.y * eip.y;
-                new_amp.y = samp.x * eip.y + samp.y * eip.x;
+                // phase and per-bounce scatter
+                float  ph  = neighborPhase[gN];
+                float2 eip = cplx_expf(ph);
 
+                // multiply by exp(i*phase)
+                float2 A1;
+                A1.x = AmpIn.x * eip.x - AmpIn.y * eip.y;
+                A1.y = AmpIn.x * eip.y + AmpIn.y * eip.x;
+
+                // neighbor atom index
+                int j = neighborIdxAtom[gN];
+
+                // multiply by s0[j] if local; otherwise s0 = 1
+                float2 s0 = make_float2(1.f, 0.f);
+                if (j >= 0 && j < nAtomsLocal) {
+                    s0 = s0_per_atom[j];
+                }
+
+                float2 A2;
+                A2.x = A1.x * s0.x - A1.y * s0.y;
+                A2.y = A1.x * s0.y + A1.y * s0.x;
+
+                // append to output buffer
                 int outPos = atomicAdd((unsigned int*)&out_atomIndex[maxPaths], 1);
                 if (outPos < maxPaths) {
-                    out_x[outPos]   = 0.f;
-                    out_y[outPos]   = 0.f;
-                    out_z[outPos]   = 0.f;
-                    out_kx[outPos]  = neighborKx[gN];
-                    out_ky[outPos]  = neighborKy[gN];
-                    out_kz[outPos]  = neighborKz[gN];
-                    out_amp[outPos] = new_amp;
-                    out_atomIndex[outPos] = neighborIdxAtom[gN];
-                    out_spc[outPos]  = neighborSpc[gN];
+                    // neighbor position (meters) if local, else mark invalid
+                    if (j >= 0 && j < nAtomsLocal) {
+                        out_x[outPos] = atom_x_m[j];
+                        out_y[outPos] = atom_y_m[j];
+                        out_z[outPos] = atom_z_m[j];
+                        out_atomIndex[outPos] = j;
+                    } else {
+                        float nanv = __int_as_float(0x7fffffff); // qNaN
+                        out_x[outPos] = nanv;
+                        out_y[outPos] = nanv;
+                        out_z[outPos] = nanv;
+                        out_atomIndex[outPos] = -1;
+                    }
+
+                    // carry neighbor direction (units kept as provided)
+                    out_kx[outPos] = neighborKx[gN];
+                    out_ky[outPos] = neighborKy[gN];
+                    out_kz[outPos] = neighborKz[gN];
+
+                    out_amp[outPos] = A2;
+                    out_spc[outPos] = neighborSpc[gN];
                 }
             }
         }
@@ -1094,7 +1139,7 @@ class beam:
 
         mod = cp.RawModule(
             code=code,
-            options=('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true'),
+            options=('-O3', '--ftz=true', '--fmad=true'),
             backend='nvcc'
         )
         return mod.get_function('expand_paths_kernel')
@@ -2507,43 +2552,66 @@ class beam:
     
     def compute_nearest_neighbor_distances_passA(self, sample, r_cut, max_neighbors_per_atom):
         """
-        Pass A: Intra-chunk neighbor searches for all chunks, identify boundary
-        atoms, and store (phase, kx, ky, kz, neighbor_idx, neighbor_species).
-        We do not compute or store scattering factors here.
+        Pass A with species encoded as contiguous int32 codes (GPU-safe).
+        Stores (phase, kx, ky, kz, neighbor_idx, neighbor_species_code).
         """
+        # lazy codec
+        if not hasattr(self, "_species_code_map"):
+            self._species_code_map = {}   # sym -> code (int)
+            self._species_decode   = []   # code -> sym (list)
+
+        def _sym_of(x):
+            if isinstance(x, (str, np.str_)):
+                return str(x)
+            if hasattr(sample, "get_symbol_from_id"):
+                try:
+                    return str(sample.get_symbol_from_id(int(x)))
+                except Exception:
+                    return str(x)
+            return str(x)
+
+        def _encode_species(arr):
+            out = np.empty(arr.shape, dtype=np.int32)
+            for i, v in enumerate(arr):
+                sym = _sym_of(v)
+                code = self._species_code_map.get(sym)
+                if code is None:
+                    code = len(self._species_decode)
+                    self._species_code_map[sym] = code
+                    self._species_decode.append(sym)
+                out[i] = code
+            return out
+
         boundary_dict   = {}
         all_data_memory = {}
 
         for cid in range(1, sample.chunk_total+1):
             chunk_positions = sample.load_chunk_positions(cid, use_gpu=True)
-            chunk_species   = sample.load_chunk_species(cid, use_gpu=False)  # CPU side
+            chunk_species   = sample.load_chunk_species(cid, use_gpu=False)
             n_atoms = chunk_positions.shape[0]
 
             if n_atoms == 0:
-                # trivial chunk
                 sample.write_chunk_nn_phase([], cid)
-                sample.write_chunk_nn_scatter([], cid)  # reusing "scatter" slot for k-vectors
+                sample.write_chunk_nn_scatter([], cid)
                 sample.write_chunk_nn_indices([], cid)
                 sample.write_chunk_nn_species([], cid)
                 boundary_dict[cid] = {
                     "positions": cp.zeros((0,3), dtype=cp.float32),
                     "indices":   cp.zeros((0,),  dtype=cp.int32),
-                    "species":   np.array([], dtype=chunk_species.dtype)
+                    "species":   np.array([], dtype=np.int32)
                 }
                 all_data_memory[cid] = []
                 continue
 
-            # (1) Intra-chunk i->i neighbors
+            # encode species -> int32 codes
+            chunk_codes = _encode_species(chunk_species)
+
             results_intra = self.compute_intra_chunk_neighbors_gpu(
-                sample,
-                chunk_positions,
-                r_cut=r_cut,
+                sample, chunk_positions, r_cut=r_cut,
                 max_neighbors_per_atom=max_neighbors_per_atom
             )
-            # results_intra is a list of length n_atoms, each entry:
-            #   (phase_array, kvec_3, neighbor_idx_array)
 
-            # (2) Identify boundary
+            # boundary set (Å)
             min_val = cp.min(chunk_positions, axis=0)
             max_val = cp.max(chunk_positions, axis=0)
             margin  = r_cut
@@ -2553,40 +2621,30 @@ class beam:
             boundary_positions = chunk_positions[boundary_mask]
             boundary_indices   = cp.arange(n_atoms, dtype=cp.int32)[boundary_mask]
             boundary_mask_cpu  = boundary_mask.get()
+            boundary_species   = chunk_codes[boundary_mask_cpu]  # codes
 
-            boundary_species   = chunk_species[boundary_mask_cpu]
-
-            # (3) Write partial .npz-like data
             phase_list    = []
             kvector_list  = []
             idx_list      = []
             species_list  = []
-
-            ### We build an augmented data structure (ph, kvec, idx, spc) ###
             results_intra_with_spc = [None] * n_atoms
 
             for i_atom, (ph, kvec_3, n_idx) in enumerate(results_intra):
-                # The neighbor species for this atom come from chunk_species[n_idx].
-                # n_idx is a 1D array of neighbor indices in the same chunk.
-                n_spc = chunk_species[n_idx]  # CPU side indexing
+                n_spc_codes = chunk_codes[n_idx]  # codes for neighbors
 
                 phase_list.append(ph.astype(np.float32))
                 kvector_list.append(kvec_3.astype(np.float32))
                 idx_list.append(n_idx.astype(np.int32))
-                species_list.append(n_spc)  # store neighbor species array
+                species_list.append(n_spc_codes.astype(np.int32))
 
-                # Also store internally for pass B merges
-                results_intra_with_spc[i_atom] = (ph, kvec_3, n_idx, n_spc)
+                results_intra_with_spc[i_atom] = (ph, kvec_3, n_idx, n_spc_codes)
 
             sample.write_chunk_nn_phase(phase_list, cid)
-            sample.write_chunk_nn_scatter(kvector_list, cid)  # still using 'scatter' slot
+            sample.write_chunk_nn_scatter(kvector_list, cid)
             sample.write_chunk_nn_indices(idx_list, cid)
             sample.write_chunk_nn_species(species_list, cid)
 
-            # Save to all_data_memory for pass B usage
             all_data_memory[cid] = results_intra_with_spc
-
-            # Save boundary
             boundary_dict[cid] = {
                 "positions": boundary_positions,
                 "indices":   boundary_indices,
@@ -2601,8 +2659,7 @@ class beam:
     def compute_nearest_neighbor_distances_passB(self, sample, boundary_dict, all_data_memory,
                                                 r_cut, max_neighbors_per_atom):
         """
-        (unchanged docstring) — only the bounding-box quick reject now wraps CuPy
-        reductions with bool(...).
+        Pass B with int32 species codes and bool(...) CuPy guards.
         """
         # Build bounding boxes
         chunk_bounds = {}
@@ -2620,7 +2677,7 @@ class beam:
             i_data = all_data_memory[i]
             pos_i  = i_bd["positions"]
             idx_i  = i_bd["indices"]
-            spc_i  = i_bd["species"]
+            spc_i  = i_bd["species"]  # codes
             if pos_i.size == 0:
                 continue
             N_i = pos_i.shape[0]
@@ -2631,7 +2688,7 @@ class beam:
                 j_data = all_data_memory[j]
                 pos_j  = j_bd["positions"]
                 idx_j  = j_bd["indices"]
-                spc_j  = j_bd["species"]
+                spc_j  = j_bd["species"]  # codes
                 if pos_j.size == 0:
                     continue
                 N_j = pos_j.shape[0]
@@ -2640,13 +2697,12 @@ class beam:
                 if (min_i is None) or (min_j is None):
                     continue
 
-                # ---- bool(...) guards ----
-                sep_ij = ((max_i + r_cut) < (min_j - r_cut)).any()
-                sep_ji = ((max_j + r_cut) < (min_i - r_cut)).any()
-                if bool(sep_ij) or bool(sep_ji):
+                # quick reject with explicit bool(...)
+                bool_sep_ij = bool(((max_i + r_cut) < (min_j - r_cut)).any())
+                bool_sep_ji = bool(((max_j + r_cut) < (min_i - r_cut)).any())
+                if bool_sep_ij or bool_sep_ji:
                     continue
 
-                # ... (rest of your original function body is unchanged) ...
                 cross_list = self.compute_inter_chunk_neighbors_gpu(
                     sample, pos_i, pos_j, r_cut=r_cut,
                     max_neighbors_per_atom=max_neighbors_per_atom
@@ -2655,13 +2711,14 @@ class beam:
                 idx_i_cpu = idx_i.get()
                 idx_j_cpu = idx_j.get()
 
+                # attach neighbors into i_data (codes preserved)
                 for local_i in range(N_i):
                     (ph_new, kvec_new, idx_new) = cross_list[local_i]
                     if ph_new.size > 0:
                         global_i = idx_i_cpu[local_i]
                         (ph_old, kvec_old, idx_old, spc_old) = i_data[global_i]
                         spc_new = np.array([spc_j[n - N_i] if n >= N_i else spc_i[n]
-                                            for n in idx_new], dtype=spc_old.dtype)
+                                            for n in idx_new], dtype=np.int32)
                         i_data[global_i] = (
                             np.concatenate([ph_old, ph_new]),
                             np.vstack([kvec_old, kvec_new]),
@@ -2669,13 +2726,14 @@ class beam:
                             np.concatenate([spc_old, spc_new])
                         )
 
+                # attach neighbors into j_data (codes preserved)
                 for local_j in range(N_j):
                     (ph_new, kvec_new, idx_new) = cross_list[N_i + local_j]
                     if ph_new.size > 0:
                         global_j = idx_j_cpu[local_j]
                         (ph_old, kvec_old, idx_old, spc_old) = j_data[global_j]
                         spc_new = np.array([spc_i[n] if n < N_i else spc_j[n - N_i]
-                                            for n in idx_new], dtype=spc_old.dtype)
+                                            for n in idx_new], dtype=np.int32)
                         j_data[global_j] = (
                             np.concatenate([ph_old, ph_new]),
                             np.vstack([kvec_old, kvec_new]),
@@ -2739,10 +2797,11 @@ class beam:
                                     n_bounces=0, offset=None, use_gpu=True,
                                     sub_chunk_size=100_000):
         """
-        Multi-bounce GPU scattering. Now:
-        • Passes f0_zero and remove_forward to interaction_kernal (fix).
-        • Builds per-path f0_params / anomalous / f0(0) from stored neighbor species (fix).
-        • Removes unused args from expand_paths_kernel launch (fix).
+        Multi-bounce GPU scattering with the following fixes:
+        • Expanded paths carry the NEIGHBOR atom position (meters).
+        • Each expansion multiplies by s0 ~= f0(0) + f1 + i f2 (small-angle).
+        • Neighbor species are int32 codes; a GPU LUT maps code->(f0 params, f0(0), anom).
+        • No Python per-path loops; everything is vectorized on GPU.
         """
         if (not use_gpu) or (cp is None):
             raise RuntimeError("GPU-based dynamical code requires CuPy and use_gpu=True.")
@@ -2761,21 +2820,60 @@ class beam:
         print(f"[beam] Using GPU dynamical scattering with up to {n_bounces} bounce(s).")
         print(f"[beam] Total of {chunk_total} chunk(s) to process.")
 
-        # Scattering DBs
-        db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
-        db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
-        f0_zero_map      = self._build_f0_zero_dict(db_dict_f0_all)
+        # DBs and a stable species codec (built by Pass A; fallback here if needed)
+        db_f0   = self.parse_f0_db_all('f0_WaasKirf.dat')
+        db_f1f2 = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
 
+        if not hasattr(self, "_species_code_map"):
+            self._species_code_map = {}
+            self._species_decode   = []
+
+        def _ensure_codes_from(arr):
+            # encode to int32 codes; extend codec lazily
+            out = np.empty(arr.shape, dtype=np.int32)
+            for i, v in enumerate(arr):
+                if isinstance(v, (str, np.str_)):
+                    sym = str(v)
+                elif hasattr(sample, "get_symbol_from_id"):
+                    try:
+                        sym = str(sample.get_symbol_from_id(int(v)))
+                    except Exception:
+                        sym = str(v)
+                else:
+                    sym = str(v)
+                code = self._species_code_map.get(sym)
+                if code is None:
+                    code = len(self._species_decode)
+                    self._species_code_map[sym] = code
+                    self._species_decode.append(sym)
+                out[i] = code
+            return out
+
+        # Build a per-code LUT once per process (on demand)
+        n_codes = len(self._species_decode)
+        code_to_f0_params = np.zeros((max(1, n_codes), 11), np.float32)
+        code_to_f0_zero   = np.zeros((max(1, n_codes),),   np.float32)
+        code_to_anom      = np.zeros((max(1, n_codes),),   np.complex64)
+
+        for code, sym in enumerate(self._species_decode):
+            f0p = db_f0.get(sym)
+            if f0p is not None:
+                code_to_f0_params[code, :] = f0p
+                # f0(0) = c + sum(a_i)
+                code_to_f0_zero[code] = float(f0p[5] + f0p[0] + f0p[1] + f0p[2] + f0p[3] + f0p[4])
+            tbl = db_f1f2.get(sym)
+            if tbl is not None:
+                code_to_anom[code] = self.get_f1f2_from_params(self._energy, tbl)
+
+        # detector & stage (pinned → GPU)
         Nx, Ny = detector.shape
         final_result = np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # Detector coords (m) pinned
         mp = detector.pixel_coordinates
         px_pin = self.allocate_pinned_array(mp[0, :].astype(np.float32) / 1e10)
         py_pin = self.allocate_pinned_array(mp[1, :].astype(np.float32) / 1e10)
         pz_pin = self.allocate_pinned_array(mp[2, :].astype(np.float32) / 1e10)
 
-        # Stage pinned
         R_stage_pin = self.allocate_pinned_array(stage.rotation)
         T_stage_pin = self.allocate_pinned_array(stage.translation)
 
@@ -2785,139 +2883,61 @@ class beam:
 
         interaction_kernel = self.build_interaction_kernel()
         expand_kernel      = self.build_expand_paths_kernel()
-
-        # We don't expose a remove_forward toggle for dynamical; keep it off by default.
-        remove_forward_flag = 0
+        remove_forward_flag = 0  # keep anomalous term
 
         def gpu_worker(gpu_id, chunk_list, out_idx):
             cp.cuda.Device(gpu_id).use()
 
-            # Stage & detector on this GPU
+            # stage & detector
             Rg = cp.asarray(R_stage_pin, dtype=cp.float32)
             Tg = cp.asarray(T_stage_pin, dtype=cp.float32)
             pxg = cp.asarray(px_pin); pyg = cp.asarray(py_pin); pzg = cp.asarray(pz_pin)
 
-            dfield_gpu = cp.zeros((Nx * Ny,), dtype=cp.complex64)
+            # per-code LUTs on GPU (vectorized gathers later)
+            lut_f0p = cp.asarray(code_to_f0_params)
+            lut_f0z = cp.asarray(code_to_f0_zero)
+            lut_anm = cp.asarray(code_to_anom)
 
+            dfield_gpu = cp.zeros((Nx * Ny,), dtype=cp.complex64)
             block2d = (16, 16)
             grid2d  = ((Nx + block2d[0] - 1) // block2d[0],
                     (Ny + block2d[1] - 1) // block2d[1])
-
             block1d = 256
 
-            # ----- helper: resolve species id -> element symbol -----
-            def resolve_symbol(spc_id):
-                # if it's already a string-like symbol
-                if isinstance(spc_id, (str, np.str_)):
-                    return str(spc_id)
-                # try common mappings
-                if hasattr(sample, "get_symbol_from_id"):
-                    try: return str(sample.get_symbol_from_id(int(spc_id)))
-                    except Exception: pass
-                if hasattr(sample, "species_id_map"):
-                    try: return str(sample.species_id_map[int(spc_id)])
-                    except Exception: pass
-                if hasattr(sample, "species_lookup"):
-                    try: return str(sample.species_lookup[int(spc_id)])
-                    except Exception: pass
-                return None  # unknown => contributes zero
-
-            # ----- helper: final scattering for a sub-chunk of expanded paths -----
-            def process_subchunk(start_idx, end_idx,
-                                out_x_gpu, out_y_gpu, out_z_gpu,
-                                out_kx_gpu, out_ky_gpu, out_kz_gpu,
-                                out_amp_gpu, out_spc_gpu, sub_sz):
-
-                sub_x   = out_x_gpu[start_idx:end_idx]
-                sub_y   = out_y_gpu[start_idx:end_idx]
-                sub_z   = out_z_gpu[start_idx:end_idx]
-                sub_kx  = out_kx_gpu[start_idx:end_idx]
-                sub_ky  = out_ky_gpu[start_idx:end_idx]
-                sub_kz  = out_kz_gpu[start_idx:end_idx]
-                sub_amp = out_amp_gpu[start_idx:end_idx]
-                sub_spc = out_spc_gpu[start_idx:end_idx].get()
-
-                # Build per-path scattering arrays
-                f0_local   = np.zeros((sub_sz, 11), dtype=np.float32)
-                f0z_local  = np.zeros((sub_sz,),    dtype=np.float32)
-                anom_local = np.zeros((sub_sz,),    dtype=np.complex64)
-
-                # Fill by species
-                for i in range(sub_sz):
-                    sym = resolve_symbol(sub_spc[i])
-                    if not sym:
-                        continue
-                    f0p = db_dict_f0_all.get(sym)
-                    if f0p is not None:
-                        f0_local[i, :] = f0p
-                        f0z_local[i]   = f0_zero_map.get(sym, 0.0)
-                    tbl = db_dict_f1f2_all.get(sym)
-                    if tbl is not None:
-                        anom_local[i] = self.get_f1f2_from_params(self._energy, tbl)
-
-                f0_params_gpu = cp.asarray(f0_local)
-                f0_zero_gpu   = cp.asarray(f0z_local)
-                anom_gpu      = cp.asarray(anom_local)
-
-                # Launch interaction kernel
-                interaction_kernel(
-                    grid2d, block2d,
-                    (
-                        np.int32(sub_sz),
-                        sub_kx, sub_ky, sub_kz,
-                        sub_x,  sub_y,  sub_z,
-                        sub_amp,
-                        anom_gpu,
-                        f0_params_gpu,
-                        f0_zero_gpu,
-                        pxg, pyg, pzg,
-                        dfield_gpu,
-                        np.int32(Nx),
-                        np.int32(Ny),
-                        np.int32(remove_forward_flag)
-                    )
-                )
-                cp.cuda.stream.get_current_stream().synchronize()
-
-            # ---- per-chunk processing ----
             for cidx in chunk_list:
+                # atoms in this chunk
                 spc_host = sample.load_chunk_species(cidx, use_gpu=False)
                 nA = int(spc_host.shape[0])
                 if nA == 0:
                     continue
 
+                # encode per-atom species → codes
+                codes_host = _ensure_codes_from(spc_host)
+                codes_gpu  = cp.asarray(codes_host, dtype=cp.int32)
+
                 pos = cp.array(sample.load_chunk_positions(cidx, use_gpu=True), dtype=cp.float32)
                 pos = pos @ Rg; pos += Tg
 
-                px_at = pos[:, 0] / 1e10
-                py_at = pos[:, 1] / 1e10
-                pz_at = pos[:, 2] / 1e10
+                # atom positions in meters for expansion outputs
+                px_at = (pos[:, 0] / 1e10).astype(cp.float32)
+                py_at = (pos[:, 1] / 1e10).astype(cp.float32)
+                pz_at = (pos[:, 2] / 1e10).astype(cp.float32)
 
-                # Build per-atom scattering for bounce=0
-                f0_params_host = np.zeros((nA, 11), dtype=np.float32)
-                anom_host      = np.zeros((nA,),    dtype=np.complex64)
-                f0z_host       = np.zeros((nA,),    dtype=np.float32)
+                # per-atom s0 ~= f0(0)+anom for expansion step (GPU gather)
+                f0z_gpu = lut_f0z[codes_gpu]
+                anm_gpu = lut_anm[codes_gpu]
+                s0_gpu  = (f0z_gpu + anm_gpu).astype(cp.complex64)
 
-                unique_els = pd.unique(spc_host)
-                for el in unique_els:
-                    mask = (spc_host == el)
-                    if el in db_dict_f0_all:
-                        f0_params_host[mask] = db_dict_f0_all[el]
-                        f0z_host[mask] = f0_zero_map.get(el, 0.0)
-                    if el in db_dict_f1f2_all:
-                        anom_host[mask] = self.get_f1f2_from_params(self._energy, db_dict_f1f2_all[el])
+                # bounce 0: direct scattering to detector (full Q on kernel)
+                f0_params_gpu = lut_f0p[codes_gpu]
+                anom_gpu0     = anm_gpu
+                f0_zero_gpu   = f0z_gpu
 
-                f0_params_gpu = cp.asarray(f0_params_host)
-                anom_gpu      = cp.asarray(anom_host)
-                f0_zero_gpu   = cp.asarray(f0z_host)
-
-                # initial wavevector = beam
                 kx_atom_gpu = cp.full((nA,), self._kx_scalar, dtype=cp.float32)
                 ky_atom_gpu = cp.full((nA,), self._ky_scalar, dtype=cp.float32)
                 kz_atom_gpu = cp.full((nA,), self._kz_scalar, dtype=cp.float32)
                 amp_atom_gpu= cp.ones((nA,), dtype=cp.complex64)
 
-                # Direct scattering (bounce 0)
                 interaction_kernel(
                     grid2d, block2d,
                     (
@@ -2925,7 +2945,7 @@ class beam:
                         kx_atom_gpu, ky_atom_gpu, kz_atom_gpu,
                         px_at, py_at, pz_at,
                         amp_atom_gpu,
-                        anom_gpu,
+                        anom_gpu0,
                         f0_params_gpu,
                         f0_zero_gpu,
                         pxg, pyg, pzg,
@@ -2941,21 +2961,21 @@ class beam:
                     cp.get_default_memory_pool().free_all_blocks()
                     continue
 
-                # Load precomputed neighbor data (phase, kvec, indices, species)
+                # Load precomputed neighbor data (phase, kvec, indices, species codes)
                 ph_flat,  offs_ph = sample.load_chunk_nn_phase(cidx)
                 kx_flat, ky_flat, kz_flat, offs_kv = sample.load_chunk_nn_scatter(cidx)
                 idx_flat, offs_ix = sample.load_chunk_nn_indices(cidx)
-                spc_flat, offs_sp = sample.load_chunk_nn_species(cidx)
+                spc_flat, offs_sp = sample.load_chunk_nn_species(cidx)  # int32 codes expected
 
                 neighborPhase_gpu = cp.asarray(ph_flat,  dtype=cp.float32)
                 neighborKx_gpu    = cp.asarray(kx_flat,  dtype=cp.float32)
                 neighborKy_gpu    = cp.asarray(ky_flat,  dtype=cp.float32)
                 neighborKz_gpu    = cp.asarray(kz_flat,  dtype=cp.float32)
                 neighborIdx_gpu   = cp.asarray(idx_flat, dtype=cp.int32)
-                neighborSpc_gpu   = cp.asarray(spc_flat)  # dtype may be int or string codes -> kept as is
+                neighborSpc_gpu   = cp.asarray(spc_flat, dtype=cp.int32)
 
-                neighborStart_gpu  = cp.asarray(offs_ph[:-1].astype(np.int32))
-                neighborCount_gpu  = cp.asarray((offs_ph[1:] - offs_ph[:-1]).astype(np.int32))
+                neighborStart_gpu = cp.asarray(offs_ph[:-1].astype(np.int32))
+                neighborCount_gpu = cp.asarray((offs_ph[1:] - offs_ph[:-1]).astype(np.int32))
 
                 # Inputs for first expansion step
                 cur_size   = nA
@@ -2970,16 +2990,67 @@ class beam:
 
                 expand_max = int(sub_chunk_size)
 
+                # helper: scatter a sub-batch to the detector (vectorized)
+                def process_subchunk(sbStart, sbEnd,
+                                    out_x_gpu, out_y_gpu, out_z_gpu,
+                                    out_kx_gpu, out_ky_gpu, out_kz_gpu,
+                                    out_amp_gpu, out_idx_gpu, out_spc_gpu):
+
+                    # slice
+                    sub_x  = out_x_gpu[sbStart:sbEnd]
+                    sub_y  = out_y_gpu[sbStart:sbEnd]
+                    sub_z  = out_z_gpu[sbStart:sbEnd]
+                    sub_kx = out_kx_gpu[sbStart:sbEnd]
+                    sub_ky = out_ky_gpu[sbStart:sbEnd]
+                    sub_kz = out_kz_gpu[sbStart:sbEnd]
+                    sub_amp= out_amp_gpu[sbStart:sbEnd]
+                    sub_idx= out_idx_gpu[sbStart:sbEnd]
+                    sub_spc= out_spc_gpu[sbStart:sbEnd]
+
+                    # keep only valid (local) expansions
+                    valid = (sub_idx >= 0) & (sub_idx < nA)
+                    if not bool(valid.any()):
+                        return 0  # nothing to scatter
+
+                    sub_x   = sub_x[valid];   sub_y   = sub_y[valid];   sub_z   = sub_z[valid]
+                    sub_kx  = sub_kx[valid];  sub_ky  = sub_ky[valid];  sub_kz  = sub_kz[valid]
+                    sub_amp = sub_amp[valid]; sub_spc = sub_spc[valid]
+
+                    # per-path scattering arrays via LUT gather (GPU)
+                    f0p_paths = lut_f0p[sub_spc]          # (M, 11)
+                    f0z_paths = lut_f0z[sub_spc]          # (M,)
+                    anm_paths = lut_anm[sub_spc]          # (M,) complex
+
+                    interaction_kernel(
+                        grid2d, block2d,
+                        (
+                            np.int32(int(sub_x.size)),
+                            sub_kx, sub_ky, sub_kz,  # NOTE: kernel uses kx magnitude & dotv (+x specialization)
+                            sub_x,  sub_y,  sub_z,
+                            sub_amp,
+                            anm_paths,
+                            f0p_paths,
+                            f0z_paths,
+                            pxg, pyg, pzg,
+                            dfield_gpu,
+                            np.int32(Nx),
+                            np.int32(Ny),
+                            np.int32(remove_forward_flag)
+                        )
+                    )
+                    cp.cuda.stream.get_current_stream().synchronize()
+                    return int(sub_x.size)
+
                 for bounce_i in range(1, n_bounces + 1):
-                    out_x_gpu   = cp.zeros((expand_max,), dtype=cp.float32)
-                    out_y_gpu   = cp.zeros((expand_max,), dtype=cp.float32)
-                    out_z_gpu   = cp.zeros((expand_max,), dtype=cp.float32)
-                    out_kx_gpu  = cp.zeros((expand_max,), dtype=cp.float32)
-                    out_ky_gpu  = cp.zeros((expand_max,), dtype=cp.float32)
-                    out_kz_gpu  = cp.zeros((expand_max,), dtype=cp.float32)
-                    out_amp_gpu = cp.zeros((expand_max,), dtype=cp.complex64)
-                    out_idx_gpu = cp.zeros((expand_max + 1,), dtype=cp.int32)  # last slot is counter
-                    out_spc_gpu = cp.zeros((expand_max,), dtype=neighborSpc_gpu.dtype)
+                    out_x_gpu   = cp.empty((expand_max,), dtype=cp.float32)
+                    out_y_gpu   = cp.empty((expand_max,), dtype=cp.float32)
+                    out_z_gpu   = cp.empty((expand_max,), dtype=cp.float32)
+                    out_kx_gpu  = cp.empty((expand_max,), dtype=cp.float32)
+                    out_ky_gpu  = cp.empty((expand_max,), dtype=cp.float32)
+                    out_kz_gpu  = cp.empty((expand_max,), dtype=cp.float32)
+                    out_amp_gpu = cp.empty((expand_max,), dtype=cp.complex64)
+                    out_idx_gpu = cp.empty((expand_max + 1,), dtype=cp.int32)  # last slot is counter
+                    out_spc_gpu = cp.empty((expand_max,), dtype=cp.int32)
 
                     out_idx_gpu[expand_max] = 0  # reset counter
 
@@ -3003,6 +3074,9 @@ class beam:
 
                             np.int32(cur_size),
 
+                            px_at, py_at, pz_at,
+                            s0_gpu, np.int32(nA),
+
                             out_x_gpu, out_y_gpu, out_z_gpu,
                             out_kx_gpu, out_ky_gpu, out_kz_gpu,
                             out_amp_gpu, out_idx_gpu, out_spc_gpu,
@@ -3015,38 +3089,41 @@ class beam:
                     if expansions_written == 0:
                         break
 
+                    # scatter to detector in sub-batches (vectorized)
                     batchSize = expand_max
                     nSubBatches = (expansions_written + batchSize - 1) // batchSize
                     for sb in range(nSubBatches):
                         sbStart = sb * batchSize
                         sbEnd   = min(sbStart + batchSize, expansions_written)
-                        sub_sz  = sbEnd - sbStart
-                        if sub_sz <= 0:
-                            continue
+                        _ = process_subchunk(sbStart, sbEnd,
+                                            out_x_gpu, out_y_gpu, out_z_gpu,
+                                            out_kx_gpu, out_ky_gpu, out_kz_gpu,
+                                            out_amp_gpu, out_idx_gpu, out_spc_gpu)
 
-                        process_subchunk(sbStart, sbEnd,
-                                        out_x_gpu, out_y_gpu, out_z_gpu,
-                                        out_kx_gpu, out_ky_gpu, out_kz_gpu,
-                                        out_amp_gpu, out_spc_gpu, sub_sz)
-
-                    # Prepare next bounce inputs
+                    # Prepare next bounce inputs — keep only *local* expansions
                     if bounce_i < n_bounces:
-                        in_x_gpu   = out_x_gpu
-                        in_y_gpu   = out_y_gpu
-                        in_z_gpu   = out_z_gpu
-                        in_kx_gpu  = out_kx_gpu
-                        in_ky_gpu  = out_ky_gpu
-                        in_kz_gpu  = out_kz_gpu
-                        in_amp_gpu = out_amp_gpu
-                        in_idx_gpu = out_idx_gpu
-                        cur_size   = expansions_written
+                        valid_next = (out_idx_gpu[:expansions_written] >= 0) & \
+                                    (out_idx_gpu[:expansions_written] < nA)
+                        if not bool(valid_next.any()):
+                            break
+                        sel = valid_next.nonzero()[0]
+
+                        in_x_gpu   = out_x_gpu[sel]
+                        in_y_gpu   = out_y_gpu[sel]
+                        in_z_gpu   = out_z_gpu[sel]
+                        in_kx_gpu  = out_kx_gpu[sel]
+                        in_ky_gpu  = out_ky_gpu[sel]
+                        in_kz_gpu  = out_kz_gpu[sel]
+                        in_amp_gpu = out_amp_gpu[sel]
+                        in_idx_gpu = out_idx_gpu[sel]
+                        cur_size   = int(sel.size)
+
+                    cp.get_default_memory_pool().free_all_blocks()
 
                 cp.get_default_memory_pool().free_all_blocks()
 
             # Save partial image
             partial_results[out_idx] = dfield_gpu.reshape((Ny, Nx)).get()
-
-            # Cleanup
             del pxg, pyg, pzg, dfield_gpu
             cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
