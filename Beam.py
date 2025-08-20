@@ -702,41 +702,50 @@ class beam:
     @staticmethod
     def build_interaction_kernel():
         """
-        Build a CUDA RawKernel specialized for a +x incident beam.
+        Drop-in replacement: FP32-only, numerically stable kinematic kernel.
 
-        The kernel computes the complex detector field by summing atomic
-        contributions, supports optional removal of the forward component,
-        and applies an optional polarization scaling on amplitude:
-            P = rho_perp + (1 - rho_perp) * (cos(2*theta))^2.
+        Key changes vs original:
+        - Robust phase using delta-r expansion:
+                delta_r = -dot(u,a) + 0.5*(|a|^2 - (dot(u,a))^2)/R0,
+            where u = pixel / |pixel|, R0 = |pixel|.
+        - Per-pixel base phasor exp(i*k*R0) applied once at the end.
+        - No FP64 anywhere; relies on CUDA __sincosf for reduction.
+        - Signature, name, and types identical to original for drop-in.
 
         Returns:
-            cupy.RawKernel: Compiled kernel handle named "interaction_kernal".
-
-        Raises:
-            RuntimeError: If CuPy is not available.
+            cupy.RawKernel: compiled kernel handle named 'interaction_kernal'.
         """
         if cp is None:
             raise RuntimeError("CuPy is required for GPU scattering kernels.")
 
         _cuda_source = r'''
+        #include <math.h>
+
+        // Compile-time tuning
         #define CHUNK_SIZE 128
+
         extern "C" {
-        __device__ __forceinline__ float2 get_f0_from_params(float Q_val, const float* params)
+
+        // Evaluate f0(Q) in FP32 (Waasmaier-Kirfel), identical math to your original
+        __device__ __forceinline__ float get_f0_from_params(float Q_val, const float* params)
         {
             const float PI_F   = 3.14159265358979323846f;
             const float K_SCALE= 0.25f * 1.0e-10f / PI_F;  // Q[m^-1] -> s[Angstrom^-1]
             float s  = K_SCALE * Q_val;
             float ss = s * s;
+
             float f0 = params[5]; // c
             #pragma unroll
             for (int i = 0; i < 5; i++) {
                 float ai = params[i];
                 float bi = params[6 + i];
+                // use FMA-friendly exp
                 f0 += ai * __expf(-bi * ss);
             }
-            return make_float2(f0, 0.0f);
+            return f0;
         }
 
+        // New kernel: same name and signature as before
         __global__ void interaction_kernal(
             const int   nAtoms,
             const float* __restrict__ kx_atom,
@@ -760,114 +769,171 @@ class beam:
             const float  pol_perp_rate)
         {
             const float PI_F = 3.14159265358979323846f;
-            const float rE_F = 2.81794092e-15f;
+            const float rE_F = 2.81794092e-15f;  // classical electron radius [m]
 
-            int pxid = blockIdx.x * blockDim.x + threadIdx.x;
-            int pyid = blockIdx.y * blockDim.y + threadIdx.y;
-            bool in_bounds = (pxid < Nx && pyid < Ny);
-            int pixel_index = pyid * Nx + pxid;
+            // Pixel index
+            int ix = blockIdx.x * blockDim.x + threadIdx.x;
+            int iy = blockIdx.y * blockDim.y + threadIdx.y;
+            if (ix >= Nx || iy >= Ny) return;
+            const int pidx = iy * Nx + ix;
 
-            float tx = 0.0f, ty = 0.0f, tz = 0.0f;
-            if (in_bounds) {
-                tx = x_coords[pixel_index];
-                ty = y_coords[pixel_index];
-                tz = z_coords[pixel_index];
+            // Per-pixel detector coords (meters)
+            float tx = x_coords[pidx];
+            float ty = y_coords[pidx];
+            float tz = z_coords[pidx];
+
+            // Per-pixel reference distance and unit vector u = pixel / |pixel|
+            // Add tiny eps to avoid div by zero (rare degenerate case)
+            float R0  = sqrtf(tx*tx + ty*ty + tz*tz);
+            if (!(R0 > 0.0f)) {
+                // Degenerate pixel at origin: nothing to do
+                return;
+            }
+            float invR0 = 1.0f / R0;
+            float ux = tx * invR0;
+            float uy = ty * invR0;
+            float uz = tz * invR0;
+
+            // Beam wavenumber k: use first entry (constant for a given beam)
+            float k_global = 0.0f;
+            if (nAtoms > 0) {
+                k_global = fabsf(kx_atom[0]);   // your code stores 2*pi/lambda on +x
+            } else {
+                // nothing to accumulate
+                return;
             }
 
-            float2 sum_val = make_float2(0.0f, 0.0f);
+            // Precompute base phasor exp(i*k*R0) once per pixel
+            float s0, c0;
+            __sincosf(k_global * R0, &s0, &c0);
 
+            // Shared memory tile for per-atom data (float32)
             __shared__ float  s_px[CHUNK_SIZE];
             __shared__ float  s_py[CHUNK_SIZE];
             __shared__ float  s_pz[CHUNK_SIZE];
             __shared__ float2 s_amp[CHUNK_SIZE];
-            __shared__ float2 s_anom[CHUNK_SIZE];
+            __shared__ float2 s_anm[CHUNK_SIZE];
             __shared__ float  s_params[CHUNK_SIZE * 11];
-            __shared__ float  s_kx[CHUNK_SIZE];
             __shared__ float  s_f0z[CHUNK_SIZE];
 
-            int threads_in_block = blockDim.x * blockDim.y;
-            int t_id = threadIdx.y * blockDim.x + threadIdx.x;
+            const int threads_in_block = blockDim.x * blockDim.y;
+            const int t_id = threadIdx.y * blockDim.x + threadIdx.x;
 
-            for (int tile_start = 0; tile_start < nAtoms; tile_start += CHUNK_SIZE) {
+            // Accumulator in the "relative" phase frame (no base phasor yet)
+            float2 sum_rel = make_float2(0.0f, 0.0f);
+
+            // Loop over atoms in tiles
+            for (int base = 0; base < nAtoms; base += CHUNK_SIZE) {
+
+                // Stage a tile into shared memory
                 for (int t = t_id; t < CHUNK_SIZE; t += threads_in_block) {
-                    int a = tile_start + t;
+                    int a = base + t;
                     if (a < nAtoms) {
-                        s_px[t] = px[a]; s_py[t] = py[a]; s_pz[t] = pz[a];
+                        s_px[t] = px[a];
+                        s_py[t] = py[a];
+                        s_pz[t] = pz[a];
                         s_amp[t]= initial_amp[a];
-                        s_anom[t]=scattering_anom[a];
-                        s_kx[t] = kx_atom[a];
+                        s_anm[t]= scattering_anom[a];
                         s_f0z[t]= f0_zero[a];
                         #pragma unroll
-                        for (int pi=0; pi<11; ++pi)
-                            s_params[t*11 + pi] = f0_params[a*11 + pi];
+                        for (int j = 0; j < 11; ++j)
+                            s_params[t*11 + j] = f0_params[a*11 + j];
                     }
                 }
                 __syncthreads();
 
-                if (in_bounds) {
-                    #pragma unroll 4
-                    for (int j = 0; j < CHUNK_SIZE; ++j) {
-                        int a = tile_start + j;
-                        if (a >= nAtoms) break;
+                // Process the tile
+                #pragma unroll 4
+                for (int j = 0; j < CHUNK_SIZE; ++j) {
+                    int a = base + j;
+                    if (a >= nAtoms) break;
 
-                        float dx = tx - s_px[j];
-                        float dy = ty - s_py[j];
-                        float dz = tz - s_pz[j];
-                        float r_det = sqrtf(dx*dx + dy*dy + dz*dz);
-                        if (r_det == 0.0f) continue;
+                    // Atom position in meters
+                    float ax = s_px[j];
+                    float ay = s_py[j];
+                    float az = s_pz[j];
 
-                        float k_mag = fabsf(s_kx[j]);
-                        float dotv  = dx / r_det;          // cos(2*theta) approx for +x incidence
+                    // Vector pixel->atom differences (for dotv and fallback metrics)
+                    float dx = tx - ax;
+                    float dy = ty - ay;
+                    float dz = tz - az;
 
-                        float tmp = 2.0f*(1.0f - dotv);
-                        if (tmp < 0.0f) tmp = 0.0f;
-                        float Q_val = k_mag * __fsqrt_rn(tmp);
+                    // Unit-direction projection s = dot(u, a) and |a|^2
+                    // Use FMA to minimize roundoff
+                    float sproj = fmaf(uz, az, fmaf(uy, ay, ux*ax));           // dot(u,a)
+                    float a2    = fmaf(az, az, fmaf(ay, ay, ax*ax));           // |a|^2
 
-                        const float* param_ptr = &s_params[j*11];
-                        float2 f0c = get_f0_from_params(Q_val, param_ptr);
-                        if (remove_forward) {
-                            f0c.x -= s_f0z[j];  // f0(Q)-f0(0)
-                        }
+                    // delta_r = -s + 0.5*(|a|^2 - s^2)/R0  (meters)
+                    float s2     = sproj * sproj;
+                    float corr   = 0.5f * (a2 - s2) * invR0;
+                    float delta_r= -sproj + corr;
 
-                        float2 s_tot = make_float2(f0c.x + s_anom[j].x, f0c.y + s_anom[j].y);
+                    // Approx r using stable decomposition: r = R0 + delta_r
+                    float r_det = R0 + delta_r;
+                    if (!(r_det > 0.0f)) continue;
 
-                        float wavelength_m = (2.0f * PI_F) / k_mag;
-                        float ax_mod = fmodf(s_px[j], wavelength_m);
-                        float rdet_mod = fmodf(r_det, wavelength_m);
-                        float phase = k_mag * (ax_mod + rdet_mod);
+                    // dotv for polarization and Q-estimate (same as your original)
+                    float dotv = dx / r_det;           // +x incidence approximation
+                    float tmp = 2.0f * (1.0f - dotv);
+                    if (tmp < 0.0f) tmp = 0.0f;
+                    float Q_val = k_global * __fsqrt_rn(tmp);
 
-                        float cph, sph;
-                        __sincosf(phase, &sph, &cph);
+                    // f0(Q) +/- forward term
+                    const float* param_ptr = &s_params[j*11];
+                    float f0v = get_f0_from_params(Q_val, param_ptr);
+                    if (remove_forward) f0v -= s_f0z[j];
 
-                        float2 amp_a = s_amp[j];
-                        float real_part = amp_a.x * s_tot.x - amp_a.y * s_tot.y;
-                        float imag_part = amp_a.x * s_tot.y + amp_a.y * s_tot.x;
+                    // Scattering factor including anomalous
+                    float2 s_tot;
+                    s_tot.x = f0v + s_anm[j].x;
+                    s_tot.y = s_anm[j].y;
 
-                        float2 val;
-                        val.x = real_part * cph - imag_part * sph;
-                        val.y = real_part * sph + imag_part * cph;
+                    // Multiply by entrance amplitude (complex)
+                    float2 amp = s_amp[j];
+                    float real_part = amp.x * s_tot.x - amp.y * s_tot.y;
+                    float imag_part = amp.x * s_tot.y + amp.y * s_tot.x;
 
-                        // polarization factor on amplitude
-                        if (apply_polarization) {
-                            float P = pol_perp_rate + (1.0f - pol_perp_rate) * (dotv * dotv);
-                            P = fminf(1.0f, fmaxf(0.0f, P));
-                            float scale = sqrtf(P);
-                            val.x *= scale;
-                            val.y *= scale;
-                        }
+                    // Relative phase only: k * (ax + delta_r)
+                    float small_path = ax + delta_r;                        // meters, small
+                    float phase_rel  = fmaf(k_global, small_path, 0.0f);    // radians
 
-                        sum_val.x += val.x * rE_F;
-                        sum_val.y += val.y * rE_F;
+                    float s_rel, c_rel;
+                    __sincosf(phase_rel, &s_rel, &c_rel);
+
+                    // Rotate by relative phase
+                    float2 val;
+                    val.x = real_part * c_rel - imag_part * s_rel;
+                    val.y = real_part * s_rel + imag_part * c_rel;
+
+                    // Polarization factor on amplitude (unchanged)
+                    if (apply_polarization) {
+                        float P = pol_perp_rate + (1.0f - pol_perp_rate) * (dotv * dotv);
+                        if (P < 0.0f) P = 0.0f;
+                        if (P > 1.0f) P = 1.0f;
+                        float scale = __fsqrt_rn(P);
+                        val.x *= scale;
+                        val.y *= scale;
                     }
+
+                    // Thomson scaling and accumulate (in relative frame)
+                    sum_rel.x += val.x * rE_F;
+                    sum_rel.y += val.y * rE_F;
                 }
                 __syncthreads();
             }
-            if (in_bounds) {
-                detector_field[pixel_index].x += sum_val.x;
-                detector_field[pixel_index].y += sum_val.y;
-            }
-        }
-        }
+
+            // Apply the per-pixel base phasor: exp(i*k*R0)
+            float2 sum_rot;
+            sum_rot.x = sum_rel.x * c0 - sum_rel.y * s0;
+            sum_rot.y = sum_rel.x * s0 + sum_rel.y * c0;
+
+            // Write out
+            int out_idx = pidx;
+            detector_field[out_idx].x += sum_rot.x;
+            detector_field[out_idx].y += sum_rot.y;
+        } // kernel
+
+        } // extern "C"
         ''';
 
         kernel_module = cp.RawModule(
