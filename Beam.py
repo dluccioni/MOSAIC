@@ -699,34 +699,176 @@ class beam:
         C_mod = ffi_obj.verify(c_source, extra_compile_args=['-O3'])
         return ffi_obj, C_mod
     
-    @staticmethod
-    def build_interaction_kernel():
+    def _select_series_mode_once(self, sample, detector, t_thresh=0.5, series_terms=None, verbose=True):
         """
-        Drop-in replacement: FP32-only, numerically stable kinematic kernel.
+        Decide once whether to use SERIES or EXACT geometric mode for all atoms,
+        based on sample size and detector geometry. Prints the chosen mode.
 
-        Key changes vs original:
-        - Robust phase using delta-r expansion:
-                delta_r = -dot(u,a) + 0.5*(|a|^2 - (dot(u,a))^2)/R0,
-            where u = pixel / |pixel|, R0 = |pixel|.
-        - Per-pixel base phasor exp(i*k*R0) applied once at the end.
-        - No FP64 anywhere; relies on CUDA __sincosf for reduction.
-        - Signature, name, and types identical to original for drop-in.
+        Uses the binomial sqrt(1+t) convergence bound: |t|max <= 2*rho + rho^2,
+        where rho = a_max / R0_min. If |t|max <= t_thresh and R0_min > 0, choose SERIES;
+        otherwise choose EXACT.
+
+        Args:
+            sample: object with 'dimensions' (Lx, Ly, Lz) in Angstrom, centered at 0.
+            detector: object with 'pixel_coordinates' (3, Nx*Ny) in Angstrom.
+            t_thresh (float): threshold on |t|max (safe default 0.5).
+            series_terms (int or None): number of series terms N; default 2 if not set on self.
+            verbose (bool): print selection.
 
         Returns:
-            cupy.RawKernel: compiled kernel handle named 'interaction_kernal'.
+            dict with keys:
+                'use_series' (bool),
+                'N' (int),
+                't_thresh' (float),
+                'a_max_m' (float),
+                'R0_min_m' (float),
+                '|t|max' (float)
+        """
+        import numpy as _np
+        import cupy as _cp  # guard
+
+        # Sample half-extent radius (meters) from bounding box centered at 0
+        dims_A = _np.asarray(sample.dimensions, dtype=float)  # [Lx, Ly, Lz] in Angstrom
+        half_A = 0.5 * dims_A
+        a_max_A = float(_np.sqrt(_np.sum(half_A**2)))
+        a_max_m = a_max_A * 1e-10
+
+        # Closest detector pixel distance R0_min (meters)
+        pix = detector.pixel_coordinates
+        if (cp is not None) and isinstance(pix, cp.ndarray):
+            pix_cpu = pix.get()
+        else:
+            pix_cpu = _np.asarray(pix)
+        # pix_cpu shape: (3, Nx*Ny) in Angstrom
+        r2_min_A2 = _np.min(_np.sum(pix_cpu * pix_cpu, axis=0))
+        R0_min_m = float(_np.sqrt(r2_min_A2) * 1e-10)
+
+        # Decide SERIES vs EXACT once, using worst-case t bound
+        if series_terms is None:
+            N = int(getattr(self, "_series_terms", 2))
+        else:
+            N = int(series_terms)
+        if N < 1: N = 1
+        if N > 32: N = 32
+
+        T = float(t_thresh) if (t_thresh is not None and t_thresh > 0.0) else float(getattr(self, "_series_t_thresh", 0.5) if hasattr(self, "_series_t_thresh") else 0.5)
+        if T <= 0.0: T = 0.5
+
+        if R0_min_m <= 0.0:
+            use_series = False
+            t_max_est = float("inf")
+        else:
+            rho = a_max_m / R0_min_m
+            t_max_est = 2.0 * rho + rho * rho
+            use_series = (t_max_est <= T)
+
+        # Persist on self for builder
+        self._global_use_series = bool(use_series)
+        self._series_terms = N
+        self._series_t_thresh = T
+
+        if verbose:
+            mode_str = "SERIES" if use_series else "EXACT"
+            print("[beam] Geometric mode: {0} (N={1}, t_thresh={2:.3g}, a_max={3:.3e} m, R0_min={4:.3e} m, |t|max={5:.3g})"
+                .format(mode_str, N, T, a_max_m, R0_min_m, t_max_est))
+
+        return dict(use_series=use_series, N=N, t_thresh=T, a_max_m=a_max_m, R0_min_m=R0_min_m, t_max= t_max_est)
+
+    def build_interaction_kernel(self, series_terms: int | None = None, t_thresh: float | None = None, force_mode: str | None = None):
+        """
+        Build (and cache) the FP32-only kinematic kernel with a global mode:
+        SERIES (delta_r by N-term series) or EXACT (delta_r = r - R0).
+
+        The kernel name and signature remain 'interaction_kernal', unchanged.
+
+        Args:
+            series_terms: optional override for N terms (1..32). Defaults to self._series_terms or 2.
+            t_thresh: kept for compatibility; not used in the kernel path now that mode is global.
+            force_mode: 'series' or 'exact' to force mode regardless of self._global_use_series.
+
+        Returns:
+            cupy.RawKernel
         """
         if cp is None:
             raise RuntimeError("CuPy is required for GPU scattering kernels.")
 
+        # Resolve N and mode
+        if series_terms is None:
+            N = int(getattr(self, "_series_terms", 2))
+        else:
+            N = int(series_terms)
+        if N < 1: N = 1
+        if N > 32: N = 32
+
+        if force_mode is not None:
+            use_series = (str(force_mode).lower() == "series")
+        else:
+            use_series = bool(getattr(self, "_global_use_series", True))
+
+        global_use_series = 1 if use_series else 0
+
+        # Cache by (N, global_use_series)
+        if not hasattr(self, "_interaction_kernel_cache"):
+            self._interaction_kernel_cache = {}
+        key = (N, global_use_series)
+        if key in self._interaction_kernel_cache:
+            return self._interaction_kernel_cache[key]
+
         _cuda_source = r'''
         #include <math.h>
 
-        // Compile-time tuning
+        // Compile-time settings
+        #ifndef N_SERIES
+        #define N_SERIES 2
+        #endif
+        #if N_SERIES < 1
+        #undef N_SERIES
+        #define N_SERIES 1
+        #endif
+        #if N_SERIES > 32
+        #undef N_SERIES
+        #define N_SERIES 32
+        #endif
+
+        #ifndef GLOBAL_USE_SERIES
+        #define GLOBAL_USE_SERIES 1
+        #endif
+
         #define CHUNK_SIZE 128
+
+        // Split constants for robust FP32 argument reduction
+        #define TWOPI_H 6.2831854820251465f
+        #define TWOPI_L -1.748455531469517e-07f
+        #define INV_TWOPI_H 0.15915493667125702f
+        #define PI_H 3.1415927410125732f
 
         extern "C" {
 
-        // Evaluate f0(Q) in FP32 (Waasmaier-Kirfel), identical math to your original
+        __device__ __forceinline__ void two_prod_fma(float a, float b, float& p, float& e)
+        {
+            p = a * b;
+            e = fmaf(a, b, -p);
+        }
+
+        // Robust sincos of (k*s) with FP32-only modulo-2pi reduction
+        __device__ __forceinline__ void sincos_k_times_reduced(float k, float s, float& sn, float& cs)
+        {
+            float xh, xl;
+            two_prod_fma(k, s, xh, xl);
+
+            float q = nearbyintf(fmaf(xh, INV_TWOPI_H, xl * INV_TWOPI_H));
+
+            float r = fmaf(-q, TWOPI_H, xh);
+            r = fmaf(-q, TWOPI_L, r);
+            r = r + xl;
+
+            if (r > PI_H)       r = fmaf(-1.0f, TWOPI_H, r);
+            else if (r < -PI_H) r = fmaf( 1.0f, TWOPI_H, r);
+
+            __sincosf(r, &sn, &cs);
+        }
+
+        // f0(Q) as before
         __device__ __forceinline__ float get_f0_from_params(float Q_val, const float* params)
         {
             const float PI_F   = 3.14159265358979323846f;
@@ -734,31 +876,48 @@ class beam:
             float s  = K_SCALE * Q_val;
             float ss = s * s;
 
-            float f0 = params[5]; // c
+            float f0 = params[5];
             #pragma unroll
             for (int i = 0; i < 5; i++) {
                 float ai = params[i];
                 float bi = params[6 + i];
-                // use FMA-friendly exp
                 f0 += ai * __expf(-bi * ss);
             }
             return f0;
         }
 
-        // New kernel: same name and signature as before
+        // Series for sqrt(1+t) - 1 up to N terms
+        __device__ __forceinline__ float sqrt1pm1_series(float t)
+        {
+            float coeff = 0.5f;  // C1
+            float tk    = t;     // t^1
+            float poly  = coeff * tk;
+
+            #pragma unroll
+            for (int k = 2; k <= N_SERIES; ++k) {
+                float kf  = (float)k;
+                float num = 0.5f - (kf - 1.0f);
+                coeff = coeff * (num / kf);
+                tk = tk * t;
+                poly = fmaf(coeff, tk, poly);
+            }
+            return poly;
+        }
+
+        // Main kernel (global mode baked in)
         __global__ void interaction_kernal(
             const int   nAtoms,
             const float* __restrict__ kx_atom,
             const float* __restrict__ ky_atom,
             const float* __restrict__ kz_atom,
-            const float* __restrict__ px,
+            const float* __restrict__ px,   // atom positions in meters
             const float* __restrict__ py,
             const float* __restrict__ pz,
             const float2* __restrict__ initial_amp,
             const float2* __restrict__ scattering_anom,
             const float*  __restrict__ f0_params,
             const float*  __restrict__ f0_zero,
-            const float* __restrict__ x_coords,
+            const float* __restrict__ x_coords,  // detector coords in meters
             const float* __restrict__ y_coords,
             const float* __restrict__ z_coords,
             float2*      __restrict__ detector_field,
@@ -768,46 +927,35 @@ class beam:
             const int    apply_polarization,
             const float  pol_perp_rate)
         {
-            const float PI_F = 3.14159265358979323846f;
-            const float rE_F = 2.81794092e-15f;  // classical electron radius [m]
+            const float rE_F = 2.81794092e-15f;
 
-            // Pixel index
             int ix = blockIdx.x * blockDim.x + threadIdx.x;
             int iy = blockIdx.y * blockDim.y + threadIdx.y;
             if (ix >= Nx || iy >= Ny) return;
             const int pidx = iy * Nx + ix;
 
-            // Per-pixel detector coords (meters)
+            // Pixel position and reference quantities
             float tx = x_coords[pidx];
             float ty = y_coords[pidx];
             float tz = z_coords[pidx];
 
-            // Per-pixel reference distance and unit vector u = pixel / |pixel|
-            // Add tiny eps to avoid div by zero (rare degenerate case)
-            float R0  = sqrtf(tx*tx + ty*ty + tz*tz);
-            if (!(R0 > 0.0f)) {
-                // Degenerate pixel at origin: nothing to do
-                return;
-            }
-            float invR0 = 1.0f / R0;
-            float ux = tx * invR0;
-            float uy = ty * invR0;
-            float uz = tz * invR0;
-
-            // Beam wavenumber k: use first entry (constant for a given beam)
-            float k_global = 0.0f;
-            if (nAtoms > 0) {
-                k_global = fabsf(kx_atom[0]);   // your code stores 2*pi/lambda on +x
-            } else {
-                // nothing to accumulate
-                return;
+            float R0 = sqrtf(tx*tx + ty*ty + tz*tz);
+            float invR0 = 0.0f, ux = 0.0f, uy = 0.0f, uz = 0.0f;
+            if (R0 > 0.0f) {
+                invR0 = 1.0f / R0;
+                ux = tx * invR0;
+                uy = ty * invR0;
+                uz = tz * invR0;
             }
 
-            // Precompute base phasor exp(i*k*R0) once per pixel
-            float s0, c0;
-            __sincosf(k_global * R0, &s0, &c0);
+            if (nAtoms <= 0) return;
+            float k_global = fabsf(kx_atom[0]);
 
-            // Shared memory tile for per-atom data (float32)
+            // Base phasor exp(i*k*R0) with robust reduction
+            float sb, cb;
+            sincos_k_times_reduced(k_global, R0, sb, cb);
+
+            // Shared tiles
             __shared__ float  s_px[CHUNK_SIZE];
             __shared__ float  s_py[CHUNK_SIZE];
             __shared__ float  s_pz[CHUNK_SIZE];
@@ -819,118 +967,101 @@ class beam:
             const int threads_in_block = blockDim.x * blockDim.y;
             const int t_id = threadIdx.y * blockDim.x + threadIdx.x;
 
-            // Accumulator in the "relative" phase frame (no base phasor yet)
             float2 sum_rel = make_float2(0.0f, 0.0f);
 
-            // Loop over atoms in tiles
             for (int base = 0; base < nAtoms; base += CHUNK_SIZE) {
-
-                // Stage a tile into shared memory
                 for (int t = t_id; t < CHUNK_SIZE; t += threads_in_block) {
                     int a = base + t;
                     if (a < nAtoms) {
-                        s_px[t] = px[a];
-                        s_py[t] = py[a];
-                        s_pz[t] = pz[a];
+                        s_px[t] = px[a]; s_py[t] = py[a]; s_pz[t] = pz[a];
                         s_amp[t]= initial_amp[a];
                         s_anm[t]= scattering_anom[a];
                         s_f0z[t]= f0_zero[a];
                         #pragma unroll
-                        for (int j = 0; j < 11; ++j)
+                        for (int j=0;j<11;++j)
                             s_params[t*11 + j] = f0_params[a*11 + j];
                     }
                 }
                 __syncthreads();
 
-                // Process the tile
                 #pragma unroll 4
                 for (int j = 0; j < CHUNK_SIZE; ++j) {
                     int a = base + j;
                     if (a >= nAtoms) break;
 
-                    // Atom position in meters
                     float ax = s_px[j];
                     float ay = s_py[j];
                     float az = s_pz[j];
 
-                    // Vector pixel->atom differences (for dotv and fallback metrics)
+                    // Exact r_det for geometry and Q
                     float dx = tx - ax;
                     float dy = ty - ay;
                     float dz = tz - az;
-
-                    // Unit-direction projection s = dot(u, a) and |a|^2
-                    // Use FMA to minimize roundoff
-                    float sproj = fmaf(uz, az, fmaf(uy, ay, ux*ax));           // dot(u,a)
-                    float a2    = fmaf(az, az, fmaf(ay, ay, ax*ax));           // |a|^2
-
-                    // delta_r = -s + 0.5*(|a|^2 - s^2)/R0  (meters)
-                    float s2     = sproj * sproj;
-                    float corr   = 0.5f * (a2 - s2) * invR0;
-                    float delta_r= -sproj + corr;
-
-                    // Approx r using stable decomposition: r = R0 + delta_r
-                    float r_det = R0 + delta_r;
+                    float r_det = sqrtf(dx*dx + dy*dy + dz*dz);
                     if (!(r_det > 0.0f)) continue;
 
-                    // dotv for polarization and Q-estimate (same as your original)
-                    float dotv = dx / r_det;           // +x incidence approximation
+                    float dotv = dx / r_det; // +x incidence approximation
+
                     float tmp = 2.0f * (1.0f - dotv);
                     if (tmp < 0.0f) tmp = 0.0f;
                     float Q_val = k_global * __fsqrt_rn(tmp);
 
-                    // f0(Q) +/- forward term
                     const float* param_ptr = &s_params[j*11];
                     float f0v = get_f0_from_params(Q_val, param_ptr);
                     if (remove_forward) f0v -= s_f0z[j];
 
-                    // Scattering factor including anomalous
                     float2 s_tot;
                     s_tot.x = f0v + s_anm[j].x;
                     s_tot.y = s_anm[j].y;
 
-                    // Multiply by entrance amplitude (complex)
                     float2 amp = s_amp[j];
                     float real_part = amp.x * s_tot.x - amp.y * s_tot.y;
                     float imag_part = amp.x * s_tot.y + amp.y * s_tot.x;
 
-                    // Relative phase only: k * (ax + delta_r)
-                    float small_path = ax + delta_r;                        // meters, small
-                    float phase_rel  = fmaf(k_global, small_path, 0.0f);    // radians
+                    float delta_r;
 
+                    #if GLOBAL_USE_SERIES
+                        if (R0 > 0.0f) {
+                            float sproj = fmaf(uz, az, fmaf(uy, ay, ux*ax));
+                            float a2    = fmaf(az, az, fmaf(ay, ay, ax*ax));
+                            float tval  = -2.0f * sproj * invR0 + a2 * (invR0 * invR0);
+                            delta_r = R0 * sqrt1pm1_series(tval);
+                        } else {
+                            // At R0 == 0, fall back to exact residual
+                            delta_r = r_det;
+                        }
+                    #else
+                        delta_r = r_det - R0;
+                    #endif
+
+                    // Relative phase with robust reduction
                     float s_rel, c_rel;
-                    __sincosf(phase_rel, &s_rel, &c_rel);
+                    sincos_k_times_reduced(k_global, ax + delta_r, s_rel, c_rel);
 
-                    // Rotate by relative phase
                     float2 val;
                     val.x = real_part * c_rel - imag_part * s_rel;
                     val.y = real_part * s_rel + imag_part * c_rel;
 
-                    // Polarization factor on amplitude (unchanged)
                     if (apply_polarization) {
                         float P = pol_perp_rate + (1.0f - pol_perp_rate) * (dotv * dotv);
-                        if (P < 0.0f) P = 0.0f;
-                        if (P > 1.0f) P = 1.0f;
-                        float scale = __fsqrt_rn(P);
-                        val.x *= scale;
-                        val.y *= scale;
+                        P = fminf(1.0f, fmaxf(0.0f, P));
+                        float sc = __fsqrt_rn(P);
+                        val.x *= sc; val.y *= sc;
                     }
 
-                    // Thomson scaling and accumulate (in relative frame)
                     sum_rel.x += val.x * rE_F;
                     sum_rel.y += val.y * rE_F;
                 }
                 __syncthreads();
             }
 
-            // Apply the per-pixel base phasor: exp(i*k*R0)
+            // Apply per-pixel base phasor
             float2 sum_rot;
-            sum_rot.x = sum_rel.x * c0 - sum_rel.y * s0;
-            sum_rot.y = sum_rel.x * s0 + sum_rel.y * c0;
+            sum_rot.x = sum_rel.x * cb - sum_rel.y * sb;
+            sum_rot.y = sum_rel.x * sb + sum_rel.y * cb;
 
-            // Write out
-            int out_idx = pidx;
-            detector_field[out_idx].x += sum_rot.x;
-            detector_field[out_idx].y += sum_rot.y;
+            detector_field[pidx].x += sum_rot.x;
+            detector_field[pidx].y += sum_rot.y;
         } // kernel
 
         } // extern "C"
@@ -939,9 +1070,16 @@ class beam:
         kernel_module = cp.RawModule(
             code=_cuda_source,
             backend='nvcc',
-            options=('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true')
+            options=(
+                '--gpu-architecture=native',
+                '-O3', '--ftz=true', '--fmad=true',
+                f'-DN_SERIES={N}',
+                f'-DGLOBAL_USE_SERIES={global_use_series}',
+            )
         )
-        return kernel_module.get_function('interaction_kernal')
+        kern = kernel_module.get_function('interaction_kernal')
+        self._interaction_kernel_cache[key] = kern
+        return kern
     # -------------------------------------
     
     # -------------------------------------
@@ -2086,32 +2224,10 @@ class beam:
     ):
         """
         Orchestrate GPU kinematic scattering across chunks and GPUs.
-
-        Behavior:
-            - Falls back to CPU if CuPy is not available or if no GPU is found.
-            - Distributes chunks across available GPUs and accumulates results.
-            - Optionally computes depth-dependent entrance amplitude Ein on the beam
-            grid and interpolates it at atom positions, with on-disk caching.
-            - Applies optional removal of the forward component and optional
-            polarization scaling inside the CUDA kernel.
-
-        Args:
-            sample: Provides chunk_total and per-chunk loaders.
-            measurement_positions (np.ndarray or cupy.ndarray): Pixel coordinates
-                shaped (3, Nx*Ny) in angstrom.
-            measurement_shape (tuple[int, int]): (Nx, Ny).
-            stage: Object with rotation (3x3) and translation (3,) arrays.
-            remove_forward (bool): If True, subtract f0(0) in the kernel.
-            use_depth_ein (bool): If True, compute Ein and use as entrance amplitude.
-            ein_cache_dir (str or None): Directory for Ein cache files.
-            recompute_cache (bool): If True, force recomputation of Ein cache.
-            apply_polarization (bool): If True, apply polarization scaling.
-
-        Returns:
-            np.ndarray: Complex64 array of shape (Ny, Nx) with the final field.
+        Modified to select a single geometric mode (SERIES or EXACT) once per run,
+        print the mode, and apply it to all atoms.
         """
         if cp is None:
-            # Fallback to CPU when CuPy is not installed
             print("[beam] CuPy not installed, falling back to CPU.")
             return self.interact_beam_cpu(sample, measurement_positions, measurement_shape, stage,
                                         remove_forward_component=remove_forward,
@@ -2122,7 +2238,6 @@ class beam:
 
         n_gpus = cp.cuda.runtime.getDeviceCount()
         if n_gpus < 1:
-            # Fallback to CPU when no CUDA device is available
             print("[beam] No GPUs found, falling back to CPU.")
             return self.interact_beam_cpu(sample, measurement_positions, measurement_shape, stage,
                                         remove_forward_component=remove_forward,
@@ -2132,8 +2247,21 @@ class beam:
                                         apply_polarization=apply_polarization)
 
         import hashlib, json
-
         print(f"[beam] Found {n_gpus} GPU(s).")
+
+        # Select global geometric mode once and print it
+        # Use detector from measurement_positions to compute the closest pixel distance
+        class _TmpDet:
+            def __init__(self, pix): self.pixel_coordinates = pix
+        _det_for_mode = _TmpDet(measurement_positions)
+
+        mode_info = self._select_series_mode_once(sample, _det_for_mode,
+                                                t_thresh=getattr(self, "_series_t_thresh", 0.5) if hasattr(self, "_series_t_thresh") else 0.5,
+                                                series_terms=getattr(self, "_series_terms", 2),
+                                                verbose=True)
+        # Build kernel with global mode baked in
+        interaction_kernel = self.build_interaction_kernel(series_terms=mode_info["N"],
+                                                        force_mode=("series" if mode_info["use_series"] else "exact"))
 
         # Load databases once on host
         db_f0   = self.parse_f0_db_all('f0_WaasKirf.dat')
@@ -2143,7 +2271,7 @@ class beam:
         Nx, Ny = measurement_shape
         final_result = np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # Pinned host buffers for detector coordinates and stage transform
+        # Pinned host buffers for detector coordinates and stage transform (meters)
         x_coords = self.allocate_pinned_array(measurement_positions[0, :].astype(np.float32) / 1e10)
         y_coords = self.allocate_pinned_array(measurement_positions[1, :].astype(np.float32) / 1e10)
         z_coords = self.allocate_pinned_array(measurement_positions[2, :].astype(np.float32) / 1e10)
@@ -2154,7 +2282,7 @@ class beam:
         chunk_total = sample.chunk_total
         print(f"[beam] Total of {chunk_total} chunk(s) to process.")
 
-        # Optional Ein precomputation (CPU or GPU path reused internally)
+        # Optional Ein precomputation
         A_beam_np = None
         s_min = s_max = None
         if use_depth_ein:
@@ -2164,7 +2292,6 @@ class beam:
                 A_beam_np = self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius=0)
             s_min, s_max = self._compute_global_depth_bounds(sample, stage)
 
-        # Prepare cache key for Ein if enabled
         if use_depth_ein:
             key_obj = dict(
                 E_eV=float(self._energy),
@@ -2192,14 +2319,9 @@ class beam:
         remainder = chunk_total % n_gpus
         partial_results = [None] * n_gpus
 
-        # Compile the interaction kernel once
-        interaction_kernel = self.build_interaction_kernel()
-
         def gpu_worker(gpu_id, x_coords, y_coords, z_coords, chunk_indices, result_index):
-            # Select device for this worker
             cp.cuda.Device(gpu_id).use()
 
-            # Upload stage and detector arrays
             Rg = cp.asarray(R_pin, dtype=cp.float32)
             Tg = cp.asarray(T_pin, dtype=cp.float32)
             xg = cp.asarray(x_coords); yg = cp.asarray(y_coords); zg = cp.asarray(z_coords)
@@ -2210,7 +2332,6 @@ class beam:
             grid  = ((Nx + block[0] - 1) // block[0],
                     (Ny + block[1] - 1) // block[1])
 
-            # Bind beam-grid data for Ein interpolation if enabled
             if use_depth_ein:
                 A_gpu = cp.asarray(A_beam_np)
                 E0_gpu = cp.asarray(self._beam_E0_map)
@@ -2224,13 +2345,11 @@ class beam:
                 smin = cp.float32(s_min); smax = cp.float32(s_max)
 
             def _ein_for_positions(pos_g):
-                # Project onto beam transverse basis
                 au = pos_g[:, 0]*e1g[0] + pos_g[:, 1]*e1g[1] + pos_g[:, 2]*e1g[2]
                 av = pos_g[:, 0]*e2g[0] + pos_g[:, 1]*e2g[1] + pos_g[:, 2]*e2g[2]
                 iu = au / du_g + uc_g
                 iv = av / dv_g + vc_g
 
-                # Bilinear interpolation indices and weights
                 i0 = cp.floor(iu).astype(cp.int64); j0 = cp.floor(iv).astype(cp.int64)
                 i1 = cp.clip(i0 + 1, 0, NyB-1); j1 = cp.clip(j0 + 1, 0, NzB-1)
                 i0 = cp.clip(i0, 0, NyB - 1);     j0 = cp.clip(j0, 0, NzB - 1)
@@ -2241,7 +2360,6 @@ class beam:
                 r00 = (i0 * NzB + j0).astype(cp.int64); r01 = (i0 * NzB + j1).astype(cp.int64)
                 r10 = (i1 * NzB + j0).astype(cp.int64); r11 = (i1 * NzB + j1).astype(cp.int64)
 
-                # Interpolate A_beam and E0 on the grid
                 A00 = A_gpu.ravel()[r00]; A01 = A_gpu.ravel()[r01]
                 A10 = A_gpu.ravel()[r10]; A11 = A_gpu.ravel()[r11]
                 A_s = (A00 * (one - fu)*(one - fv) +
@@ -2256,11 +2374,9 @@ class beam:
                         E0_10 * fu*(one - fv) +
                         E0_11 * fu*fv).astype(cp.complex64)
 
-                # Depth fraction along the beam
                 s = pos_g[:, 0]*khat[0] + pos_g[:, 1]*khat[1] + pos_g[:, 2]*khat[2]
                 f = cp.clip((s - smin) / (smax - smin + cp.float32(1e-12)), 0.0, 1.0).astype(cp.float32)
 
-                # Ein = E0 * A^f; handle tiny amplitudes robustly
                 tiny = cp.float32(1e-12)
                 absA = cp.abs(A_s)
                 Ein = cp.exp(cp.log(A_s + 0j) * f) * E0_s
@@ -2268,7 +2384,6 @@ class beam:
                 Ein = cp.where(mask00, E0_s, Ein)
                 return Ein
 
-            # Process assigned chunks on this GPU
             for cidx in chunk_indices:
                 spc = sample.load_chunk_species(cidx, use_gpu=False)
                 nA = spc.shape[0]
@@ -2278,7 +2393,6 @@ class beam:
                 pos = cp.array(sample.load_chunk_positions(cidx, use_gpu=True), dtype=cp.float32)
                 pos = pos @ Rg; pos += Tg
 
-                # Build per-atom tables on host and upload compactly
                 s_anom = np.zeros(nA, np.complex64)
                 f0p    = np.zeros((nA, 11), np.float32)
                 f0z    = np.zeros(nA, np.float32)
@@ -2295,7 +2409,6 @@ class beam:
                 if use_depth_ein:
                     cache_path = os.path.join(cache_dir, f"ein_chunk_{cidx}_{key_hash}.npz")
                     initial_amp = None
-                    # Attempt to load Ein from cache
                     if (not recompute_cache) and os.path.isfile(cache_path):
                         try:
                             with np.load(cache_path) as npz:
@@ -2304,7 +2417,6 @@ class beam:
                                 initial_amp = cp.asarray(arr.astype(np.complex64))
                         except Exception:
                             initial_amp = None
-                    # Compute and cache Ein if needed
                     if initial_amp is None:
                         initial_amp = _ein_for_positions(pos)
                         try:
@@ -2314,20 +2426,20 @@ class beam:
                 else:
                     initial_amp = cp.ones(nA, dtype=cp.complex64)
 
-                # Convert positions to meters
-                px = pos[:, 0] / 1e10; py = pos[:, 1] / 1e10; pz = pos[:, 2] / 1e10
+                # Positions in meters (float32)
+                px = (pos[:, 0] / 1e10).astype(cp.float32)
+                py = (pos[:, 1] / 1e10).astype(cp.float32)
+                pz = (pos[:, 2] / 1e10).astype(cp.float32)
 
-                # k components for +x propagation
+                # k components (only kx used for magnitude)
                 kx_cp = cp.full(nA, self._kx_scalar, dtype=cp.float32)
                 ky_cp = cp.full(nA, self._ky_scalar, dtype=cp.float32)
                 kz_cp = cp.full(nA, self._kz_scalar, dtype=cp.float32)
 
-                # Upload per-atom parameters
                 s_anom_cp = cp.asarray(s_anom)
                 f0_params_cp = cp.asarray(f0p)
                 f0_zero_cp   = cp.asarray(f0z)
 
-                # Launch interaction kernel
                 interaction_kernel(
                     grid, block,
                     (
@@ -2347,16 +2459,13 @@ class beam:
                         np.float32(self._pol_perp_rate)
                     )
                 )
-                # Release any cached blocks for this iteration
                 cp.get_default_memory_pool().free_all_blocks()
 
-            # Copy back this GPU's partial result
             partial_results[result_index] = dfield.reshape((Ny, Nx)).get()
             del xg, yg, zg
             cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
 
-        # Start one worker thread per GPU
         threads = []
         start_chunk = 1
         for gid in range(n_gpus):
@@ -2368,7 +2477,6 @@ class beam:
                                 args=(gid, x_coords, y_coords, z_coords, chunk_indices, gid))
             t.start(); threads.append(t)
 
-        # Join threads and sum results
         for t in threads: t.join()
 
         for pr in partial_results:
