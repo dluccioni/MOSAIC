@@ -699,100 +699,159 @@ class beam:
         C_mod = ffi_obj.verify(c_source, extra_compile_args=['-O3'])
         return ffi_obj, C_mod
     
-    def _select_series_mode_once(self, sample, detector, t_thresh=0.5, series_terms=None, verbose=True):
+    def set_phase_tolerance(self, phi_tol_rad: float):
         """
-        Decide once whether to use SERIES or EXACT geometric mode for all atoms,
-        based on sample size and detector geometry. Prints the chosen mode.
-
-        Uses the binomial sqrt(1+t) convergence bound: |t|max <= 2*rho + rho^2,
-        where rho = a_max / R0_min. If |t|max <= t_thresh and R0_min > 0, choose SERIES;
-        otherwise choose EXACT.
+        Set the target maximum phase error (radians) for choosing the series order N.
+        Default (if never set) is 1e-6 rad.
 
         Args:
-            sample: object with 'dimensions' (Lx, Ly, Lz) in Angstrom, centered at 0.
-            detector: object with 'pixel_coordinates' (3, Nx*Ny) in Angstrom.
-            t_thresh (float): threshold on |t|max (safe default 0.5).
-            series_terms (int or None): number of series terms N; default 2 if not set on self.
-            verbose (bool): print selection.
+            phi_tol_rad (float): desired maximum phase error per contribution in radians.
+        """
+        try:
+            val = float(phi_tol_rad)
+            if not (val > 0.0):
+                val = 1e-6
+        except Exception:
+            val = 1e-6
+        self._phase_tol_rad = val
+        
+    def _estimate_required_series_terms(self, a_max_m: float, R0_min_m: float, phi_tol_rad: float):
+        """
+        Estimate the minimum N for the series delta_r = R0 * (sqrt(1+t) - 1),
+        such that k * |err_r| <= phi_tol_rad, using worst-case |t| and the
+        next-omitted-term bound: err_r ≈ R0 * |C_{N+1}| * |t|^{N+1}.
 
         Returns:
             dict with keys:
-                'use_series' (bool),
-                'N' (int),
-                't_thresh' (float),
-                'a_max_m' (float),
-                'R0_min_m' (float),
-                '|t|max' (float)
+                'use_series' (bool), 'N' (int), 't_max' (float)
+        """
+        import math
+        # Guard wavelength and k
+        if getattr(self, "_wavelength", None) is None or self._wavelength <= 0.0:
+            # Cannot determine, fall back to EXACT
+            return dict(use_series=False, N=0, t_max=float("inf"))
+
+        k_val = 2.0 * math.pi / float(self._wavelength)  # rad/m
+
+        if R0_min_m <= 0.0:
+            return dict(use_series=False, N=0, t_max=float("inf"))
+
+        # Worst-case dimensionless t bound for sqrt(1+t), with u·a and |a| <= a_max
+        rho = float(a_max_m) / float(R0_min_m)
+        t_max = 2.0 * rho + rho * rho
+
+        # Convergence requires |t| < 1
+        if not (t_max < 1.0):
+            return dict(use_series=False, N=0, t_max=t_max)
+
+        # Iterate coefficients for sqrt(1+t) - 1:
+        # C1 = +1/2, Ck = C_{k-1} * ((1/2 - (k-1)) / k)
+        # We want smallest N with: k * R0 * |C_{N+1}| * t^{N+1} <= phi_tol_rad
+        Nmax = 32
+        C = 0.5  # C1
+        t = float(t_max)
+        # We will maintain t^k and Ck. For N candidate, check NEXT term (N+1).
+        # Precompute powers incrementally
+        tk = t  # t^1
+
+        # Prepare list of |Ck|*t^k for k starting at 1
+        coeff_pow = [(abs(C) * tk, 1)]  # (value, k)
+
+        # Build up to Nmax+1 so we can test the next omitted term
+        for k in range(2, Nmax + 1):
+            num = 0.5 - (k - 1.0)
+            C = C * (num / k)
+            tk = tk * t
+            coeff_pow.append((abs(C) * tk, k))
+
+        # Now choose N
+        use_series = False
+        chosen_N = 0
+        for N in range(1, Nmax):
+            # next omitted is k = N+1
+            val, kpow = coeff_pow[N]  # 0-based index, so N -> N+1 term
+            err_r = R0_min_m * val
+            err_phi = k_val * err_r
+            if err_phi <= float(phi_tol_rad):
+                use_series = True
+                chosen_N = N  # keep exactly N terms
+                break
+
+        if not use_series:
+            # Not meeting tolerance up to Nmax; you may still choose SERIES with Nmax,
+            # but we return EXACT to be conservative.
+            return dict(use_series=False, N=0, t_max=t_max)
+
+        # Clamp
+        if chosen_N < 1: chosen_N = 1
+        if chosen_N > Nmax: chosen_N = Nmax
+
+        return dict(use_series=True, N=chosen_N, t_max=t_max)
+        
+    def _select_series_mode_once(self, sample, detector, safety_t_thresh=0.5, verbose=True):
+        """
+        Decide global mode (SERIES vs EXACT) and the series order N automatically.
+        Prints the chosen mode and N.
+
+        Uses:
+        - sample.dimensions: (Lx, Ly, Lz) in Angstrom, centered at 0
+        - detector.pixel_coordinates: (3, Nx*Ny) in Angstrom
+        - wavelength from self._wavelength
+        - phase tolerance from self._phase_tol_rad (default 1e-2 rad if unset)
+        - safety_t_thresh for convergence margin (default 0.5)
+
+        Sets:
+        self._global_use_series (bool)
+        self._series_terms (int)
         """
         import numpy as _np
-        import cupy as _cp  # guard
 
-        # Sample half-extent radius (meters) from bounding box centered at 0
-        dims_A = _np.asarray(sample.dimensions, dtype=float)  # [Lx, Ly, Lz] in Angstrom
+        # Sample half-diagonal radius (meters)
+        dims_A = _np.asarray(sample.dimensions, dtype=float)
         half_A = 0.5 * dims_A
         a_max_A = float(_np.sqrt(_np.sum(half_A**2)))
         a_max_m = a_max_A * 1e-10
 
-        # Closest detector pixel distance R0_min (meters)
+        # Closest detector pixel distance (meters)
         pix = detector.pixel_coordinates
         if (cp is not None) and isinstance(pix, cp.ndarray):
             pix_cpu = pix.get()
         else:
             pix_cpu = _np.asarray(pix)
-        # pix_cpu shape: (3, Nx*Ny) in Angstrom
-        r2_min_A2 = _np.min(_np.sum(pix_cpu * pix_cpu, axis=0))
-        R0_min_m = float(_np.sqrt(r2_min_A2) * 1e-10)
+        r2_min_A2 = float(_np.min(_np.sum(pix_cpu * pix_cpu, axis=0)))
+        R0_min_m = (r2_min_A2 ** 0.5) * 1e-10
 
-        # Decide SERIES vs EXACT once, using worst-case t bound
-        if series_terms is None:
-            N = int(getattr(self, "_series_terms", 2))
-        else:
-            N = int(series_terms)
-        if N < 1: N = 1
-        if N > 32: N = 32
+        # Phase tolerance
+        phi_tol = float(getattr(self, "_phase_tol_rad", 1e-2))
 
-        T = float(t_thresh) if (t_thresh is not None and t_thresh > 0.0) else float(getattr(self, "_series_t_thresh", 0.5) if hasattr(self, "_series_t_thresh") else 0.5)
-        if T <= 0.0: T = 0.5
+        # Estimate N and check convergence bound
+        est = self._estimate_required_series_terms(a_max_m, R0_min_m, phi_tol)
+        use_series = bool(est["use_series"])
+        N_auto = int(est["N"])
+        t_max = float(est["t_max"])
 
-        if R0_min_m <= 0.0:
+        # Apply safety threshold on |t| to avoid marginal series
+        if not (R0_min_m > 0.0) or not (t_max < safety_t_thresh):
             use_series = False
-            t_max_est = float("inf")
-        else:
-            rho = a_max_m / R0_min_m
-            t_max_est = 2.0 * rho + rho * rho
-            use_series = (t_max_est <= T)
 
-        # Persist on self for builder
-        self._global_use_series = bool(use_series)
-        self._series_terms = N
-        self._series_t_thresh = T
+        # Persist selection
+        self._global_use_series = use_series
+        self._series_terms = (N_auto if (use_series and N_auto >= 1) else 1)
 
         if verbose:
             mode_str = "SERIES" if use_series else "EXACT"
-            print("[beam] Geometric mode: {0} (N={1}, t_thresh={2:.3g}, a_max={3:.3e} m, R0_min={4:.3e} m, |t|max={5:.3g})"
-                .format(mode_str, N, T, a_max_m, R0_min_m, t_max_est))
+            print("[beam] Geometric mode: {0} (N={1}, phi_tol={2:.3g} rad, a_max={3:.3e} m, R0_min={4:.3e} m, |t|max={5:.3g})"
+                .format(mode_str, self._series_terms, phi_tol, a_max_m, R0_min_m, t_max))
 
-        return dict(use_series=use_series, N=N, t_thresh=T, a_max_m=a_max_m, R0_min_m=R0_min_m, t_max= t_max_est)
-
-    def build_interaction_kernel(self, series_terms: int | None = None, t_thresh: float | None = None, force_mode: str | None = None):
+    def build_interaction_kernel(self, series_terms: int | None = None, force_mode: str | None = None):
         """
-        Build (and cache) the FP32-only kinematic kernel with a global mode:
-        SERIES (delta_r by N-term series) or EXACT (delta_r = r - R0).
-
-        The kernel name and signature remain 'interaction_kernal', unchanged.
-
-        Args:
-            series_terms: optional override for N terms (1..32). Defaults to self._series_terms or 2.
-            t_thresh: kept for compatibility; not used in the kernel path now that mode is global.
-            force_mode: 'series' or 'exact' to force mode regardless of self._global_use_series.
-
-        Returns:
-            cupy.RawKernel
+        Build (and cache) the FP32-only kinematic kernel with a global mode and N
+        baked in at compile time. Kernel name/signature remain 'interaction_kernal'.
         """
         if cp is None:
             raise RuntimeError("CuPy is required for GPU scattering kernels.")
 
-        # Resolve N and mode
+        # Resolve N and global mode from self unless overridden
         if series_terms is None:
             N = int(getattr(self, "_series_terms", 2))
         else:
@@ -807,7 +866,7 @@ class beam:
 
         global_use_series = 1 if use_series else 0
 
-        # Cache by (N, global_use_series)
+        # Cache by (N, mode)
         if not hasattr(self, "_interaction_kernel_cache"):
             self._interaction_kernel_cache = {}
         key = (N, global_use_series)
@@ -934,7 +993,6 @@ class beam:
             if (ix >= Nx || iy >= Ny) return;
             const int pidx = iy * Nx + ix;
 
-            // Pixel position and reference quantities
             float tx = x_coords[pidx];
             float ty = y_coords[pidx];
             float tz = z_coords[pidx];
@@ -951,7 +1009,7 @@ class beam:
             if (nAtoms <= 0) return;
             float k_global = fabsf(kx_atom[0]);
 
-            // Base phasor exp(i*k*R0) with robust reduction
+            // Base phasor exp(i*k*R0)
             float sb, cb;
             sincos_k_times_reduced(k_global, R0, sb, cb);
 
@@ -993,7 +1051,6 @@ class beam:
                     float ay = s_py[j];
                     float az = s_pz[j];
 
-                    // Exact r_det for geometry and Q
                     float dx = tx - ax;
                     float dy = ty - ay;
                     float dz = tz - az;
@@ -1027,14 +1084,12 @@ class beam:
                             float tval  = -2.0f * sproj * invR0 + a2 * (invR0 * invR0);
                             delta_r = R0 * sqrt1pm1_series(tval);
                         } else {
-                            // At R0 == 0, fall back to exact residual
                             delta_r = r_det;
                         }
                     #else
                         delta_r = r_det - R0;
                     #endif
 
-                    // Relative phase with robust reduction
                     float s_rel, c_rel;
                     sincos_k_times_reduced(k_global, ax + delta_r, s_rel, c_rel);
 
@@ -1055,7 +1110,6 @@ class beam:
                 __syncthreads();
             }
 
-            // Apply per-pixel base phasor
             float2 sum_rot;
             sum_rot.x = sum_rel.x * cb - sum_rel.y * sb;
             sum_rot.y = sum_rel.x * sb + sum_rel.y * cb;
@@ -2224,8 +2278,8 @@ class beam:
     ):
         """
         Orchestrate GPU kinematic scattering across chunks and GPUs.
-        Modified to select a single geometric mode (SERIES or EXACT) once per run,
-        print the mode, and apply it to all atoms.
+        Now automatically selects SERIES/EXACT and N once, prints the choice,
+        compiles the kernel accordingly, then runs as before.
         """
         if cp is None:
             print("[beam] CuPy not installed, falling back to CPU.")
@@ -2249,21 +2303,23 @@ class beam:
         import hashlib, json
         print(f"[beam] Found {n_gpus} GPU(s).")
 
-        # Select global geometric mode once and print it
-        # Use detector from measurement_positions to compute the closest pixel distance
+        # Temporary detector wrapper to reuse existing selector on measurement_positions
         class _TmpDet:
             def __init__(self, pix): self.pixel_coordinates = pix
         _det_for_mode = _TmpDet(measurement_positions)
 
-        mode_info = self._select_series_mode_once(sample, _det_for_mode,
-                                                t_thresh=getattr(self, "_series_t_thresh", 0.5) if hasattr(self, "_series_t_thresh") else 0.5,
-                                                series_terms=getattr(self, "_series_terms", 2),
-                                                verbose=True)
-        # Build kernel with global mode baked in
-        interaction_kernel = self.build_interaction_kernel(series_terms=mode_info["N"],
-                                                        force_mode=("series" if mode_info["use_series"] else "exact"))
+        # Ensure we have a phase tolerance
+        if not hasattr(self, "_phase_tol_rad"):
+            self._phase_tol_rad = 1e-2
 
-        # Load databases once on host
+        # Select mode and N once, print it
+        self._select_series_mode_once(sample, _det_for_mode, safety_t_thresh=0.5, verbose=True)
+
+        # Build kernel with global mode and N baked in
+        interaction_kernel = self.build_interaction_kernel(series_terms=self._series_terms,
+                                                        force_mode=("series" if self._global_use_series else "exact"))
+
+        # From here down, identical to your previous GPU path (unchanged except kernel var)
         db_f0   = self.parse_f0_db_all('f0_WaasKirf.dat')
         db_f1f2 = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
         f0_zero = self._build_f0_zero_dict(db_f0)
@@ -2271,7 +2327,6 @@ class beam:
         Nx, Ny = measurement_shape
         final_result = np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # Pinned host buffers for detector coordinates and stage transform (meters)
         x_coords = self.allocate_pinned_array(measurement_positions[0, :].astype(np.float32) / 1e10)
         y_coords = self.allocate_pinned_array(measurement_positions[1, :].astype(np.float32) / 1e10)
         z_coords = self.allocate_pinned_array(measurement_positions[2, :].astype(np.float32) / 1e10)
@@ -2282,7 +2337,6 @@ class beam:
         chunk_total = sample.chunk_total
         print(f"[beam] Total of {chunk_total} chunk(s) to process.")
 
-        # Optional Ein precomputation
         A_beam_np = None
         s_min = s_max = None
         if use_depth_ein:
@@ -2314,7 +2368,6 @@ class beam:
             key_hash = None
             cache_dir = None
 
-        # Partition chunks across GPUs
         chunks_per_gpu = chunk_total // n_gpus
         remainder = chunk_total % n_gpus
         partial_results = [None] * n_gpus
@@ -2379,7 +2432,7 @@ class beam:
 
                 tiny = cp.float32(1e-12)
                 absA = cp.abs(A_s)
-                Ein = cp.exp(cp.log(A_s + 0j) * f) * E0_s
+                Ein = cp.exp(cp.log(A_s + 0.0j) * f) * E0_s
                 mask00 = (absA < tiny) & (f < tiny)
                 Ein = cp.where(mask00, E0_s, Ein)
                 return Ein
@@ -2426,12 +2479,10 @@ class beam:
                 else:
                     initial_amp = cp.ones(nA, dtype=cp.complex64)
 
-                # Positions in meters (float32)
                 px = (pos[:, 0] / 1e10).astype(cp.float32)
                 py = (pos[:, 1] / 1e10).astype(cp.float32)
                 pz = (pos[:, 2] / 1e10).astype(cp.float32)
 
-                # k components (only kx used for magnitude)
                 kx_cp = cp.full(nA, self._kx_scalar, dtype=cp.float32)
                 ky_cp = cp.full(nA, self._ky_scalar, dtype=cp.float32)
                 kz_cp = cp.full(nA, self._kz_scalar, dtype=cp.float32)
