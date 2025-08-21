@@ -1134,6 +1134,134 @@ class beam:
         kern = kernel_module.get_function('interaction_kernal')
         self._interaction_kernel_cache[key] = kern
         return kern
+    
+    @staticmethod
+    def build_ein_sampler_kernel():
+        """
+        CUDA kernel: bilinearly sample tau, phi, and E0 on the beam grid; then
+        write Ein = E0 * exp(-f*tau) * exp(i*f*phi) for a list of positions.
+
+        Returns:
+            cupy.RawKernel named "ein_bilinear_kernel".
+        """
+        if cp is None:
+            raise RuntimeError("CuPy is required for build_ein_sampler_kernel")
+
+        src = r'''
+        #include <math.h>
+
+        extern "C" __global__
+        void ein_bilinear_kernel(
+            const float* __restrict__ pos,   // (N,3) in Angstrom
+            const int N,
+
+            const float* __restrict__ tau,   // (NyB*NzB)
+            const float* __restrict__ phi,   // (NyB*NzB)
+            const float2* __restrict__ E0,   // (NyB*NzB)
+
+            const int NyB,
+            const int NzB,
+
+            const float inv_du,
+            const float inv_dv,
+            const float uc,
+            const float vc,
+
+            const float* __restrict__ e1,    // len=3
+            const float* __restrict__ e2,    // len=3
+            const float* __restrict__ khat,  // len=3
+
+            const float s_min,
+            const float s_max,
+
+            float2* __restrict__ out_amp
+        )
+        {
+            int tid = blockDim.x * blockIdx.x + threadIdx.x;
+            int stride = blockDim.x * gridDim.x;
+
+            float denom = s_max - s_min;
+            if (!(denom > 0.0f)) denom = 1.0f;
+
+            for (int i = tid; i < N; i += stride)
+            {
+                float x = pos[3*i + 0];
+                float y = pos[3*i + 1];
+                float z = pos[3*i + 2];
+
+                // Project to beam basis
+                float au = e1[0]*x + e1[1]*y + e1[2]*z;
+                float av = e2[0]*x + e2[1]*y + e2[2]*z;
+
+                // Continuous -> grid indices
+                float iu = au * inv_du + uc;
+                float iv = av * inv_dv + vc;
+
+                int i0 = (int)floorf(iu);
+                int j0 = (int)floorf(iv);
+                int i1 = i0 + 1;
+                int j1 = j0 + 1;
+
+                // Clamp
+                i0 = max(0, min(NyB - 1, i0));
+                i1 = max(0, min(NyB - 1, i1));
+                j0 = max(0, min(NzB - 1, j0));
+                j1 = max(0, min(NzB - 1, j1));
+
+                // Bilinear weights
+                float fu = fminf(1.0f, fmaxf(0.0f, iu - (float)i0));
+                float fv = fminf(1.0f, fmaxf(0.0f, iv - (float)j0));
+                float w00 = (1.0f - fu)*(1.0f - fv);
+                float w01 = (1.0f - fu)*fv;
+                float w10 = fu*(1.0f - fv);
+                float w11 = fu*fv;
+
+                int r00 = i0 * NzB + j0;
+                int r01 = i0 * NzB + j1;
+                int r10 = i1 * NzB + j0;
+                int r11 = i1 * NzB + j1;
+
+                // Sample tau, phi
+                float tau_s = w00 * tau[r00] + w01 * tau[r01] + w10 * tau[r10] + w11 * tau[r11];
+                float phi_s = w00 * phi[r00] + w01 * phi[r01] + w10 * phi[r10] + w11 * phi[r11];
+
+                // Sample E0 (complex)
+                float2 e00 = E0[r00];
+                float2 e01 = E0[r01];
+                float2 e10 = E0[r10];
+                float2 e11 = E0[r11];
+                float2 e0s;
+                e0s.x = w00*e00.x + w01*e01.x + w10*e10.x + w11*e11.x;
+                e0s.y = w00*e00.y + w01*e01.y + w10*e10.y + w11*e11.y;
+
+                // Depth fraction f in [0,1]
+                float s_val = khat[0]*x + khat[1]*y + khat[2]*z;
+                float f = (s_val - s_min) / denom;
+                f = fminf(1.0f, fmaxf(0.0f, f));
+
+                // Ein = E0 * exp(-f*tau) * exp(i*f*phi)
+                float amp = __expf(-f * tau_s);
+                float phase = f * phi_s;
+                float sn, cs;
+                __sincosf(phase, &sn, &cs);
+
+                float2 scale; scale.x = amp * cs; scale.y = amp * sn;
+
+                float2 outv;
+                outv.x = e0s.x * scale.x - e0s.y * scale.y;
+                outv.y = e0s.x * scale.y + e0s.y * scale.x;
+
+                out_amp[i] = outv;
+            }
+        }
+        ''';
+
+        mod = cp.RawModule(
+            code=src,
+            backend='nvcc',
+            options=('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true')
+        )
+        return mod.get_function('ein_bilinear_kernel')
     # -------------------------------------
     
     # -------------------------------------
@@ -1890,6 +2018,296 @@ class beam:
     ## Main Functions
     # -------------------------------------
     # Kinematic scattering
+    def precompute_depth_ein_all_chunks(
+        self,
+        sample,
+        stage,
+        use_gpu=True,
+        ein_cache_dir=None,
+        recompute_cache=False,
+        kernel_radius=0,
+        chunk_ids=None
+    ):
+        """
+        DROP-IN REPLACEMENT.
+        Precompute Ein for requested chunks using a streaming pipeline that keeps
+        the GPU busy. Supports multi-GPU by sharding chunks across devices and
+        using multiple CUDA streams per GPU for overlap.
+
+        Env knobs (optional):
+            BEAM_EIN_STREAMS_PER_GPU   : int, default 4   (concurrent streams per GPU)
+            BEAM_EIN_SAVE_THREADS      : int, default 2   (threads for NPZ writes)
+        """
+        import hashlib, json, os, gc, threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Decide backend
+        use_gpu = bool(use_gpu and (cp is not None))
+
+        # Sanity
+        if sample.chunk_total is None or int(sample.chunk_total) == 0:
+            raise ValueError("No chunks to precompute Ein for.")
+
+        # Determine which chunks to process
+        if chunk_ids is None:
+            chunk_ids = list(range(1, int(sample.chunk_total) + 1))
+        else:
+            chunk_ids = list(chunk_ids)
+
+        # Depth bounds and beam maps
+        s_min, s_max = self._compute_global_depth_bounds(sample, stage)
+
+        # Compute A(u,v) once (GPU if requested, else CPU)
+        if use_gpu:
+            A_beam_np = self._compute_beam_column_A_map_gpu(sample, stage, kernel_radius=kernel_radius)
+        else:
+            A_beam_np = self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius=kernel_radius)
+
+        # Cache key and dir
+        key_obj = dict(
+            E_eV=float(self._energy),
+            lam=float(self._wavelength),
+            direction=[float(x) for x in self._direction],
+            stage_R=np.asarray(stage.rotation, dtype=float).round(7).tolist(),
+            stage_T=[float(x) for x in np.asarray(stage.translation, dtype=float)],
+            beam_size=[float(x) for x in self._beam_size],
+            beam_samples=[int(self._beam_Ny), int(self._beam_Nz)],
+            beam_profile=self._beam_profile,
+            gauss_waist=[None if self._gauss_waist is None else float(self._gauss_waist[0]),
+                        None if self._gauss_waist is None else float(self._gauss_waist[1])],
+            s_min=float(s_min),
+            s_max=float(s_max)
+        )
+        key_hash = hashlib.sha1(json.dumps(key_obj, sort_keys=True).encode("utf-8")).hexdigest()
+        cache_dir = ein_cache_dir or os.path.join(self.directory, "ein_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Filter already-cached chunks unless forced to recompute
+        to_do = []
+        if recompute_cache:
+            to_do = chunk_ids
+        else:
+            for cid in chunk_ids:
+                p = os.path.join(cache_dir, f"ein_chunk_{cid}_{key_hash}.npz")
+                if not os.path.isfile(p):
+                    to_do.append(cid)
+
+        if not to_do:
+            return cache_dir, key_hash
+
+        # CPU fallback path (unchanged logic, but parallel NPZ saves)
+        if not use_gpu:
+            tau_np = (-np.log(np.abs(A_beam_np) + np.float32(1e-20))).astype(np.float32)
+            phi_np = np.angle(A_beam_np).astype(np.float32)
+            E0_np  = self._beam_E0_map.astype(np.complex64)
+            e1     = self._beam_e1.astype(np.float32)
+            e2     = self._beam_e2.astype(np.float32)
+            khat   = (self._direction / np.linalg.norm(self._direction)).astype(np.float32)
+            du     = float(self._beam_du)
+            dv     = float(self._beam_dv)
+            uc     = float(self._beam_uc)
+            vc     = float(self._beam_vc)
+            R_np   = np.asarray(stage.rotation, dtype=np.float32)
+            T_np   = np.asarray(stage.translation, dtype=np.float32)
+
+            save_threads = int(os.getenv("BEAM_EIN_SAVE_THREADS", "2"))
+            with ThreadPoolExecutor(max_workers=max(1, save_threads)) as saver:
+                futures = []
+                for cid in to_do:
+                    cache_path = os.path.join(cache_dir, f"ein_chunk_{cid}_{key_hash}.npz")
+                    pos = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float32)
+                    if pos.size == 0:
+                        futures.append(saver.submit(np.savez_compressed, cache_path, ein=np.zeros((0,), np.complex64)))
+                        continue
+                    pos = pos @ R_np
+                    pos = pos + T_np
+                    ein_np = self._ein_bilinear_cpu(
+                        pos_np=pos, tau=tau_np, phi=phi_np, E0=E0_np,
+                        e1=e1, e2=e2, khat=khat, du=du, dv=dv, uc=uc, vc=vc,
+                        s_min=s_min, s_max=s_max
+                    ).astype(np.complex64)
+                    futures.append(saver.submit(np.savez_compressed, cache_path, ein=ein_np))
+                for f in as_completed(futures):
+                    _ = f.result()
+            return cache_dir, key_hash
+
+        # GPU streaming path
+        # Prepare static maps on host once; each GPU will copy its own device copies.
+        tau_host = (-np.log(np.abs(A_beam_np) + np.float32(1e-20))).astype(np.float32)
+        phi_host = np.angle(A_beam_np).astype(np.float32)
+        E0_host  = self._beam_E0_map.astype(np.complex64)
+        e1_host  = self._beam_e1.astype(np.float32)
+        e2_host  = self._beam_e2.astype(np.float32)
+        khat_host= (self._direction / np.linalg.norm(self._direction)).astype(np.float32)
+        R_host   = np.asarray(stage.rotation, dtype=np.float32)
+        T_host   = np.asarray(stage.translation, dtype=np.float32)
+
+        # Config
+        try:
+            n_gpus = cp.cuda.runtime.getDeviceCount()
+        except Exception:
+            n_gpus = 1
+        n_gpus = max(1, n_gpus)
+        streams_per_gpu = max(1, int(os.getenv("BEAM_EIN_STREAMS_PER_GPU", "4")))
+        save_threads = max(1, int(os.getenv("BEAM_EIN_SAVE_THREADS", "6")))
+
+        # Shard chunks across GPUs
+        shards = [[] for _ in range(n_gpus)]
+        for i, cid in enumerate(to_do):
+            shards[i % n_gpus].append(cid)
+
+        # Utility: async NPZ save (keep pinned mem alive until write completes)
+        def _save_npz_keepalive(path, arr_view, pinned_mem):
+            try:
+                # Wrap in try so a failed compressed save falls back to uncompressed.
+                np.savez_compressed(path, ein=np.asarray(arr_view, dtype=np.complex64))
+            except Exception:
+                np.savez(path, ein=np.asarray(arr_view, dtype=np.complex64))
+            # When this function returns, references to arr_view and pinned_mem drop.
+
+        def gpu_worker(dev_id, my_chunks):
+            if not my_chunks:
+                return
+            cp.cuda.Device(dev_id).use()
+
+            # Device copies of static maps
+            tau_g = cp.asarray(tau_host)
+            phi_g = cp.asarray(phi_host)
+            E0_g  = cp.asarray(E0_host)
+            e1g   = cp.asarray(e1_host)
+            e2g   = cp.asarray(e2_host)
+            khatg = cp.asarray(khat_host)
+            Rg    = cp.asarray(R_host)
+            Tg    = cp.asarray(T_host)
+
+            # Build kernel once (cached on self)
+            if getattr(self, "_ein_kernel", None) is None:
+                self._ein_kernel = self.build_ein_sampler_kernel()
+
+            # Streams and ring slots
+            streams = [cp.cuda.Stream(non_blocking=True) for _ in range(streams_per_gpu)]
+            # Per-slot state
+            slot_event = [None] * streams_per_gpu
+            slot_chunk = [None] * streams_per_gpu
+            slot_devout= [None] * streams_per_gpu
+            slot_host_mem = [None] * streams_per_gpu
+            slot_host_view= [None] * streams_per_gpu
+
+            # Thread pool for saving
+            saver = ThreadPoolExecutor(max_workers=save_threads)
+            save_futs = []
+
+            # Helper: flush finished slot (wait, then schedule save)
+            def flush_slot(idx, cache_dir_local):
+                ev = slot_event[idx]
+                if ev is None:
+                    return
+                # Wait for D2H to complete
+                ev.synchronize()
+
+                # Kick off NPZ save while GPU continues
+                cid = slot_chunk[idx]
+                path = os.path.join(cache_dir_local, f"ein_chunk_{cid}_{key_hash}.npz")
+                hv = slot_host_view[idx]
+                pm = slot_host_mem[idx]
+                save_futs.append(saver.submit(_save_npz_keepalive, path, hv, pm))
+
+                # Clear slot
+                slot_event[idx] = None
+                slot_chunk[idx] = None
+                slot_devout[idx]= None
+                slot_host_mem[idx] = None
+                slot_host_view[idx]= None
+
+            # Main loop
+            for n, cid in enumerate(my_chunks):
+                s_id = n % streams_per_gpu
+                st = streams[s_id]
+
+                # If this slot is busy, flush it now (waits only for its own event)
+                if slot_event[s_id] is not None:
+                    flush_slot(s_id, cache_dir)
+
+                # Load positions
+                pos = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float32)
+                if pos.size == 0:
+                    # No atoms: write empty cache immediately (no GPU work)
+                    empty_path = os.path.join(cache_dir, f"ein_chunk_{cid}_{key_hash}.npz")
+                    try:
+                        np.savez_compressed(empty_path, ein=np.zeros((0,), np.complex64))
+                    except Exception:
+                        np.savez(empty_path, ein=np.zeros((0,), np.complex64))
+                    continue
+
+                # H2D copy and transform on this stream
+                with st:
+                    pos_g = cp.asarray(pos)
+                    pos_g = pos_g @ Rg
+                    pos_g += Tg
+
+                    # Compute Ein on device
+                    ein_g = self._ein_for_positions_gpu_fast(
+                        pos_g=pos_g,
+                        tau_g=tau_g, phi_g=phi_g, E0_g=E0_g,
+                        e1g=e1g, e2g=e2g, khat_g=khatg,
+                        s_min=np.float32(s_min), s_max=np.float32(s_max),
+                        stream=st
+                    )
+
+                    # Async D2H into pinned host buffer
+                    nbytes = int(ein_g.size) * 8  # complex64
+                    pmem = cp.cuda.alloc_pinned_memory(nbytes)
+                    # Create a numpy view into pinned memory (kept alive in slot)
+                    h_view = np.frombuffer(pmem, dtype=np.complex64, count=ein_g.size)
+                    cp.cuda.runtime.memcpyAsync(
+                        int(pmem.ptr),
+                        int(ein_g.data.ptr),
+                        nbytes,
+                        cp.cuda.runtime.memcpyDeviceToHost,
+                        st.ptr
+                    )
+                    ev = cp.cuda.Event()
+                    ev.record(st)
+
+                # Stash slot state
+                slot_event[s_id] = ev
+                slot_chunk[s_id] = cid
+                slot_devout[s_id]= ein_g
+                slot_host_mem[s_id] = pmem
+                slot_host_view[s_id]= h_view
+
+                # Release local refs quickly
+                del pos, pos_g
+
+            # Flush any remaining in-flight slots
+            for s_id in range(streams_per_gpu):
+                if slot_event[s_id] is not None:
+                    flush_slot(s_id, cache_dir)
+
+            # Wait for all saves to complete
+            for f in as_completed(save_futs):
+                _ = f.result()
+            saver.shutdown(wait=True)
+
+            # Clean up device allocations on this worker
+            del tau_g, phi_g, E0_g, e1g, e2g, khatg, Rg, Tg
+            for st in streams:
+                st.synchronize()
+            cp.get_default_memory_pool().free_all_blocks()
+            gc.collect()
+
+        # Launch one thread per GPU
+        threads = []
+        for dev_id in range(n_gpus):
+            t = threading.Thread(target=gpu_worker, args=(dev_id, shards[dev_id]))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        cp.get_default_memory_pool().free_all_blocks()
+        
+        return cache_dir, key_hash
+    
     def _compute_global_depth_bounds(self, sample, stage):
         """
         Compute global front-to-back bounds along the beam direction in angstrom.
@@ -2064,6 +2482,73 @@ class beam:
         # Return complex field reshaped to (Ny, Nx)
         return (out_r + 1j*out_i).reshape((Ny, Nx)).astype(np.complex64)
 
+    @staticmethod
+    def _ein_bilinear_cpu(
+        pos_np,   # (N,3) float32, Angstrom, on host
+        tau,      # (NyB,NzB) float32
+        phi,      # (NyB,NzB) float32
+        E0,       # (NyB,NzB) complex64
+        e1, e2, khat,  # (3,) float32
+        du, dv, uc, vc,
+        s_min, s_max
+    ):
+        """
+        CPU evaluator: Ein = E0 * exp(-f*tau) * exp(i*f*phi) with bilinear sampling.
+        Returns complex64 array of length N.
+        """
+        N = int(pos_np.shape[0])
+        if N == 0:
+            return np.zeros((0,), dtype=np.complex64)
+
+        NyB, NzB = int(tau.shape[0]), int(tau.shape[1])
+
+        au = pos_np[:, 0]*e1[0] + pos_np[:, 1]*e1[1] + pos_np[:, 2]*e1[2]
+        av = pos_np[:, 0]*e2[0] + pos_np[:, 1]*e2[1] + pos_np[:, 2]*e2[2]
+        iu = au / float(du) + float(uc)
+        iv = av / float(dv) + float(vc)
+
+        i0 = np.floor(iu).astype(np.int64)
+        j0 = np.floor(iv).astype(np.int64)
+        i1 = np.clip(i0 + 1, 0, NyB - 1)
+        j1 = np.clip(j0 + 1, 0, NzB - 1)
+        i0 = np.clip(i0, 0, NyB - 1)
+        j0 = np.clip(j0, 0, NzB - 1)
+
+        fu = (iu - i0).astype(np.float32)
+        fv = (iv - j0).astype(np.float32)
+        w00 = (1.0 - fu)*(1.0 - fv)
+        w01 = (1.0 - fu)*fv
+        w10 = fu*(1.0 - fv)
+        w11 = fu*fv
+
+        r00 = i0 * NzB + j0
+        r01 = i0 * NzB + j1
+        r10 = i1 * NzB + j0
+        r11 = i1 * NzB + j1
+
+        tau_f = tau.ravel()
+        phi_f = phi.ravel()
+        E0_f  = E0.ravel()
+
+        tau_s = tau_f[r00]*w00 + tau_f[r01]*w01 + tau_f[r10]*w10 + tau_f[r11]*w11
+        phi_s = phi_f[r00]*w00 + phi_f[r01]*w01 + phi_f[r10]*w10 + phi_f[r11]*w11
+        E0_s  = E0_f[r00]*w00 + E0_f[r01]*w01 + E0_f[r10]*w10 + E0_f[r11]*w11
+
+        s_vals = pos_np[:, 0]*khat[0] + pos_np[:, 1]*khat[1] + pos_np[:, 2]*khat[2]
+        denom = float(s_max) - float(s_min)
+        if not (denom > 0.0):
+            denom = 1.0
+        f = np.clip((s_vals - float(s_min))/denom, 0.0, 1.0).astype(np.float32)
+
+        amp = np.exp(-f * tau_s).astype(np.float32)
+        phase = f * phi_s
+        cph = np.cos(phase)
+        sph = np.sin(phase)
+
+        real = (E0_s.real * cph - E0_s.imag * sph) * amp
+        imag = (E0_s.real * sph + E0_s.imag * cph) * amp
+        return (real + 1j*imag).astype(np.complex64)
+    
     def interact_beam_cpu(
         self,
         sample,
@@ -2078,35 +2563,12 @@ class beam:
         apply_polarization=False
     ):
         """
-        Orchestrate CPU kinematic scattering over all chunks.
-
-        Steps:
-            1) Load scattering databases (f0 and f1/f2).
-            2) Prepare detector coordinates in meters and beam wave number.
-            3) Optionally compute or load depth-dependent entrance amplitude Ein
-            on the beam grid and interpolate it at atom positions.
-            4) Compile the CPU scattering kernel and process all chunks in parallel.
-            5) Sum complex fields from all chunks.
-
-        Args:
-            sample: Provides chunk_total and loaders for species and positions.
-            measurement_positions (np.ndarray or cupy.ndarray): Array of shape
-                (3, Nx*Ny) with pixel coordinates in angstrom.
-            measurement_shape (tuple[int, int]): (Nx, Ny) detector shape.
-            stage: Object providing rotation (3x3) and translation (3,) arrays.
-            detector: Unused placeholder for API parity.
-            remove_forward_component (bool): If True, subtract f0(0) inside the kernel.
-            use_depth_ein (bool): If True, compute Ein using the current beam grid
-                and use it as per-atom entrance amplitude.
-            ein_cache_dir (str or None): Directory for Ein cache files. If None,
-                uses a directory under self.directory.
-            recompute_cache (bool): If True, force recomputation of Ein.
-            apply_polarization (bool): If True, apply polarization scaling in kernel.
-
-        Returns:
-            np.ndarray: Complex64 array of shape (Ny, Nx) with the final field.
+        DROP-IN REPLACEMENT.
+        Uses precomputed Ein caches when use_depth_ein=True. If any caches are
+        missing (or recompute_cache=True), it computes the missing ones once
+        up front by calling precompute_depth_ein_all_chunks (CPU or GPU path).
         """
-        import hashlib, json
+        import hashlib, json, os
         Nx, Ny = measurement_shape
 
         # Load scattering databases
@@ -2128,15 +2590,11 @@ class beam:
         if chunk_total == 0:
             return np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # Optional depth-dependent entrance amplitude
-        A_beam_np = None
-        s_min = s_max = None
+        # Ensure Ein caches exist if requested
+        key_hash = None
+        cache_dir = None
         if use_depth_ein:
-            A_beam_np = self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius=0)
             s_min, s_max = self._compute_global_depth_bounds(sample, stage)
-
-        # Prepare cache key for Ein if enabled
-        if use_depth_ein:
             key_obj = dict(
                 E_eV=float(self._energy),
                 lam=float(self._wavelength),
@@ -2148,66 +2606,28 @@ class beam:
                 beam_profile=self._beam_profile,
                 gauss_waist=[None if self._gauss_waist is None else float(self._gauss_waist[0]),
                             None if self._gauss_waist is None else float(self._gauss_waist[1])],
-                s_min=float(s_min) if s_min is not None else None,
-                s_max=float(s_max) if s_max is not None else None
+                s_min=float(s_min),
+                s_max=float(s_max)
             )
             key_hash = hashlib.sha1(json.dumps(key_obj, sort_keys=True).encode('utf-8')).hexdigest()
             cache_dir = ein_cache_dir or os.path.join(self.directory, "ein_cache")
             os.makedirs(cache_dir, exist_ok=True)
-        else:
-            key_hash = None
-            cache_dir = None
 
-        # Pre-bind some beam-grid arrays for Ein interpolation
-        if use_depth_ein:
-            NyB, NzB = self._beam_Ny, self._beam_Nz
-            du, dv = self._beam_du, self._beam_dv
-            uc, vc = self._beam_uc, self._beam_vc
-            e1 = self._beam_e1; e2 = self._beam_e2
-            khat = (self._direction / np.linalg.norm(self._direction)).astype(np.float32)
-            E0_map = self._beam_E0_map.astype(np.complex64)
-
-            def _ein_for_positions_cpu(pos_np):
-                # Project atom positions onto beam transverse basis (u, v)
-                au = pos_np[:, 0]*e1[0] + pos_np[:, 1]*e1[1] + pos_np[:, 2]*e1[2]
-                av = pos_np[:, 0]*e2[0] + pos_np[:, 1]*e2[1] + pos_np[:, 2]*e2[2]
-                iu = au / du + uc
-                iv = av / dv + vc
-
-                # Bilinear weights and indices
-                i0 = np.floor(iu).astype(np.int64); j0 = np.floor(iv).astype(np.int64)
-                i1 = np.clip(i0 + 1, 0, NyB-1);     j1 = np.clip(j0 + 1, 0, NzB-1)
-                i0 = np.clip(i0,       0, NyB-1);   j0 = np.clip(j0,       0, NzB-1)
-
-                fu = (iu - i0).astype(np.float32); fv = (iv - j0).astype(np.float32)
-                r00 = (i0 * NzB + j0); r01 = (i0 * NzB + j1)
-                r10 = (i1 * NzB + j0); r11 = (i1 * NzB + j1)
-
-                # Interpolate A_beam and E0 on the grid
-                A00 = A_beam_np.ravel()[r00]; A01 = A_beam_np.ravel()[r01]
-                A10 = A_beam_np.ravel()[r10]; A11 = A_beam_np.ravel()[r11]
-                A_s = (A00 * (1.0 - fu)*(1.0 - fv) +
-                    A01 * (1.0 - fu)*fv +
-                    A10 * fu*(1.0 - fv) +
-                    A11 * fu*fv).astype(np.complex64)
-
-                E0_00 = E0_map.ravel()[r00]; E0_01 = E0_map.ravel()[r01]
-                E0_10 = E0_map.ravel()[r10]; E0_11 = E0_map.ravel()[r11]
-                E0_s = (E0_00 * (1.0 - fu)*(1.0 - fv) +
-                        E0_01 * (1.0 - fu)*fv +
-                        E0_10 * fu*(1.0 - fv) +
-                        E0_11 * fu*fv).astype(np.complex64)
-
-                # Depth fraction along the beam
-                s = pos_np @ khat
-                f = np.clip((s - s_min) / (s_max - s_min + 1e-12), 0.0, 1.0).astype(np.float32)
-
-                # Ein = E0 * A^f; handle tiny amplitudes robustly
-                tiny = 1e-12
-                Ein = np.exp(np.log(A_s + 0j) * f) * E0_s
-                mask00 = (np.abs(A_s) < tiny) & (f < tiny)
-                Ein[mask00] = E0_s[mask00]
-                return Ein.astype(np.complex64)
+            missing = []
+            for cid in range(1, chunk_total + 1):
+                p = os.path.join(cache_dir, f"ein_chunk_{cid}_{key_hash}.npz")
+                if recompute_cache or (not os.path.isfile(p)):
+                    missing.append(cid)
+            if missing:
+                # Use GPU for precompute if available; otherwise CPU
+                self.precompute_depth_ein_all_chunks(
+                    sample, stage,
+                    use_gpu=(cp is not None),
+                    ein_cache_dir=cache_dir,
+                    recompute_cache=recompute_cache,
+                    kernel_radius=0,
+                    chunk_ids=missing
+                )
 
         # Compile the CPU CFFI kernel
         ffi_obj, complied_code = self.compile_compute_scattering_cffi()
@@ -2218,44 +2638,52 @@ class beam:
         n_threads = min(chunk_total, multiprocessing.cpu_count())
 
         def worker(chunk_id):
-            # Load and transform positions for this chunk
-            pos_A = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
-            if pos_A.size == 0:
+            species_chunk_np = sample.load_chunk_species(chunk_id, use_gpu=False)
+            atom_count = int(species_chunk_np.shape[0])
+            if atom_count == 0:
                 return np.zeros((Ny, Nx), dtype=np.complex64)
 
-            pos_A = pos_A @ stage.rotation
-            pos_A += stage.translation
+            scattering_anom_np_real = np.zeros(atom_count, dtype=np.float32)
+            scattering_anom_np_imag = np.zeros(atom_count, dtype=np.float32)
+            f0_params_np            = np.zeros((atom_count, 11), dtype=np.float32)
+            f0_zero_np              = np.zeros((atom_count,), dtype=np.float32)
 
-            init_amp = None
+            f0_zero_dict = self._build_f0_zero_dict(db_dict_f0_all)
+            unique_elements = pd.unique(species_chunk_np)
+            for el in unique_elements:
+                el = str(el)
+                if el not in db_dict_f0_all:
+                    continue
+                mask = (species_chunk_np == el)
+                table = db_dict_f1f2_all.get(el, None)
+                if table is not None:
+                    cplx = self.get_f1f2_from_params(self._energy, table)
+                    scattering_anom_np_real[mask] = float(cplx.real)
+                    scattering_anom_np_imag[mask] = float(cplx.imag)
+                f0_params_np[mask] = db_dict_f0_all[el]
+                f0_zero_np[mask]   = float(f0_zero_dict.get(el, 0.0))
+
+            positions_chunk = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
+            positions_chunk = positions_chunk @ stage.rotation
+            positions_chunk += stage.translation
+            positions_chunk_m = positions_chunk / 1e10
+
             if use_depth_ein:
-                cache_dir_local = ein_cache_dir or os.path.join(self.directory, "ein_cache")
-                cache_path = os.path.join(cache_dir_local, f"ein_chunk_{chunk_id}_{key_hash}.npz")
-                # Try cache first
-                if (not recompute_cache) and os.path.isfile(cache_path):
-                    try:
-                        with np.load(cache_path) as npz:
-                            arr = npz["ein"]
-                        if arr.shape[0] == pos_A.shape[0]:
-                            init_amp = arr.astype(np.complex64, copy=False)
-                    except Exception:
-                        init_amp = None
-                # Compute and cache if needed
-                if init_amp is None:
-                    init_amp = _ein_for_positions_cpu(pos_A)
-                    try:
-                        np.savez_compressed(cache_path, ein=init_amp)
-                    except Exception:
-                        pass
+                cache_path = os.path.join(cache_dir, f"ein_chunk_{chunk_id}_{key_hash}.npz")
+                with np.load(cache_path) as npz:
+                    init_amp = npz["ein"].astype(np.complex64)
+            else:
+                init_amp = None
 
-            # Scatter this chunk on CPU
-            return self.cpu_scatter_chunk_cffi(
+            out = self.cpu_scatter_chunk_cffi(
                 complied_code, ffi_obj, chunk_id, sample, Nx, Ny,
                 coords_x_m, coords_y_m, coords_z_m,
                 db_dict_f0_all, db_dict_f1f2_all, k_val, stage,
-                detector, remove_forward_component,
+                detector=None, remove_forward_component=remove_forward_component,
                 initial_amp_complex=init_amp,
                 apply_polarization=apply_polarization
             )
+            return out
 
         final_result = np.zeros((Ny, Nx), dtype=np.complex64)
         with ThreadPoolExecutor(max_workers=n_threads) as exe:
@@ -2264,6 +2692,68 @@ class beam:
                 final_result += fut.result()
         return final_result
 
+    def _ein_for_positions_gpu_fast(
+        self,
+        pos_g,            # (N,3) float32, Angstrom, on device
+        tau_g,            # (NyB,NzB) float32, on device
+        phi_g,            # (NyB,NzB) float32, on device
+        E0_g,             # (NyB,NzB) complex64, on device
+        e1g, e2g, khat_g, # (3,) float32, on device
+        s_min, s_max,     # float32, Angstrom
+        stream=None
+    ):
+        """
+        GPU evaluator for Ein using the fused kernel.
+        Returns: cupy.ndarray, shape (N,), dtype=complex64, on device.
+        """
+        if cp is None:
+            raise RuntimeError("CuPy is required for _ein_for_positions_gpu_fast")
+
+        N = int(pos_g.shape[0])
+        if N == 0:
+            return cp.zeros((0,), dtype=cp.complex64)
+
+        NyB, NzB = int(tau_g.shape[0]), int(tau_g.shape[1])
+
+        kernel = getattr(self, "_ein_kernel", None)
+        if kernel is None:
+            kernel = self.build_ein_sampler_kernel()
+            self._ein_kernel = kernel
+
+        inv_du = cp.float32(1.0 / float(self._beam_du))
+        inv_dv = cp.float32(1.0 / float(self._beam_dv))
+        uc = cp.float32(self._beam_uc)
+        vc = cp.float32(self._beam_vc)
+
+        out = cp.empty((N,), dtype=cp.complex64)
+
+        threads = 256
+        blocks = (N + threads - 1) // threads
+        blocks = min(max(blocks, 1), 65535)
+
+        args = (
+            pos_g.astype(cp.float32, copy=False).ravel(),
+            np.int32(N),
+            tau_g.ravel(),
+            phi_g.ravel(),
+            E0_g.ravel(),
+            np.int32(NyB),
+            np.int32(NzB),
+            inv_du,
+            inv_dv,
+            uc,
+            vc,
+            e1g.astype(cp.float32, copy=False),
+            e2g.astype(cp.float32, copy=False),
+            khat_g.astype(cp.float32, copy=False),
+            cp.float32(s_min),
+            cp.float32(s_max),
+            out.ravel()
+        )
+
+        kernel((blocks,), (threads,), args, stream=stream)
+        return out
+    
     def interact_beam_gpu(
         self,
         sample,
@@ -2278,14 +2768,9 @@ class beam:
     ):
         """
         DROP-IN REPLACEMENT.
-        Feed the GPU more consistently by overlapping H2D copies and compute
-        across multiple streams per device and by avoiding per-chunk allocator flushes.
-        Each stream accumulates into its own detector buffer; we reduce at the end.
-
-        Args: same as original.
-
-        Returns:
-            np.ndarray complex64 of shape (Ny, Nx)
+        Uses precomputed Ein caches when use_depth_ein=True. If any caches are
+        missing (or recompute_cache=True), it computes the missing ones once
+        up front by calling precompute_depth_ein_all_chunks, then proceeds.
         """
         if cp is None:
             print("[beam] CuPy not installed, falling back to CPU.")
@@ -2321,23 +2806,19 @@ class beam:
         import hashlib, json, os
         print(f"[beam] Found {n_gpus} GPU(s).")
 
-        # Temporary detector wrapper to re-use selector
         class _TmpDet:
             def __init__(self, pix): self.pixel_coordinates = pix
         _det_for_mode = _TmpDet(measurement_positions)
 
-        # Phase tolerance default and auto mode selection
         if not hasattr(self, "_phase_tol_rad"):
             self._phase_tol_rad = 1e-2
         self._select_series_mode_once(sample, _det_for_mode, safety_t_thresh=0.5, verbose=True)
 
-        # Compile interaction kernel with chosen mode and N
         interaction_kernel = self.build_interaction_kernel(
             series_terms=self._series_terms,
             force_mode=("series" if self._global_use_series else "exact")
         )
 
-        # Databases and element constants on host
         db_f0   = self.parse_f0_db_all('f0_WaasKirf.dat')
         db_f1f2 = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
         f0_zero = self._build_f0_zero_dict(db_f0)
@@ -2345,7 +2826,6 @@ class beam:
         Nx, Ny = measurement_shape
         final_result = np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # Pinned detector coordinates and stage transforms (shared by all devices)
         x_coords = self.allocate_pinned_array(measurement_positions[0, :].astype(np.float32) / 1e10)
         y_coords = self.allocate_pinned_array(measurement_positions[1, :].astype(np.float32) / 1e10)
         z_coords = self.allocate_pinned_array(measurement_positions[2, :].astype(np.float32) / 1e10)
@@ -2357,17 +2837,11 @@ class beam:
         if chunk_total == 0:
             return np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # Optional depth-dependent entrance amplitude map for GPU-side interpolation
-        A_beam_np = None
-        s_min = s_max = None
+        # Ensure Ein caches exist if requested
+        key_hash = None
+        cache_dir = None
         if use_depth_ein:
-            # Prefer GPU path for A(u,v) if available
-            A_beam_np = self._compute_beam_column_A_map_gpu(sample, stage, kernel_radius=0)
             s_min, s_max = self._compute_global_depth_bounds(sample, stage)
-        cp.get_default_memory_pool().free_all_blocks()
-
-        # Cache key for Ein if enabled
-        if use_depth_ein:
             key_obj = dict(
                 E_eV=float(self._energy),
                 lam=float(self._wavelength),
@@ -2379,22 +2853,34 @@ class beam:
                 beam_profile=self._beam_profile,
                 gauss_waist=[None if self._gauss_waist is None else float(self._gauss_waist[0]),
                             None if self._gauss_waist is None else float(self._gauss_waist[1])],
-                s_min=float(s_min) if s_min is not None else None,
-                s_max=float(s_max) if s_max is not None else None
+                s_min=float(s_min),
+                s_max=float(s_max)
             )
             key_hash = hashlib.sha1(json.dumps(key_obj, sort_keys=True).encode('utf-8')).hexdigest()
             cache_dir = ein_cache_dir or os.path.join(self.directory, "ein_cache")
             os.makedirs(cache_dir, exist_ok=True)
-        else:
-            key_hash = None
-            cache_dir = None
+
+            missing = []
+            for cid in range(1, chunk_total + 1):
+                p = os.path.join(cache_dir, f"ein_chunk_{cid}_{key_hash}.npz")
+                if recompute_cache or (not os.path.isfile(p)):
+                    missing.append(cid)
+            if missing:
+                print(f"[beam] Precomputing Ein for {len(missing)} chunk(s).")
+                self.precompute_depth_ein_all_chunks(
+                    sample, stage,
+                    use_gpu=True,
+                    ein_cache_dir=cache_dir,
+                    recompute_cache=recompute_cache,
+                    kernel_radius=0,
+                    chunk_ids=missing
+                )
 
         # Distribute chunks across devices
         chunks_per_gpu = chunk_total // n_gpus
         remainder = chunk_total % n_gpus
         partial_results = [None] * n_gpus
 
-        # Tunable concurrency per GPU via env var; default to 3 streams per GPU
         try:
             _streams_per_gpu = max(1, int(os.getenv("BEAM_STREAMS_PER_GPU", "3")))
         except Exception:
@@ -2403,14 +2889,12 @@ class beam:
         def gpu_worker(gpu_id, chunk_indices, result_index):
             cp.cuda.Device(gpu_id).use()
 
-            # Static device data
             Rg = cp.asarray(R_pin, dtype=cp.float32)
             Tg = cp.asarray(T_pin, dtype=cp.float32)
             xg = cp.asarray(x_coords)
             yg = cp.asarray(y_coords)
             zg = cp.asarray(z_coords)
 
-            # Streams and one detector buffer per stream (no races)
             streams = [cp.cuda.Stream(non_blocking=True) for _ in range(_streams_per_gpu)]
             dfields = [cp.zeros((Nx * Ny,), dtype=cp.complex64) for _ in streams]
 
@@ -2418,69 +2902,10 @@ class beam:
             grid  = ((Nx + block[0] - 1) // block[0],
                     (Ny + block[1] - 1) // block[1])
 
-            # Pre-bind Ein helpers if needed
-            if use_depth_ein:
-                A_gpu  = cp.asarray(A_beam_np)
-                E0_gpu = cp.asarray(self._beam_E0_map)
-                NyB, NzB = A_gpu.shape
-                du, dv = self._beam_du, self._beam_dv
-                uc, vc = self._beam_uc, self._beam_vc
-                du_g, dv_g = cp.float32(du), cp.float32(dv)
-                uc_g, vc_g = cp.float32(uc), cp.float32(vc)
-                e1g = cp.asarray(self._beam_e1)
-                e2g = cp.asarray(self._beam_e2)
-                khat = cp.asarray(self._direction / np.linalg.norm(self._direction), dtype=cp.float32)
-                smin = cp.float32(s_min)
-                smax = cp.float32(s_max)
-
-                def _ein_for_positions(pos_g):
-                    # Bilinear sample of A and E0 on the beam grid, then depth weighting
-                    au = pos_g[:, 0]*e1g[0] + pos_g[:, 1]*e1g[1] + pos_g[:, 2]*e1g[2]
-                    av = pos_g[:, 0]*e2g[0] + pos_g[:, 1]*e2g[1] + pos_g[:, 2]*e2g[2]
-                    iu = au / du_g + uc_g
-                    iv = av / dv_g + vc_g
-
-                    i0 = cp.floor(iu).astype(cp.int64); j0 = cp.floor(iv).astype(cp.int64)
-                    i1 = cp.clip(i0 + 1, 0, NyB-1);     j1 = cp.clip(j0 + 1, 0, NzB-1)
-                    i0 = cp.clip(i0,       0, NyB-1);   j0 = cp.clip(j0,       0, NzB-1)
-
-                    fu = (iu - i0).astype(cp.float32); fv = (iv - j0).astype(cp.float32)
-                    one = cp.float32(1.0)
-
-                    r00 = (i0 * NzB + j0).astype(cp.int64); r01 = (i0 * NzB + j1).astype(cp.int64)
-                    r10 = (i1 * NzB + j0).astype(cp.int64); r11 = (i1 * NzB + j1).astype(cp.int64)
-
-                    A00 = A_gpu.ravel()[r00]; A01 = A_gpu.ravel()[r01]
-                    A10 = A_gpu.ravel()[r10]; A11 = A_gpu.ravel()[r11]
-                    A_s = (A00 * (one - fu)*(one - fv) +
-                        A01 * (one - fu)*fv +
-                        A10 * fu*(one - fv) +
-                        A11 * fu*fv).astype(cp.complex64)
-
-                    E0_00 = E0_gpu.ravel()[r00]; E0_01 = E0_gpu.ravel()[r01]
-                    E0_10 = E0_gpu.ravel()[r10]; E0_11 = E0_gpu.ravel()[r11]
-                    E0_s = (E0_00 * (one - fu)*(one - fv) +
-                            E0_01 * (one - fu)*fv +
-                            E0_10 * fu*(one - fv) +
-                            E0_11 * fu*fv).astype(cp.complex64)
-
-                    s = pos_g[:, 0]*khat[0] + pos_g[:, 1]*khat[1] + pos_g[:, 2]*khat[2]
-                    f = cp.clip((s - smin) / (smax - smin + cp.float32(1e-12)), 0.0, 1.0).astype(cp.float32)
-
-                    tiny = cp.float32(1e-12)
-                    absA = cp.abs(A_s)
-                    Ein = cp.exp(cp.log(A_s + 0.0j) * f) * E0_s
-                    mask00 = (absA < tiny) & (f < tiny)
-                    Ein = cp.where(mask00, E0_s, Ein)
-                    return Ein
-
-            # Round-robin schedule across streams. We allow at most one chunk in flight per stream.
             for i, cidx in enumerate(chunk_indices):
                 s_id = i % len(streams)
-                # Ensure previous work on this stream has completed so temporary arrays can be freed
                 streams[s_id].synchronize()
 
-                # Host work: species lookup and scattering parameters
                 spc = sample.load_chunk_species(cidx, use_gpu=False)
                 nA = int(spc.shape[0])
                 if nA == 0:
@@ -2500,28 +2925,17 @@ class beam:
                         s_anom_host[m] = self.get_f1f2_from_params(self._energy, tbl)
 
                 with streams[s_id]:
-                    # Positions to device, transform on device, then metrics
+                    # Positions to device, transform, then meters
                     pos = cp.array(sample.load_chunk_positions(cidx, use_gpu=True), dtype=cp.float32)
                     pos = pos @ Rg
                     pos += Tg
 
                     if use_depth_ein:
+                        # Load precomputed Ein
                         cache_path = os.path.join(cache_dir, f"ein_chunk_{cidx}_{key_hash}.npz")
-                        initial_amp = None
-                        if (not recompute_cache) and os.path.isfile(cache_path):
-                            try:
-                                with np.load(cache_path) as npz:
-                                    arr = npz["ein"]
-                                if int(arr.shape[0]) == nA:
-                                    initial_amp = cp.asarray(arr.astype(np.complex64))
-                            except Exception:
-                                initial_amp = None
-                        if initial_amp is None:
-                            initial_amp = _ein_for_positions(pos)
-                            try:
-                                np.savez_compressed(cache_path, ein=initial_amp.get())
-                            except Exception:
-                                pass
+                        with np.load(cache_path) as npz:
+                            arr = npz["ein"]
+                        initial_amp = cp.asarray(arr.astype(np.complex64))
                     else:
                         initial_amp = cp.ones(nA, dtype=cp.complex64)
 
@@ -2537,7 +2951,6 @@ class beam:
                     f0_params_cp  = cp.asarray(f0p_host)
                     f0_zero_cp    = cp.asarray(f0z_host)
 
-                    # Launch on this stream, accumulate into its dedicated detector buffer
                     interaction_kernel(
                         grid, block,
                         (
@@ -2559,7 +2972,6 @@ class beam:
                         stream=streams[s_id]
                     )
 
-            # Wait for all streams, reduce partial buffers, copy back once
             for st in streams:
                 st.synchronize()
 
@@ -2569,11 +2981,9 @@ class beam:
 
             partial_results[result_index] = dfield_total.reshape((Ny, Nx)).get()
 
-            # Cleanup: keep memory pool allocations cached for reuse across calls.
             del xg, yg, zg
             gc.collect()
 
-        # Launch one Python thread per GPU
         threads = []
         start_chunk = 1
         for gid in range(n_gpus):
@@ -2588,12 +2998,11 @@ class beam:
         for t in threads:
             t.join()
 
-        # Reduce across devices
         for pr in partial_results:
             if pr is not None:
                 final_result += pr
         cp.get_default_memory_pool().free_all_blocks()
-        
+
         return final_result
     
     def atomic_scattering_kinematic(
