@@ -5025,7 +5025,7 @@ class beam:
                             E_out[iy, ix] = 0.0
             return E_out
 
-    def wavefield_propagation(self, detector, optics_stack,
+    def wavefield_propagation(self, detector, optics,
                             use_gpu=True, step_max=0.02, pad_factor=1.0,
                             padding_mode: str = "edge",
                             pad_constant: float = 0.0):
@@ -5041,7 +5041,7 @@ class beam:
                 - shape: tuple (Ny, Nx).
                 - pixel_values: complex64 array of shape (Ny, Nx).
                 - input_pixel_values(array): method to write the updated field.
-            optics_stack: Object with attribute `components`, a list of dicts.
+            optics: Object with attribute `components`, a list of dicts.
                 Supported element kinds and required keys:
                 - "free space": {"kind": "free space", "length": mm}
                 - "lens box": {"kind": "lens box", "focal_length": mm,
@@ -5083,7 +5083,7 @@ class beam:
             ffi, lib = self.compile_propagation_multiplier_cffi()
 
         # Walk the optics stack and apply each element in order.
-        for elem in optics_stack.components:
+        for elem in optics.components:
             kind = elem['kind'].lower()
 
             if kind == 'free space':
@@ -5103,12 +5103,22 @@ class beam:
                         )
 
             elif kind == 'lens box':
-                # Apply thin-lens phase and optional uniform absorption.
-                E = self._apply_thin_lens_box(E, dx, dy, elem, use_gpu and cp is not None)
-
+                # Apply thin-lens phase and optional uniform absorption via optics_stack
+                E = optics._apply_thin_lens_box(
+                        E, dx, dy, elem, self._wavelength, use_gpu and cp is not None
+                    )
+                
+            elif kind == 'bragg magnifier 2b':
+                # Anisotropic resample with amplitude/phase from the component dict.
+                E = optics._apply_bragg_magnifier_2b(
+                        E, dx, dy, elem, use_gpu and cp is not None
+                    )
+                
             elif kind == 'aperture':
-                # Apply real-space aperture mask centered at the field center.
-                E = self._apply_aperture(E, dx, dy, elem, use_gpu and cp is not None)
+                # Apply aperture via optics_stack (accepts 'shape' or 'type')
+                E = optics._apply_aperture(
+                        E, dx, dy, elem, use_gpu and cp is not None
+                    )
 
             else:
                 # Unknown element type: fail fast with the element kind in the message.
