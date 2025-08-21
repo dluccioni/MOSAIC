@@ -560,7 +560,6 @@ class beam:
             tuple: (ffi_obj, C_mod) from cffi.verify for calling the compiled function.
 
         Notes:
-            - Only comments and docstrings were edited. Computation is unchanged.
             - Requires a working C compiler through cffi.
         """
         from cffi import FFI
@@ -698,6 +697,83 @@ class beam:
         # Compile with optimization
         C_mod = ffi_obj.verify(c_source, extra_compile_args=['-O3'])
         return ffi_obj, C_mod
+    
+    @staticmethod
+    def _ein_bilinear_cpu(
+        pos_np,   # (N,3) float32, Angstrom, on host
+        tau,      # (NyB,NzB) float32
+        phi,      # (NyB,NzB) float32
+        E0,       # (NyB,NzB) complex64
+        e1, e2, khat,  # (3,) float32
+        du, dv, uc, vc,
+        s_min, s_max
+    ):
+        """
+        CPU evaluator: Ein = E0 * exp(-f*tau) * exp(i*f*phi) with bilinear sampling.
+        This version returns Ein=0 for atoms that project outside the beam grid.
+        Returns complex64 array of length N.
+        """
+        N = int(pos_np.shape[0])
+        out = np.zeros((N,), dtype=np.complex64)
+        if N == 0:
+            return out
+
+        NyB, NzB = int(tau.shape[0]), int(tau.shape[1])
+
+        # Project to beam basis and grid index space
+        au = pos_np[:, 0]*e1[0] + pos_np[:, 1]*e1[1] + pos_np[:, 2]*e1[2]
+        av = pos_np[:, 0]*e2[0] + pos_np[:, 1]*e2[1] + pos_np[:, 2]*e2[2]
+        iu = au / float(du) + float(uc)
+        iv = av / float(dv) + float(vc)
+
+        # In-bounds mask (no edge replication when out)
+        inb = (iu >= 0.0) & (iu <= (NyB - 1)) & (iv >= 0.0) & (iv <= (NzB - 1))
+        if not np.any(inb):
+            return out
+
+        # Work only on in-bounds subset
+        iu_in = iu[inb]; iv_in = iv[inb]
+        i0 = np.floor(iu_in).astype(np.int64)
+        j0 = np.floor(iv_in).astype(np.int64)
+        i1 = np.clip(i0 + 1, 0, NyB - 1)
+        j1 = np.clip(j0 + 1, 0, NzB - 1)
+
+        fu = (iu_in - i0).astype(np.float32)
+        fv = (iv_in - j0).astype(np.float32)
+        w00 = (1.0 - fu)*(1.0 - fv)
+        w01 = (1.0 - fu)*fv
+        w10 = fu*(1.0 - fv)
+        w11 = fu*fv
+
+        r00 = i0 * NzB + j0
+        r01 = i0 * NzB + j1
+        r10 = i1 * NzB + j0
+        r11 = i1 * NzB + j1
+
+        tau_f = tau.ravel()
+        phi_f = phi.ravel()
+        E0_f  = E0.ravel()
+
+        tau_s = tau_f[r00]*w00 + tau_f[r01]*w01 + tau_f[r10]*w10 + tau_f[r11]*w11
+        phi_s = phi_f[r00]*w00 + phi_f[r01]*w01 + phi_f[r10]*w10 + phi_f[r11]*w11
+        E0_s  = E0_f[r00]*w00 + E0_f[r01]*w01 + E0_f[r10]*w10 + E0_f[r11]*w11
+
+        # Depth fraction f in [0,1]
+        s_vals = pos_np[inb, 0]*khat[0] + pos_np[inb, 1]*khat[1] + pos_np[inb, 2]*khat[2]
+        denom = float(s_max) - float(s_min)
+        if not (denom > 0.0):
+            denom = 1.0
+        f = np.clip((s_vals - float(s_min))/denom, 0.0, 1.0).astype(np.float32)
+
+        amp = np.exp(-f * tau_s).astype(np.float32)
+        phase = f * phi_s
+        cph = np.cos(phase)
+        sph = np.sin(phase)
+
+        real = (E0_s.real * cph - E0_s.imag * sph) * amp
+        imag = (E0_s.real * sph + E0_s.imag * cph) * amp
+        out[inb] = (real + 1j*imag).astype(np.complex64)
+        return out
     
     def set_phase_tolerance(self, phi_tol_rad: float):
         """
@@ -1141,8 +1217,8 @@ class beam:
         CUDA kernel: bilinearly sample tau, phi, and E0 on the beam grid; then
         write Ein = E0 * exp(-f*tau) * exp(i*f*phi) for a list of positions.
 
-        Returns:
-            cupy.RawKernel named "ein_bilinear_kernel".
+        This version zeros Ein for atoms that project outside the beam grid
+        (no edge clamping when out-of-bounds).
         """
         if cp is None:
             raise RuntimeError("CuPy is required for build_ein_sampler_kernel")
@@ -1197,12 +1273,20 @@ class beam:
                 float iu = au * inv_du + uc;
                 float iv = av * inv_dv + vc;
 
+                // Hard in-bounds check (no clamping when out)
+                if (iu < 0.0f || iu > (float)(NyB - 1) ||
+                    iv < 0.0f || iv > (float)(NzB - 1))
+                {
+                    out_amp[i] = make_float2(0.0f, 0.0f);
+                    continue;
+                }
+
                 int i0 = (int)floorf(iu);
                 int j0 = (int)floorf(iv);
                 int i1 = i0 + 1;
                 int j1 = j0 + 1;
 
-                // Clamp
+                // Clamp neighbors to valid range (safe inside-grid interpolation)
                 i0 = max(0, min(NyB - 1, i0));
                 i1 = max(0, min(NyB - 1, i1));
                 j0 = max(0, min(NzB - 1, j0));
@@ -2029,7 +2113,6 @@ class beam:
         chunk_ids=None
     ):
         """
-        DROP-IN REPLACEMENT.
         Precompute Ein for requested chunks using a streaming pipeline that keeps
         the GPU busy. Supports multi-GPU by sharding chunks across devices and
         using multiple CUDA streams per GPU for overlap.
@@ -2095,7 +2178,7 @@ class beam:
         if not to_do:
             return cache_dir, key_hash
 
-        # CPU fallback path (unchanged logic, but parallel NPZ saves)
+        # CPU fallback path (parallel NPZ saves)
         if not use_gpu:
             tau_np = (-np.log(np.abs(A_beam_np) + np.float32(1e-20))).astype(np.float32)
             phi_np = np.angle(A_beam_np).astype(np.float32)
@@ -2563,10 +2646,8 @@ class beam:
         apply_polarization=False
     ):
         """
-        DROP-IN REPLACEMENT.
-        Uses precomputed Ein caches when use_depth_ein=True. If any caches are
-        missing (or recompute_cache=True), it computes the missing ones once
-        up front by calling precompute_depth_ein_all_chunks (CPU or GPU path).
+        If use_depth_ein is False, per-atom initial amplitudes are taken from
+        the beam E0(u,v) map (bilinear), and are zero outside the beam grid.
         """
         import hashlib, json, os
         Nx, Ny = measurement_shape
@@ -2590,11 +2671,13 @@ class beam:
         if chunk_total == 0:
             return np.zeros((Ny, Nx), dtype=np.complex64)
 
+        # Compute global depth bounds once (used for Ein and E0 sampling)
+        s_min, s_max = self._compute_global_depth_bounds(sample, stage)
+
         # Ensure Ein caches exist if requested
         key_hash = None
         cache_dir = None
         if use_depth_ein:
-            s_min, s_max = self._compute_global_depth_bounds(sample, stage)
             key_obj = dict(
                 E_eV=float(self._energy),
                 lam=float(self._wavelength),
@@ -2637,6 +2720,18 @@ class beam:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         n_threads = min(chunk_total, multiprocessing.cpu_count())
 
+        # Static beam maps and basis for E0 sampling when depth_ein is False
+        tau_zero = np.zeros((self._beam_Ny, self._beam_Nz), dtype=np.float32)
+        phi_zero = np.zeros_like(tau_zero)
+        E0_np    = self._beam_E0_map.astype(np.complex64)
+        e1       = self._beam_e1.astype(np.float32)
+        e2       = self._beam_e2.astype(np.float32)
+        khat     = (self._direction / np.linalg.norm(self._direction)).astype(np.float32)
+        du       = float(self._beam_du)
+        dv       = float(self._beam_dv)
+        uc       = float(self._beam_uc)
+        vc       = float(self._beam_vc)
+
         def worker(chunk_id):
             species_chunk_np = sample.load_chunk_species(chunk_id, use_gpu=False)
             atom_count = int(species_chunk_np.shape[0])
@@ -2673,7 +2768,16 @@ class beam:
                 with np.load(cache_path) as npz:
                     init_amp = npz["ein"].astype(np.complex64)
             else:
-                init_amp = None
+                # Sample the incident beam E0(u,v); zero outside beam grid
+                init_amp = self._ein_bilinear_cpu(
+                    pos_np=positions_chunk,
+                    tau=tau_zero,
+                    phi=phi_zero,
+                    E0=E0_np,
+                    e1=e1, e2=e2, khat=khat,
+                    du=du, dv=dv, uc=uc, vc=vc,
+                    s_min=s_min, s_max=s_max
+                ).astype(np.complex64)
 
             out = self.cpu_scatter_chunk_cffi(
                 complied_code, ffi_obj, chunk_id, sample, Nx, Ny,
@@ -2767,10 +2871,8 @@ class beam:
         apply_polarization: bool = False
     ):
         """
-        DROP-IN REPLACEMENT.
-        Uses precomputed Ein caches when use_depth_ein=True. If any caches are
-        missing (or recompute_cache=True), it computes the missing ones once
-        up front by calling precompute_depth_ein_all_chunks, then proceeds.
+        If use_depth_ein is False, initial amplitudes are sampled from the
+        incident E0(u,v) on the GPU with Ein=0 outside the beam grid.
         """
         if cp is None:
             print("[beam] CuPy not installed, falling back to CPU.")
@@ -2837,11 +2939,13 @@ class beam:
         if chunk_total == 0:
             return np.zeros((Ny, Nx), dtype=np.complex64)
 
+        # Global depth bounds for Ein/E0 sampling
+        s_min, s_max = self._compute_global_depth_bounds(sample, stage)
+
         # Ensure Ein caches exist if requested
         key_hash = None
         cache_dir = None
         if use_depth_ein:
-            s_min, s_max = self._compute_global_depth_bounds(sample, stage)
             key_obj = dict(
                 E_eV=float(self._energy),
                 lam=float(self._wavelength),
@@ -2886,6 +2990,10 @@ class beam:
         except Exception:
             _streams_per_gpu = 3
 
+        # Ensure Ein kernel (used also for E0-only sampling)
+        if getattr(self, "_ein_kernel", None) is None:
+            self._ein_kernel = self.build_ein_sampler_kernel()
+
         def gpu_worker(gpu_id, chunk_indices, result_index):
             cp.cuda.Device(gpu_id).use()
 
@@ -2894,6 +3002,14 @@ class beam:
             xg = cp.asarray(x_coords)
             yg = cp.asarray(y_coords)
             zg = cp.asarray(z_coords)
+
+            # Static beam maps for E0/EIN sampling on this device
+            E0_g  = cp.asarray(self._beam_E0_map.astype(np.complex64))
+            tau_g = cp.zeros(E0_g.shape, dtype=cp.float32)
+            phi_g = cp.zeros_like(tau_g)
+            e1g   = cp.asarray(self._beam_e1.astype(np.float32))
+            e2g   = cp.asarray(self._beam_e2.astype(np.float32))
+            khatg = cp.asarray((self._direction / np.linalg.norm(self._direction)).astype(np.float32))
 
             streams = [cp.cuda.Stream(non_blocking=True) for _ in range(_streams_per_gpu)]
             dfields = [cp.zeros((Nx * Ny,), dtype=cp.complex64) for _ in streams]
@@ -2937,7 +3053,14 @@ class beam:
                             arr = npz["ein"]
                         initial_amp = cp.asarray(arr.astype(np.complex64))
                     else:
-                        initial_amp = cp.ones(nA, dtype=cp.complex64)
+                        # E0-only sampling (tau=0, phi=0), zero outside beam grid
+                        initial_amp = self._ein_for_positions_gpu_fast(
+                            pos_g=pos,
+                            tau_g=tau_g, phi_g=phi_g, E0_g=E0_g,
+                            e1g=e1g, e2g=e2g, khat_g=khatg,
+                            s_min=np.float32(s_min), s_max=np.float32(s_max),
+                            stream=streams[s_id]
+                        )
 
                     px = (pos[:, 0] / 1e10).astype(cp.float32)
                     py = (pos[:, 1] / 1e10).astype(cp.float32)
@@ -2981,7 +3104,7 @@ class beam:
 
             partial_results[result_index] = dfield_total.reshape((Ny, Nx)).get()
 
-            del xg, yg, zg
+            del xg, yg, zg, E0_g, tau_g, phi_g, e1g, e2g, khatg
             gc.collect()
 
         threads = []
@@ -3083,21 +3206,10 @@ class beam:
     # Direct transmission
     def _compute_beam_column_A_map_cpu(self, sample, stage, kernel_radius=0):
         """
-        Compute the transmission map A(u,v) = exp(-tau + i*phi) on the beam grid (CPU).
+        Compute A(u,v) = exp(-tau + i*phi) on the beam grid (CPU).
 
-        For each chunk, atoms are rotated and translated by the stage, projected onto
-        the beam transverse basis, and deposited onto the beam grid using a Triangular
-        Shaped Cloud (TSC) kernel. The result is the product of per-atom contributions,
-        expressed via accumulated absorption (tau) and phase (phi).
-
-        Args:
-            sample: Sample object with chunk accessors.
-            stage: Stage object with `rotation` (3x3) and `translation` (3,) arrays.
-            kernel_radius (int): Optional Gaussian blur radius in pixels applied to
-                tau and phi after accumulation. Zero disables the blur.
-
-        Returns:
-            np.ndarray: Complex64 array of shape (Ny_beam, Nz_beam) with A(u,v).
+        Only atoms whose (iu,iv) are inside [0..NyB-1]x[0..NzB-1] contribute.
+        This prevents out-of-beam atoms from contributing to transmission.
         """
         # Constants (angstrom)
         r_e_A = 2.81794092e-5
@@ -3131,19 +3243,17 @@ class beam:
 
         for cid in range(1, sample.chunk_total + 1):
             spc = sample.load_chunk_species(cid, use_gpu=False)
-            pos = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float32)  # angstrom
+            pos = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float32)  # Angstrom
             if pos.size == 0:
                 continue
             # Apply stage transform in real space (angstrom)
             pos = pos @ stage.rotation
             pos += stage.translation
 
-            nA = pos.shape[0]
-            f1  = np.zeros(nA, np.float32)
-            f2  = np.zeros(nA, np.float32)
-            f0z = np.zeros(nA, np.float32)
-
-            # Fill per-atom f0(0), f1, f2 by species
+            nA_all = pos.shape[0]
+            f1  = np.zeros(nA_all, np.float32)
+            f2  = np.zeros(nA_all, np.float32)
+            f0z = np.zeros(nA_all, np.float32)
             for el in pd.unique(spc):
                 el_s = str(el)
                 m = (spc == el)
@@ -3154,13 +3264,20 @@ class beam:
                     f1[m] = float(cplx.real)
                     f2[m] = float(cplx.imag)
 
-            # Project to beam basis (u, v), then to continuous grid indices
+            # Project to beam basis and continuous indices
             au = pos[:, 0]*e1[0] + pos[:, 1]*e1[1] + pos[:, 2]*e1[2]
             av = pos[:, 0]*e2[0] + pos[:, 1]*e2[1] + pos[:, 2]*e2[2]
             iu = au / du + self._beam_uc
             iv = av / dv + self._beam_vc
 
-            # TSC central pixel and neighbor distances
+            # Keep only atoms inside the beam grid
+            inb = (iu >= 0.0) & (iu <= (NyB - 1)) & (iv >= 0.0) & (iv <= (NzB - 1))
+            if not np.any(inb):
+                continue
+
+            iu = iu[inb]; iv = iv[inb]
+            f1 = f1[inb]; f2 = f2[inb]; f0z = f0z[inb]
+
             ic = np.floor(iu + 0.5).astype(np.int64)
             jc = np.floor(iv + 0.5).astype(np.int64)
 
@@ -3169,8 +3286,7 @@ class beam:
 
             wu_m1, wu_0, wu_p1 = _tsc_w(du_m1), _tsc_w(du_0), _tsc_w(du_p1)
             wv_m1, wv_0, wv_p1 = _tsc_w(dv_m1), _tsc_w(dv_0), _tsc_w(dv_p1)
-            
-            # Per-atom weights for tau and phi
+
             w_phi_atom = (-scale * (f0z + f1)).astype(np.float32)
             w_tau_atom = ( scale *  f2).astype(np.float32)
 
@@ -3178,13 +3294,12 @@ class beam:
             idx_tau = []; w_tau = []
 
             def _push(ii, jj, fac, w_atom):
-                # Append valid (linear_index, weight) pairs for accumulation
-                inb = (ii >= 0) & (ii < NyB) & (jj >= 0) & (jj < NzB) & (fac > 0.0)
-                if not np.any(inb):
+                mask = (ii >= 0) & (ii < NyB) & (jj >= 0) & (jj < NzB) & (fac > 0.0)
+                if not np.any(mask):
                     return np.empty((0,), np.int64), np.empty((0,), np.float32)
-                rows = ii[inb]; cols = jj[inb]
+                rows = ii[mask]; cols = jj[mask]
                 idx = (rows * NzB + cols).astype(np.int64)
-                w = (w_atom[inb] * fac[inb]).astype(np.float32)
+                w = (w_atom[mask] * fac[mask]).astype(np.float32)
                 return idx, w
 
             # 3x3 TSC stencil accumulation
@@ -3219,20 +3334,9 @@ class beam:
 
     def _compute_beam_column_A_map_gpu(self, sample, stage, kernel_radius=0):
         """
-        Compute the transmission map A(u,v) = exp(-tau + i*phi) on the beam grid (GPU).
+        Compute A(u,v) = exp(-tau + i*phi) on the beam grid (GPU).
 
-        If no GPU is present, this falls back to the CPU implementation. Accumulation
-        uses a TSC deposition onto the beam grid, with optional Gaussian blur on
-        tau and phi.
-
-        Args:
-            sample: Sample object with chunk accessors.
-            stage: Stage object with `rotation` (3x3) and `translation` (3,) arrays.
-            kernel_radius (int): Optional Gaussian blur radius in pixels applied to
-                tau and phi after accumulation. Zero disables the blur.
-
-        Returns:
-            np.ndarray: Complex64 array of shape (Ny_beam, Nz_beam) with A(u,v).
+        Only atoms with (iu,iv) inside the beam grid contribute.
         """
         if cp is None:
             return self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius)
@@ -3269,7 +3373,7 @@ class beam:
 
             tau_acc = cp.zeros((NyB, NzB), dtype=cp.float32)
             phi_acc = cp.zeros((NyB, NzB), dtype=cp.float32)
-
+            
             def _tsc_w(d):
                 # 1D TSC weights on distances in pixel units
                 w = cp.zeros_like(d, dtype=cp.float32)
@@ -3282,7 +3386,7 @@ class beam:
 
             for cid in chunks:
                 spc = sample.load_chunk_species(cid, use_gpu=False)
-                pos = sample.load_chunk_positions(cid, use_gpu=False)  # angstrom
+                pos = sample.load_chunk_positions(cid, use_gpu=False)  # Angstrom
                 nA = pos.shape[0]
                 if nA == 0:
                     continue
@@ -3308,14 +3412,22 @@ class beam:
                 # Apply stage transform in real space (angstrom)
                 posg = posg @ Rg; posg += Tg
 
-                # Project onto (u,v) in the beam basis
-                e1g = cp.asarray(self._beam_e1); e2g = cp.asarray(self._beam_e2)
+                e1g = cp.asarray(self._beam_e1)
+                e2g = cp.asarray(self._beam_e2)
                 au = posg[:, 0]*e1g[0] + posg[:, 1]*e1g[1] + posg[:, 2]*e1g[2]
                 av = posg[:, 0]*e2g[0] + posg[:, 1]*e2g[1] + posg[:, 2]*e2g[2]
 
                 # Continuous grid indices (center at uc/vc)
                 iu = au / self._beam_du + self._beam_uc
                 iv = av / self._beam_dv + self._beam_vc
+
+                inb = (iu >= 0.0) & (iu <= (NyB - 1)) & (iv >= 0.0) & (iv <= (NzB - 1))
+                if not bool(cp.any(inb)):
+                    cp.get_default_memory_pool().free_all_blocks()
+                    continue
+
+                iu = iu[inb]; iv = iv[inb]
+                f1g = f1g[inb]; f2g = f2g[inb]; f0zg = f0zg[inb]
 
                 ic = cp.floor(iu + 0.5).astype(cp.int64)
                 jc = cp.floor(iv + 0.5).astype(cp.int64)
@@ -3334,13 +3446,12 @@ class beam:
                 idx_tau = []; w_tau = []
 
                 def _push(ii, jj, fac, w_atom):
-                    # Append valid (linear_index, weight) pairs for accumulation
-                    inb = (ii >= 0) & (ii < NyB) & (jj >= 0) & (jj < NzB) & (fac > 0.0)
-                    if not bool(cp.any(inb)):
+                    mask = (ii >= 0) & (ii < NyB) & (jj >= 0) & (jj < NzB) & (fac > 0.0)
+                    if not bool(cp.any(mask)):
                         return cp.empty((0,), cp.int64), cp.empty((0,), cp.float32)
-                    rows = ii[inb]; cols = jj[inb]
+                    rows = ii[mask]; cols = jj[mask]
                     idx = (rows * NzB + cols).astype(cp.int64)
-                    w = (w_atom[inb] * fac[inb]).astype(cp.float32)
+                    w = (w_atom[mask] * fac[mask]).astype(cp.float32)
                     return idx, w
 
                 # 3x3 TSC stencil accumulation
@@ -3403,149 +3514,207 @@ class beam:
                             padding_mode: str = "edge",
                             pad_constant: float = 0.0):
         """
-        Compute the transmitted field at the sample exit plane and map it to the detector.
+        Compute the transmitted field with propagation performed on the FULL
+        DETECTOR GRID (NyD, NxD), not on the beam grid.
 
         Steps:
-        1) Build A(u,v) on the beam grid (CPU or GPU).
-        2) Form the exit-plane field E_plane = E0(u,v) * A(u,v).
-        3) If the detector plane is not coincident with the exit plane, propagate
-            E_plane by free-space angular spectrum.
-        4) Bilinearly resample the field onto detector pixels.
-
-        Args:
-            sample: Sample object with chunk accessors.
-            detector: Detector object with `shape`, `pixel_coordinates`, and `pixel_size`.
-            stage: Stage object with `rotation` (3x3) and `translation` (3,) arrays.
-            use_gpu (bool): If True and CuPy is available, use GPU for steps that support it.
-            kernel_radius (int): Optional Gaussian blur radius in pixels used when
-                computing A(u,v). Zero disables the blur.
-            padding_mode (str): Padding strategy for propagation. One of {"edge", "constant"}.
-            pad_constant (float): Fill value when `padding_mode == "constant"`.
+        1) Build A(u,v) on the beam grid and the exit-plane field E_exit(u,v).
+        2) Bilinearly resample E_exit onto EVERY detector pixel; zero OOB.
+        3) Decide the propagation distance from the sample exit plane to the
+            detector plane using beam direction.
+        4) If needed, propagate the full detector field using the detector's
+            sampling (pixel_size if available; otherwise estimated from geometry).
 
         Returns:
-            np.ndarray: Complex64 array of shape (Ny_detector, Nx_detector) on the detector plane.
+        np.ndarray complex64 of shape (NyD, NxD)
         """
-        # 1) A(u,v) on the beam grid
+        # 1) A(u,v) on beam grid, possibly blurred
         if use_gpu and (cp is not None):
             A_beam = self._compute_beam_column_A_map_gpu(sample, stage, kernel_radius)
         else:
             A_beam = self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius)
 
-        # 2) Exit field on the sample exit plane
-        E_plane = (self._beam_E0_map * A_beam).astype(np.complex64)
-        NyB, NzB = E_plane.shape
-        du_A = float(self._beam_du)  # angstrom
-        dv_A = float(self._beam_dv)  # angstrom
+        # Exit-plane field on the beam grid (NyB, NzB)
+        E_exit = (self._beam_E0_map * A_beam).astype(np.complex64)
+        NyB, NzB = E_exit.shape
+        du_A = float(self._beam_du)  # Angstrom (row axis corresponds to u)
+        dv_A = float(self._beam_dv)  # Angstrom (col axis corresponds to v)
 
-        # Geometry to detect detector-plane offset relative to exit plane
-        k_hat = (self._direction / np.linalg.norm(self._direction)).astype(np.float32)
-        _, s_max = self._compute_global_depth_bounds(sample, stage)  # angstrom (exit plane)
-        pix = detector.pixel_coordinates
-        pix_cpu = pix.get() if (cp is not None and isinstance(pix, cp.ndarray)) else np.asarray(pix)
-        s_det = (pix_cpu[0, :] * k_hat[0] + pix_cpu[1, :] * k_hat[1] + pix_cpu[2, :] * k_hat[2]).astype(np.float64)
-        s_det_min, s_det_max = float(np.min(s_det)), float(np.max(s_det))
-        s_det_mean = float(np.mean(s_det))
-        plane_span_A = s_det_max - s_det_min
-        tol_plane_A = max(1e-3, 1e-6 * abs(s_det_mean))
-        tol_off_A   = 1e-3
-
-        need_propagation = False
-        dz_A = 0.0
-        if plane_span_A <= tol_plane_A:
-            dz_A = s_det_mean - float(s_max)
-            need_propagation = (abs(dz_A) > tol_off_A)
-        else:
-            dz_A = s_det_mean - float(s_max)
-            if abs(dz_A) > tol_off_A:
-                need_propagation = True
-                print(f"[beam] atomic_transmission: detector appears non-planar (Delta s range={plane_span_A:.3g} A). "
-                    f"Propagating by mean Delta z={dz_A:.3g} A.")
-
-        # 3) Propagate if needed
-        if need_propagation:
-            dz_m = dz_A * 1e-10  # angstrom -> meters
-            dx_m = dv_A * 1e-10  # columns (v)
-            dy_m = du_A * 1e-10  # rows    (u)
-
-            if use_gpu and (cp is not None):
-                kernel = self.build_propagation_multiplier_kernel()
-                E_gpu = cp.asarray(E_plane)
-                E_gpu = self._angular_spectrum_propagate_gpu(
-                    field=E_gpu, dx=dx_m, dy=dy_m, z=dz_m, kernel=kernel,
-                    step_max=0.02, pad_factor=1.0,
-                    padding_mode=padding_mode, pad_constant=pad_constant
-                )
-                E_plane = E_gpu
-            else:
-                ffi, lib = self.compile_propagation_multiplier_cffi()
-                E_plane = self._angular_spectrum_propagate_cpu(
-                    field=E_plane, dx=dx_m, dy=dy_m, z=dz_m, lib=lib, ffi=ffi,
-                    step_max=0.02, pad_factor=1.0,
-                    padding_mode=padding_mode, pad_constant=pad_constant
-                ).astype(np.complex64)
-
-        # 4) Bilinear resampling to detector pixels
+        # 2) Resample E_exit to the detector grid (before propagation)
         NyD, NxD = detector.shape
+        pix = detector.pixel_coordinates
+
+        # Build u,v for each detector pixel
         if use_gpu and (cp is not None):
             pix_g = pix if isinstance(pix, cp.ndarray) else cp.asarray(pix)
-            e1g = cp.asarray(self._beam_e1); e2g = cp.asarray(self._beam_e2)
-            u = pix_g[0]*e1g[0] + pix_g[1]*e1g[1] + pix_g[2]*e1g[2]
-            v = pix_g[0]*e2g[0] + pix_g[1]*e2g[1] + pix_g[2]*e2g[2]
+            e1g = cp.asarray(self._beam_e1)
+            e2g = cp.asarray(self._beam_e2)
+
+            # transverse coordinates of each detector pixel
+            u = pix_g[0] * e1g[0] + pix_g[1] * e1g[1] + pix_g[2] * e1g[2]
+            v = pix_g[0] * e2g[0] + pix_g[1] * e2g[1] + pix_g[2] * e2g[2]
+
+            # beam-grid fractional indices
             iu = u / cp.float32(du_A) + cp.float32(self._beam_uc)
             iv = v / cp.float32(dv_A) + cp.float32(self._beam_vc)
 
+            # in-bounds mask
+            mask = (iu >= 0.0) & (iu <= (NyB - 1)) & (iv >= 0.0) & (iv <= (NzB - 1))
+
+            # neighbors and weights
             i0 = cp.floor(iu).astype(cp.int64); j0 = cp.floor(iv).astype(cp.int64)
             i1 = i0 + 1; j1 = j0 + 1
-            fu = (iu - i0).astype(cp.float32); fv = (iv - j0).astype(cp.float32)
-
             i0 = cp.clip(i0, 0, NyB - 1); i1 = cp.clip(i1, 0, NyB - 1)
             j0 = cp.clip(j0, 0, NzB - 1); j1 = cp.clip(j1, 0, NzB - 1)
+            fu = (iu - i0).astype(cp.float32); fv = (iv - j0).astype(cp.float32)
 
-            E_src = E_plane if isinstance(E_plane, cp.ndarray) else cp.asarray(E_plane)
+            Eb = E_exit if isinstance(E_exit, cp.ndarray) else cp.asarray(E_exit)
             idx00 = (i0 * NzB + j0).astype(cp.int64)
             idx01 = (i0 * NzB + j1).astype(cp.int64)
             idx10 = (i1 * NzB + j0).astype(cp.int64)
             idx11 = (i1 * NzB + j1).astype(cp.int64)
 
-            E00 = E_src.ravel()[idx00]
-            E01 = E_src.ravel()[idx01]
-            E10 = E_src.ravel()[idx10]
-            E11 = E_src.ravel()[idx11]
+            E00 = Eb.ravel()[idx00]
+            E01 = Eb.ravel()[idx01]
+            E10 = Eb.ravel()[idx10]
+            E11 = Eb.ravel()[idx11]
 
             one = cp.float32(1.0)
-            E_flat = (E00 * (one - fu)*(one - fv) +
-                    E01 * (one - fu)*fv +
-                    E10 * (fu)*(one - fv) +
-                    E11 * (fu)*fv).astype(cp.complex64)
-            E_det = E_flat.reshape(NyD, NxD).get()
+            E_det_exit = (E00 * (one - fu) * (one - fv) +
+                        E01 * (one - fu) * fv +
+                        E10 * fu * (one - fv) +
+                        E11 * fu * fv).astype(cp.complex64)
+
+            # zero out-of-bounds
+            E_det_exit = cp.where(mask, E_det_exit, cp.complex64(0.0 + 0.0j))
+            E_det_exit = E_det_exit.reshape(NyD, NxD)
+
         else:
+            pix_cpu = pix.get() if (cp is not None and isinstance(pix, cp.ndarray)) else np.asarray(pix)
             e1 = self._beam_e1; e2 = self._beam_e2
-            u = pix_cpu[0]*e1[0] + pix_cpu[1]*e1[1] + pix_cpu[2]*e1[2]
-            v = pix_cpu[0]*e2[0] + pix_cpu[1]*e2[1] + pix_cpu[2]*e2[2]
+
+            u = pix_cpu[0] * e1[0] + pix_cpu[1] * e1[1] + pix_cpu[2] * e1[2]
+            v = pix_cpu[0] * e2[0] + pix_cpu[1] * e2[1] + pix_cpu[2] * e2[2]
+
             iu = u / du_A + self._beam_uc
             iv = v / dv_A + self._beam_vc
 
+            mask = (iu >= 0.0) & (iu <= (NyB - 1)) & (iv >= 0.0) & (iv <= (NzB - 1))
+
             i0 = np.floor(iu).astype(np.int64); j0 = np.floor(iv).astype(np.int64)
             i1 = i0 + 1; j1 = j0 + 1
-            fu = (iu - i0).astype(np.float32); fv = (iv - j0).astype(np.float32)
-
             i0 = np.clip(i0, 0, NyB - 1); i1 = np.clip(i1, 0, NyB - 1)
             j0 = np.clip(j0, 0, NzB - 1); j1 = np.clip(j1, 0, NzB - 1)
+            fu = (iu - i0).astype(np.float32); fv = (iv - j0).astype(np.float32)
 
-            Eb = (E_plane if isinstance(E_plane, np.ndarray) else np.asarray(E_plane)).ravel()
+            Eb = (E_exit if isinstance(E_exit, np.ndarray) else np.asarray(E_exit)).ravel()
             idx00 = (i0 * NzB + j0).astype(np.int64)
             idx01 = (i0 * NzB + j1).astype(np.int64)
             idx10 = (i1 * NzB + j0).astype(np.int64)
             idx11 = (i1 * NzB + j1).astype(np.int64)
 
             E00 = Eb[idx00]; E01 = Eb[idx01]; E10 = Eb[idx10]; E11 = Eb[idx11]
-            E_flat = (E00 * (1.0 - fu)*(1.0 - fv) +
-                    E01 * (1.0 - fu)*fv +
-                    E10 * fu*(1.0 - fv) +
-                    E11 * fu*fv).astype(np.complex64)
-            E_det = E_flat.reshape(NyD, NxD)
+            E_det_exit = (E00 * (1.0 - fu) * (1.0 - fv) +
+                        E01 * (1.0 - fu) * fv +
+                        E10 * fu * (1.0 - fv) +
+                        E11 * fu * fv).astype(np.complex64)
+            E_det_exit[~mask] = 0.0 + 0.0j
+            E_det_exit = E_det_exit.reshape(NyD, NxD)
 
-        return E_det.astype(np.complex64)
+        # 3) Decide whether free-space propagation is needed, using beam direction
+        k_hat = (self._direction / np.linalg.norm(self._direction)).astype(np.float32)
+        _, s_max = self._compute_global_depth_bounds(sample, stage)  # exit plane depth (Angstrom)
+
+        if use_gpu and (cp is not None):
+            pix_cpu = pix if isinstance(pix, np.ndarray) else pix.get()
+        else:
+            pix_cpu = pix_cpu if "pix_cpu" in locals() else np.asarray(pix)
+
+        s_det = (pix_cpu[0, :] * k_hat[0] +
+                pix_cpu[1, :] * k_hat[1] +
+                pix_cpu[2, :] * k_hat[2]).astype(np.float64)
+
+        s_det_min = float(np.min(s_det))
+        s_det_max = float(np.max(s_det))
+        s_det_mean = float(np.mean(s_det))
+        plane_span_A = s_det_max - s_det_min
+        tol_plane_A = max(1e-3, 1e-6 * abs(s_det_mean))
+        tol_off_A = 1e-3
+
+        need_propagation = False
+        dz_A = s_det_mean - float(s_max)
+        if plane_span_A <= tol_plane_A:
+            need_propagation = (abs(dz_A) > tol_off_A)
+        else:
+            # Non-planar detector: propagate by mean offset
+            need_propagation = (abs(dz_A) > tol_off_A)
+            if need_propagation:
+                print("[beam] atomic_transmission: detector appears non-planar "
+                    "(Delta s range={:.3g} A). Propagating by mean Delta z={:.3g} A."
+                    .format(plane_span_A, dz_A))
+
+        if not need_propagation:
+            # Return the exit field mapped to the detector without additional propagation
+            return (E_det_exit.get() if (use_gpu and cp is not None and isinstance(E_det_exit, cp.ndarray))
+                    else E_det_exit).astype(np.complex64)
+
+        # 4) Propagate the FULL detector field by dz using detector sampling
+        dz_m = float(dz_A) * 1e-10
+
+        # Prefer detector.pixel_size if available; fallback to estimating from geometry
+        def _estimate_dx_dy_from_uv(u_flat, v_flat, ny, nx):
+            u_img = u_flat.reshape(ny, nx)
+            v_img = v_flat.reshape(ny, nx)
+            # dy corresponds to change of u across rows; dx corresponds to change of v across cols
+            du_rows = np.abs(u_img[1:, :] - u_img[:-1, :]).ravel()
+            dv_cols = np.abs(v_img[:, 1:] - v_img[:, :-1]).ravel()
+            dy_A_est = float(np.median(du_rows)) if du_rows.size else 0.0
+            dx_A_est = float(np.median(dv_cols)) if dv_cols.size else 0.0
+            # Safety fallback
+            if not np.isfinite(dy_A_est) or dy_A_est <= 0.0:
+                dy_A_est = du_A
+            if not np.isfinite(dx_A_est) or dx_A_est <= 0.0:
+                dx_A_est = dv_A
+            return dx_A_est * 1e-10, dy_A_est * 1e-10  # meters
+
+        # Determine dx, dy (meters) for the detector grid
+        have_psize = hasattr(detector, "pixel_size")
+        dx_m = dy_m = None
+        if have_psize:
+            try:
+                dy_A_ps, dx_A_ps = detector.pixel_size  # documented as (dy, dx) in Angstrom
+                dy_m = float(dy_A_ps) * 1e-10
+                dx_m = float(dx_A_ps) * 1e-10
+            except Exception:
+                dx_m = dy_m = None
+
+        if (dx_m is None) or (dy_m is None) or (dx_m <= 0.0) or (dy_m <= 0.0):
+            # Estimate from u,v geometry
+            if use_gpu and (cp is not None):
+                u_cpu = u.get() if isinstance(u, cp.ndarray) else np.asarray(u)
+                v_cpu = v.get() if isinstance(v, cp.ndarray) else np.asarray(v)
+                dx_m, dy_m = _estimate_dx_dy_from_uv(u_cpu, v_cpu, NyD, NxD)
+            else:
+                dx_m, dy_m = _estimate_dx_dy_from_uv(u, v, NyD, NxD)
+
+        # Propagate on GPU or CPU over the FULL detector field
+        if use_gpu and (cp is not None):
+            kernel = self.build_propagation_multiplier_kernel()
+            E_gpu = E_det_exit if isinstance(E_det_exit, cp.ndarray) else cp.asarray(E_det_exit)
+            E_gpu = self._angular_spectrum_propagate_gpu(
+                field=E_gpu, dx=dx_m, dy=dy_m, z=dz_m, kernel=kernel,
+                step_max=0.02, pad_factor=1.0,
+                padding_mode=padding_mode, pad_constant=pad_constant
+            )
+            return E_gpu.get().astype(np.complex64)
+        else:
+            ffi, lib = self.compile_propagation_multiplier_cffi()
+            E_out = self._angular_spectrum_propagate_cpu(
+                field=E_det_exit, dx=dx_m, dy=dy_m, z=dz_m, lib=lib, ffi=ffi,
+                step_max=0.02, pad_factor=1.0,
+                padding_mode=padding_mode, pad_constant=pad_constant
+            )
+            return E_out.astype(np.complex64)
     # -------------------------------------
     
     # -------------------------------------
@@ -4489,40 +4658,28 @@ class beam:
             None. The combined complex field is written back into `detector`.
         """
         Nx, Ny = detector.shape
-        final_field = np.zeros((Ny, Nx), dtype=np.complex128)
+        final_field = np.zeros((Ny, Nx), dtype=np.complex64)
 
         # Parse scattering params
         sc_offset = scattering_params[0] if (len(scattering_params) >= 1) else None
         use_depth_ein = scattering_params[1] if len(scattering_params) >= 2 else False
 
-        if use_gpu and (cp is not None):
-            if scattering:
-                final_field += self.atomic_scattering_kinematic(
-                    sample, detector, stage,
-                    offset=sc_offset, use_gpu=True,
-                    remove_forward=transmission,      # remove forward if also transmitting
-                    use_depth_ein=use_depth_ein
-                )
-            if transmission:
-                final_field += self.atomic_transmission(
-                    sample, detector, stage, use_gpu=True,
-                    kernel_radius=transmission_params[0]
-                )
-        else:
-            # CPU path; warn if GPU requested but not available
-            if cp is None and use_gpu:
-                print("[beam] Cupy not installed, running CPU mode.")
-            if scattering:
-                final_field += self.atomic_scattering_kinematic(
-                    sample, detector, stage,
-                    offset=sc_offset, use_gpu=False,
-                    remove_forward=transmission
-                )
-            if transmission:
-                final_field += self.atomic_transmission(
-                    sample, detector, stage, use_gpu=False,
-                    kernel_radius=transmission_params[0]
-                )
+        if scattering:
+            sc = self.atomic_scattering_kinematic(
+                sample, detector, stage,
+                offset=sc_offset, use_gpu=bool(use_gpu and (cp is not None)),
+                remove_forward=bool(transmission),      # remove forward if also transmitting
+                use_depth_ein=bool(use_depth_ein)
+            )
+            final_field += np.asarray(sc, dtype=np.complex64)
+
+        if transmission:
+            tx = self.atomic_transmission(
+                sample, detector, stage,
+                use_gpu=bool(use_gpu and (cp is not None)),
+                kernel_radius=transmission_params[0]
+            )
+            final_field += np.asarray(tx, dtype=np.complex64)
 
         detector.input_pixel_values(final_field)
     # -------------------------------------
