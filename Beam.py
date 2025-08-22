@@ -528,9 +528,6 @@ class beam:
     def compile_compute_scattering_cffi():
         """
         Build and return a CPU scattering routine (CFFI) with optional polarization.
-
-        The compiled C function signature is:
-
             void compute_scattering_cffi(
                 int atom_count,
                 const float* positions,     // (atom_count, 3) in meters
@@ -567,19 +564,20 @@ class beam:
         c_source = r'''
         #include <math.h>
         #include <stddef.h>
+        #include <stdlib.h>
 
         static inline float get_f0_value(float Q_val, const float* params)
         {
             const float PI_F = 3.14159265358979323846f;
-            const float K_SCALE_FACTOR = 0.25f * 1.0e-10f / PI_F;  // 0.25 * Angstrom / pi
-            const float k   = K_SCALE_FACTOR * Q_val;
-            const float kk  = k*k;
+            const float K_SCALE_FACTOR = 0.25f * 1.0e-10f / PI_F;  // Q[m^-1] -> s[Angstrom^-1]
+            const float s   = K_SCALE_FACTOR * Q_val;
+            const float ss  = s*s;
 
             float f0_val = params[5]; // c
             for (int i=0;i<5;i++){
                 const float ai = params[i];
                 const float bi = params[6+i];
-                f0_val += ai * expf(-bi * kk);
+                f0_val += ai * expf(-bi * ss);
             }
             return f0_val;
         }
@@ -608,6 +606,72 @@ class beam:
             const float rE_F = 2.81794092e-15f;  // classical electron radius [m]
             const int pixel_count = Nx*Ny;
 
+            // Precompute per-pixel Q_cut (one-pixel "radius" in Q-space), matching the GPU kernel.
+            // Use right (+x) and up (+y) neighbors with edge fallback.
+            int have_qcut = 1;
+            float* Q_cut = (float*)malloc((size_t)pixel_count * sizeof(float));
+            if (!Q_cut) have_qcut = 0;
+
+            if (have_qcut) {
+                for (int p = 0; p < pixel_count; ++p) {
+                    // 2D index
+                    int ix = p % Nx;
+                    int iy = p / Nx;
+
+                    // Center pixel vector and unit direction
+                    float tx = coords_x[p];
+                    float ty = coords_y[p];
+                    float tz = coords_z[p];
+                    float R0 = sqrtf(tx*tx + ty*ty + tz*tz);
+                    float ux = 0.0f, uy = 0.0f, uz = 0.0f;
+                    if (R0 > 0.0f) {
+                        float invR0 = 1.0f / R0;
+                        ux = tx * invR0; uy = ty * invR0; uz = tz * invR0;
+                    }
+
+                    // Right neighbor (or left if on right edge; else self if single column)
+                    int n_right = (ix + 1 < Nx) ? (p + 1) : ((ix > 0) ? (p - 1) : p);
+                    float rx = coords_x[n_right];
+                    float ry = coords_y[n_right];
+                    float rz = coords_z[n_right];
+                    float Rr = sqrtf(rx*rx + ry*ry + rz*rz);
+                    float urx = 0.0f, ury = 0.0f, urz = 0.0f;
+                    if (Rr > 0.0f) {
+                        float invRr = 1.0f / Rr;
+                        urx = rx*invRr; ury = ry*invRr; urz = rz*invRr;
+                    }
+                    float cos_dx = ux*urx + uy*ury + uz*urz;
+                    if (cos_dx > 1.0f) cos_dx = 1.0f;
+                    if (cos_dx < -1.0f) cos_dx = -1.0f;
+                    float Qx = k_val * sqrtf(fmaxf(0.0f, 2.0f * (1.0f - cos_dx)));
+
+                    // Up neighbor (or down if on top edge; else self if single row)
+                    int n_up = (iy + 1 < Ny) ? (p + Nx) : ((iy > 0) ? (p - Nx) : p);
+                    float ux2 = coords_x[n_up];
+                    float uy2 = coords_y[n_up];
+                    float uz2 = coords_z[n_up];
+                    float Ru = sqrtf(ux2*ux2 + uy2*uy2 + uz2*uz2);
+                    float vux = 0.0f, vuy = 0.0f, vuz = 0.0f;
+                    if (Ru > 0.0f) {
+                        float invRu = 1.0f / Ru;
+                        vux = ux2*invRu; vuy = uy2*invRu; vuz = uz2*invRu;
+                    }
+                    float cos_dy = ux*vux + uy*vuy + uz*vuz;
+                    if (cos_dy > 1.0f) cos_dy = 1.0f;
+                    if (cos_dy < -1.0f) cos_dy = -1.0f;
+                    float Qy = k_val * sqrtf(fmaxf(0.0f, 2.0f * (1.0f - cos_dy)));
+
+                    // Diagonal half-width in Q (approximate pixel radius in Q-space)
+                    float Qhx = 0.5f * Qx;
+                    float Qhy = 0.5f * Qy;
+                    Q_cut[p] = sqrtf(Qhx*Qhx + Qhy*Qhy);
+                }
+            }
+
+            // Precompute wavelength from k
+            const float wavelength_m = (2.0f * PI_F) / k_val;
+
+            // Main accumulation
             for (int a=0; a<atom_count; ++a)
             {
                 const float ax = positions[3*a+0];
@@ -631,13 +695,25 @@ class beam:
                     float r_det = sqrtf(dx*dx + dy*dy + dz*dz);
                     if (r_det == 0.0f) continue;
 
-                    float dotv = (dx / r_det);  // cos(2*theta) approx for +x incidence
+                    float dotv = (dx / r_det);  // +x incidence approximation
                     float tmp = 2.0f*(1.0f - dotv);
                     if (tmp < 0.0f) tmp = 0.0f;
                     float Q_val = k_val * sqrtf(tmp);
 
                     float f0_val = get_f0_value(Q_val, f0p);
-                    if (remove_forward != 0) { f0_val -= f00; }
+
+                    // Pixel-adaptive forward-term removal (matches GPU). Fallback to
+                    // unconditional behavior if Q_cut allocation failed.
+                    if (remove_forward) {
+                        if (have_qcut) {
+                            if (Q_val < Q_cut[p]) {
+                                f0_val -= f00;
+                            }
+                        } else {
+                            // Fallback: old behavior
+                            f0_val -= f00;
+                        }
+                    }
 
                     float s_re = (f0_val + sanr);
                     float s_im = (sani);
@@ -646,7 +722,6 @@ class beam:
                     float t_re = amp_r * s_re - amp_i * s_im;
                     float t_im = amp_r * s_im + amp_i * s_re;
 
-                    float wavelength_m = (2.0f * PI_F) / k_val;  // derived from k
                     float phase = k_val * (fmodf(ax, wavelength_m) + fmodf(r_det, wavelength_m));
                     float cph = cosf(phase);
                     float sph = sinf(phase);
@@ -668,6 +743,8 @@ class beam:
                     out_i[p] += val_i;
                 }
             }
+
+            if (Q_cut) free(Q_cut);
         }
         ''';
 
@@ -922,7 +999,7 @@ class beam:
     def build_interaction_kernel(self, series_terms: int | None = None, force_mode: str | None = None):
         """
         Build (and cache) the FP32-only kinematic kernel with a global mode and N
-        baked in at compile time. Kernel name/signature remain 'interaction_kernal'.
+        baked in at compile time.
         """
         if cp is None:
             raise RuntimeError("CuPy is required for GPU scattering kernels.")
@@ -1073,6 +1150,7 @@ class beam:
             float ty = y_coords[pidx];
             float tz = z_coords[pidx];
 
+            // Pixel sightline (from origin) and unit vector
             float R0 = sqrtf(tx*tx + ty*ty + tz*tz);
             float invR0 = 0.0f, ux = 0.0f, uy = 0.0f, uz = 0.0f;
             if (R0 > 0.0f) {
@@ -1088,6 +1166,42 @@ class beam:
             // Base phasor exp(i*k*R0)
             float sb, cb;
             sincos_k_times_reduced(k_global, R0, sb, cb);
+
+            // Compute Q_cut from the local pixel size:
+            // take neighbor in +x (or -x at edge) and +y (or -y), build unit directions,
+            // then convert angular deltas to Q-steps; use diagonal half-width.
+            float Q_cut = 0.0f;
+            {
+                int n_right = (ix + 1 < Nx) ? (pidx + 1) : ((ix > 0) ? (pidx - 1) : pidx);
+                int n_up    = (iy + 1 < Ny) ? (pidx + Nx) : ((iy > 0) ? (pidx - Nx) : pidx);
+
+                // neighbor +x/-x
+                float rx = x_coords[n_right];
+                float ry = y_coords[n_right];
+                float rz = z_coords[n_right];
+                float Rr = sqrtf(rx*rx + ry*ry + rz*rz);
+                float urx = 0.0f, ury = 0.0f, urz = 0.0f;
+                if (Rr > 0.0f) { float invRr = 1.0f / Rr; urx = rx*invRr; ury = ry*invRr; urz = rz*invRr; }
+                float cos_dx = ux*urx + uy*ury + uz*urz;
+                cos_dx = fminf(1.0f, fmaxf(-1.0f, cos_dx));
+                float Qx = k_global * __fsqrt_rn(fmaxf(0.0f, 2.0f * (1.0f - cos_dx)));
+
+                // neighbor +y/-y
+                float ux2 = x_coords[n_up];
+                float uy2 = y_coords[n_up];
+                float uz2 = z_coords[n_up];
+                float Ru = sqrtf(ux2*ux2 + uy2*uy2 + uz2*uz2);
+                float vux = 0.0f, vuy = 0.0f, vuz = 0.0f;
+                if (Ru > 0.0f) { float invRu = 1.0f / Ru; vux = ux2*invRu; vuy = uy2*invRu; vuz = uz2*invRu; }
+                float cos_dy = ux*vux + uy*vuy + uz*vuz;
+                cos_dy = fminf(1.0f, fmaxf(-1.0f, cos_dy));
+                float Qy = k_global * __fsqrt_rn(fmaxf(0.0f, 2.0f * (1.0f - cos_dy)));
+
+                // diagonal half-width in Q (approximate pixel "radius" in Q-space)
+                float Qhx = 0.5f * Qx;
+                float Qhy = 0.5f * Qy;
+                Q_cut = __fsqrt_rn(Qhx*Qhx + Qhy*Qhy);
+            }
 
             // Shared tiles
             __shared__ float  s_px[CHUNK_SIZE];
@@ -1133,7 +1247,8 @@ class beam:
                     float r_det = sqrtf(dx*dx + dy*dy + dz*dz);
                     if (!(r_det > 0.0f)) continue;
 
-                    float dotv = dx / r_det; // +x incidence approximation
+                    // +x incidence approximation
+                    float dotv = dx / r_det;
 
                     float tmp = 2.0f * (1.0f - dotv);
                     if (tmp < 0.0f) tmp = 0.0f;
@@ -1141,7 +1256,11 @@ class beam:
 
                     const float* param_ptr = &s_params[j*11];
                     float f0v = get_f0_from_params(Q_val, param_ptr);
-                    if (remove_forward) f0v -= s_f0z[j];
+
+                    // forward-term removal gated by local Q_cut (one-pixel radius in Q)
+                    if (remove_forward && (Q_val < Q_cut)) {
+                        f0v -= s_f0z[j];
+                    }
 
                     float2 s_tot;
                     s_tot.x = f0v + s_anm[j].x;
@@ -2564,73 +2683,6 @@ class beam:
 
         # Return complex field reshaped to (Ny, Nx)
         return (out_r + 1j*out_i).reshape((Ny, Nx)).astype(np.complex64)
-
-    @staticmethod
-    def _ein_bilinear_cpu(
-        pos_np,   # (N,3) float32, Angstrom, on host
-        tau,      # (NyB,NzB) float32
-        phi,      # (NyB,NzB) float32
-        E0,       # (NyB,NzB) complex64
-        e1, e2, khat,  # (3,) float32
-        du, dv, uc, vc,
-        s_min, s_max
-    ):
-        """
-        CPU evaluator: Ein = E0 * exp(-f*tau) * exp(i*f*phi) with bilinear sampling.
-        Returns complex64 array of length N.
-        """
-        N = int(pos_np.shape[0])
-        if N == 0:
-            return np.zeros((0,), dtype=np.complex64)
-
-        NyB, NzB = int(tau.shape[0]), int(tau.shape[1])
-
-        au = pos_np[:, 0]*e1[0] + pos_np[:, 1]*e1[1] + pos_np[:, 2]*e1[2]
-        av = pos_np[:, 0]*e2[0] + pos_np[:, 1]*e2[1] + pos_np[:, 2]*e2[2]
-        iu = au / float(du) + float(uc)
-        iv = av / float(dv) + float(vc)
-
-        i0 = np.floor(iu).astype(np.int64)
-        j0 = np.floor(iv).astype(np.int64)
-        i1 = np.clip(i0 + 1, 0, NyB - 1)
-        j1 = np.clip(j0 + 1, 0, NzB - 1)
-        i0 = np.clip(i0, 0, NyB - 1)
-        j0 = np.clip(j0, 0, NzB - 1)
-
-        fu = (iu - i0).astype(np.float32)
-        fv = (iv - j0).astype(np.float32)
-        w00 = (1.0 - fu)*(1.0 - fv)
-        w01 = (1.0 - fu)*fv
-        w10 = fu*(1.0 - fv)
-        w11 = fu*fv
-
-        r00 = i0 * NzB + j0
-        r01 = i0 * NzB + j1
-        r10 = i1 * NzB + j0
-        r11 = i1 * NzB + j1
-
-        tau_f = tau.ravel()
-        phi_f = phi.ravel()
-        E0_f  = E0.ravel()
-
-        tau_s = tau_f[r00]*w00 + tau_f[r01]*w01 + tau_f[r10]*w10 + tau_f[r11]*w11
-        phi_s = phi_f[r00]*w00 + phi_f[r01]*w01 + phi_f[r10]*w10 + phi_f[r11]*w11
-        E0_s  = E0_f[r00]*w00 + E0_f[r01]*w01 + E0_f[r10]*w10 + E0_f[r11]*w11
-
-        s_vals = pos_np[:, 0]*khat[0] + pos_np[:, 1]*khat[1] + pos_np[:, 2]*khat[2]
-        denom = float(s_max) - float(s_min)
-        if not (denom > 0.0):
-            denom = 1.0
-        f = np.clip((s_vals - float(s_min))/denom, 0.0, 1.0).astype(np.float32)
-
-        amp = np.exp(-f * tau_s).astype(np.float32)
-        phase = f * phi_s
-        cph = np.cos(phase)
-        sph = np.sin(phase)
-
-        real = (E0_s.real * cph - E0_s.imag * sph) * amp
-        imag = (E0_s.real * sph + E0_s.imag * cph) * amp
-        return (real + 1j*imag).astype(np.complex64)
     
     def interact_beam_cpu(
         self,
