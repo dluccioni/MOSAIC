@@ -316,7 +316,12 @@ class detector:
                 eta_pixels = np.rad2deg(eta_pixels)
             return np.stack((eta_pixels, two_theta_pixels, distance), axis=0)
         
-    def get_detector_axis(self, system="angular", units="deg", axis=None):
+    def get_detector_axis(
+        self, 
+        system="angular", 
+        units="deg", 
+        axis=None
+    ):
         """
         Returns the detector coordinates (3, Nx, Ny) in either cartesian or angular
         form. If 'axis' is specified, return only that axis (0=x/eta, 1=y/2theta, 2=z/distance).
@@ -349,7 +354,16 @@ class detector:
         else:
             return coords_reshaped
         
-    def plot_detector(self,type="Intensity",title=None,scaling="linear",limits=np.array([0,1]),figsize=(8, 6), cmap="gist_gray"):
+    def plot_detector(
+        self,
+        type="Intensity",
+        title=None,
+        scaling="linear",
+        vmin=None,vmax=None,
+        xlim=None,ylim=None,
+        figsize=(8, 6), 
+        cmap="gist_gray"
+    ):
         import matplotlib.pyplot as plt
         import matplotlib.colors as pltcolor
         if type == "Intensity":
@@ -371,7 +385,10 @@ class detector:
         im = ax1.imshow(
             plot_val,
             extent=[-detector_extent[0], detector_extent[0], -detector_extent[1], detector_extent[1]],
-            origin='lower', cmap=cmap
+            origin='lower', 
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax
         )
         ax1.set_xlabel("X")
         ax1.set_ylabel("Y")
@@ -380,11 +397,26 @@ class detector:
         else:
             ax1.set_title(title)
         ax1.axis('scaled')
-        fig.colorbar(im, ax=ax1)
-        # fig.show()
+        cbar = fig.colorbar(im, ax=ax1)
+        cbar.set_label(type)
+        if xlim is not None:
+            ax1.set_xlim(xlim)
+        if ylim is not None:
+            ax1.set_ylim(ylim)
         return fig, ax1
     
-    def plot_detector_angles(self,type="Intensity",title=None,scaling="linear",degrees=True,figsize=(8, 6),cmap="gist_gray",vmin=None,vmax=None,xlim=None,ylim=None,marker_size=2):
+    def plot_detector_angles(
+        self,
+        type="Intensity",
+        title=None,
+        scaling="linear",
+        degrees=True,
+        figsize=(8, 6),
+        cmap="gist_gray",
+        vmin=None,vmax=None,
+        xlim=None,ylim=None,
+        marker_size=2
+    ):
         """
         Compute and plot each pixel's value in diffraction‑angle coordinates
         (η on x‑axis, 2θ on y‑axis).
@@ -472,8 +504,6 @@ class detector:
             ax.set_title(type)
         else:
             ax.set_title(title)
-        # ax.axis('scaled')
-
         return fig, ax
 
     def plot_detector_position(self,elev=0,azim=90,figsize=(8, 8),title="Detector Position"):
