@@ -3315,29 +3315,32 @@ class beam:
         Only atoms whose (iu,iv) are inside [0..NyB-1]x[0..NzB-1] contribute.
         This prevents out-of-beam atoms from contributing to transmission.
         """
+        import numpy as _np
+
         # Constants (angstrom)
         r_e_A = 2.81794092e-5
         lam_A = self._wavelength * 1e10
-        du, dv = self._beam_du, self._beam_dv
-        NyB, NzB = self._beam_Ny, self._beam_Nz
-        A_pix_A2 = float(du) * float(dv)
-        # Scale linking per-atom factors to per-pixel tau/phi
-        scale = (r_e_A * lam_A) / A_pix_A2
 
-        # Accumulators for absorption (tau) and phase (phi)
-        tau = np.zeros((NyB, NzB), np.float32)
-        phi = np.zeros((NyB, NzB), np.float32)
+        # Beam-grid geometry
+        du, dv = float(self._beam_du), float(self._beam_dv)
+        NyB, NzB = int(self._beam_Ny), int(self._beam_Nz)
+        A_pix_A2 = du * dv
 
-        # Databases for f1, f2, and f0(0)
-        f1f2_dict = self.parse_f1f2_db_all("f1f2_CromerLiberman.dat")
+        # Accumulate column sums of forward factors (real and imag parts)
+        sum_real = _np.zeros((NyB, NzB), _np.float32)  # sum of f0(0)+f1
+        sum_imag = _np.zeros((NyB, NzB), _np.float32)  # sum of f2
+
+        # Databases
+        f1f2_dict      = self.parse_f1f2_db_all("f1f2_CromerLiberman.dat")
         f0_params_dict = self.parse_f0_db_all('f0_WaasKirf.dat')
-        f0_zero_dict = self._build_f0_zero_dict(f0_params_dict)
+        f0_zero_dict   = self._build_f0_zero_dict(f0_params_dict)
 
-        e1 = self._beam_e1; e2 = self._beam_e2
+        e1 = self._beam_e1
+        e2 = self._beam_e2
 
         def _tsc_w(d):
-            # 1D TSC weights on distances in pixel units
-            w = np.zeros_like(d, dtype=np.float32)
+            # 1D TSC weights for distances in pixel units (centered on integer indices)
+            w = _np.zeros_like(d, dtype=_np.float32)
             m0 = d <= 0.5
             w[m0] = 0.75 - d[m0]*d[m0]
             m1 = (~m0) & (d <= 1.5)
@@ -3347,20 +3350,21 @@ class beam:
 
         for cid in range(1, sample.chunk_total + 1):
             spc = sample.load_chunk_species(cid, use_gpu=False)
-            pos = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float32)  # Angstrom
+            pos = sample.load_chunk_positions(cid, use_gpu=False).astype(_np.float32)  # Angstrom
             if pos.size == 0:
                 continue
-            # Apply stage transform in real space (angstrom)
+
+            # Stage transform in real space (angstrom)
             pos = pos @ stage.rotation
             pos += stage.translation
 
-            nA_all = pos.shape[0]
-            f1  = np.zeros(nA_all, np.float32)
-            f2  = np.zeros(nA_all, np.float32)
-            f0z = np.zeros(nA_all, np.float32)
-            for el in pd.unique(spc):
+            nA = pos.shape[0]
+            f1  = _np.zeros(nA, _np.float32)
+            f2  = _np.zeros(nA, _np.float32)
+            f0z = _np.zeros(nA, _np.float32)
+            for el in _np.unique(spc):
                 el_s = str(el)
-                m = (spc == el)
+                m = (spc == el_s)
                 f0z[m] = float(f0_zero_dict.get(el_s, 0.0))
                 tbl = f1f2_dict.get(el_s)
                 if tbl is not None:
@@ -3368,72 +3372,89 @@ class beam:
                     f1[m] = float(cplx.real)
                     f2[m] = float(cplx.imag)
 
-            # Project to beam basis and continuous indices
+            # Project to beam basis and grid indices
             au = pos[:, 0]*e1[0] + pos[:, 1]*e1[1] + pos[:, 2]*e1[2]
             av = pos[:, 0]*e2[0] + pos[:, 1]*e2[1] + pos[:, 2]*e2[2]
-            iu = au / du + self._beam_uc
-            iv = av / dv + self._beam_vc
+            iu = au/du + self._beam_uc
+            iv = av/dv + self._beam_vc
 
-            # Keep only atoms inside the beam grid
             inb = (iu >= 0.0) & (iu <= (NyB - 1)) & (iv >= 0.0) & (iv <= (NzB - 1))
-            if not np.any(inb):
+            if not _np.any(inb):
                 continue
 
             iu = iu[inb]; iv = iv[inb]
-            f1 = f1[inb]; f2 = f2[inb]; f0z = f0z[inb]
+            fr = (f0z[inb] + f1[inb]).astype(_np.float32)  # real forward factor
+            fi = (f2[inb]).astype(_np.float32)             # imag forward factor
 
-            ic = np.floor(iu + 0.5).astype(np.int64)
-            jc = np.floor(iv + 0.5).astype(np.int64)
+            ic = _np.floor(iu + 0.5).astype(_np.int64)
+            jc = _np.floor(iv + 0.5).astype(_np.int64)
 
-            du_m1 = np.abs(iu - (ic - 1)); du_0 = np.abs(iu - ic); du_p1 = np.abs(iu - (ic + 1))
-            dv_m1 = np.abs(iv - (jc - 1)); dv_0 = np.abs(iv - jc); dv_p1 = np.abs(iv - (jc + 1))
+            du_m1 = _np.abs(iu - (ic - 1)); du_0 = _np.abs(iu - ic); du_p1 = _np.abs(iu - (ic + 1))
+            dv_m1 = _np.abs(iv - (jc - 1)); dv_0 = _np.abs(iv - jc); dv_p1 = _np.abs(iv - (jc + 1))
 
             wu_m1, wu_0, wu_p1 = _tsc_w(du_m1), _tsc_w(du_0), _tsc_w(du_p1)
             wv_m1, wv_0, wv_p1 = _tsc_w(dv_m1), _tsc_w(dv_0), _tsc_w(dv_p1)
 
-            w_phi_atom = (-scale * (f0z + f1)).astype(np.float32)
-            w_tau_atom = ( scale *  f2).astype(np.float32)
+            idx_list_R = []; w_list_R = []
+            idx_list_I = []; w_list_I = []
 
-            idx_phi = []; w_phi = []
-            idx_tau = []; w_tau = []
-
-            def _push(ii, jj, fac, w_atom):
+            def _push(ii, jj, fac, val):
                 mask = (ii >= 0) & (ii < NyB) & (jj >= 0) & (jj < NzB) & (fac > 0.0)
-                if not np.any(mask):
-                    return np.empty((0,), np.int64), np.empty((0,), np.float32)
+                if not _np.any(mask):
+                    return
                 rows = ii[mask]; cols = jj[mask]
-                idx = (rows * NzB + cols).astype(np.int64)
-                w = (w_atom[mask] * fac[mask]).astype(np.float32)
+                idx  = (rows * NzB + cols).astype(_np.int64)
+                w    = (val[mask] * fac[mask]).astype(_np.float32)
                 return idx, w
 
-            # 3x3 TSC stencil accumulation
+            # 3x3 TSC deposition for both real and imaginary forward sums
             for dx, wx in [(-1, wu_m1), (0, wu_0), (1, wu_p1)]:
                 ii = ic + dx
-                for dy, wy in [(-1, wv_m1), (0, wv_0), (1, wv_p1)]:
-                    jj = jc + dy
-                    fac = wx * wy
-                    idx, w = _push(ii, jj, fac, w_phi_atom); idx_phi.append(idx); w_phi.append(w)
-                    idx, w = _push(ii, jj, fac, w_tau_atom); idx_tau.append(idx); w_tau.append(w)
+                for dy, wy in [( -1, wv_m1), (0, wv_0), (1, wv_p1)]:
+                    jj   = jc + dy
+                    fac  = wx * wy
 
-            if idx_phi:
-                idxp = np.concatenate(idx_phi); wp = np.concatenate(w_phi)
-                idxt = np.concatenate(idx_tau); wt = np.concatenate(w_tau)
-                # Scatter-add into flat arrays
-                np.add.at(phi.ravel(), idxp, wp)
-                np.add.at(tau.ravel(), idxt, wt)
+                    r = _push(ii, jj, fac, fr)
+                    if r is not None:
+                        idx_list_R.append(r[0]); w_list_R.append(r[1])
+                    r = _push(ii, jj, fac, fi)
+                    if r is not None:
+                        idx_list_I.append(r[0]); w_list_I.append(r[1])
 
-        # Optional Gaussian blur on tau and phi (same-size FFT convolution)
+            if idx_list_R:
+                idxR = _np.concatenate(idx_list_R); wR = _np.concatenate(w_list_R)
+                idxI = _np.concatenate(idx_list_I); wI = _np.concatenate(w_list_I)
+                _np.add.at(sum_real.ravel(), idxR, wR)
+                _np.add.at(sum_imag.ravel(), idxI, wI)
+
+        # Convert forward sums -> total phase/attenuation (column integrals)
+        # phi = -k*delta_int, tau = k*beta_int, with:
+        # delta_int = (r_e * lambda^2 / (2*pi) / A_pix) * sum_real
+        # beta_int  = (r_e * lambda^2 / (2*pi) / A_pix) * sum_imag
+        two_pi = 2.0 * _np.pi
+        C = (r_e_A * (lam_A * lam_A)) / (two_pi * A_pix_A2)  # dimensionless
+        delta_int = C * sum_real.astype(_np.float32)
+        beta_int  = C * sum_imag.astype(_np.float32)
+
+        kA = two_pi / lam_A
+        phi = (-kA * delta_int).astype(_np.float32)
+        tau = ( kA * beta_int ).astype(_np.float32)
+
+        # Numerical safety: never allow gain
+        tau = _np.maximum(tau, _np.float32(0.0))
+
+        # Optional blur (same as before)
         if kernel_radius > 0:
             rad = int(kernel_radius); sig = rad / 2.0
-            y, x = np.ogrid[-rad:rad+1, -rad:rad+1]
-            k = np.exp(-(x*x + y*y) / (2.0*sig*sig)).astype(np.float32)
+            y, x = _np.ogrid[-rad:rad+1, -rad:rad+1]
+            k = _np.exp(-(x*x + y*y) / (2.0*sig*sig)).astype(_np.float32)
             k /= k.sum()
-            Fk = np.fft.fft2(k, s=tau.shape)
-            tau = np.fft.ifft2(np.fft.fft2(tau) * Fk).real.astype(np.float32)
-            phi = np.fft.ifft2(np.fft.fft2(phi) * Fk).real.astype(np.float32)
+            Fk = _np.fft.fft2(k, s=phi.shape)
+            phi = _np.fft.ifft2(_np.fft.fft2(phi) * Fk).real.astype(_np.float32)
+            tau = _np.fft.ifft2(_np.fft.fft2(tau) * Fk).real.astype(_np.float32)
+            tau = _np.maximum(tau, _np.float32(0.0))  # keep no-gain after blur
 
-        # Compose final complex transmission
-        A_map = np.exp(-tau + 1j*phi).astype(np.complex64)
+        A_map = _np.exp(-tau + 1j * phi).astype(_np.complex64)
         return A_map
 
     def _compute_beam_column_A_map_gpu(self, sample, stage, kernel_radius=0):
@@ -3452,34 +3473,32 @@ class beam:
         # Constants (angstrom)
         r_e_A = 2.81794092e-5
         lam_A = self._wavelength * 1e10
-        du, dv = self._beam_du, self._beam_dv
-        NyB, NzB = self._beam_Ny, self._beam_Nz
-        A_pix_A2 = float(du) * float(dv)
-        scale = (r_e_A * lam_A) / A_pix_A2
 
-        # Pin stage arrays for faster host->device copies
+        du, dv = float(self._beam_du), float(self._beam_dv)
+        NyB, NzB = int(self._beam_Ny), int(self._beam_Nz)
+        A_pix_A2 = du * dv
+
+        # Pin stage for faster H2D
         R_pin = self.allocate_pinned_array(stage.rotation)
         T_pin = self.allocate_pinned_array(stage.translation)
 
-        # Databases for anomalous and f0(0)
-        f1f2_dict = self.parse_f1f2_db_all("f1f2_CromerLiberman.dat")
+        # Databases
+        f1f2_dict      = self.parse_f1f2_db_all("f1f2_CromerLiberman.dat")
         f0_params_dict = self.parse_f0_db_all('f0_WaasKirf.dat')
-        f0_zero_dict = self._build_f0_zero_dict(f0_params_dict)
+        f0_zero_dict   = self._build_f0_zero_dict(f0_params_dict)
 
         partial = [None] * n_gpus
         chunks_per_gpu = sample.chunk_total // n_gpus
-        remainder = sample.chunk_total % n_gpus
+        remainder      = sample.chunk_total % n_gpus
 
-        # Worker processes a subset of chunks on one device
         def worker(dev_id, chunks, out_idx):
             cp.cuda.Device(dev_id).use()
             Rg = cp.asarray(R_pin); Tg = cp.asarray(T_pin)
 
-            tau_acc = cp.zeros((NyB, NzB), dtype=cp.float32)
-            phi_acc = cp.zeros((NyB, NzB), dtype=cp.float32)
-            
+            sum_real_g = cp.zeros((NyB, NzB), dtype=cp.float32)
+            sum_imag_g = cp.zeros((NyB, NzB), dtype=cp.float32)
+
             def _tsc_w(d):
-                # 1D TSC weights on distances in pixel units
                 w = cp.zeros_like(d, dtype=cp.float32)
                 m0 = d <= 0.5
                 w[m0] = 0.75 - d[m0] * d[m0]
@@ -3491,17 +3510,17 @@ class beam:
             for cid in chunks:
                 spc = sample.load_chunk_species(cid, use_gpu=False)
                 pos = sample.load_chunk_positions(cid, use_gpu=False)  # Angstrom
-                nA = pos.shape[0]
+                nA  = pos.shape[0]
                 if nA == 0:
                     continue
 
-                # Build per-atom f0(0), f1, f2 on host
+                # Build per-atom forward factors on host
                 f1  = np.zeros(nA, np.float32)
                 f2  = np.zeros(nA, np.float32)
                 f0z = np.zeros(nA, np.float32)
                 for el in pd.unique(spc):
                     el_s = str(el)
-                    m = (spc == el)
+                    m = (spc == el_s)
                     f0z[m] = float(f0_zero_dict.get(el_s, 0.0))
                     tbl = f1f2_dict.get(el_s)
                     if tbl is not None:
@@ -3509,11 +3528,10 @@ class beam:
                         f1[m] = float(cplx.real)
                         f2[m] = float(cplx.imag)
 
-                f1g  = cp.asarray(f1);   f2g  = cp.asarray(f2)
-                f0zg = cp.asarray(f0z)
+                fr_g = cp.asarray(f0z + f1, dtype=cp.float32)  # real forward part
+                fi_g = cp.asarray(f2,         dtype=cp.float32)  # imag forward part
 
                 posg = cp.asarray(pos, dtype=cp.float32)
-                # Apply stage transform in real space (angstrom)
                 posg = posg @ Rg; posg += Tg
 
                 e1g = cp.asarray(self._beam_e1)
@@ -3521,9 +3539,8 @@ class beam:
                 au = posg[:, 0]*e1g[0] + posg[:, 1]*e1g[1] + posg[:, 2]*e1g[2]
                 av = posg[:, 0]*e2g[0] + posg[:, 1]*e2g[1] + posg[:, 2]*e2g[2]
 
-                # Continuous grid indices (center at uc/vc)
-                iu = au / self._beam_du + self._beam_uc
-                iv = av / self._beam_dv + self._beam_vc
+                iu = au/du + self._beam_uc
+                iv = av/dv + self._beam_vc
 
                 inb = (iu >= 0.0) & (iu <= (NyB - 1)) & (iv >= 0.0) & (iv <= (NzB - 1))
                 if not bool(cp.any(inb)):
@@ -3531,7 +3548,7 @@ class beam:
                     continue
 
                 iu = iu[inb]; iv = iv[inb]
-                f1g = f1g[inb]; f2g = f2g[inb]; f0zg = f0zg[inb]
+                fr = fr_g[inb]; fi = fi_g[inb]
 
                 ic = cp.floor(iu + 0.5).astype(cp.int64)
                 jc = cp.floor(iv + 0.5).astype(cp.int64)
@@ -3542,60 +3559,67 @@ class beam:
                 wu_m1, wu_0, wu_p1 = _tsc_w(du_m1), _tsc_w(du_0), _tsc_w(du_p1)
                 wv_m1, wv_0, wv_p1 = _tsc_w(dv_m1), _tsc_w(dv_0), _tsc_w(dv_p1)
 
-                # Per-atom weights for tau and phi
-                w_phi_atom = (-scale * (f0zg + f1g)).astype(cp.float32)
-                w_tau_atom = ( scale *  f2g).astype(cp.float32)
+                idxR = []; wR = []
+                idxI = []; wI = []
 
-                idx_phi = []; w_phi = []
-                idx_tau = []; w_tau = []
-
-                def _push(ii, jj, fac, w_atom):
+                def _push(ii, jj, fac, val):
                     mask = (ii >= 0) & (ii < NyB) & (jj >= 0) & (jj < NzB) & (fac > 0.0)
                     if not bool(cp.any(mask)):
-                        return cp.empty((0,), cp.int64), cp.empty((0,), cp.float32)
+                        return None
                     rows = ii[mask]; cols = jj[mask]
-                    idx = (rows * NzB + cols).astype(cp.int64)
-                    w = (w_atom[mask] * fac[mask]).astype(cp.float32)
+                    idx  = (rows * NzB + cols).astype(cp.int64)
+                    w    = (val[mask] * fac[mask]).astype(cp.float32)
                     return idx, w
 
-                # 3x3 TSC stencil accumulation
                 for dx, wx in [(-1, wu_m1), (0, wu_0), (1, wu_p1)]:
                     ii = ic + dx
                     for dy, wy in [(-1, wv_m1), (0, wv_0), (1, wv_p1)]:
                         jj = jc + dy
                         fac = wx * wy
-                        idx, w = _push(ii, jj, fac, w_phi_atom); idx_phi.append(idx); w_phi.append(w)
-                        idx, w = _push(ii, jj, fac, w_tau_atom); idx_tau.append(idx); w_tau.append(w)
+                        r = _push(ii, jj, fac, fr)
+                        if r is not None:
+                            idxR.append(r[0]); wR.append(r[1])
+                        r = _push(ii, jj, fac, fi)
+                        if r is not None:
+                            idxI.append(r[0]); wI.append(r[1])
 
-                if idx_phi:
-                    idxp = cp.concatenate(idx_phi); wp = cp.concatenate(w_phi)
-                    idxt = cp.concatenate(idx_tau); wt = cp.concatenate(w_tau)
-                    bins = int(NyB) * int(NzB)
-                    # Accumulate into flat arrays via safe GPU bincount
-                    phi_hist = self._safe_bincount_gpu(idxp, wp, bins, dtype=cp.float32)
-                    tau_hist = self._safe_bincount_gpu(idxt, wt, bins, dtype=cp.float32)
-                    phi_acc += phi_hist.reshape(NyB, NzB)
-                    tau_acc += tau_hist.reshape(NyB, NzB)
+                if idxR:
+                    idxR = cp.concatenate(idxR); wR = cp.concatenate(wR)
+                    idxI = cp.concatenate(idxI); wI = cp.concatenate(wI)
+                    bins = NyB * NzB
+                    sum_real_g += self._safe_bincount_gpu(idxR, wR, bins, dtype=cp.float32).reshape(NyB, NzB)
+                    sum_imag_g += self._safe_bincount_gpu(idxI, wI, bins, dtype=cp.float32).reshape(NyB, NzB)
 
-                # Release unused blocks between chunks
                 cp.get_default_memory_pool().free_all_blocks()
 
-            # Optional Gaussian blur
+            # Convert forward sums -> phi, tau
+            two_pi = 2.0 * np.pi
+            C = (r_e_A * (lam_A * lam_A)) / (two_pi * A_pix_A2)
+            delta_int = C * sum_real_g
+            beta_int  = C * sum_imag_g
+
+            kA = two_pi / lam_A
+            phi_g = (-kA * delta_int).astype(cp.float32)
+            tau_g = ( kA * beta_int ).astype(cp.float32)
+            tau_g = cp.maximum(tau_g, cp.float32(0.0))  # no gain
+
             if kernel_radius > 0:
                 rad = int(kernel_radius); sig = rad / 2.0
                 yg = cp.arange(-rad, rad + 1, dtype=cp.float32)[:, None]
                 xg = cp.arange(-rad, rad + 1, dtype=cp.float32)[None, :]
                 kg = cp.exp(-(xg * xg + yg * yg) / (2.0 * sig * sig))
                 kg /= cp.sum(kg)
-                Fk = cp.fft.fft2(kg, tau_acc.shape)
-                tau_acc = cp.fft.ifft2(cp.fft.fft2(tau_acc) * Fk).real
-                phi_acc = cp.fft.ifft2(cp.fft.fft2(phi_acc) * Fk).real
+                Fk = cp.fft.fft2(kg, phi_g.shape)
+                phi_g = cp.fft.ifft2(cp.fft.fft2(phi_g) * Fk).real.astype(cp.float32)
+                tau_g = cp.fft.ifft2(cp.fft.fft2(tau_g) * Fk).real.astype(cp.float32)
+                tau_g = cp.maximum(tau_g, cp.float32(0.0))
 
-            A_gpu = cp.exp(-tau_acc + 1j * phi_acc).astype(cp.complex64)
+            A_gpu = cp.exp(-tau_g + 1j * phi_g).astype(cp.complex64)
             partial[out_idx] = A_gpu.get()
             cp.get_default_memory_pool().free_all_blocks()
 
-        # Launch workers per GPU
+        # Launch workers
+        import threading
         threads = []
         start = 1
         for gid in range(n_gpus):
@@ -3604,10 +3628,11 @@ class beam:
             t = threading.Thread(target=worker, args=(gid, range(start, end), gid))
             t.start(); threads.append(t)
             start = end
-        for t in threads: t.join()
+        for t in threads:
+            t.join()
 
-        # Combine independent partial products
-        A_total = np.ones((self._beam_Ny, self._beam_Nz), np.complex64)
+        # Combine multiplicatively (independent chunk products)
+        A_total = np.ones((NyB, NzB), np.complex64)
         for p in partial:
             if p is not None:
                 A_total *= p
