@@ -823,9 +823,37 @@ class beam:
         s_min, s_max
     ):
         """
-        CPU evaluator: Ein = E0 * exp(-f*tau) * exp(i*f*phi) with bilinear sampling.
-        This version returns Ein=0 for atoms that project outside the beam grid.
-        Returns complex64 array of length N.
+        Compute per-atom entrance field Ein by bilinearly sampling the beam grid.
+
+        For each atom position in Angstrom, this projects onto the beam-basis
+        coordinates (u,v), performs bilinear sampling of tau, phi, and E0 on the
+        beam grid, and evaluates:
+            Ein = E0 * exp(-f * tau) * exp(i * f * phi)
+        where f in [0, 1] is the normalized depth fraction along khat between
+        s_min and s_max. Atoms projecting outside the beam grid receive Ein = 0.
+
+        Args:
+            pos_np (np.ndarray): Shape (N, 3), float32. Atom positions in Angstrom.
+            tau (np.ndarray): Shape (NyB, NzB), float32. Attenuation map on beam grid.
+            phi (np.ndarray): Shape (NyB, NzB), float32. Phase map on beam grid.
+            E0 (np.ndarray): Shape (NyB, NzB), complex64. Incident field on beam grid.
+            e1 (np.ndarray): Shape (3,), float32. First transverse unit vector.
+            e2 (np.ndarray): Shape (3,), float32. Second transverse unit vector.
+            khat (np.ndarray): Shape (3,), float32. Unit beam direction.
+            du (float): Beam-grid spacing along u in Angstrom.
+            dv (float): Beam-grid spacing along v in Angstrom.
+            uc (float): Beam-grid center index along u.
+            vc (float): Beam-grid center index along v.
+            s_min (float): Minimum depth along khat in Angstrom.
+            s_max (float): Maximum depth along khat in Angstrom.
+
+        Returns:
+            np.ndarray: Shape (N,), complex64. Entrance field for each atom; zero
+                for atoms outside the beam grid.
+
+        Notes:
+            - No edge replication: out-of-bounds indices are treated as zero.
+            - A small guard on the depth denominator prevents division by zero.
         """
         N = int(pos_np.shape[0])
         out = np.zeros((N,), dtype=np.complex64)
@@ -834,18 +862,18 @@ class beam:
 
         NyB, NzB = int(tau.shape[0]), int(tau.shape[1])
 
-        # Project to beam basis and grid index space
+        # Project positions to beam basis and then to fractional grid indices
         au = pos_np[:, 0]*e1[0] + pos_np[:, 1]*e1[1] + pos_np[:, 2]*e1[2]
         av = pos_np[:, 0]*e2[0] + pos_np[:, 1]*e2[1] + pos_np[:, 2]*e2[2]
         iu = au / float(du) + float(uc)
         iv = av / float(dv) + float(vc)
 
-        # In-bounds mask (no edge replication when out)
+        # Hard in-bounds mask; atoms outside the grid get zero
         inb = (iu >= 0.0) & (iu <= (NyB - 1)) & (iv >= 0.0) & (iv <= (NzB - 1))
         if not np.any(inb):
             return out
 
-        # Work only on in-bounds subset
+        # Bilinear weights and gather indices (restricted to in-bounds atoms)
         iu_in = iu[inb]; iv_in = iv[inb]
         i0 = np.floor(iu_in).astype(np.int64)
         j0 = np.floor(iv_in).astype(np.int64)
@@ -872,13 +900,14 @@ class beam:
         phi_s = phi_f[r00]*w00 + phi_f[r01]*w01 + phi_f[r10]*w10 + phi_f[r11]*w11
         E0_s  = E0_f[r00]*w00 + E0_f[r01]*w01 + E0_f[r10]*w10 + E0_f[r11]*w11
 
-        # Depth fraction f in [0,1]
+        # Normalize depth along khat into f in [0,1]
         s_vals = pos_np[inb, 0]*khat[0] + pos_np[inb, 1]*khat[1] + pos_np[inb, 2]*khat[2]
         denom = float(s_max) - float(s_min)
         if not (denom > 0.0):
-            denom = 1.0
+            denom = 1.0  # robust fallback
         f = np.clip((s_vals - float(s_min))/denom, 0.0, 1.0).astype(np.float32)
 
+        # Combine attenuation and phase
         amp = np.exp(-f * tau_s).astype(np.float32)
         phase = f * phi_s
         cph = np.cos(phase)
@@ -1035,8 +1064,28 @@ class beam:
 
     def build_interaction_kernel(self, series_terms: int | None = None, force_mode: str | None = None):
         """
-        Build (and cache) the FP32-only kinematic kernel with a global mode and N
-        baked in at compile time.
+        Build and cache the FP32-only kinematic interaction CUDA kernel.
+
+        The kernel computes per-pixel scattered field contributions from a set of
+        atoms. Two global geometric modes are supported at compile time:
+        - SERIES: uses a truncated series for sqrt(1 + t) - 1 with N terms.
+        - EXACT: uses the exact geometric distance difference without series.
+
+        Args:
+            series_terms (int | None): Number of terms N to bake in for the SERIES
+                mode. If None, uses self._series_terms. Clamped to [1, 32].
+            force_mode (str | None): If "series" or "exact", overrides the globally
+                selected mode. If None, uses self._global_use_series.
+
+        Returns:
+            cupy.RawKernel: Compiled and cached kernel object.
+
+        Raises:
+            RuntimeError: If CuPy is not available.
+
+        Notes:
+            - Kernels are cached by (N, mode) to avoid repeated compilation.
+            - This wrapper does not launch the kernel; it only builds/returns it.
         """
         if cp is None:
             raise RuntimeError("CuPy is required for GPU scattering kernels.")
@@ -1375,11 +1424,26 @@ class beam:
     @staticmethod
     def build_ein_sampler_kernel():
         """
-        CUDA kernel: bilinearly sample tau, phi, and E0 on the beam grid; then
-        write Ein = E0 * exp(-f*tau) * exp(i*f*phi) for a list of positions.
+        Build the CUDA kernel that bilinearly samples E0, tau, and phi on the beam grid.
 
-        This version zeros Ein for atoms that project outside the beam grid
-        (no edge clamping when out-of-bounds).
+        For each input position, the kernel:
+        1) Projects to beam-basis coordinates (u, v).
+        2) Performs bilinear sampling of tau, phi, and E0.
+        3) Computes Ein = E0 * exp(-f * tau) * exp(i * f * phi) with
+            f derived from the depth fraction along the beam direction.
+
+        Args:
+            None
+
+        Returns:
+            cupy.RawKernel: Compiled kernel handle named "ein_bilinear_kernel".
+
+        Raises:
+            RuntimeError: If CuPy is not available.
+
+        Notes:
+            - Out-of-bounds samples are set to zero (no edge clamping).
+            - The kernel expects Angstrom units for positions and grid spacings.
         """
         if cp is None:
             raise RuntimeError("CuPy is required for build_ein_sampler_kernel")
@@ -2274,21 +2338,47 @@ class beam:
         chunk_ids=None
     ):
         """
-        Precompute Ein for requested chunks using a streaming pipeline that keeps
-        the GPU busy. Supports multi-GPU by sharding chunks across devices and
-        using multiple CUDA streams per GPU for overlap.
+        Precompute and cache depth-dependent entrance amplitudes (Ein) per chunk.
 
-        Env knobs (optional):
-            BEAM_EIN_STREAMS_PER_GPU   : int, default 4   (concurrent streams per GPU)
-            BEAM_EIN_SAVE_THREADS      : int, default 2   (threads for NPZ writes)
+        This streams chunks through CPU or GPU to produce Ein arrays consistent with
+        the current beam grid and stage transform, then writes:
+            ein_chunk_{cid}_{hash}.npz  -> array "ein" of shape (N_atoms_chunk,)
+        where the cache key encodes beam, stage, and depth-window parameters.
+
+        Args:
+            sample: Object exposing:
+                - chunk_total (int)
+                - load_chunk_positions(cid, use_gpu=False) -> (Ni,3) Angstrom
+            stage: Object with rotation (3x3) and translation (3,) arrays.
+            use_gpu (bool): If True and CuPy is available, use the GPU path.
+            ein_cache_dir (str or None): Directory to store NPZ files. Defaults to
+                "<self.directory>/ein_cache".
+            recompute_cache (bool): If True, overwrite existing cache entries.
+            kernel_radius (int): Optional Gaussian blur radius (pixels) applied to
+                phi and tau when building A(u,v). Set 0 to disable.
+            chunk_ids (iterable[int] or None): If provided, only process these
+                chunk IDs. Defaults to all chunks 1..chunk_total.
+
+        Returns:
+            tuple[str, str]: (cache_dir, cache_key_hash) used for the generated files.
+
+        Raises:
+            ValueError: If there are no chunks to precompute.
+
+        Notes:
+            - Uses pinned memory and multiple CUDA streams per GPU to overlap H2D,
+            compute, D2H, and disk writes.
+            - On CPU, a thread pool is used to parallelize NPZ writes.
+            - The Ein definition relies on the beam grid, entrance E0, and the
+            global depth window [s_min, s_max] along the beam direction.
         """
         import hashlib, json, os, gc, threading
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        # Decide backend
+        # Backend selection
         use_gpu = bool(use_gpu and (cp is not None))
 
-        # Sanity
+        # Sanity checks
         if sample.chunk_total is None or int(sample.chunk_total) == 0:
             raise ValueError("No chunks to precompute Ein for.")
 
@@ -2301,13 +2391,13 @@ class beam:
         # Depth bounds and beam maps
         s_min, s_max = self._compute_global_depth_bounds(sample, stage)
 
-        # Compute A(u,v) once (GPU if requested, else CPU)
+        # Compute A(u,v) once; reuse for all chunks (GPU or CPU)
         if use_gpu:
             A_beam_np = self._compute_beam_column_A_map_gpu(sample, stage, kernel_radius=kernel_radius)
         else:
             A_beam_np = self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius=kernel_radius)
 
-        # Cache key and dir
+        # Build cache key (captures beam, stage, grid, and depth window)
         key_obj = dict(
             E_eV=float(self._energy),
             lam=float(self._wavelength),
@@ -2326,7 +2416,7 @@ class beam:
         cache_dir = ein_cache_dir or os.path.join(self.directory, "ein_cache")
         os.makedirs(cache_dir, exist_ok=True)
 
-        # Filter already-cached chunks unless forced to recompute
+        # Skip chunks already cached unless recompute is requested
         to_do = []
         if recompute_cache:
             to_do = chunk_ids
@@ -2339,7 +2429,7 @@ class beam:
         if not to_do:
             return cache_dir, key_hash
 
-        # CPU fallback path (parallel NPZ saves)
+        # CPU fallback path: compute Ein with numpy and write NPZs via a saver pool
         if not use_gpu:
             tau_np = (-np.log(np.abs(A_beam_np) + np.float32(1e-20))).astype(np.float32)
             phi_np = np.angle(A_beam_np).astype(np.float32)
@@ -2363,6 +2453,7 @@ class beam:
                     if pos.size == 0:
                         futures.append(saver.submit(np.savez_compressed, cache_path, ein=np.zeros((0,), np.complex64)))
                         continue
+                    # Apply stage transform before sampling
                     pos = pos @ R_np
                     pos = pos + T_np
                     ein_np = self._ein_bilinear_cpu(
@@ -2375,8 +2466,9 @@ class beam:
                     _ = f.result()
             return cache_dir, key_hash
 
-        # GPU streaming path
-        # Prepare static maps on host once; each GPU will copy its own device copies.
+        # ---------------- GPU streaming path below (unchanged except comments) ----------------
+
+        # Host copies of static maps and vectors (copied to each device)
         tau_host = (-np.log(np.abs(A_beam_np) + np.float32(1e-20))).astype(np.float32)
         phi_host = np.angle(A_beam_np).astype(np.float32)
         E0_host  = self._beam_E0_map.astype(np.complex64)
@@ -2386,7 +2478,7 @@ class beam:
         R_host   = np.asarray(stage.rotation, dtype=np.float32)
         T_host   = np.asarray(stage.translation, dtype=np.float32)
 
-        # Config
+        # Discover devices and streaming configuration
         try:
             n_gpus = cp.cuda.runtime.getDeviceCount()
         except Exception:
@@ -2395,26 +2487,24 @@ class beam:
         streams_per_gpu = max(1, int(os.getenv("BEAM_EIN_STREAMS_PER_GPU", "4")))
         save_threads = max(1, int(os.getenv("BEAM_EIN_SAVE_THREADS", "6")))
 
-        # Shard chunks across GPUs
+        # Round-robin shard the chunk list across GPUs
         shards = [[] for _ in range(n_gpus)]
         for i, cid in enumerate(to_do):
             shards[i % n_gpus].append(cid)
 
-        # Utility: async NPZ save (keep pinned mem alive until write completes)
+        # Async saver keeps pinned host memory alive until write completes
         def _save_npz_keepalive(path, arr_view, pinned_mem):
             try:
-                # Wrap in try so a failed compressed save falls back to uncompressed.
                 np.savez_compressed(path, ein=np.asarray(arr_view, dtype=np.complex64))
             except Exception:
                 np.savez(path, ein=np.asarray(arr_view, dtype=np.complex64))
-            # When this function returns, references to arr_view and pinned_mem drop.
 
         def gpu_worker(dev_id, my_chunks):
             if not my_chunks:
                 return
             cp.cuda.Device(dev_id).use()
 
-            # Device copies of static maps
+            # Device copies of static inputs
             tau_g = cp.asarray(tau_host)
             phi_g = cp.asarray(phi_host)
             E0_g  = cp.asarray(E0_host)
@@ -2424,58 +2514,52 @@ class beam:
             Rg    = cp.asarray(R_host)
             Tg    = cp.asarray(T_host)
 
-            # Build kernel once (cached on self)
+            # Build kernel once per process
             if getattr(self, "_ein_kernel", None) is None:
                 self._ein_kernel = self.build_ein_sampler_kernel()
 
-            # Streams and ring slots
+            # Allocate one stream ring per GPU
             streams = [cp.cuda.Stream(non_blocking=True) for _ in range(streams_per_gpu)]
-            # Per-slot state
             slot_event = [None] * streams_per_gpu
             slot_chunk = [None] * streams_per_gpu
             slot_devout= [None] * streams_per_gpu
             slot_host_mem = [None] * streams_per_gpu
             slot_host_view= [None] * streams_per_gpu
 
-            # Thread pool for saving
+            # NPZ saver
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             saver = ThreadPoolExecutor(max_workers=save_threads)
             save_futs = []
 
-            # Helper: flush finished slot (wait, then schedule save)
+            # Helper that waits for copy-back and schedules the disk write
             def flush_slot(idx, cache_dir_local):
                 ev = slot_event[idx]
                 if ev is None:
                     return
-                # Wait for D2H to complete
                 ev.synchronize()
-
-                # Kick off NPZ save while GPU continues
                 cid = slot_chunk[idx]
                 path = os.path.join(cache_dir_local, f"ein_chunk_{cid}_{key_hash}.npz")
                 hv = slot_host_view[idx]
                 pm = slot_host_mem[idx]
                 save_futs.append(saver.submit(_save_npz_keepalive, path, hv, pm))
-
-                # Clear slot
                 slot_event[idx] = None
                 slot_chunk[idx] = None
                 slot_devout[idx]= None
                 slot_host_mem[idx] = None
                 slot_host_view[idx]= None
 
-            # Main loop
+            # Main loop over chunks
             for n, cid in enumerate(my_chunks):
                 s_id = n % streams_per_gpu
                 st = streams[s_id]
 
-                # If this slot is busy, flush it now (waits only for its own event)
+                # If this slot is still in flight, finalize it first
                 if slot_event[s_id] is not None:
                     flush_slot(s_id, cache_dir)
 
-                # Load positions
+                # Load positions and transform to stage frame on device
                 pos = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float32)
                 if pos.size == 0:
-                    # No atoms: write empty cache immediately (no GPU work)
                     empty_path = os.path.join(cache_dir, f"ein_chunk_{cid}_{key_hash}.npz")
                     try:
                         np.savez_compressed(empty_path, ein=np.zeros((0,), np.complex64))
@@ -2483,7 +2567,6 @@ class beam:
                         np.savez(empty_path, ein=np.zeros((0,), np.complex64))
                     continue
 
-                # H2D copy and transform on this stream
                 with st:
                     pos_g = cp.asarray(pos)
                     pos_g = pos_g @ Rg
@@ -2498,10 +2581,9 @@ class beam:
                         stream=st
                     )
 
-                    # Async D2H into pinned host buffer
+                    # Async device-to-host into pinned memory
                     nbytes = int(ein_g.size) * 8  # complex64
                     pmem = cp.cuda.alloc_pinned_memory(nbytes)
-                    # Create a numpy view into pinned memory (kept alive in slot)
                     h_view = np.frombuffer(pmem, dtype=np.complex64, count=ein_g.size)
                     cp.cuda.runtime.memcpyAsync(
                         int(pmem.ptr),
@@ -2513,34 +2595,31 @@ class beam:
                     ev = cp.cuda.Event()
                     ev.record(st)
 
-                # Stash slot state
+                # Stash slot state for later flush
                 slot_event[s_id] = ev
                 slot_chunk[s_id] = cid
                 slot_devout[s_id]= ein_g
                 slot_host_mem[s_id] = pmem
                 slot_host_view[s_id]= h_view
 
-                # Release local refs quickly
                 del pos, pos_g
 
-            # Flush any remaining in-flight slots
+            # Flush remaining slots and wait for all saves
             for s_id in range(streams_per_gpu):
                 if slot_event[s_id] is not None:
                     flush_slot(s_id, cache_dir)
-
-            # Wait for all saves to complete
             for f in as_completed(save_futs):
                 _ = f.result()
             saver.shutdown(wait=True)
 
-            # Clean up device allocations on this worker
+            # Cleanup device allocations for this worker
             del tau_g, phi_g, E0_g, e1g, e2g, khatg, Rg, Tg
             for st in streams:
                 st.synchronize()
             cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
 
-        # Launch one thread per GPU
+        # Launch one worker per GPU
         threads = []
         for dev_id in range(n_gpus):
             t = threading.Thread(target=gpu_worker, args=(dev_id, shards[dev_id]))
@@ -2549,7 +2628,7 @@ class beam:
         for t in threads:
             t.join()
         cp.get_default_memory_pool().free_all_blocks()
-        
+
         return cache_dir, key_hash
     
     def _compute_global_depth_bounds(self, sample, stage):
@@ -2743,16 +2822,49 @@ class beam:
         apply_spherical_decay=True
     ):
         """
-        CPU path for kinematic scattering. Adds apply_spherical_decay to toggle 1/R.
+        Compute kinematic scattering on CPU and return the detector field.
+
+        This CPU path prepares per-chunk per-atom scattering parameters, optionally
+        samples a depth-dependent entrance field Ein, and accumulates the complex
+        field on the detector grid. A 1/R spherical-decay toggle is exposed.
+
+        Args:
+            sample: Object exposing per-chunk loaders:
+                - load_chunk_species(cid, use_gpu=False) -> (Ni,)
+                - load_chunk_positions(cid, use_gpu=False) -> (Ni,3) Angstrom
+                - chunk_total (int)
+            measurement_positions (np.ndarray or cupy.ndarray): Shape (3, Nx*Ny)
+                detector pixel positions in Angstrom.
+            measurement_shape (tuple[int, int]): (Nx, Ny) detector shape.
+            stage: Object with rotation (3x3) and translation (3,) arrays.
+            detector: Unused placeholder for API parity with the GPU path.
+            remove_forward_component (bool): If True, subtract f0(0) inside the
+                CPU kernel to avoid double counting the forward term.
+            use_depth_ein (bool): If True, use cached per-atom Ein values; if any
+                are missing, they are precomputed and cached.
+            ein_cache_dir (str or None): Directory for Ein cache files.
+            recompute_cache (bool): If True, recompute Ein even if already cached.
+            apply_polarization (bool): If True, apply polarization factor inside
+                the CPU CFFI kernel.
+            apply_spherical_decay (bool): If True, apply relative 1/R scaling in
+                the CPU kernel.
+
+        Returns:
+            np.ndarray: Complex64 array of shape (Ny, Nx) with the accumulated field.
+
+        Notes:
+            - Uses a threaded loop across chunks for CPU parallelism.
+            - The forward component toggle should be consistent with transmission
+            to avoid double-counting the forward-scattered term.
         """
         import hashlib, json, os
         Nx, Ny = measurement_shape
 
-        # Load scattering databases
+        # Load scattering databases once
         db_dict_f0_all   = self.parse_f0_db_all('f0_WaasKirf.dat')
         db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
 
-        # Wave number
+        # Wave number (meters)
         k_val = np.float32(2.0 * np.pi / self._wavelength)
 
         # Ensure detector coordinates are on CPU and in meters
@@ -2762,15 +2874,15 @@ class beam:
         coords_y_m = np.ascontiguousarray(measurement_positions[1, :].astype(np.float32) / 1e10)
         coords_z_m = np.ascontiguousarray(measurement_positions[2, :].astype(np.float32) / 1e10)
 
-        # Handle empty samples
+        # Empty-sample fast path
         chunk_total = int(sample.chunk_total or 0)
         if chunk_total == 0:
             return np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # Compute global depth bounds once (used for Ein and E0 sampling)
+        # Global depth window along the beam for Ein/E0 sampling
         s_min, s_max = self._compute_global_depth_bounds(sample, stage)
 
-        # Ensure Ein caches exist if requested
+        # Ensure Ein cache is present if requested
         key_hash = None
         cache_dir = None
         if use_depth_ein:
@@ -2798,7 +2910,7 @@ class beam:
                 if recompute_cache or (not os.path.isfile(p)):
                     missing.append(cid)
             if missing:
-                # Use GPU for precompute if available; otherwise CPU
+                # Precompute Ein as needed (GPU if available, else CPU)
                 self.precompute_depth_ein_all_chunks(
                     sample, stage,
                     use_gpu=(cp is not None),
@@ -2808,15 +2920,15 @@ class beam:
                     chunk_ids=missing
                 )
 
-        # Compile the CPU CFFI kernel
+        # Compile the CPU CFFI kernel once
         ffi_obj, complied_code = self.compile_compute_scattering_cffi()
 
-        # Threaded loop over chunks
+        # Threaded per-chunk loop
         import multiprocessing
         from concurrent.futures import ThreadPoolExecutor, as_completed
         n_threads = min(chunk_total, multiprocessing.cpu_count())
 
-        # Static beam maps and basis for E0 sampling when depth_ein is False
+        # Static beam maps and basis for E0 sampling when Ein is disabled
         tau_zero = np.zeros((self._beam_Ny, self._beam_Nz), dtype=np.float32)
         phi_zero = np.zeros_like(tau_zero)
         E0_np    = self._beam_E0_map.astype(np.complex64)
@@ -2829,11 +2941,13 @@ class beam:
         vc       = float(self._beam_vc)
 
         def worker(chunk_id):
+            # Skip empty chunks early
             species_chunk_np = sample.load_chunk_species(chunk_id, use_gpu=False)
             atom_count = int(species_chunk_np.shape[0])
             if atom_count == 0:
                 return np.zeros((Ny, Nx), dtype=np.complex64)
 
+            # Build per-atom scattering parameters (f0 params, f0(0), anomalous)
             scattering_anom_np_real = np.zeros(atom_count, dtype=np.float32)
             scattering_anom_np_imag = np.zeros(atom_count, dtype=np.float32)
             f0_params_np            = np.zeros((atom_count, 11), dtype=np.float32)
@@ -2854,17 +2968,18 @@ class beam:
                 f0_params_np[mask] = db_dict_f0_all[el]
                 f0_zero_np[mask]   = float(f0_zero_dict.get(el, 0.0))
 
+            # Stage transform to sample frame and convert to meters for the C kernel
             positions_chunk = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
             positions_chunk = positions_chunk @ stage.rotation
             positions_chunk += stage.translation
             positions_chunk_m = positions_chunk / 1e10
 
+            # Choose initial amplitudes: depth-dependent Ein or E0-only sampling
             if use_depth_ein:
                 cache_path = os.path.join(cache_dir, f"ein_chunk_{chunk_id}_{key_hash}.npz")
                 with np.load(cache_path) as npz:
                     init_amp = npz["ein"].astype(np.complex64)
             else:
-                # Sample the incident beam E0(u,v); zero outside beam grid
                 init_amp = self._ein_bilinear_cpu(
                     pos_np=positions_chunk,
                     tau=tau_zero,
@@ -2875,6 +2990,7 @@ class beam:
                     s_min=s_min, s_max=s_max
                 ).astype(np.complex64)
 
+            # Invoke the CFFI scattering kernel for this chunk
             out = self.cpu_scatter_chunk_cffi(
                 complied_code, ffi_obj, chunk_id, sample, Nx, Ny,
                 coords_x_m, coords_y_m, coords_z_m,
@@ -2886,6 +3002,7 @@ class beam:
             )
             return out
 
+        # Accumulate results across chunks
         final_result = np.zeros((Ny, Nx), dtype=np.complex64)
         with ThreadPoolExecutor(max_workers=n_threads) as exe:
             futures = {exe.submit(worker, cid): cid for cid in range(1, chunk_total + 1)}
@@ -2904,40 +3021,67 @@ class beam:
         stream=None
     ):
         """
-        GPU evaluator for Ein using the fused kernel.
-        Returns: cupy.ndarray, shape (N,), dtype=complex64, on device.
+        Compute Ein for a set of atom positions on the GPU using the fused bilinear-sampler kernel.
+
+        For each atom at pos_g[n], this projects onto the beam-basis coordinates (u, v), bilinearly
+        samples tau, phi and E0 on the beam grid, then evaluates
+            Ein = E0 * exp(-f * tau) * exp(i * f * phi)
+        where f is the normalized depth fraction along khat between s_min and s_max.
+
+        Args:
+            pos_g (cupy.ndarray): Shape (N, 3), float32. Atom positions in Angstrom, on device.
+            tau_g (cupy.ndarray): Shape (NyB, NzB), float32. Attenuation map on device.
+            phi_g (cupy.ndarray): Shape (NyB, NzB), float32. Phase map on device.
+            E0_g (cupy.ndarray): Shape (NyB, NzB), complex64. Incident field on device.
+            e1g (cupy.ndarray): Shape (3,), float32. First transverse unit vector (device).
+            e2g (cupy.ndarray): Shape (3,), float32. Second transverse unit vector (device).
+            khat_g (cupy.ndarray): Shape (3,), float32. Unit beam direction (device).
+            s_min (float): Minimum depth along khat in Angstrom.
+            s_max (float): Maximum depth along khat in Angstrom.
+            stream (cupy.cuda.Stream | None): Optional CUDA stream for the launch.
+
+        Returns:
+            cupy.ndarray: Shape (N,), complex64. Ein per atom on device.
+
+        Raises:
+            RuntimeError: If CuPy is not available.
+
+        Notes:
+            - Expects build_ein_sampler_kernel() to have been called previously so that the
+            kernel is compiled and cached on self._ein_kernel.
+            - All arrays must already live on the same device; no host-device transfers occur here.
         """
         if cp is None:
             raise RuntimeError("CuPy is required for _ein_for_positions_gpu_fast")
 
-        N = int(pos_g.shape[0])
-        if N == 0:
-            return cp.zeros((0,), dtype=cp.complex64)
-
-        NyB, NzB = int(tau_g.shape[0]), int(tau_g.shape[1])
-
+        # Kernel handle and output allocation
         kernel = getattr(self, "_ein_kernel", None)
         if kernel is None:
             kernel = self.build_ein_sampler_kernel()
             self._ein_kernel = kernel
+        N = int(pos_g.shape[0])
+        out = cp.zeros((N,), dtype=cp.complex64)
 
+        # Compute grid/block sizes for a simple 1D launch (tuned elsewhere)
+        threads = 256
+        blocks = (N + threads - 1) // threads
+
+        # Precompute reciprocals to avoid divisions in the kernel
         inv_du = cp.float32(1.0 / float(self._beam_du))
         inv_dv = cp.float32(1.0 / float(self._beam_dv))
+
+        NyB = int(self._beam_Ny)
+        NzB = int(self._beam_Nz)
         uc = cp.float32(self._beam_uc)
         vc = cp.float32(self._beam_vc)
 
-        out = cp.empty((N,), dtype=cp.complex64)
-
-        threads = 256
-        blocks = (N + threads - 1) // threads
-        blocks = min(max(blocks, 1), 65535)
-
+        # Assemble kernel arguments (keep order in sync with kernel signature)
         args = (
             pos_g.astype(cp.float32, copy=False).ravel(),
             np.int32(N),
-            tau_g.ravel(),
-            phi_g.ravel(),
-            E0_g.ravel(),
+            tau_g.astype(cp.float32, copy=False).ravel(),
+            phi_g.astype(cp.float32, copy=False).ravel(),
+            E0_g.view(cp.float32).ravel(),  # pass as float2 underlying storage
             np.int32(NyB),
             np.int32(NzB),
             inv_du,
@@ -2952,6 +3096,7 @@ class beam:
             out.ravel()
         )
 
+        # Launch
         kernel((blocks,), (threads,), args, stream=stream)
         return out
     
@@ -2969,8 +3114,43 @@ class beam:
         spherical_decay: bool = True
     ):
         """
-        If use_depth_ein is False, initial amplitudes are sampled from the
-        incident E0(u,v) on the GPU with Ein=0 outside the beam grid.
+        Compute kinematic scattering on the GPU and return the detector field.
+
+        This routine shards the chunked sample across available GPUs, optionally
+        uses cached depth-dependent Ein per atom, and accumulates complex field
+        values at detector pixels. A spherical 1/R amplitude decay and Thomson
+        polarization factor can be toggled.
+
+        Args:
+            sample: Object exposing per-chunk loaders:
+                - load_chunk_species(cid, use_gpu=False) -> (Ni,)
+                - load_chunk_positions(cid, use_gpu=False) -> (Ni, 3) in Angstrom
+                - chunk_total (int)
+            measurement_positions (cupy.ndarray | numpy.ndarray): Shape (3, Nx*Ny)
+                detector pixel coordinates in Angstrom. cupy.ndarray preferred.
+            measurement_shape (tuple[int, int]): (Nx, Ny) detector shape.
+            stage: Object with rotation (3x3) and translation (3,) arrays.
+            remove_forward (bool): If True, subtract f0(0) inside the kernel to
+                avoid double counting the forward term.
+            use_depth_ein (bool): If True, read per-atom Ein from cache; missing
+                entries will be computed and cached.
+            ein_cache_dir (str | None): Directory holding Ein npz cache files.
+            recompute_cache (bool): If True, force recomputation of Ein caches.
+            apply_polarization (bool): Apply polarization factor inside the kernel.
+            spherical_decay (bool): Apply 1/R amplitude decay inside the kernel.
+
+        Returns:
+            cupy.ndarray: Complex64 array (Ny, Nx) with accumulated field on device.
+
+        Raises:
+            RuntimeError: If CuPy is not available.
+
+        Notes:
+            - Uses one worker thread per GPU with multiple CUDA streams to overlap H2D,
+            compute, D2H, and disk I/O.
+            - Frees the default CuPy memory pool before returning to keep memory bounded.
+            - If use_depth_ein is False, initial amplitudes are sampled from the
+            incident E0(u,v) on the GPU with Ein=0 outside the beam grid.
         """
         if cp is None:
             print("[beam] CuPy not installed, falling back to CPU.")
@@ -3244,27 +3424,32 @@ class beam:
         spherical_decay: bool = False
     ):
         """
-        Compute kinematic atomic scattering (single bounce) and return the field.
+        Top-level convenience wrapper that computes single-bounce (kinematic) atomic scattering.
 
-        This is a high-level wrapper that routes to the GPU or CPU path. When
-        `use_depth_ein` is True, a depth-dependent entrance amplitude is computed
-        on the beam grid and interpolated at atom positions.
+        This selects GPU or CPU implementation, handles optional cached depth-dependent Ein,
+        and returns the complex field on the detector grid. You may pass an optional
+        offset field to subtract (e.g., a precomputed background).
 
         Args:
-            sample: Sample object that exposes chunk_total and per-chunk loaders.
-            detector: Detector object with `shape` and `pixel_coordinates`.
-            stage: Stage object with `rotation` (3x3) and `translation` (3,) arrays.
-            offset (np.ndarray or None): Optional complex field to subtract from the
-                final result. If provided, it must broadcast to (Ny, Nx).
-            use_gpu (bool): If True and CuPy is available, use the GPU path.
-            remove_forward (bool): If True, subtract f0(0) in the scattering kernel.
-            use_depth_ein (bool): If True, compute depth-dependent entrance amplitude.
-            ein_cache_dir (str or None): Directory for entrance-amplitude cache files.
-            recompute_cache (bool): If True, recompute entrance-amplitude cache.
-            apply_polarization (bool): If True, apply polarization scaling in kernel.
+            sample: Chunked sample object required by the chosen backend.
+            detector: Detector object exposing pixel geometry; used to get (x,y,z) coordinates.
+            stage: Object with rotation (3x3) and translation (3,) arrays.
+            offset (numpy.ndarray | None): Optional complex field (Ny, Nx) to subtract.
+            use_gpu (bool): If True and CuPy is available, run GPU path; otherwise CPU.
+            remove_forward (bool): Remove forward f0(0) term inside the backend kernel.
+            use_depth_ein (bool): If True, use cached per-atom Ein values.
+            ein_cache_dir (str | None): Directory for Ein cache files.
+            recompute_cache (bool): Recompute Ein even if cache files exist.
+            apply_polarization (bool): Apply polarization factor in the kernel.
+            spherical_decay (bool): Apply 1/R amplitude decay in the kernel.
 
         Returns:
-            np.ndarray: Complex64 array of shape (Ny, Nx) with the scattered field.
+            numpy.ndarray or cupy.ndarray: Complex64 field (Ny, Nx) on the chosen backend.
+
+        Notes:
+            - CPU path synthesizes measurement positions from the detector object.
+            - Keep the forward-term toggle consistent with your transmission model to
+            avoid double counting the forward-scattered component.
         """
         # Pull detector coordinates once (angstrom)
         measurement_positions = detector.pixel_coordinates
@@ -3310,10 +3495,29 @@ class beam:
     # Direct transmission
     def _compute_beam_column_A_map_cpu(self, sample, stage, kernel_radius=0):
         """
-        Compute A(u,v) = exp(-tau + i*phi) on the beam grid (CPU).
+        Build the transmission column map A(u,v) = exp(-tau + i*phi) on the beam grid using CPU.
 
-        Only atoms whose (iu,iv) are inside [0..NyB-1]x[0..NzB-1] contribute.
-        This prevents out-of-beam atoms from contributing to transmission.
+        For each atom in each chunk, the algorithm projects its position into beam-basis
+        grid coordinates (u,v), accumulates real (tau) and imaginary (phi) parts on nearby
+        pixels using a compact kernel (nearest grid point or higher-order, as implemented),
+        and finally exponentiates to form A.
+
+        Args:
+            sample: Chunked sample object; must provide:
+                - chunk_total (int)
+                - load_chunk_positions(cid, use_gpu=False) -> (Ni, 3) Angstrom
+                - load_chunk_species(cid, use_gpu=False) -> (Ni,)
+            stage: Object providing rotation (3x3) and translation (3,) for sample-to-beam frame.
+            kernel_radius (int): Optional Gaussian blur radius (pixels) applied to tau and phi
+                after accumulation; set 0 to disable.
+
+        Returns:
+            numpy.ndarray: Complex64 array of shape (NyB, NzB) with A(u,v) on the beam grid.
+
+        Notes:
+            - Only atoms whose projected indices fall inside the beam grid contribute.
+            - tau is lower-bounded at 0 after blur to avoid unphysical gain.
+            - Units: positions and spacings are in Angstrom.
         """
         import numpy as _np
 
@@ -3643,19 +3847,36 @@ class beam:
                             padding_mode: str = "edge",
                             pad_constant: float = 0.0):
         """
-        Compute the transmitted field with propagation performed on the FULL
-        DETECTOR GRID (NyD, NxD), not on the beam grid.
+        Compute transmitted field and propagate on the full detector grid.
 
-        Steps:
-        1) Build A(u,v) on the beam grid and the exit-plane field E_exit(u,v).
-        2) Bilinearly resample E_exit onto EVERY detector pixel; zero OOB.
-        3) Decide the propagation distance from the sample exit plane to the
-            detector plane using beam direction.
-        4) If needed, propagate the full detector field using the detector's
-            sampling (pixel_size if available; otherwise estimated from geometry).
+        Pipeline:
+        1) Build A(u,v) on the beam grid and form exit-plane field E_exit(u,v).
+        2) Bilinearly resample E_exit to every detector pixel (zero out OOB).
+        3) Decide if free-space propagation is needed from exit plane to detector
+            by comparing their average offset along the beam direction.
+        4) If needed, propagate the full detector field using detector sampling
+            (uses detector.pixel_size when available; otherwise estimated from
+            geometry of u,v across the detector grid).
+
+        Args:
+            sample: Chunked sample object. Used by A(u,v) builders and for depth bounds.
+            detector: Object exposing:
+                - shape -> (NyD, NxD)
+                - pixel_coordinates -> (3, NyD*NxD) coordinates in angstrom
+                - optionally pixel_size -> (dy_A, dx_A) in angstrom for propagation sampling
+            stage: Object with rotation (3x3) and translation (3,) arrays.
+            use_gpu (bool): If True and CuPy available, use GPU path for A(u,v) and propagation.
+            kernel_radius (int): Optional Gaussian blur radius (pixels) for tau/phi when building A.
+            padding_mode (str): "edge" for edge replication or "constant" for a constant pad.
+            pad_constant (float): Pad value when padding_mode == "constant".
 
         Returns:
-        np.ndarray complex64 of shape (NyD, NxD)
+            np.ndarray: Complex64 array of shape (NyD, NxD) on CPU.
+
+        Notes:
+            - Resampling is done in the detector plane before any propagation.
+            - Propagation distance is taken as mean(detector s) - s_max(exit plane).
+            - For non-planar detector geometry, the mean offset is used (conservative).
         """
         # 1) A(u,v) on beam grid, possibly blurred
         if use_gpu and (cp is not None):
@@ -4764,31 +4985,28 @@ class beam:
                                 transmission=True, transmission_params=[0.0],
                                 use_gpu=True):
         """
-        High-level wrapper that combines scattering and transmission contributions.
-        ### TODO: NEED TO BE UPDATED FOR NEW OPTIONS ###
+        Combine scattering and transmission contributions and write to detector.
 
         Behavior:
-        * If `scattering` is True, calls `atomic_scattering_kinematic`.
-        * If `transmission` is True, calls `atomic_transmission`.
-        * Forward component removal in scattering is auto-toggled from the
-            `transmission` flag to avoid double-counting the forward term.
+        - If scattering is True, calls atomic_scattering_kinematic (optionally subtracting
+            the forward term when transmission is also computed).
+        - If transmission is True, calls atomic_transmission.
+        - The final complex field is written back into detector via detector.input_pixel_values.
 
         Args:
             sample: Sample object with chunk accessors.
-            detector: Detector object with `shape`, `pixel_coordinates`,
-                and `input_pixel_values(field)`.
-            stage: Stage object with `rotation` (3x3) and `translation` (3,) arrays.
-            scattering (bool): If True, include kinematic scattering term.
-            scattering_params (list): Optional parameters for scattering:
-                [offset, use_depth_ein]. Index 0 is a complex field offset (or None).
-                Index 1 is a bool that enables depth-dependent entrance amplitude.
-            transmission (bool): If True, include transmission term.
-            transmission_params (list): Parameters for transmission:
-                [kernel_radius]. Index 0 is Gaussian blur radius (pixels) for A(u,v).
-            use_gpu (bool): If True and CuPy is available, use GPU code paths.
+            detector: Detector with 'shape', 'pixel_coordinates', and 'input_pixel_values(field)'.
+            stage: Stage with 'rotation' (3x3) and 'translation' (3,) arrays.
+            scattering (bool): Include kinematic scattering.
+            scattering_params (list): [offset, use_depth_ein].
+                offset (np.ndarray or None): Optional complex field to subtract.
+                use_depth_ein (bool): Enable depth-dependent entrance amplitude.
+            transmission (bool): Include transmission term.
+            transmission_params (list): [kernel_radius], Gaussian blur radius (pixels) for A(u,v).
+            use_gpu (bool): If True and CuPy available, use GPU code paths.
 
         Returns:
-            None. The combined complex field is written back into `detector`.
+            None. The combined complex field is written into detector.
         """
         Nx, Ny = detector.shape
         final_field = np.zeros((Ny, Nx), dtype=np.complex64)
@@ -4828,32 +5046,32 @@ class beam:
         """
         Band-limited angular spectrum propagation on GPU with symmetric padding.
 
-        The distance `z` is split into sub-steps if `abs(z) > step_max`, each
-        applied in sequence. Padding is chosen based on sampling and `|z|` to
-        limit wrap-around, then the spectrum is multiplied by a propagation
-        transfer function on the GPU.
+        The total distance z is split into ceil(abs(z)/step_max) sub-steps to bound
+        phase error and wrap-around. For each step:
+        1) Pad the input to sizes chosen by _choose_optimal_pad (also enforces a
+            minimum multiplicative pad_factor and rounds to power-of-two for FFTs).
+        2) FFT -> multiply by the free-space transfer function using the provided
+            CUDA kernel (built by build_propagation_multiplier_kernel) -> IFFT.
+        3) Center-crop back to (Ny, Nx).
 
         Args:
-            field (array-like): Complex field, shape (Ny, Nx). CuPy or NumPy.
-            dx (float): Pixel size along x (meters).
-            dy (float): Pixel size along y (meters).
+            field (array-like): Complex field, shape (Ny, Nx). NumPy or CuPy.
+            dx (float): Pixel size along x in meters.
+            dy (float): Pixel size along y in meters.
             z (float): Propagation distance in meters (can be negative).
-            kernel: Compiled CUDA kernel returned by `build_propagation_multiplier_kernel`.
-            step_max (float): Maximum step size in meters. Longer distances are
-                split into ceil(abs(z)/step_max) steps.
-            pad_factor (float): Minimum multiplicative padding factor. Must be >= 1.0.
-            padding_mode (str): "edge" to replicate edges, or "constant" to pad
-                with a constant value.
-            pad_constant (float): Value used when `padding_mode == "constant"`.
+            kernel (cupy.RawKernel): "prop_mul_kernel" compiled by
+                build_propagation_multiplier_kernel.
+            step_max (float): Maximum per-step distance in meters.
+            pad_factor (float): Minimum multiplicative padding factor (>=1.0).
+            padding_mode (str): "edge" to replicate edges or "constant" to pad with
+                pad_constant.
+            pad_constant (float): Value used when padding_mode == "constant".
 
         Returns:
-            cupy.ndarray: Complex64 field after propagation, cropped back to (Ny, Nx).
+            cupy.ndarray: Complex64 field after propagation, cropped to (Ny, Nx).
 
         Raises:
             RuntimeError: If CuPy is not available.
-
-        Notes:
-            Padding sizes are also rounded up to the next power of two for FFT speed.
         """
         if cp is None:
             raise RuntimeError('CuPy required for GPU propagation')
@@ -4923,20 +5141,23 @@ class beam:
         """
         Band-limited angular spectrum propagation on CPU with symmetric padding.
 
-        The distance `z` is split into sub-steps if `abs(z) > step_max`. Padding is
-        chosen from sampling and `|z|`, rounded to a power of two for FFTs.
+        Splits distance z into sub-steps if abs(z) > step_max to improve numerical
+        stability, pads out to sizes chosen by _choose_optimal_pad, multiplies the
+        spectrum by the free-space transfer function using lib.prop_mul_cpu, and
+        crops back to the original size.
 
         Args:
-            field (array-like): Complex field, shape (Ny, Nx). NumPy array preferred.
-            dx (float): Pixel size along x (meters).
-            dy (float): Pixel size along y (meters).
+            field (array-like): Complex field, shape (Ny, Nx). NumPy preferred.
+            dx (float): Pixel size along x in meters.
+            dy (float): Pixel size along y in meters.
             z (float): Propagation distance in meters (can be negative).
-            lib: CFFI-verified library with `prop_mul_cpu`.
-            ffi: CFFI interface object.
-            step_max (float): Maximum step size in meters for auto-splitting.
-            pad_factor (float): Minimum multiplicative padding factor. Must be >= 1.0.
-            padding_mode (str): "edge" or "constant".
-            pad_constant (float): Value used when `padding_mode == "constant"`.
+            lib: CFFI-verified library with function prop_mul_cpu(...).
+            ffi: CFFI FFI object.
+            step_max (float): Maximum per-step distance in meters.
+            pad_factor (float): Minimum multiplicative padding factor (>=1.0).
+            padding_mode (str): "edge" to replicate edges or "constant" to pad
+                with pad_constant.
+            pad_constant (float): Value used when padding_mode == "constant".
 
         Returns:
             np.ndarray: Complex64 field after propagation, cropped to (Ny, Nx).
