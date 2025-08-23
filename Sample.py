@@ -126,7 +126,15 @@ class sample:
         else:
             positions = np.load(full_path)
         if self.enable_temp is True:
-            positions = self.apply_temperature(positions,distribution=self.temp_params[0],sigma=self.temp_params[1],max_displacement=self.temp_params[2],seed=self.temp_params[3])
+            # Note: 'sigma' now means 'temperature_K' when distribution='einstein'
+            positions = self.apply_temperature(
+                positions,
+                distribution=self.temp_params[0],
+                sigma=self.temp_params[1],
+                max_displacement=self.temp_params[2],
+                seed=self.temp_params[3],
+                chunk_number=chunk_number  # enables per-species masses if configured
+            )
         return positions
         
 
@@ -531,79 +539,185 @@ class sample:
             )
             flat_grid = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
             return flat_grid
-        
-    @staticmethod
-    def apply_temperature(positions,distribution='gaussian',sigma=0.25,max_displacement=1,seed=40):
+
+    def set_temperature_einstein(
+        self,
+        T_K,
+        mass_amu=None,
+        theta_E_K=None,
+        species_mass_amu=None,
+        species_theta_E_K=None,
+        max_displacement=None,
+        seed=40
+    ):
         """
-        Randomly displace atomic positions according to a chosen probability distribution,
-        supporting either CPU (NumPy) or GPU (CuPy) arrays.
+        Convenience: configure physical mapping (Einstein model) and set temp_params
+        so that enable_temp + temp_params drive temperature-based displacements.
 
-        Parameters
-        ----------
-        positions : np.ndarray or cp.ndarray, shape (N, 3)
-            Array of atomic positions. Can be CPU or GPU array.
-        distribution : str or callable
-            Distribution type or a custom function that returns a random sample 
-            of shape (N, 3). Defaults to 'gaussian'.
-            - If 'gaussian', uses xp.random.normal(0, sigma, positions.shape)
-            - If a callable, it should accept a 'size' argument (tuple) and 
-              return a NumPy or CuPy array of shape (N, 3).
-        sigma : float
-            Standard deviation for the Gaussian displacement. 
-            Ignored if distribution is a custom callable.
-        max_displacement : float, optional
-            Maximum displacement allowed per coordinate. If None, no clipping 
-            is performed. If set, each coordinate is clipped to
-            [-max_displacement, max_displacement].
-        seed : int, optional
-            Random seed for reproducible random sampling. If using CuPy arrays 
-            and CuPy is available, sets cp.random.seed(); if using NumPy arrays, 
-            sets np.random.seed().
+        Typical usage:
+            s.set_temperature_einstein(
+                T_K=300,
+                mass_amu=28.0855,
+                theta_E_K=400.0,
+                max_displacement=3.0  # optional per-axis clip, in position units
+            )
+            s.enable_temp = True
 
-        Returns
-        -------
-        displaced_positions : same type as 'positions' (NumPy or CuPy), shape (N, 3)
-            Positions after applying random displacements.
+        For per-species control, pass dictionaries:
+            species_mass_amu = {'Si': 28.0855, 'C': 12.011}
+            species_theta_E_K = {'Si': 645.0, 'C': 2230.0}
         """
-        # Determine if positions is on CPU or GPU
-        if cp is not None and isinstance(positions, cp.ndarray):
-            xp = cp  # We'll use CuPy
-            if seed is not None:
-                cp.random.seed(seed)
-        else:
-            # Fallback to CPU (NumPy)
-            xp = np
-            if seed is not None:
-                np.random.seed(seed)
+        # Configure temp_params to use the new 'einstein' mode.
+        self.enable_temp = True
+        self.temp_params = ['einstein', float(T_K), max_displacement, seed]
 
-        # Generate random displacements
-        if isinstance(distribution, str):
-            if distribution.lower() == 'gaussian':
-                displacements = xp.random.normal(
-                    loc=0.0, scale=sigma, size=positions.shape
-                )
+        # Save global fallbacks if provided
+        if mass_amu is not None:
+            self._temp_mass_amu = float(mass_amu)
+        if theta_E_K is not None:
+            self._temp_theta_E_K = float(theta_E_K)
+
+        # Save optional per-species maps
+        if species_mass_amu is not None:
+            self._temp_species_mass_amu = dict(species_mass_amu)
+        if species_theta_E_K is not None:
+            self._temp_species_theta_E_K = dict(species_theta_E_K)
+
+        # Default position unit is angstrom. Override with set_position_unit_in_m if needed.
+        if not hasattr(self, '_position_unit_in_m'):
+            self._position_unit_in_m = 1.0e-10
+
+    def set_position_unit_in_m(self, unit_in_m):
+        """
+        Set the conversion from one position unit to meters.
+        Default is 1e-10 (angstrom). Set to 1e-9 for nanometer units, etc.
+        """
+        self._position_unit_in_m = float(unit_in_m)
+
+    def apply_temperature(
+        self,
+        positions,
+        distribution='gaussian',
+        sigma=0.25,
+        max_displacement=1,
+        seed=40,
+        chunk_number=None
+    ):
+        """
+        Apply random displacements to 'positions' according to:
+        - 'gaussian': same behavior as before; 'sigma' is stddev in position units.
+        - 'einstein': 'sigma' now means temperature in kelvin; we compute the
+            physically-based Gaussian width from the Einstein model:
+                <x^2> = (hbar / (2 m omega)) * coth(hbar*omega / (2 k_B T))
+            where omega = k_B * theta_E / hbar. You configure m (amu) and theta_E (K)
+            globally or per species using 'set_temperature_einstein' (see helper below).
+        The optional 'max_displacement' still clips each coordinate if provided.
+        A random 'seed' is used for reproducibility.
+        """
+        # Select backend
+        use_cp = (cp is not None) and isinstance(positions, cp.ndarray)
+        xp = cp if use_cp else np
+
+        # Seed RNG
+        if seed is not None:
+            if use_cp:
+                cp.random.seed(int(seed))
             else:
-                raise ValueError(f"Unknown distribution: {distribution}")
-        elif callable(distribution):
-            # Call the user-supplied distribution function
-            displacements = distribution(size=positions.shape)
-            # Ensure types match (if distribution returns NumPy but we want CuPy, or vice versa)
-            if isinstance(displacements, np.ndarray) and xp is cp:
-                displacements = cp.asarray(displacements)
-            elif cp is not None and isinstance(displacements, cp.ndarray) and xp is np:
-                displacements = displacements.get()
-        else:
-            raise ValueError("distribution must be either a string or a callable")
+                np.random.seed(int(seed))
 
-        # Optionally clip each coordinate to a maximum magnitude
-        if (max_displacement is not None) and (max_displacement > 0.0):
-            xp.clip(displacements,
-                    a_min=-max_displacement,
-                    a_max= max_displacement,
-                    out=displacements)
+        # Fast path: keep original Gaussian behavior
+        if isinstance(distribution, str) and distribution.lower() in ('gaussian', 'normal'):
+            displacements = xp.random.normal(loc=0.0, scale=float(sigma), size=positions.shape)
+            if (max_displacement is not None) and (max_displacement > 0.0):
+                xp.clip(displacements, -max_displacement, max_displacement, out=displacements)
+            return positions + displacements
 
-        # Return positions + displacements, preserving the array type
-        return positions + displacements
+        # Temperature-driven displacement using the Einstein model
+        if isinstance(distribution, str) and distribution.lower() in ('einstein', 'temperature', 'kelvin'):
+            # 'sigma' carries T in kelvin in this mode
+            T_K = float(sigma)
+
+            # Position unit scale: default assumes arrays are in angstroms (1e-10 m)
+            pos_unit_m = getattr(self, '_position_unit_in_m', 1e-10)
+
+            # Physical constants (SI)
+            k_B = 1.380649e-23
+            hbar = 1.054571817e-34
+            amu_to_kg = 1.66053906660e-27
+
+            N = int(positions.shape[0])
+
+            # Resolve masses and Einstein temperatures (either per species or global)
+            masses_amu = None
+            thetaE_K = None
+
+            have_per_species = (
+                hasattr(self, '_temp_species_mass_amu') and
+                hasattr(self, '_temp_species_theta_E_K') and
+                (self._temp_species_mass_amu is not None) and
+                (self._temp_species_theta_E_K is not None) and
+                (chunk_number is not None)
+            )
+
+            if have_per_species:
+                # Load species for this chunk on CPU; map to arrays of m and theta_E
+                species = self.load_chunk_species(chunk_number, use_gpu=False)
+                masses_amu = np.empty(N, dtype=np.float64)
+                thetaE_K = np.empty(N, dtype=np.float64)
+
+                # Fallbacks if a species key is missing
+                m_default = getattr(self, '_temp_mass_amu', 28.0)
+                th_default = getattr(self, '_temp_theta_E_K', 300.0)
+
+                for i, sp in enumerate(species):
+                    key = str(sp)
+                    masses_amu[i] = self._temp_species_mass_amu.get(key, m_default)
+                    thetaE_K[i] = self._temp_species_theta_E_K.get(key, th_default)
+            else:
+                # Use global values (with safe fallbacks)
+                m_default = getattr(self, '_temp_mass_amu', 28.0)
+                th_default = getattr(self, '_temp_theta_E_K', 300.0)
+                masses_amu = np.full(N, m_default, dtype=np.float64)
+                thetaE_K = np.full(N, th_default, dtype=np.float64)
+
+            # Move to correct backend
+            m_kg = xp.asarray(masses_amu, dtype=xp.float64) * amu_to_kg
+            thetaE_K = xp.asarray(thetaE_K, dtype=xp.float64)
+
+            # omega from theta_E: omega = k_B * theta_E / hbar
+            omega = (k_B * thetaE_K) / hbar
+
+            # Handle coth safely for very small and very large arguments
+            # z = hbar * omega / (2 k_B T)
+            if T_K <= 0.0:
+                # Zero temperature -> zero-point motion only: coth(z)->1
+                coth_z = xp.ones_like(omega, dtype=xp.float64)
+            else:
+                z = (hbar * omega) / (2.0 * k_B * T_K)
+                # Use series near zero to avoid 1/tanh underflow
+                small = z < 1.0e-6
+                coth_series = (1.0 / z) + (z / 3.0)
+                coth_exact = 1.0 / xp.tanh(z)
+                coth_z = xp.where(small, coth_series, coth_exact)
+
+            # <x^2> in meters^2
+            msd_m2 = (hbar / (2.0 * m_kg * omega)) * coth_z
+            # Convert to position units (angstroms if pos_unit_m = 1e-10)
+            sigma_units = xp.sqrt(msd_m2) / pos_unit_m  # shape (N,)
+
+            # Draw Gaussian displacements with per-atom sigma
+            rand = xp.random.standard_normal(size=positions.shape)
+            displacements = rand * sigma_units.reshape(-1, 1)
+            # Match dtype of input
+            displacements = displacements.astype(positions.dtype, copy=False)
+
+            if (max_displacement is not None) and (max_displacement > 0.0):
+                xp.clip(displacements, -max_displacement, max_displacement, out=displacements)
+
+            return positions + displacements
+
+        # Unknown distribution keyword
+        raise ValueError("Unknown distribution: {}".format(distribution))
     # -------------------------------------
         
     # -------------------------------------
