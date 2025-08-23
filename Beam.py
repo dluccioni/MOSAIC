@@ -606,13 +606,17 @@ class beam:
             const float rE_F = 2.81794092e-15f;  // classical electron radius [m]
             const int pixel_count = Nx*Ny;
 
-            // Precompute per-pixel Q_cut (one-pixel "radius" in Q-space), matching the GPU kernel.
-            // Use right (+x) and up (+y) neighbors with edge fallback.
+            // Precompute per-pixel Q_cut (one-pixel "radius" in Q-space)
             int have_qcut = 1;
             float* Q_cut = (float*)malloc((size_t)pixel_count * sizeof(float));
             if (!Q_cut) have_qcut = 0;
 
-            if (have_qcut) {
+            // We will also precompute per-pixel R0 (distance from origin to pixel).
+            int have_r0 = 1;
+            float* R0_arr = (float*)malloc((size_t)pixel_count * sizeof(float));
+            if (!R0_arr) have_r0 = 0;
+
+            if (have_qcut || have_r0) {
                 for (int p = 0; p < pixel_count; ++p) {
                     // 2D index
                     int ix = p % Nx;
@@ -628,43 +632,50 @@ class beam:
                         float invR0 = 1.0f / R0;
                         ux = tx * invR0; uy = ty * invR0; uz = tz * invR0;
                     }
-
-                    // Right neighbor (or left if on right edge; else self if single column)
-                    int n_right = (ix + 1 < Nx) ? (p + 1) : ((ix > 0) ? (p - 1) : p);
-                    float rx = coords_x[n_right];
-                    float ry = coords_y[n_right];
-                    float rz = coords_z[n_right];
-                    float Rr = sqrtf(rx*rx + ry*ry + rz*rz);
-                    float urx = 0.0f, ury = 0.0f, urz = 0.0f;
-                    if (Rr > 0.0f) {
-                        float invRr = 1.0f / Rr;
-                        urx = rx*invRr; ury = ry*invRr; urz = rz*invRr;
+                    if (have_r0) {
+                        R0_arr[p] = R0;
                     }
-                    float cos_dx = ux*urx + uy*ury + uz*urz;
-                    if (cos_dx > 1.0f) cos_dx = 1.0f;
-                    if (cos_dx < -1.0f) cos_dx = -1.0f;
-                    float Qx = k_val * sqrtf(fmaxf(0.0f, 2.0f * (1.0f - cos_dx)));
 
-                    // Up neighbor (or down if on top edge; else self if single row)
-                    int n_up = (iy + 1 < Ny) ? (p + Nx) : ((iy > 0) ? (p - Nx) : p);
-                    float ux2 = coords_x[n_up];
-                    float uy2 = coords_y[n_up];
-                    float uz2 = coords_z[n_up];
-                    float Ru = sqrtf(ux2*ux2 + uy2*uy2 + uz2*uz2);
-                    float vux = 0.0f, vuy = 0.0f, vuz = 0.0f;
-                    if (Ru > 0.0f) {
-                        float invRu = 1.0f / Ru;
-                        vux = ux2*invRu; vuy = uy2*invRu; vuz = uz2*invRu;
+                    if (have_qcut) {
+                        // Right neighbor (or left if on right edge; else self if single column)
+                        int n_right = (ix + 1 < Nx) ? (p + 1) : ((ix > 0) ? (p - 1) : p);
+                        float rx = coords_x[n_right];
+                        float ry = coords_y[n_right];
+                        float rz = coords_z[n_right];
+                        float Rr = sqrtf(rx*rx + ry*ry + rz*rz);
+                        float urx = 0.0f, ury = 0.0f, urz = 0.0f;
+                        if (Rr > 0.0f) {
+                            float invRr = 1.0f / Rr;
+                            urx = rx*invRr; ury = ry*invRr; urz = rz*invRr;
+                        }
+                        float cos_dx = ux*urx + uy*ury + uz*urz;
+                        if (cos_dx > 1.0f) cos_dx = 1.0f;
+                        if (cos_dx < -1.0f) cos_dx = -1.0f;
+                        float Qx = k_val * sqrtf(fmaxf(0.0f, 2.0f * (1.0f - cos_dx)));
+
+                        // Up neighbor (or down if on top edge; else self if single row)
+                        int n_up = (iy + 1 < Ny) ? (p + Nx) : ((iy > 0) ? (p - Nx) : p);
+                        float ux2 = coords_x[n_up];
+                        float uy2 = coords_y[n_up];
+                        float uz2 = coords_z[n_up];
+                        float Ru = sqrtf(ux2*ux2 + uy2*uy2 + uz2*uz2);
+                        float vux = 0.0f, vuy = 0.0f, vuz = 0.0f;
+                        if (Ru > 0.0f) {
+                            float invRu = 1.0f / Ru;
+                            vux = ux2*invRu; vuy = uy2*invRu; vuz = uz2*invRu;
+                        }
+                        float cos_dy = ux*vux + uy*vuy + uz*vuz;
+                        if (cos_dy > 1.0f) cos_dy = 1.0f;
+                        if (cos_dy < -1.0f) cos_dy = -1.0f;
+                        float Qy = k_val * sqrtf(fmaxf(0.0f, 2.0f * (1.0f - cos_dy)));
+
+                        // Diagonal half-width in Q (approximate pixel radius in Q-space)
+                        float Qhx = 0.5f * Qx;
+                        float Qhy = 0.5f * Qy;
+                        if (have_qcut) {
+                            Q_cut[p] = sqrtf(Qhx*Qhx + Qhy*Qhy);
+                        }
                     }
-                    float cos_dy = ux*vux + uy*vuy + uz*vuz;
-                    if (cos_dy > 1.0f) cos_dy = 1.0f;
-                    if (cos_dy < -1.0f) cos_dy = -1.0f;
-                    float Qy = k_val * sqrtf(fmaxf(0.0f, 2.0f * (1.0f - cos_dy)));
-
-                    // Diagonal half-width in Q (approximate pixel radius in Q-space)
-                    float Qhx = 0.5f * Qx;
-                    float Qhy = 0.5f * Qy;
-                    Q_cut[p] = sqrtf(Qhx*Qhx + Qhy*Qhy);
                 }
             }
 
@@ -695,39 +706,60 @@ class beam:
                     float r_det = sqrtf(dx*dx + dy*dy + dz*dz);
                     if (r_det == 0.0f) continue;
 
-                    float dotv = (dx / r_det);  // +x incidence approximation
+                    // +x incidence approximation for scattering angle
+                    float dotv = (dx / r_det);
                     float tmp = 2.0f*(1.0f - dotv);
                     if (tmp < 0.0f) tmp = 0.0f;
                     float Q_val = k_val * sqrtf(tmp);
 
+                    // f0(Q)
                     float f0_val = get_f0_value(Q_val, f0p);
 
-                    // Pixel-adaptive forward-term removal (matches GPU). Fallback to
-                    // unconditional behavior if Q_cut allocation failed.
+                    // Build scattering factor including anomalous
+                    float s_re = (f0_val + sanr);
+                    float s_im = (sani);
+
+                    // (B) Remove full forward amplitude inside Q < Q_cut
                     if (remove_forward) {
                         if (have_qcut) {
                             if (Q_val < Q_cut[p]) {
-                                f0_val -= f00;
+                                // subtract (f0(0) + anomalous)
+                                s_re -= (f00 + sanr);
+                                s_im -= (sani);
                             }
                         } else {
-                            // Fallback: old behavior
-                            f0_val -= f00;
+                            // Fallback when Q_cut not available
+                            s_re -= (f00 + sanr);
+                            s_im -= (sani);
                         }
                     }
-
-                    float s_re = (f0_val + sanr);
-                    float s_im = (sani);
 
                     // multiply by complex entrance amplitude
                     float t_re = amp_r * s_re - amp_i * s_im;
                     float t_im = amp_r * s_im + amp_i * s_re;
 
+                    // Phase: ax + r_det (modulo wavelength reduction for stability)
                     float phase = k_val * (fmodf(ax, wavelength_m) + fmodf(r_det, wavelength_m));
                     float cph = cosf(phase);
                     float sph = sinf(phase);
 
-                    float val_r = (t_re * cph - t_im * sph) * rE_F;
-                    float val_i = (t_re * sph + t_im * cph) * rE_F;
+                    float val_r = (t_re * cph - t_im * sph);
+                    float val_i = (t_re * sph + t_im * cph);
+
+                    // (A) Relative spherical-decay factor: R0 / r_det
+                    float scale_rel = 1.0f;
+                    if (r_det > 0.0f) {
+                        float R0_local;
+                        if (have_r0) {
+                            R0_local = R0_arr[p];
+                        } else {
+                            float tx = coords_x[p], ty = coords_y[p], tz = coords_z[p];
+                            R0_local = sqrtf(tx*tx + ty*ty + tz*tz);
+                        }
+                        if (R0_local > 0.0f) {
+                            scale_rel = R0_local / r_det;
+                        }
+                    }
 
                     // polarization factor applied on amplitude
                     if (apply_pol) {
@@ -739,12 +771,17 @@ class beam:
                         val_i *= scale;
                     }
 
+                    // Final scaling and accumulate
+                    val_r *= (rE_F * scale_rel);
+                    val_i *= (rE_F * scale_rel);
+
                     out_r[p] += val_r;
                     out_i[p] += val_i;
                 }
             }
 
             if (Q_cut) free(Q_cut);
+            if (R0_arr) free(R0_arr);
         }
         ''';
 
@@ -1257,14 +1294,16 @@ class beam:
                     const float* param_ptr = &s_params[j*11];
                     float f0v = get_f0_from_params(Q_val, param_ptr);
 
-                    // forward-term removal gated by local Q_cut (one-pixel radius in Q)
-                    if (remove_forward && (Q_val < Q_cut)) {
-                        f0v -= s_f0z[j];
-                    }
-
+                    // (B) Build scattering factor and optionally remove full forward amplitude
                     float2 s_tot;
                     s_tot.x = f0v + s_anm[j].x;
                     s_tot.y = s_anm[j].y;
+
+                    if (remove_forward && (Q_val < Q_cut)) {
+                        // subtract (f0(0) + anomalous) -> leaves (f0(Q) - f0(0)), imag -> 0
+                        s_tot.x -= (s_f0z[j] + s_anm[j].x);
+                        s_tot.y -= (s_anm[j].y);
+                    }
 
                     float2 amp = s_amp[j];
                     float real_part = amp.x * s_tot.x - amp.y * s_tot.y;
@@ -1299,8 +1338,11 @@ class beam:
                         val.x *= sc; val.y *= sc;
                     }
 
-                    sum_rel.x += val.x * rE_F;
-                    sum_rel.y += val.y * rE_F;
+                    // (A) Relative spherical-decay factor
+                    float amp_rel = (R0 > 0.0f) ? (R0 / r_det) : 1.0f;
+
+                    sum_rel.x += val.x * rE_F * amp_rel;
+                    sum_rel.y += val.y * rE_F * amp_rel;
                 }
                 __syncthreads();
             }
@@ -2557,7 +2599,8 @@ class beam:
                             db_dict_f0_all, db_dict_f1f2_all, k_val,
                             stage, detector=None, remove_forward_component=False,
                             initial_amp_complex=None,
-                            apply_polarization=False):
+                            apply_polarization=False,
+                            apply_spherical_decay=True):
         """
         Compute kinematic scattering on CPU for a single chunk using the CFFI kernel.
 
@@ -2677,6 +2720,7 @@ class beam:
             coords_x_ptr, coords_y_ptr, coords_z_ptr,
             k_val,
             int(1 if apply_polarization else 0),
+            int(1 if apply_spherical_decay else 0),
             float(self._pol_perp_rate),
             out_r_ptr, out_i_ptr
         )
@@ -2695,11 +2739,11 @@ class beam:
         use_depth_ein=False,
         ein_cache_dir=None,
         recompute_cache=False,
-        apply_polarization=False
+        apply_polarization=False,
+        apply_spherical_decay=True
     ):
         """
-        If use_depth_ein is False, per-atom initial amplitudes are taken from
-        the beam E0(u,v) map (bilinear), and are zero outside the beam grid.
+        CPU path for kinematic scattering. Adds apply_spherical_decay to toggle 1/R.
         """
         import hashlib, json, os
         Nx, Ny = measurement_shape
@@ -2837,7 +2881,8 @@ class beam:
                 db_dict_f0_all, db_dict_f1f2_all, k_val, stage,
                 detector=None, remove_forward_component=remove_forward_component,
                 initial_amp_complex=init_amp,
-                apply_polarization=apply_polarization
+                apply_polarization=apply_polarization,
+                apply_spherical_decay=apply_spherical_decay
             )
             return out
 
@@ -2920,7 +2965,8 @@ class beam:
         use_depth_ein: bool = False,
         ein_cache_dir: str | None = None,
         recompute_cache: bool = False,
-        apply_polarization: bool = False
+        apply_polarization: bool = False,
+        spherical_decay: bool = True
     ):
         """
         If use_depth_ein is False, initial amplitudes are sampled from the
@@ -2938,7 +2984,8 @@ class beam:
                 use_depth_ein=use_depth_ein,
                 ein_cache_dir=ein_cache_dir,
                 recompute_cache=recompute_cache,
-                apply_polarization=apply_polarization
+                apply_polarization=apply_polarization,
+                apply_spherical_decay=spherical_decay
             )
 
         n_gpus = cp.cuda.runtime.getDeviceCount()
@@ -2954,7 +3001,8 @@ class beam:
                 use_depth_ein=use_depth_ein,
                 ein_cache_dir=ein_cache_dir,
                 recompute_cache=recompute_cache,
-                apply_polarization=apply_polarization
+                apply_polarization=apply_polarization,
+                apply_spherical_decay=spherical_decay
             )
 
         import hashlib, json, os
@@ -3142,6 +3190,7 @@ class beam:
                             np.int32(Ny),
                             np.int32(1 if remove_forward else 0),
                             np.int32(1 if apply_polarization else 0),
+                            np.int32(1 if spherical_decay else 0),
                             np.float32(self._pol_perp_rate)
                         ),
                         stream=streams[s_id]
@@ -3191,7 +3240,8 @@ class beam:
         use_depth_ein: bool = False,
         ein_cache_dir: str | None = None,
         recompute_cache: bool = False,
-        apply_polarization: bool = False
+        apply_polarization: bool = False,
+        spherical_decay: bool = False
     ):
         """
         Compute kinematic atomic scattering (single bounce) and return the field.
@@ -3231,7 +3281,8 @@ class beam:
                 use_depth_ein=use_depth_ein,
                 ein_cache_dir=ein_cache_dir,
                 recompute_cache=recompute_cache,
-                apply_polarization=apply_polarization
+                apply_polarization=apply_polarization,
+                spherical_decay=spherical_decay
             )
         else:
             # CPU path; optionally warn if GPU was requested but not available
@@ -3247,7 +3298,8 @@ class beam:
                 use_depth_ein=use_depth_ein,
                 ein_cache_dir=ein_cache_dir,
                 recompute_cache=recompute_cache,
-                apply_polarization=apply_polarization
+                apply_polarization=apply_polarization,
+                apply_spherical_decay=spherical_decay
             )
 
         # Optional offset subtraction
@@ -4465,6 +4517,7 @@ class beam:
                 kz_atom_gpu = cp.full((nA,), self._kz_scalar, dtype=cp.float32)
                 amp_atom_gpu= cp.ones((nA,), dtype=cp.complex64)
 
+                # Updated signature: pass apply_spherical_decay=0
                 interaction_kernel(
                     grid2d, block2d,
                     (
@@ -4481,6 +4534,7 @@ class beam:
                         np.int32(Ny),
                         np.int32(remove_forward_flag),
                         np.int32(1 if apply_polarization else 0),
+                        np.int32(0),
                         np.float32(self._pol_perp_rate)
                     )
                 )
@@ -4544,6 +4598,7 @@ class beam:
                     f0z_paths = lut_f0z[sub_spc]
                     anm_paths = lut_anm[sub_spc]
 
+                    # Updated signature: pass apply_spherical_decay=0
                     interaction_kernel(
                         grid2d, block2d,
                         (
@@ -4560,6 +4615,7 @@ class beam:
                             np.int32(Ny),
                             np.int32(remove_forward_flag),
                             np.int32(1 if apply_polarization else 0),
+                            np.int32(0),
                             np.float32(self._pol_perp_rate)
                         )
                     )
