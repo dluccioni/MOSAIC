@@ -514,31 +514,23 @@ class sample:
     @staticmethod
     def get_flat_grid(dimensions, use_gpu=False):
         """
-        Create a 3D grid of integer coordinates. If use_gpu=True and cupy is available,
-        use CuPy arrays; otherwise use NumPy arrays.
+        Create a 3D grid of integer coordinates as an (N, 3) array without
+        materializing three full 3D arrays. Returns float32 for parity with GPU.
         """
+        d0 = int(dimensions[0])
+        d1 = int(dimensions[1])
+        d2 = int(dimensions[2])
+
         if use_gpu and (cp is not None):
-            # GPU path
-            ii, jj, kk = cp.meshgrid(
-                cp.arange(dimensions[0], dtype=cp.float32),
-                cp.arange(dimensions[1], dtype=cp.float32),
-                cp.arange(dimensions[2], dtype=cp.float32),
-                indexing='ij'
-            )
-            flat_grid_cp = cp.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
-            return flat_grid_cp
+            ii = cp.repeat(cp.arange(d0, dtype=cp.float32), d1 * d2)
+            jj = cp.tile(cp.repeat(cp.arange(d1, dtype=cp.float32), d2), d0)
+            kk = cp.tile(cp.arange(d2, dtype=cp.float32), d0 * d1)
+            return cp.stack((ii, jj, kk), axis=1)
         else:
-            # CPU path
-            # Force float32 for CPU so it matches GPU's single precision
-            dims_np = np.array(dimensions, dtype=np.float32)
-            ii, jj, kk = np.meshgrid(
-                np.arange(dims_np[0], dtype=np.float32),
-                np.arange(dims_np[1], dtype=np.float32),
-                np.arange(dims_np[2], dtype=np.float32),
-                indexing='ij'
-            )
-            flat_grid = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
-            return flat_grid
+            ii = np.repeat(np.arange(d0, dtype=np.float32), d1 * d2)
+            jj = np.tile(np.repeat(np.arange(d1, dtype=np.float32), d2), d0)
+            kk = np.tile(np.arange(d2, dtype=np.float32), d0 * d1)
+            return np.stack((ii, jj, kk), axis=1)
 
     def set_temperature_einstein(
         self,
@@ -1133,89 +1125,160 @@ class sample:
     
     # -------------------------------------
     # Sample generation
+    def _gpu_stream_chunk(self, material, chunk_position, chunk_dimensions, stream):
+        """
+        Compute the selected atomic positions for one geometric chunk entirely on a
+        given CUDA stream, and return:
+        pos_sel_cp : cp.ndarray of shape (M, 3), float32, positions after offset shift
+        idx_sel_cp : cp.ndarray of shape (M,), int64, indices into the flattened atoms
+                    (used to map to species on CPU without building a huge tile)
+        This does not synchronize; it only enqueues work on 'stream'.
+        """
+        if cp is None:
+            raise RuntimeError("CuPy is not available but _gpu_stream_chunk was called")
+
+        with stream:
+            # Crystal -> sample transforms
+            lattice_matrix_cp = cp.asarray(material.lattice_matrix.T, dtype=cp.float32)
+            chunk_position_cp = cp.asarray(chunk_position, dtype=cp.float32)
+
+            # Lattice points of this chunk in sample frame
+            lattice_positions_C = self.get_flat_grid(chunk_dimensions, use_gpu=True)
+            lattice_positions_S = lattice_positions_C @ lattice_matrix_cp + chunk_position_cp
+
+            # Unit-cell atom offsets, broadcast over lattice points, then flatten
+            atom_uc = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
+            atomic_positions = (lattice_positions_S[:, cp.newaxis, :] +
+                                atom_uc[cp.newaxis, :, :]).reshape(-1, 3)
+
+            # In-box mask using [0, dimensions]
+            dims = cp.asarray(self.dimensions, dtype=cp.float32)
+            mask = ((atomic_positions[:, 0] >= 0) & (atomic_positions[:, 0] <= dims[0]) &
+                    (atomic_positions[:, 1] >= 0) & (atomic_positions[:, 1] <= dims[1]) &
+                    (atomic_positions[:, 2] >= 0) & (atomic_positions[:, 2] <= dims[2]))
+
+            # Compact on GPU
+            pos_sel_cp = atomic_positions[mask, :]
+
+            # Offset shift (centered sample)
+            offset_cp = cp.asarray(self.offset, dtype=cp.float32)
+            pos_sel_cp = pos_sel_cp + (offset_cp - 0.5 * dims)
+
+            # Selected flattened indices (used to map species on CPU via modulo)
+            idx_sel_cp = cp.where(mask)[0].astype(cp.int64, copy=False)
+
+        return pos_sel_cp, idx_sel_cp
+    
     def get_chunk_positions(self, material):
-        '''
-        Gets the list of clipped chunk positions in real space the and chunk dimensions in unit cell lengths
-        Works for any arbitrary sample dimensions or unit cell.
-        Inputs:
-            material -> crystal class object
-        Outputs:
-            chunk_positions_S -> chunk corner positions in the sample frame
-            chunk_dimensions -> chunk dimensions in unit cell lengths
-        '''
+        """
+        Compute candidate chunk positions and dimensions, prefilter with a cheap
+        AABB test against the sample box [0..dimensions], then run SAT via CFFI
+        only on the survivors. This greatly reduces SAT calls.
+        """
         lattice_matrix = material.lattice_matrix.T
         lattice_volume = material.lattice_volume
-        
-        # Precompute for performance
+
         inv_lattice_matrix = np.linalg.inv(lattice_matrix)
+
+        # Corners of sample in lattice frame for span measurement
         corners_in_lattice = self.corners @ inv_lattice_matrix
-        
-        # Get number of lattice units along sample in crystal frame
-        lattice_units = np.ceil(np.max(corners_in_lattice, axis=0) - np.min(corners_in_lattice, axis=0))
-        
-        # Get default chunk size in number of unit cells for each direction.
-        chunk_dimensions = np.zeros(lattice_units.shape) + np.floor((self.chunk_volume / lattice_volume)**(1/3))
-        
-        # Check if any dimensions are smaller than sample for more efficient chunking
+
+        # Number of lattice units spanning the sample
+        lattice_units = np.ceil(
+            np.max(corners_in_lattice, axis=0) - np.min(corners_in_lattice, axis=0)
+        )
+
+        # Default chunk size in unit cells for each axis
+        base_cells = np.floor((self.chunk_volume / lattice_volume) ** (1.0 / 3.0))
+        chunk_dimensions = np.zeros(lattice_units.shape, dtype=np.float32) + base_cells
+
         size_check = lattice_units > chunk_dimensions
         if not np.all(size_check):
-            chunk_dimensions[~size_check] = np.min((chunk_dimensions, lattice_units), axis=0)[~size_check]
-            chunk_dimensions[size_check] = np.floor(
-                ((self.chunk_volume/lattice_volume) / np.prod(chunk_dimensions[~size_check])) ** 
-                (1/np.sum(size_check))
-            )
-            chunk_dimensions[size_check] = np.floor(lattice_units[size_check] / np.ceil(lattice_units[size_check] / chunk_dimensions[size_check]))
-        
-        chunk_units = np.ceil(lattice_units / chunk_dimensions)
-        
-        # Generate positions in the crystal frame (CPU by default)
+            # Keep dims that are not smaller than sample size, adjust others
+            tmp = np.min((chunk_dimensions, lattice_units), axis=0)
+            chunk_dimensions[~size_check] = tmp[~size_check]
+            # Rebalance remaining dims
+            remaining = np.sum(size_check)
+            if remaining > 0:
+                scale = ((self.chunk_volume / lattice_volume) /
+                        np.prod(chunk_dimensions[~size_check])) ** (1.0 / remaining)
+                chunk_dimensions[size_check] = np.floor(scale)
+                # Ensure aligned division of lattice_units by chunk_dimensions
+                chunk_dimensions[size_check] = np.floor(
+                    lattice_units[size_check] /
+                    np.ceil(lattice_units[size_check] / chunk_dimensions[size_check])
+                )
+
+        # How many chunks along each axis
+        chunk_units = np.ceil(lattice_units / chunk_dimensions).astype(np.int64)
+
+        # Candidate chunk origins in crystal frame
         chunk_positions_C = self.get_flat_grid(chunk_units, use_gpu=False) * chunk_dimensions
-        
-        # Convert to sample frame, adjusting positions to center
+
+        # Convert to sample frame and center relative to sample [0..dimensions]
         adj_val = (lattice_units * 0.5) - (self.dimensions @ inv_lattice_matrix * 0.5)
-        chunk_positions_S = (chunk_positions_C - adj_val) @ lattice_matrix
-        
-        # Generate corners array
-        chunk_corners_S = chunk_positions_S[:, np.newaxis, :] + ((self.get_unit_corners() * chunk_dimensions) @ lattice_matrix)[np.newaxis, :, :]
-        
-        # Using self.get_unit_corners() @ self.matrix for sample corner positions
-        mask_arr = self.parallelepipeds_intersect_cffi(
+        chunk_positions_S = (chunk_positions_C - adj_val) @ lattice_matrix  # (N, 3)
+
+        # Precompute corner offsets once: 8x3 offsets in sample frame for one chunk
+        u8 = self.get_unit_corners().astype(np.float32)
+        corner_offsets_S = (u8 * chunk_dimensions.astype(np.float32)) @ lattice_matrix.astype(np.float32)
+
+        # All chunk corners in sample frame: (N, 8, 3)
+        chunk_corners_S = chunk_positions_S[:, np.newaxis, :] + corner_offsets_S[np.newaxis, :, :]
+
+        # AABB prefilter against [0, dimensions]
+        sample_min = np.zeros(3, dtype=np.float32)
+        sample_max = self.dimensions.astype(np.float32)
+
+        cc_min = chunk_corners_S.min(axis=1)
+        cc_max = chunk_corners_S.max(axis=1)
+
+        aabb_mask = (
+            (cc_max[:, 0] >= sample_min[0]) & (cc_min[:, 0] <= sample_max[0]) &
+            (cc_max[:, 1] >= sample_min[1]) & (cc_min[:, 1] <= sample_max[1]) &
+            (cc_max[:, 2] >= sample_min[2]) & (cc_min[:, 2] <= sample_max[2])
+        )
+
+        if not np.any(aabb_mask):
+            return chunk_positions_S[:0, :], chunk_dimensions
+
+        # SAT on survivors only
+        sample_corners_S = (self.get_unit_corners() @ self.matrix)  # 8x3 in sample frame
+        sat_mask_sub = self.parallelepipeds_intersect_cffi(
             self._intersect_function,
             self._ffi_object,
-            chunk_corners_S,
-            (self.get_unit_corners() @ self.matrix),
+            chunk_corners_S[aabb_mask, :, :],
+            sample_corners_S,
             eps=1e-12
         )
-        chunk_positions_S = chunk_positions_S[mask_arr, :]
-        return chunk_positions_S, chunk_dimensions
+
+        # Reconstruct full mask
+        full_mask = np.zeros(chunk_positions_S.shape[0], dtype=bool)
+        full_mask[np.flatnonzero(aabb_mask)] = sat_mask_sub
+
+        chunk_positions_S = chunk_positions_S[full_mask, :]
+        return chunk_positions_S.astype(np.float32, copy=False), chunk_dimensions.astype(np.float32, copy=False)
         
     def parallelepipeds_intersect_cffi(self, compiled_code, ffi_object, pts1, pts2, eps=1e-12):
-        '''
-        Code to check if two parallelepipeds intersect (in this case seeing if
-        a chunk intersects with the sample).
-        
-        Inputs:
-            compiled_code, ffi_object -> required inputs to call fast C code
-            pts1 -> set of n chunk corner points
-            pts2 -> set of sample corner points
-        Outputs:
-            mask_arr -> a mask of which chunks intersect the sample
-        '''
+        """
+        Faster CFFI bridge: avoid Python lists and extra copies by passing buffers
+        directly to C. Input arrays are made contiguous float64 and referenced
+        through ffi.from_buffer.
+        """
         pts1 = np.ascontiguousarray(pts1, dtype=np.float64)
         pts2 = np.ascontiguousarray(pts2, dtype=np.float64)
-        n = pts1.shape[0]
-        
-        arr_all = pts1.ravel().tolist()  # cffi needs a Python list
-        arr2 = pts2.ravel().tolist()
-        
-        c_all   = ffi_object.new("double[]", arr_all)
-        c_arr2  = ffi_object.new("double[]", arr2)
+        n = int(pts1.shape[0])
+
         results_int = np.zeros(n, dtype=np.int32)
+
+        c_all = ffi_object.from_buffer("double[]", pts1)
+        c_arr2 = ffi_object.from_buffer("double[]", pts2)
         c_out = ffi_object.cast("int *", results_int.ctypes.data)
-        
-        compiled_code.check_parallelepipeds_intersect_batch(c_all, c_arr2, float(eps), n, c_out)
-        mask_arr = (results_int == 1)
-        return mask_arr
+
+        compiled_code.check_parallelepipeds_intersect_batch(
+            c_all, c_arr2, float(eps), n, c_out
+        )
+        return results_int == 1
 
     def get_lattice_positions(self, material, chunk_position, chunk_dimensions, use_gpu=True):
         '''
@@ -1245,161 +1308,315 @@ class sample:
             lattice_positions_S = lattice_positions_C @ lattice_matrix_np + chunk_position_np
             return lattice_positions_S
 
-    def get_atomic_data(self, material, chunk_position, chunk_dimensions, use_gpu=True):
-        '''
-        Gets the location of all lattice points in the sample frame in a given chunk,
-        plus the species. Returns (positions, species).
-        
-        - If use_gpu=True and cupy is available, positions will be a cp.ndarray
-          (until masking finishes, then we bring them partially back).
-        - If use_gpu=False or cupy is unavailable, positions will be an np.ndarray.
-        '''
-        # If we have a GPU available and user wants GPU, do it on GPU
+    def get_atomic_data(
+        self,
+        material,
+        chunk_position,
+        chunk_dimensions,
+        use_gpu=True,
+        stream=None,
+        return_on_gpu=False,
+        lattice_atom_cartesian_cp=None,
+        offset_gpu=None,
+        dim_half_gpu=None
+    ):
+        """
+        Gets atom positions and species for one geometric chunk.
+
+        New optional args:
+        - stream: cp.cuda.Stream to enqueue GPU work on.
+        - return_on_gpu: if True, keeps positions/mask on GPU and returns them
+            along with a site_count so the caller can finish on the host later.
+        - lattice_atom_cartesian_cp, offset_gpu, dim_half_gpu:
+            optional preloaded cp arrays to avoid re-uploading per chunk.
+
+        Returns:
+        if return_on_gpu is False (default): (positions_np, species_np)
+        if return_on_gpu is True:  (positions_cp, mask_cp, site_count)
+        """
         use_gpu = (use_gpu and (cp is not None))
 
         if use_gpu:
-            # GPU branch
-            lattice_atom_cartesian_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
-            lattice_positions_cp = self.get_lattice_positions(material, chunk_position, chunk_dimensions, use_gpu=True)
-            
-            atomic_positions_S = (
-                lattice_positions_cp[:, cp.newaxis, :] + 
-                lattice_atom_cartesian_cp[cp.newaxis, :, :]
-            ).reshape(-1, 3)
-            
-            atomic_species = np.tile(material.species, lattice_positions_cp.shape[0])
-            mask = (
-                (atomic_positions_S[:, 0] >= 0) & (atomic_positions_S[:, 0] <= self.dimensions[0]) &
-                (atomic_positions_S[:, 1] >= 0) & (atomic_positions_S[:, 1] <= self.dimensions[1]) &
-                (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= self.dimensions[2])
-            )
-            mask_np = mask.get()  # bring mask back to CPU
-            
-            atomic_positions_S = atomic_positions_S[mask, :]  # still cp array
-            atomic_species = atomic_species[mask_np]
-            
-            offset_gpu = cp.array(self.offset, dtype=cp.float32)
-            dim_half_gpu = cp.array(self.dimensions * 0.5, dtype=cp.float32)
-            atomic_positions_S += (offset_gpu - dim_half_gpu)
+            s = stream if (stream is not None) else cp.cuda.Stream.null
 
-            # Return final positions to CPU
-            atomic_positions_S = atomic_positions_S.get()
-            cp.get_default_memory_pool().free_all_blocks()
-            gc.collect()
-            return atomic_positions_S, atomic_species
+            with s:
+                # Preload invariant device arrays if not provided
+                if lattice_atom_cartesian_cp is None:
+                    lattice_atom_cartesian_cp = cp.asarray(
+                        material.lattice_atom_cartesian, dtype=cp.float32
+                    )
+                if offset_gpu is None:
+                    offset_gpu = cp.asarray(self.offset, dtype=cp.float32)
+                if dim_half_gpu is None:
+                    dim_half_gpu = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
 
-        else:
-            # CPU branch
-            # Convert all relevant data to float32 to match GPU path
-            lattice_atom_cartesian_np = material.lattice_atom_cartesian.astype(np.float32)
-            lattice_positions_np = self.get_lattice_positions(material, chunk_position, chunk_dimensions, use_gpu=False)
-            
-            atomic_positions_S = (
-                lattice_positions_np[:, np.newaxis, :].astype(np.float32) +
-                lattice_atom_cartesian_np[np.newaxis, :, :]
-            ).reshape(-1, 3)
-            
-            atomic_species = np.tile(material.species, lattice_positions_np.shape[0])
-            # Mask
-            mask = (
-                (atomic_positions_S[:, 0] >= 0) & (atomic_positions_S[:, 0] <= self.dimensions[0]) &
-                (atomic_positions_S[:, 1] >= 0) & (atomic_positions_S[:, 1] <= self.dimensions[1]) &
-                (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= self.dimensions[2])
-            )
-            atomic_positions_S = atomic_positions_S[mask, :].astype(np.float32)
-            atomic_species = atomic_species[mask]
+                # Lattice positions in this chunk on GPU
+                lattice_positions_cp = self.get_lattice_positions(
+                    material, chunk_position, chunk_dimensions, use_gpu=True
+                )  # uses current stream
 
-            # Offset in float32
-            offset_np = self.offset.astype(np.float32)
-            dim_half_np = (self.dimensions * 0.5).astype(np.float32)
-            atomic_positions_S += (offset_np - dim_half_np)
-            gc.collect()
-            return atomic_positions_S, atomic_species
+                # Expand to atom sites, then flatten
+                atomic_positions_S = (
+                    lattice_positions_cp[:, cp.newaxis, :] + lattice_atom_cartesian_cp[cp.newaxis, :, :]
+                ).reshape(-1, 3)
 
-    def generate_sample(self, material, flush_size=100000000, use_gpu=True):
+                # In-box mask against [0, dimensions]
+                dims_gpu = cp.asarray(self.dimensions, dtype=cp.float32)
+                mask = (
+                    (atomic_positions_S[:, 0] >= 0) & (atomic_positions_S[:, 0] <= dims_gpu[0]) &
+                    (atomic_positions_S[:, 1] >= 0) & (atomic_positions_S[:, 1] <= dims_gpu[1]) &
+                    (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= dims_gpu[2])
+                )
+
+                # Filter and apply center/offset
+                atomic_positions_S = atomic_positions_S[mask, :]
+                atomic_positions_S += (offset_gpu - dim_half_gpu)
+
+                if return_on_gpu:
+                    # Defer host copies; caller will handle mask/species tiling
+                    site_count = int(lattice_positions_cp.shape[0])
+                    return atomic_positions_S, mask, site_count
+
+                # Host path identical to original behavior
+                mask_np = mask.get()
+                positions_np = atomic_positions_S.get()
+
+                atomic_species = np.tile(material.species, int(lattice_positions_cp.shape[0]))
+                atomic_species = atomic_species[mask_np]
+
+                cp.get_default_memory_pool().free_all_blocks()
+                gc.collect()
+                return positions_np.astype(np.float32, copy=False), atomic_species
+
+        # CPU branch (unchanged semantics)
+        lattice_atom_cartesian_np = material.lattice_atom_cartesian.astype(np.float32)
+        lattice_positions_np = self.get_lattice_positions(
+            material, chunk_position, chunk_dimensions, use_gpu=False
+        )
+
+        atomic_positions_S = (
+            lattice_positions_np[:, np.newaxis, :].astype(np.float32) +
+            lattice_atom_cartesian_np[np.newaxis, :, :]
+        ).reshape(-1, 3)
+
+        atomic_species = np.tile(material.species, lattice_positions_np.shape[0])
+
+        mask = (
+            (atomic_positions_S[:, 0] >= 0) & (atomic_positions_S[:, 0] <= self.dimensions[0]) &
+            (atomic_positions_S[:, 1] >= 0) & (atomic_positions_S[:, 1] <= self.dimensions[1]) &
+            (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= self.dimensions[2])
+        )
+
+        atomic_positions_S = atomic_positions_S[mask, :].astype(np.float32)
+        atomic_species = atomic_species[mask]
+
+        offset_np = self.offset.astype(np.float32)
+        dim_half_np = (self.dimensions * 0.5).astype(np.float32)
+        atomic_positions_S += (offset_np - dim_half_np)
+        gc.collect()
+        return atomic_positions_S, atomic_species
+
+    def generate_sample(
+        self,
+        material,
+        flush_size=100000000,
+        use_gpu=True,
+        gpu_streams=6,
+        writer_threads=3
+    ):
         """
-        Accumulates the atomic positions/species from each geometric chunk.
-        Each written chunk will contain exactly `flush_size` atoms, except
-        for the last chunk if there are fewer than `flush_size` atoms left.
-
-        The `gpu` parameter controls whether to use GPU acceleration (if available)
-        or force CPU-only. 
+        Generate and write the sample in fixed-size chunks.
+        - If use_gpu is True and a CUDA device is available, runs a multi-stream GPU pipeline.
+        - If CUDA is unavailable or any GPU error occurs (OOM, runtime error),
+        falls back to a pure-CPU pipeline without losing progress already written.
         """
-        # 1) Determine the geometric chunk positions
+        # 0) Build geometric chunks once
         self._chunk_positions, self._chunk_dimensions = self.get_chunk_positions(material)
-        self._chunk_total = self.chunk_positions.shape[0]
-        
-        # 2) Prepare accumulators (lists) in CPU memory
-        acc_positions = []
-        acc_species = []
-        
-        # We'll use this to name each *written* chunk
+        num_geom = int(self.chunk_positions.shape[0])
+
+        # Early out if there is nothing to do
+        if num_geom == 0:
+            self._chunk_total = 0
+            return
+
+        flush_size = int(flush_size)
+
+        from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
+
+        # 1) Thread pool for disk writes
+        def _write_chunk(idx, pos_arr, spc_arr):
+            self.write_chunk_positions(pos_arr, idx)
+            self.write_chunk_species(spc_arr, idx)
+            return idx
+
+        writer_pool = ThreadPoolExecutor(
+            max_workers=max(1, int(writer_threads)),
+            thread_name_prefix="writer"
+        )
+        pending_writes = []
+
+        # 2) CPU-side streaming buffers shared by both GPU and CPU paths
+        buf_pos = None
+        buf_spc = None
+        fill = 0
         file_chunk_index = 0
-        # Keep track of total atoms in accumulator
-        total_accumulated = 0
-        
-        # 3) Loop over all geometric chunks
-        use_gpu = (use_gpu and (cp is not None))
-        for i in range(self.chunk_total):
-            # -- a) Get atomic data
-            atomic_positions, atomic_species = self.get_atomic_data(
-                material,
-                self.chunk_positions[i, :],
-                self._chunk_dimensions,
-                use_gpu=use_gpu
-            )
-            
-            # -- b) If this chunk alone is bigger than flush_size, split immediately
-            if atomic_positions.shape[0] >= flush_size:
-                start_idx = 0
-                while start_idx < atomic_positions.shape[0]:
-                    end_idx = start_idx + flush_size
-                    chunk_positions = atomic_positions[start_idx:end_idx]
-                    chunk_species   = atomic_species[start_idx:end_idx]
 
+        def _accumulate_to_buffers(pos_np, spc_np):
+            nonlocal buf_pos, buf_spc, fill, file_chunk_index, pending_writes
+            n = int(pos_np.shape[0])
+            if n == 0:
+                return
+            if buf_pos is None:
+                buf_pos = np.empty((flush_size, 3), dtype=pos_np.dtype)
+                buf_spc = np.empty((flush_size,), dtype=np.asarray(spc_np).dtype)
+
+            start = 0
+            while start < n:
+                space = flush_size - fill
+                take = (n - start) if (n - start) < space else space
+
+                buf_pos[fill:fill + take] = pos_np[start:start + take]
+                buf_spc[fill:fill + take] = spc_np[start:start + take]
+
+                fill += take
+                start += take
+
+                if fill == flush_size:
                     file_chunk_index += 1
-                    self.write_chunk_positions(chunk_positions, file_chunk_index)
-                    self.write_chunk_species(chunk_species, file_chunk_index)
+                    # Copy slices to isolate from subsequent overwrites
+                    pending_writes.append(
+                        writer_pool.submit(_write_chunk, file_chunk_index, buf_pos.copy(), buf_spc.copy())
+                    )
+                    fill = 0  # reset
 
-                    start_idx = end_idx
-                # Move on to next geometric chunk
-                continue
-            
-            # Otherwise, accumulate
-            acc_positions.append(atomic_positions)
-            acc_species.append(atomic_species)
-            total_accumulated += atomic_positions.shape[0]
-            
-            # -- c) While total atoms >= flush_size, write out exactly flush_size
-            while total_accumulated >= flush_size:
-                cat_positions = np.concatenate(acc_positions, axis=0)
-                cat_species   = np.concatenate(acc_species,   axis=0)
-
-                chunk_positions = cat_positions[:flush_size]
-                chunk_species   = cat_species[:flush_size]
-
+        def _flush_tail():
+            nonlocal fill, file_chunk_index, pending_writes
+            if fill > 0:
                 file_chunk_index += 1
-                self.write_chunk_positions(chunk_positions, file_chunk_index)
-                self.write_chunk_species(chunk_species, file_chunk_index)
+                pending_writes.append(
+                    writer_pool.submit(_write_chunk, file_chunk_index, buf_pos[:fill].copy(), buf_spc[:fill].copy())
+                )
+                fill = 0
 
-                leftover_positions = cat_positions[flush_size:]
-                leftover_species   = cat_species[flush_size:]
+        # 3) Decide if we can and should use GPU
+        gpu_ok = False
+        if use_gpu and (cp is not None):
+            try:
+                devcount = int(cp.cuda.runtime.getDeviceCount())
+                gpu_ok = (devcount > 0)
+            except Exception:
+                gpu_ok = False
 
-                acc_positions = [leftover_positions] if leftover_positions.size > 0 else []
-                acc_species   = [leftover_species] if leftover_species.size > 0 else []
-                total_accumulated = leftover_positions.shape[0] if leftover_positions.size > 0 else 0
-        
-        # 4) After processing all geometric chunks, check leftover
-        leftover_atoms = total_accumulated
-        if leftover_atoms > 0:
-            cat_positions = np.concatenate(acc_positions, axis=0)
-            cat_species   = np.concatenate(acc_species, axis=0)
+        # 4) GPU path (with safe fallback)
+        drained_count = 0  # number of geom-chunks fully drained into CPU buffers
+        if gpu_ok:
+            try:
+                n_streams = max(1, int(gpu_streams))
+                streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
 
-            file_chunk_index += 1
-            self.write_chunk_positions(cat_positions, file_chunk_index)
-            self.write_chunk_species(cat_species, file_chunk_index)
-        
-        self._chunk_total = file_chunk_index
+                # Preload invariants once
+                lattice_atom_cartesian_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
+                offset_gpu = cp.asarray(self.offset, dtype=cp.float32)
+                dim_half_gpu = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
+
+                inflight = []  # list of dicts: {event, pos_cp, mask_cp, site_count}
+                enqueue_idx = 0  # next geom-chunk index to enqueue
+
+                def _enqueue(i, s):
+                    with s:
+                        pos_cp, mask_cp, site_count = self.get_atomic_data(
+                            material,
+                            self.chunk_positions[i, :],
+                            self._chunk_dimensions,
+                            use_gpu=True,
+                            stream=s,
+                            return_on_gpu=True,
+                            lattice_atom_cartesian_cp=lattice_atom_cartesian_cp,
+                            offset_gpu=offset_gpu,
+                            dim_half_gpu=dim_half_gpu
+                        )
+                    ev = cp.cuda.Event()
+                    ev.record(s)
+                    inflight.append({
+                        "event": ev,
+                        "pos_cp": pos_cp,
+                        "mask_cp": mask_cp,
+                        "site_count": site_count
+                    })
+
+                def _drain_one():
+                    nonlocal drained_count
+                    task = inflight.pop(0)
+                    task["event"].synchronize()
+
+                    # Bring results to host
+                    pos_np = task["pos_cp"].get()
+                    mask_np = task["mask_cp"].get()
+
+                    # Build species vector on host
+                    spc_all = np.tile(material.species, task["site_count"])
+                    spc_np = spc_all[mask_np]
+
+                    _accumulate_to_buffers(pos_np, spc_np)
+                    drained_count += 1
+
+                    # Cleanup local references
+                    del pos_np, mask_np, spc_all, spc_np, task
+
+                # Fill-drain loop
+                while (enqueue_idx < num_geom) or inflight:
+                    # Enqueue up to ring capacity
+                    while (enqueue_idx < num_geom) and (len(inflight) < n_streams):
+                        s = streams[enqueue_idx % n_streams]
+                        _enqueue(enqueue_idx, s)
+                        enqueue_idx += 1
+
+                    # Drain at least one task if any are inflight
+                    if inflight:
+                        _drain_one()
+
+                # Free GPU memory pool
+                try:
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+
+            except (cp.cuda.memory.OutOfMemoryError, cp.cuda.runtime.CUDARuntimeError, RuntimeError, ValueError) as _gpu_err:
+                # GPU failure -> fall back to CPU for remaining work
+                try:
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+                gpu_ok = False  # signal CPU fallback
+
+            except Exception:
+                # Any other unexpected GPU-side error -> CPU fallback
+                try:
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+                gpu_ok = False
+
+        # 5) CPU path (or GPU fallback remainder)
+        if not gpu_ok:
+            start_i = drained_count  # redo from first not-drained chunk
+            for i in range(start_i, num_geom):
+                pos_np, spc_np = self.get_atomic_data(
+                    material,
+                    self.chunk_positions[i, :],
+                    self._chunk_dimensions,
+                    use_gpu=False
+                )
+                _accumulate_to_buffers(pos_np, spc_np)
+                del pos_np, spc_np
+
+        # 6) Flush trailing partial buffer and finish
+        _flush_tail()
+        wait(pending_writes, return_when=ALL_COMPLETED)
+        writer_pool.shutdown(wait=True)
+
+        # 7) Update metadata
+        self._chunk_total = int(file_chunk_index)
         return
     # -------------------------------------
     
