@@ -20,7 +20,22 @@ class sample:
     # Functions
     # -----------------------------------------------------------------------------
     ## Initialization
-    def __init__(self,directory=os.getcwd()):
+    def __init__(self, directory=os.getcwd()):
+        """Initialize core state and ensure the working directory exists.
+
+        Compiles the CFFI intersection routine, sets default attributes for the
+        sample, and guarantees that the target directory is present on disk.
+
+        Args:
+            directory (str, optional): Directory where chunk files and metadata
+                will be read from and written to. Defaults to the current
+                working directory.
+
+        Notes:
+            Geometry and data are not created here. Use `create_sample`,
+            `import_atomic_data`, or `generate_sample` to populate files.
+        """
+        # Core directory and lazily initialized fields
         self.directory = directory
         self._dimensions = None
         self._offset = None
@@ -29,39 +44,84 @@ class sample:
         self._chunk_total = None 
         self._matrix = None
         self._corners = None
+
+        # Temperature/displacement configuration (disabled by default)
         self.enable_temp = False
-        self.temp_params = ['gaussian',0.25,1,40]
+        self.temp_params = ['gaussian', 0.25, 1, 40]
+
+        # Default file basenames for chunked outputs
         self._default_filenames = np.array([
             "atomic_positions.npy",
             "atomic_species.npy",
             "sample_metadata.npy"
         ])  # sample_metadata will be a struct
+
+        # Compile the SAT-based intersection function once for reuse
         self._ffi_object, self._intersect_function = self.compile_parallelepipeds_intersect_batch_cffi()
+
+        # Ensure the working directory exists
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
             
-    def create_sample(self, dimensions, offset=[0,0,0], chunk_volume=12500000):
+    def create_sample(self, dimensions, offset=[0, 0, 0], chunk_volume=12500000):
+        """Create an axis-aligned sample box and precompute helpers.
+
+        Sets dimensions, offset, an identity rotation, and a diagonal matrix
+        representation. Also computes the 8 sample corners centered about
+        `offset` for downstream geometric operations.
+
+        Args:
+            dimensions (array-like of float): Length-3 iterable giving box
+                lengths along x, y, z.
+            offset (array-like of float, optional): Length-3 center offset of
+                the sample in the same units as `dimensions`. Defaults to
+                [0, 0, 0].
+            chunk_volume (int or float, optional): Target approximate number of
+                sites per output chunk. This is stored and later used to pick
+                chunking in `get_chunk_positions`/`generate_sample`. Defaults to
+                12_500_000.
+
+        Returns:
+            None
+        """
+        # Cache numeric forms in single precision for consistency
         self._dimensions = np.array(dimensions, dtype=np.float32)
         self._offset = np.array(offset, dtype=np.float32)
+
+        # Start from no rotation; store chunk_volume as a scalar
         self._rotation = np.eye(3, dtype=np.float32)
         self._chunk_volume = np.array(chunk_volume, dtype=np.float32)
+
+        # Build diagonal matrix and precompute corners in sample frame
         self._matrix = np.diag(self.dimensions)
+
+        # Corners are unit-cube corners scaled by dimensions and shifted by offset
         # Slightly rewritten for small overhead reduction (no functional change)
         self._corners = (self.get_unit_corners() @ self.matrix) - (self.dimensions * 0.5) + self.offset
         
     def read_sample_metadata(self):
+        """Load JSON metadata from disk and restore core state.
+
+        Reads `sample_metadata.json` from `self.directory` (or from a provided
+        override path in the writer) and restores `_dimensions`, `_offset`,
+        `_rotation`, and `_chunk_total` if present.
+
+        Raises:
+            FileNotFoundError: If the JSON metadata file does not exist.
+
+        Returns:
+            None
         """
-        Reads the metadata JSON file from disk and restores
-        this sample object's state.
-        """
+        # Compose metadata path and validate its existence
         metadata_filename = os.path.join(self.directory, "sample_metadata.json")
         if not os.path.isfile(metadata_filename):
             raise FileNotFoundError(f"No JSON metadata file found at {metadata_filename}")
 
+        # Parse JSON and restore internal arrays as NumPy types
         with open(metadata_filename, "r") as f:
             sample_metadata = json.load(f)
 
-        # Convert lists back to NumPy arrays
+        # Convert lists back to NumPy arrays where applicable
         if sample_metadata["dimensions"] is not None:
             self._dimensions = np.array(sample_metadata["dimensions"], dtype=np.float32)
         if sample_metadata["offset"] is not None:
@@ -75,25 +135,68 @@ class sample:
     # -------------------------------------
     # Generate sample
     def write_chunk_positions(self, data, chunk_num, override_directory=None):
+        """Write a positions array for a specific chunk to disk.
+
+        Saves a (N, 3) positions array as `atomic_positions_<chunk_num>.npy`
+        either under `self.directory` or `override_directory` if provided.
+
+        Args:
+            data (np.ndarray): Array of shape (N, 3) with atomic positions.
+            chunk_num (int): 1-based chunk index used in the output filename.
+            override_directory (str, optional): Alternate directory root for
+                output. If None, uses `self.directory`.
+
+        Returns:
+            None
+        """
+        # Compose the chunked filename based on the default basename
         base, ext = os.path.splitext(self._default_filenames[0])
         chunk_filename = f"{base}_{chunk_num}{ext}"
+
+        # Persist the array in the appropriate directory
         if override_directory is not None:
             np.save(os.path.join(override_directory, chunk_filename), data)
         else:
             np.save(os.path.join(self.directory, chunk_filename), data)
     
     def write_chunk_species(self, data, chunk_num, override_directory=None):
+        """Write a species array for a specific chunk to disk.
+
+        Saves a 1-D species array as `atomic_species_<chunk_num>.npy` either
+        under `self.directory` or `override_directory` if provided.
+
+        Args:
+            data (array-like): 1-D array of species labels or ids with length N.
+            chunk_num (int): 1-based chunk index used in the output filename.
+            override_directory (str, optional): Alternate directory root for
+                output. If None, uses `self.directory`.
+
+        Returns:
+            None
+        """
+        # Compose the chunked filename based on the default basename
         base, ext = os.path.splitext(self._default_filenames[1])
         chunk_filename = f"{base}_{chunk_num}{ext}"
+
+        # Persist the array in the appropriate directory
         if override_directory is not None:
             np.save(os.path.join(override_directory, chunk_filename), data)
         else:
             np.save(os.path.join(self.directory, chunk_filename), data)
             
     def write_sample_metadata(self, override_directory=None):
-        """
-        Serializes the sample object's critical internal fields to disk 
-        as human-readable JSON so that the state can be restored later.
+        """Serialize critical fields to a JSON metadata file on disk.
+
+        Writes `sample_metadata.json` containing `dimensions`, `offset`,
+        `rotation`, and `chunk_total`. NumPy arrays are converted to lists so
+        they are JSON serializable.
+
+        Args:
+            override_directory (str, optional): If provided, write the JSON to
+                this directory instead of `self.directory`.
+
+        Returns:
+            None
         """
         # Convert NumPy arrays to Python lists so JSON can handle them
         sample_metadata = {
@@ -103,28 +206,50 @@ class sample:
             "chunk_total": int(self._chunk_total) if self._chunk_total is not None else None,
         }
 
+        # Choose the output directory and filename
         if override_directory is not None:
             metadata_filename = os.path.join(override_directory, "sample_metadata.json")
         else:
             metadata_filename = os.path.join(self.directory, "sample_metadata.json")
 
-        # Write as nicely formatted JSON
+        # Write a nicely formatted JSON file for human inspection and versioning
         with open(metadata_filename, "w") as f:
             json.dump(sample_metadata, f, indent=4)
         print(f"Metadata written to {metadata_filename} in JSON format.")
     
     def load_chunk_positions(self, chunk_number, use_gpu=True):
+        """Load a chunk's positions from disk, optionally on GPU.
+
+        If `use_gpu` is True and CuPy is available, returns a `cp.ndarray`.
+        Otherwise, returns an `np.ndarray`. If `self.enable_temp` is True,
+        temperature-based displacements are applied via `apply_temperature`.
+
+        Args:
+            chunk_number (int): 1-based chunk index to load.
+            use_gpu (bool, optional): If True and CuPy is available, load using
+                `cp.load` and return a GPU array. Defaults to True.
+
+        Returns:
+            np.ndarray or cp.ndarray: Array of shape (N, 3) containing positions.
+
+        Raises:
+            FileNotFoundError: If the chunk file does not exist (raised by the
+                underlying loader).
+            ValueError: If temperature application is enabled and an unknown
+                distribution was configured.
         """
-        Load positions from disk. If use_gpu=True and cupy is available, return a cp.ndarray.
-        Otherwise, return an np.ndarray.
-        """
+        # Compose the on-disk filename for this chunk
         base, ext = os.path.splitext(self._default_filenames[0])
         positions_filename = f"{base}_{chunk_number}{ext}"
         full_path = os.path.join(self.directory, positions_filename)
+
+        # Load on GPU if requested and available; else load on CPU
         if use_gpu and (cp is not None):
             positions = cp.load(full_path)
         else:
             positions = np.load(full_path)
+
+        # Optionally apply thermal displacements according to configured model
         if self.enable_temp is True:
             # Note: 'sigma' now means 'temperature_K' when distribution='einstein'
             positions = self.apply_temperature(
@@ -136,16 +261,32 @@ class sample:
                 chunk_number=chunk_number  # enables per-species masses if configured
             )
         return positions
-        
 
     def load_chunk_species(self, chunk_number, use_gpu=True):
+        """Load a chunk's species array from disk, optionally on GPU.
+
+        If `use_gpu` is True and CuPy is available, returns a `cp.ndarray`.
+        Otherwise, returns an `np.ndarray`.
+
+        Args:
+            chunk_number (int): 1-based chunk index to load.
+            use_gpu (bool, optional): If True and CuPy is available, load using
+                `cp.load` and return a GPU array. Defaults to True.
+
+        Returns:
+            np.ndarray or cp.ndarray: 1-D species array corresponding to the
+            positions in the same chunk.
+
+        Raises:
+            FileNotFoundError: If the chunk file does not exist (raised by the
+                underlying loader).
         """
-        Load species from disk. If use_gpu=True and cupy is available, return a cp.ndarray.
-        Otherwise, return an np.ndarray.
-        """
+        # Compose the on-disk filename for this chunk
         base, ext = os.path.splitext(self._default_filenames[1])
         species_filename = f"{base}_{chunk_number}{ext}"
         full_path = os.path.join(self.directory, species_filename)
+
+        # Load on GPU if requested and available; else load on CPU
         if use_gpu and (cp is not None):
             return cp.load(full_path)
         else:
@@ -155,18 +296,24 @@ class sample:
     # -------------------------------------
     # KNN search
     def write_chunk_nn_indices(self, index_list, chunk_num, override_directory=None):
-        """
-        Write a ragged list of neighbor indices for each atom in a chunk.
+        """Write neighbor index lists for a chunk to a compact NPZ.
 
-        Parameters
-        ----------
-        index_list : list of 1D arrays
-            index_list[i] has shape (num_neighbors_i,) storing integer neighbor indices for atom i.
-        chunk_num : int
-            The chunk number to write.
-        override_directory : str, optional
-            If provided, write to this directory instead of self.directory.
+        Produces ``nearest_neighbors_indices_<chunk_num>.npz`` containing:
+        - ``flat_idx``: concatenated neighbor indices for all atoms.
+        - ``offsets``: start positions for each atom's neighbor list
+          (length n_atoms + 1; offsets[i+1] - offsets[i] = neighbors of atom i).
+
+        Args:
+            index_list (list[np.ndarray]): Ragged list where ``index_list[i]`` is
+                a 1-D integer array of neighbor indices for atom ``i``.
+            chunk_num (int): 1-based chunk number used in the output filename.
+            override_directory (str | None): If provided, write to this directory
+                instead of ``self.directory``.
+
+        Returns:
+            None
         """
+        # Compose output path
         base_name = "nearest_neighbors_indices"
         filename = f"{base_name}_{chunk_num}.npz"
         if override_directory is not None:
@@ -174,38 +321,43 @@ class sample:
         else:
             save_path = os.path.join(self.directory, filename)
 
-        # Number of atoms = number of sub-arrays
+        # Number of atoms equals number of sub-arrays
         n_atoms = len(index_list)
 
-        # (1) Compute lengths of each sub-array
+        # Build lengths and offsets to delimit each atom's sub-array
         lengths = [arr.size for arr in index_list]
-        # (2) Offsets array: size n_atoms + 1, with a cumsum
         offsets = np.zeros(n_atoms + 1, dtype=np.int64)
         offsets[1:] = np.cumsum(lengths)
 
-        # (3) Concatenate all the sub-arrays in a single pass
+        # Flatten the ragged structure into a single array
         if n_atoms > 0:
             flat_idx = np.concatenate(index_list)
         else:
-            # Handle empty case
+            # Empty case: produce valid, empty arrays
             flat_idx = np.zeros(0, dtype=np.int32)
 
-        # (4) Write to NPZ
+        # Save compressed representation
         np.savez(save_path, flat_idx=flat_idx, offsets=offsets)
         
-    def write_chunk_nn_phase(self, phase_list, chunk_num, override_directory=None):
-        """
-        Write a ragged list of float phases for each atom in a chunk.
 
-        Parameters
-        ----------
-        phase_list : list of 1D np.ndarray(float32)
-            phase_list[i] has shape (num_neighbors_i,) containing the phases for that atom.
-        chunk_num : int
-            The chunk number to write.
-        override_directory : str, optional
-            If provided, write to this directory instead of self.directory.
+    def write_chunk_nn_phase(self, phase_list, chunk_num, override_directory=None):
+        """Write neighbor phases for a chunk to a compact NPZ.
+
+        Produces ``nearest_neighbors_phase_<chunk_num>.npz`` containing:
+        - ``flat_phase``: concatenated float phases for all atoms' neighbors.
+        - ``offsets``: start positions for each atom's neighbor list.
+
+        Args:
+            phase_list (list[np.ndarray]): Ragged list where ``phase_list[i]`` is
+                a 1-D float array (float32 recommended) of phases for atom ``i``.
+            chunk_num (int): 1-based chunk number used in the output filename.
+            override_directory (str | None): If provided, write to this directory
+                instead of ``self.directory``.
+
+        Returns:
+            None
         """
+        # Compose output path
         base_name = "nearest_neighbors_phase"
         filename = f"{base_name}_{chunk_num}.npz"
         if override_directory is not None:
@@ -214,31 +366,40 @@ class sample:
             save_path = os.path.join(self.directory, filename)
 
         n_atoms = len(phase_list)
+
+        # Offsets delimit each atom's sub-array inside the flattened vector
         lengths = [arr.size for arr in phase_list]
         offsets = np.zeros(n_atoms + 1, dtype=np.int64)
         offsets[1:] = np.cumsum(lengths)
 
+        # Flatten ragged list
         if n_atoms > 0:
             flat_phase = np.concatenate(phase_list)
         else:
             flat_phase = np.zeros(0, dtype=np.float32)
 
+        # Persist to disk
         np.savez(save_path, flat_phase=flat_phase, offsets=offsets)
 
     def write_chunk_nn_scatter(self, scatter_list, chunk_num, override_directory=None):
-        """
-        Write a ragged list of wavevectors (kx, ky, kz) for each atom in a chunk.
-        Each element in scatter_list is an array of shape (N_neighbors_i, 3).
+        """Write neighbor wavevectors for a chunk to a compact NPZ.
 
-        Parameters
-        ----------
-        scatter_list : list of arrays
-            scatter_list[i] has shape (N_neighbors_i, 3), storing [kx, ky, kz].
-        chunk_num : int
-            The chunk number to write.
-        override_directory : str, optional
-            If provided, write to this directory instead of self.directory.
+        Each element of ``scatter_list`` has shape ``(N_i, 3)`` with columns
+        ``[kx, ky, kz]``. This function writes:
+        - ``flat_kx``, ``flat_ky``, ``flat_kz``: concatenated components.
+        - ``offsets``: start indices per atom so the ragged lists can be rebuilt.
+
+        Args:
+            scatter_list (list[np.ndarray]): Ragged list where ``scatter_list[i]``
+                has shape ``(N_i, 3)`` containing neighbor wavevectors for atom ``i``.
+            chunk_num (int): 1-based chunk number used in the output filename.
+            override_directory (str | None): If provided, write to this directory
+                instead of ``self.directory``.
+
+        Returns:
+            None
         """
+        # Compose output path
         base_name = "nearest_neighbors_scatter"
         filename = f"{base_name}_{chunk_num}.npz"
         if override_directory is not None:
@@ -247,13 +408,14 @@ class sample:
             save_path = os.path.join(self.directory, filename)
 
         n_atoms = len(scatter_list)
-        # Each element in scatter_list has shape (num_neighbors_i, 3)
-        lengths = [arr.shape[0] for arr in scatter_list]  # neighbors per atom
+
+        # Number of neighbors per atom and offsets into the flattened arrays
+        lengths = [arr.shape[0] for arr in scatter_list]
         offsets = np.zeros(n_atoms + 1, dtype=np.int64)
         offsets[1:] = np.cumsum(lengths)
 
+        # Split and flatten kx, ky, kz components
         if n_atoms > 0:
-            # Flatten kx, ky, kz parts
             flat_kx = np.concatenate([arr[:, 0] for arr in scatter_list])
             flat_ky = np.concatenate([arr[:, 1] for arr in scatter_list])
             flat_kz = np.concatenate([arr[:, 2] for arr in scatter_list])
@@ -262,28 +424,31 @@ class sample:
             flat_ky = np.zeros(0, dtype=np.float32)
             flat_kz = np.zeros(0, dtype=np.float32)
 
-        # Save to NPZ
+        # Persist to disk
         np.savez(save_path, flat_kx=flat_kx, flat_ky=flat_ky, flat_kz=flat_kz, offsets=offsets)
         
     def write_chunk_nn_species(self, species_list, chunk_num, override_directory=None):
-        """
-        Write a ragged list of neighbor species for each atom in a chunk.
+        """Write neighbor species for a chunk to a compact NPZ.
 
-        This mirrors the pattern used by write_chunk_nn_phase / write_chunk_nn_scatter:
-        we flatten the species arrays into a single array and store an offsets array.
+        Produces ``nearest_neighbors_species_<chunk_num>.npz`` with:
+        - ``flat_species``: concatenated neighbor species values.
+        - ``offsets``: start positions per atom (length n_atoms + 1).
 
-        Parameters
-        ----------
-        species_list : list of 1D arrays (could be string dtype, int dtype, etc.)
-            species_list[i] has shape (num_neighbors_i,) storing the species of each neighbor
-            for atom i. The dtype can be anything numpy supports (str, int, object), but note
-            that some dtypes (e.g., object) may be less portable than numeric or fixed-length
-            string arrays.
-        chunk_num : int
-            The chunk number to write.
-        override_directory : str, optional
-            If provided, write to this directory instead of self.directory.
+        Notes:
+            ``flat_species`` dtype may be numeric or string depending on input.
+            For maximum portability, prefer fixed-length dtypes over object arrays.
+
+        Args:
+            species_list (list[np.ndarray]): Ragged list where ``species_list[i]``
+                is a 1-D array of species values for atom ``i``.
+            chunk_num (int): 1-based chunk number used in the output filename.
+            override_directory (str | None): If provided, write to this directory
+                instead of ``self.directory``.
+
+        Returns:
+            None
         """
+        # Compose output path
         base_name = "nearest_neighbors_species"
         filename = f"{base_name}_{chunk_num}.npz"
         if override_directory is not None:
@@ -292,84 +457,109 @@ class sample:
             save_path = os.path.join(self.directory, filename)
 
         n_atoms = len(species_list)
+
+        # Offsets delimit each atom's species slice inside the flattened vector
         lengths = [arr.size for arr in species_list]
         offsets = np.zeros(n_atoms + 1, dtype=np.int64)
         offsets[1:] = np.cumsum(lengths)
 
-        # Concatenate all sub-arrays
+        # Concatenate ragged species values
         if n_atoms > 0:
-            # Make sure they can be concatenated.  If they are strings or mixed types,
-            # you might want to ensure they share a compatible dtype.  We'll assume so:
             flat_species = np.concatenate(species_list)
         else:
-            # Handle empty case
-            flat_species = np.array([], dtype=species_list[0].dtype if n_atoms>0 else np.int32)
+            # Empty case: choose a safe numeric dtype
+            flat_species = np.array([], dtype=species_list[0].dtype if n_atoms > 0 else np.int32)
 
-        # Save to NPZ
+        # Persist to disk
         np.savez(save_path, flat_species=flat_species, offsets=offsets)
         
     def load_chunk_nn_indices(self, chunk_num):
+        """Load neighbor indices for a chunk.
+
+        Reads ``nearest_neighbors_indices_<chunk_num>.npz`` and returns the
+        flattened indices and offsets.
+
+        Args:
+            chunk_num (int): 1-based chunk number to load.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: ``(flat_idx, offsets)`` where
+            ``flat_idx`` is a 1-D int array of all neighbor indices and
+            ``offsets`` is a 1-D int64 array of length n_atoms + 1.
+
+        Raises:
+            FileNotFoundError: If the NPZ file is missing.
         """
-        Load the flat nearest-neighbor index array and offsets for a chunk.
-        Returns (flat_idx, offsets).
-        """
+        # Build expected path and verify existence
         base_name = "nearest_neighbors_indices"
         filename = f"{base_name}_{chunk_num}.npz"
         full_path = os.path.join(self.directory, filename)
         if not os.path.isfile(full_path):
             raise FileNotFoundError(f"NN indices file not found: {full_path}")
 
+        # Load arrays from NPZ
         with np.load(full_path) as data:
-            flat_idx = data['flat_idx']  # shape (total_size,)
-            offsets = data['offsets']    # shape (n_atoms+1,)
+            flat_idx = data['flat_idx']
+            offsets = data['offsets']
 
         return flat_idx, offsets
 
 
     def load_chunk_nn_phase(self, chunk_num):
+        """Load neighbor phases for a chunk.
+
+        Reads ``nearest_neighbors_phase_<chunk_num>.npz`` and returns the
+        flattened phases and offsets.
+
+        Args:
+            chunk_num (int): 1-based chunk number to load.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: ``(flat_phase, offsets)`` where
+            ``flat_phase`` is a 1-D float array and ``offsets`` is a 1-D
+            int64 array of length n_atoms + 1.
+
+        Raises:
+            FileNotFoundError: If the NPZ file is missing.
         """
-        Load the flat nearest-neighbor phase array and offsets for a chunk.
-        Returns (flat_phase, offsets).
-        """
+        # Build expected path and verify existence
         base_name = "nearest_neighbors_phase"
         filename = f"{base_name}_{chunk_num}.npz"
         full_path = os.path.join(self.directory, filename)
         if not os.path.isfile(full_path):
             raise FileNotFoundError(f"NN phase file not found: {full_path}")
 
+        # Load arrays from NPZ
         with np.load(full_path) as data:
-            flat_phase = data['flat_phase']  # shape (total_size,)
-            offsets = data['offsets']        # shape (n_atoms+1,)
+            flat_phase = data['flat_phase']
+            offsets = data['offsets']
 
         return flat_phase, offsets
 
     def load_chunk_nn_scatter(self, chunk_num):
-        """
-        Load the flat nearest-neighbor wavevector arrays and offsets for a chunk.
-        Now stores kx, ky, kz in separate arrays.
+        """Load neighbor wavevectors for a chunk.
 
-        Parameters
-        ----------
-        chunk_num : int
-            The chunk number to load.
+        Reads ``nearest_neighbors_scatter_<chunk_num>.npz`` and returns the
+        flattened ``kx``, ``ky``, ``kz`` arrays and the offsets vector.
 
-        Returns
-        -------
-        flat_kx : np.ndarray
-            Concatenated kx values for all atoms' neighbors.
-        flat_ky : np.ndarray
-            Concatenated ky values for all atoms' neighbors.
-        flat_kz : np.ndarray
-            Concatenated kz values for all atoms' neighbors.
-        offsets : np.ndarray
-            The offsets array of shape (n_atoms+1,).
+        Args:
+            chunk_num (int): 1-based chunk number to load.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                ``(flat_kx, flat_ky, flat_kz, offsets)``.
+
+        Raises:
+            FileNotFoundError: If the NPZ file is missing.
         """
+        # Build expected path and verify existence
         base_name = "nearest_neighbors_scatter"
         filename = f"{base_name}_{chunk_num}.npz"
         full_path = os.path.join(self.directory, filename)
         if not os.path.isfile(full_path):
             raise FileNotFoundError(f"NN scatter file not found: {full_path}")
 
+        # Load arrays from NPZ
         with np.load(full_path) as data:
             flat_kx = data['flat_kx']
             flat_ky = data['flat_ky']
@@ -379,37 +569,35 @@ class sample:
         return flat_kx, flat_ky, flat_kz, offsets
     
     def load_chunk_nn_species(self, chunk_num):
+        """Load neighbor species for a chunk.
+
+        Reads ``nearest_neighbors_species_<chunk_num>.npz`` and returns the
+        flattened species array and offsets.
+
+        Example:
+            To reconstruct the ragged lists:
+
+                flat_spc, offsets = self.load_chunk_nn_species(chunk_num)
+                species_list = [flat_spc[offsets[i]:offsets[i+1]]
+                                for i in range(offsets.size - 1)]
+
+        Args:
+            chunk_num (int): 1-based chunk number to load.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: ``(flat_species, offsets)``.
+
+        Raises:
+            FileNotFoundError: If the NPZ file is missing.
         """
-        Load the flat nearest-neighbor species array and offsets for a chunk.
-        Returns (flat_species, offsets).
-
-        You can reconstruct the ragged species_list by something like:
-
-            (flat_spc, offsets) = load_chunk_nn_species(...)
-            species_list = []
-            for i in range(offsets.size - 1):
-                start = offsets[i]
-                end   = offsets[i+1]
-                species_list.append(flat_spc[start:end])
-
-        Parameters
-        ----------
-        chunk_num : int
-            Which chunk to load.
-
-        Returns
-        -------
-        flat_species : np.ndarray
-            The concatenated neighbor species for all atoms in this chunk.
-        offsets : np.ndarray, shape (n_atoms+1,)
-            offsets[i] is the start index of the i-th atom's neighbor-species in flat_species.
-        """
+        # Build expected path and verify existence
         base_name = "nearest_neighbors_species"
         filename = f"{base_name}_{chunk_num}.npz"
         full_path = os.path.join(self.directory, filename)
         if not os.path.isfile(full_path):
             raise FileNotFoundError(f"NN species file not found: {full_path}")
 
+        # allow_pickle=True to support non-numeric species types if present
         with np.load(full_path, allow_pickle=True) as data:
             flat_species = data['flat_species']
             offsets = data['offsets']
@@ -420,63 +608,117 @@ class sample:
     # -------------------------------------
     # MD sample   
     def import_atomic_data(self, import_file, element_list, header_lines=9, ID_column=1, position_columns=[2,3,4], scale=1e-10, flush_size=100000000, override_directory=None):
+        """Import a large text file of atoms and write chunked .npy outputs.
+
+        Reads atomic positions and species from a text file, skipping a header,
+        and streams them into fixed-size binary chunks for positions/species.
+        Also computes the axis-aligned bounding box to infer sample dimensions
+        and offset, and records the number of written chunks.
+
+        The input line is split on whitespace. The species identifier is read
+        from ``ID_column`` (0-based column index) and is expected to be a
+        1-based integer ID; it is mapped to ``element_list[id-1]``. Positions
+        are taken from ``position_columns`` and multiplied by
+        ``scale/1e-10`` so they end up in the same units as the rest of the
+        code (angstroms by default). With the default ``scale=1e-10``, values
+        are unchanged.
+
+        Args:
+            import_file (str): Path to the input text file.
+            element_list (list[str]): Map from 1-based species IDs in the file
+                to element symbols or species labels.
+            header_lines (int, optional): Number of header lines to skip.
+                Defaults to 9.
+            ID_column (int, optional): 0-based column index containing the
+                1-based species ID. Defaults to 1.
+            position_columns (list[int], optional): 0-based indices of x, y, z
+                position columns. Defaults to [2, 3, 4].
+            scale (float, optional): Conversion factor from input units to meters.
+                Values are multiplied by ``scale/1e-10`` to convert to angstroms.
+                Defaults to 1e-10.
+            flush_size (int, optional): Number of atoms per written chunk.
+                Defaults to 100_000_000.
+            override_directory (str | None, optional): Directory to write files
+                to instead of ``self.directory``. Defaults to None.
+
+        Returns:
+            None
+
+        Raises:
+            FileNotFoundError: If ``import_file`` does not exist.
+            ValueError: If parsing fails due to malformed lines.
+
+        Notes:
+            - After completion, ``_chunk_total``, ``_dimensions``, ``_offset``,
+              and ``_rotation`` are updated.
+            - This function streams lines to bound memory usage on very large files.
         """
-        Reads the atoms from a large text file, skipping the first 9 lines, and
-        chunks them into binary .npy files of size flush_size in the desired folder.
-        
-        The atomic positions are assumed to be in columns 3,4,5 of each line (1-based indexing).
-        Also recovers 'dimensions', 'offset', and 'chunk_total' from the bounding box
-        of these atomic positions.
-        """
-        chunk_num = 0
-        # Track min/max in x,y,z to calculate dimensions and offset afterward
+        chunk_num = 0  # running chunk counter
+
+        # Track bounding box while streaming the file
         x_min = y_min = z_min = float('inf')
         x_max = y_max = z_max = float('-inf')
+
+        # Open and iterate in batches of up to flush_size lines
         with open(import_file, "r") as f:
-            # Skip the first 9 lines
+            # Skip header lines at the top of the file
             for _ in range(header_lines):
                 next(f)
+
             while True:
-                # Read up to flush_size lines at a time
                 lines = []
+                # Collect up to flush_size lines for this batch
                 for _ in range(flush_size):
                     line = f.readline()
                     if not line:
                         break
                     lines.append(line)
-                # If no lines were read, we're at EOF
+
+                # End when we have no more lines
                 if not lines:
                     break
-                # Parse positions from columns 3,4,5
+
+                # Parse positions/species from the batch
                 data_arr = np.zeros((len(lines), 3), dtype=np.float32)
                 species_arr = []
                 for i, line in enumerate(lines):
                     split_line = line.strip().split()
-                    species_arr.append(element_list[int(split_line[ID_column])-1])
-                    data_arr[i, 0] = float(split_line[position_columns[0]])*float(scale/1e-10)
-                    data_arr[i, 1] = float(split_line[position_columns[1]])*float(scale/1e-10)
-                    data_arr[i, 2] = float(split_line[position_columns[2]])*float(scale/1e-10)
-                    # Update bounding box
+
+                    # Map 1-based species ID to label via provided element_list
+                    species_arr.append(element_list[int(split_line[ID_column]) - 1])
+
+                    # Convert coordinates; default keeps angstrom units unchanged
+                    data_arr[i, 0] = float(split_line[position_columns[0]]) * float(scale / 1e-10)
+                    data_arr[i, 1] = float(split_line[position_columns[1]]) * float(scale / 1e-10)
+                    data_arr[i, 2] = float(split_line[position_columns[2]]) * float(scale / 1e-10)
+
+                    # Update bounding box online to avoid a second pass
                     if data_arr[i, 0] < x_min: x_min = data_arr[i, 0]
                     if data_arr[i, 0] > x_max: x_max = data_arr[i, 0]
                     if data_arr[i, 1] < y_min: y_min = data_arr[i, 1]
                     if data_arr[i, 1] > y_max: y_max = data_arr[i, 1]
                     if data_arr[i, 2] < z_min: z_min = data_arr[i, 2]
                     if data_arr[i, 2] > z_max: z_max = data_arr[i, 2]
-                # Increment chunk number and save the positions
+
+                # Bump the chunk index and persist this batch
                 chunk_num += 1
                 self.write_chunk_positions(data_arr, chunk_num, override_directory=override_directory)
                 self.write_chunk_species(species_arr, chunk_num, override_directory=override_directory)
-        # Record how many chunks were created
+
+        # Record how many chunks were written to disk
         self._chunk_total = chunk_num
-        # Infer dimensions from bounding box
-        self._dimensions = np.array([x_max - x_min, 
-                                    y_max - y_min, 
-                                    z_max - z_min], dtype=np.float32)
-        # Offset is the midpoint of the bounding box (center)
+
+        # Infer sample box dimensions from the bounding box
+        self._dimensions = np.array([x_max - x_min,
+                                     y_max - y_min,
+                                     z_max - z_min], dtype=np.float32)
+
+        # Center (offset) is the mid-point of the bounding box
         self._offset = np.array([(x_min + x_max) / 2.0,
-                                (y_min + y_max) / 2.0,
-                                (z_min + z_max) / 2.0], dtype=np.float32)
+                                 (y_min + y_max) / 2.0,
+                                 (z_min + z_max) / 2.0], dtype=np.float32)
+
+        # Set default rotation to identity
         self._rotation = np.eye(3)
     # -------------------------------------
 
@@ -485,6 +727,16 @@ class sample:
     # General
     @staticmethod
     def get_unit_corners():
+        """Return the 8 corners of the unit cube as an (8, 3) float32 array.
+
+        The ordering matches bit-coded vertices used elsewhere:
+        index i has bits (x,y,z) taken from (i&1, (i>>1)&1, (i>>2)&1).
+        This convention is consistent with the SAT C code for rebuilding corners.
+
+        Returns:
+            np.ndarray: Array of shape (8, 3) with values in {0, 1}.
+        """
+        # Corners of a unit axis-aligned box in the order expected by SAT code
         unit_corners = np.array([
             [0, 0, 0],
             [1, 0, 0],
@@ -497,11 +749,20 @@ class sample:
         return unit_corners
     
     @staticmethod
-    def get_rotation(axis,angle):
+    def get_rotation(axis, angle):
+        """Compute a 3x3 rotation matrix for a rotation about an axis.
+
+        The input axis is normalized inside this function. The rotation follows
+        the right-hand rule.
+
+        Args:
+            axis (array-like): Length-3 vector representing the rotation axis.
+            angle (float): Rotation angle in radians.
+
+        Returns:
+            np.ndarray: 3x3 rotation matrix.
         """
-        Return the 3x3 rotation matrix for rotation by 'angle' radians
-        around the (normalized) 'axis'.
-        """
+        # Normalize axis to ensure a proper rotation basis
         axis = axis / np.linalg.norm(axis)
         c = np.cos(angle)
         s = np.sin(angle)
@@ -513,20 +774,35 @@ class sample:
     
     @staticmethod
     def get_flat_grid(dimensions, use_gpu=False):
-        """
-        Create a 3D grid of integer coordinates as an (N, 3) array without
-        materializing three full 3D arrays. Returns float32 for parity with GPU.
+        """Create a flat grid of integer coordinates as an (N, 3) array.
+
+        The grid spans [0..d0-1] x [0..d1-1] x [0..d2-1] in row-major order
+        without materializing a full 3D tensor. Returned dtype is float32 to
+        match downstream GPU code.
+
+        Args:
+            dimensions (array-like): Length-3 iterable of integers (d0, d1, d2).
+            use_gpu (bool, optional): If True and CuPy is available, return a
+                ``cp.ndarray``; otherwise return a ``np.ndarray``. Defaults to False.
+
+        Returns:
+            np.ndarray or cp.ndarray: Array of shape (d0*d1*d2, 3), dtype float32.
+
+        Notes:
+            This function uses repeat/tile to generate coordinates efficiently.
         """
         d0 = int(dimensions[0])
         d1 = int(dimensions[1])
         d2 = int(dimensions[2])
 
         if use_gpu and (cp is not None):
+            # GPU path: build i, j, k using cp repeat/tile and stack
             ii = cp.repeat(cp.arange(d0, dtype=cp.float32), d1 * d2)
             jj = cp.tile(cp.repeat(cp.arange(d1, dtype=cp.float32), d2), d0)
             kk = cp.tile(cp.arange(d2, dtype=cp.float32), d0 * d1)
             return cp.stack((ii, jj, kk), axis=1)
         else:
+            # CPU path: equivalent construction using NumPy
             ii = np.repeat(np.arange(d0, dtype=np.float32), d1 * d2)
             jj = np.tile(np.repeat(np.arange(d1, dtype=np.float32), d2), d0)
             kk = np.tile(np.arange(d2, dtype=np.float32), d0 * d1)
@@ -542,48 +818,72 @@ class sample:
         max_displacement=None,
         seed=40
     ):
-        """
-        Convenience: configure physical mapping (Einstein model) and set temp_params
-        so that enable_temp + temp_params drive temperature-based displacements.
+        """Configure Einstein-model thermal displacements and enable temperature.
 
-        Typical usage:
-            s.set_temperature_einstein(
-                T_K=300,
-                mass_amu=28.0855,
-                theta_E_K=400.0,
-                max_displacement=3.0  # optional per-axis clip, in position units
-            )
-            s.enable_temp = True
+        Sets ``enable_temp=True`` and programs ``temp_params`` to use the
+        Einstein model, where the random displacement variance is derived from
+        temperature and oscillator frequency.
 
-        For per-species control, pass dictionaries:
-            species_mass_amu = {'Si': 28.0855, 'C': 12.011}
-            species_theta_E_K = {'Si': 645.0, 'C': 2230.0}
+        You may specify either global values (``mass_amu``, ``theta_E_K``) or
+        per-species dictionaries (``species_mass_amu``, ``species_theta_E_K``).
+        If per-species dicts are provided and a ``chunk_number`` is later passed
+        into ``apply_temperature``, the per-atom mass and theta_E will be looked
+        up from the species data stored on disk.
+
+        Args:
+            T_K (float): Target temperature in kelvin.
+            mass_amu (float | None): Global atomic mass in amu, used if per-species
+                masses are not provided. Optional.
+            theta_E_K (float | None): Global Einstein temperature (K), used if
+                per-species values are not provided. Optional.
+            species_mass_amu (dict[str, float] | None): Map species label -> mass.
+            species_theta_E_K (dict[str, float] | None): Map species label -> theta_E.
+            max_displacement (float | None): Optional per-axis clip in position units.
+            seed (int, optional): Random seed for reproducibility. Defaults to 40.
+
+        Returns:
+            None
+
+        Notes:
+            - Default position unit is angstrom; override with
+              ``set_position_unit_in_m`` if positions are in a different unit.
+            - This function only configures parameters; displacements are applied
+              when ``apply_temperature`` is called.
         """
-        # Configure temp_params to use the new 'einstein' mode.
+        # Enable temperature-driven displacements via the Einstein model
         self.enable_temp = True
         self.temp_params = ['einstein', float(T_K), max_displacement, seed]
 
-        # Save global fallbacks if provided
+        # Save optional global fallbacks
         if mass_amu is not None:
             self._temp_mass_amu = float(mass_amu)
         if theta_E_K is not None:
             self._temp_theta_E_K = float(theta_E_K)
 
-        # Save optional per-species maps
+        # Save optional per-species overrides
         if species_mass_amu is not None:
             self._temp_species_mass_amu = dict(species_mass_amu)
         if species_theta_E_K is not None:
             self._temp_species_theta_E_K = dict(species_theta_E_K)
 
-        # Default position unit is angstrom. Override with set_position_unit_in_m if needed.
+        # Default position unit is angstrom (1e-10 m) unless user overrides later
         if not hasattr(self, '_position_unit_in_m'):
             self._position_unit_in_m = 1.0e-10
 
     def set_position_unit_in_m(self, unit_in_m):
+        """Set the conversion factor from the position unit to meters.
+
+        This affects the Einstein-model conversion from mean-square displacement
+        in meters^2 to the position units of your arrays.
+
+        Args:
+            unit_in_m (float): Number of meters represented by 1 position unit
+                in your arrays (e.g., 1e-10 for angstrom, 1e-9 for nanometer).
+
+        Returns:
+            None
         """
-        Set the conversion from one position unit to meters.
-        Default is 1e-10 (angstrom). Set to 1e-9 for nanometer units, etc.
-        """
+        # Store the unit scale so apply_temperature can convert correctly
         self._position_unit_in_m = float(unit_in_m)
 
     def apply_temperature(
@@ -595,41 +895,67 @@ class sample:
         seed=40,
         chunk_number=None
     ):
+        """Apply random displacements to positions using a chosen distribution.
+
+        Two modes are supported:
+
+        1) ``distribution='gaussian'``:
+           - ``sigma`` is the standard deviation in position units.
+        2) ``distribution='einstein'``:
+           - ``sigma`` is interpreted as temperature in kelvin.
+           - The per-atom Gaussian width is computed from the Einstein model:
+             <x^2> = (hbar / (2 m omega)) * coth(hbar*omega / (2 k_B T)),
+             with omega = k_B * theta_E / hbar.
+           - If per-species mass and theta_E were configured with
+             ``set_temperature_einstein`` and ``chunk_number`` is provided, the
+             correct per-atom parameters are used by reading species for that chunk.
+
+        Args:
+            positions (np.ndarray or cp.ndarray): Array of shape (N, 3).
+            distribution (str, optional): 'gaussian' or 'einstein'. Defaults to 'gaussian'.
+            sigma (float, optional): Stddev (gaussian) or temperature K (einstein).
+                Defaults to 0.25.
+            max_displacement (float | None, optional): Optional per-axis clip on
+                the displacement magnitude. Defaults to 1.
+            seed (int | None, optional): Random seed for reproducibility. Set to
+                None to avoid reseeding. Defaults to 40.
+            chunk_number (int | None, optional): Chunk index used to fetch
+                per-atom species on CPU for per-species Einstein parameters.
+
+        Returns:
+            np.ndarray or cp.ndarray: Displaced positions of the same shape and backend.
+
+        Raises:
+            ValueError: If an unknown ``distribution`` is provided.
+
+        Notes:
+            - Backend (NumPy vs CuPy) is inferred from ``positions`` type.
+            - If ``T_K <= 0`` in Einstein mode, only zero-point motion is applied.
         """
-        Apply random displacements to 'positions' according to:
-        - 'gaussian': same behavior as before; 'sigma' is stddev in position units.
-        - 'einstein': 'sigma' now means temperature in kelvin; we compute the
-            physically-based Gaussian width from the Einstein model:
-                <x^2> = (hbar / (2 m omega)) * coth(hbar*omega / (2 k_B T))
-            where omega = k_B * theta_E / hbar. You configure m (amu) and theta_E (K)
-            globally or per species using 'set_temperature_einstein' (see helper below).
-        The optional 'max_displacement' still clips each coordinate if provided.
-        A random 'seed' is used for reproducibility.
-        """
-        # Select backend
+        # Select backend based on input array type
         use_cp = (cp is not None) and isinstance(positions, cp.ndarray)
         xp = cp if use_cp else np
 
-        # Seed RNG
+        # Seed the RNG for deterministic noise if a seed is provided
         if seed is not None:
             if use_cp:
                 cp.random.seed(int(seed))
             else:
                 np.random.seed(int(seed))
 
-        # Fast path: keep original Gaussian behavior
+        # Mode 1: plain Gaussian displacements with a single sigma
         if isinstance(distribution, str) and distribution.lower() in ('gaussian', 'normal'):
             displacements = xp.random.normal(loc=0.0, scale=float(sigma), size=positions.shape)
             if (max_displacement is not None) and (max_displacement > 0.0):
                 xp.clip(displacements, -max_displacement, max_displacement, out=displacements)
             return positions + displacements
 
-        # Temperature-driven displacement using the Einstein model
+        # Mode 2: Einstein-model temperature-driven displacements
         if isinstance(distribution, str) and distribution.lower() in ('einstein', 'temperature', 'kelvin'):
-            # 'sigma' carries T in kelvin in this mode
+            # Treat sigma as temperature in kelvin in this mode
             T_K = float(sigma)
 
-            # Position unit scale: default assumes arrays are in angstroms (1e-10 m)
+            # Conversion from position units to meters (default assumes angstroms)
             pos_unit_m = getattr(self, '_position_unit_in_m', 1e-10)
 
             # Physical constants (SI)
@@ -639,7 +965,7 @@ class sample:
 
             N = int(positions.shape[0])
 
-            # Resolve masses and Einstein temperatures (either per species or global)
+            # Resolve per-atom mass and theta_E (per-species if configured)
             masses_amu = None
             thetaE_K = None
 
@@ -652,7 +978,7 @@ class sample:
             )
 
             if have_per_species:
-                # Load species for this chunk on CPU; map to arrays of m and theta_E
+                # Load species on CPU for this chunk and map to arrays of m and theta_E
                 species = self.load_chunk_species(chunk_number, use_gpu=False)
                 masses_amu = np.empty(N, dtype=np.float64)
                 thetaE_K = np.empty(N, dtype=np.float64)
@@ -666,49 +992,43 @@ class sample:
                     masses_amu[i] = self._temp_species_mass_amu.get(key, m_default)
                     thetaE_K[i] = self._temp_species_theta_E_K.get(key, th_default)
             else:
-                # Use global values (with safe fallbacks)
+                # Use global values (with safe fallbacks) for all atoms
                 m_default = getattr(self, '_temp_mass_amu', 28.0)
                 th_default = getattr(self, '_temp_theta_E_K', 300.0)
                 masses_amu = np.full(N, m_default, dtype=np.float64)
                 thetaE_K = np.full(N, th_default, dtype=np.float64)
 
-            # Move to correct backend
+            # Move to the active backend and compute omega from theta_E
             m_kg = xp.asarray(masses_amu, dtype=xp.float64) * amu_to_kg
             thetaE_K = xp.asarray(thetaE_K, dtype=xp.float64)
-
-            # omega from theta_E: omega = k_B * theta_E / hbar
             omega = (k_B * thetaE_K) / hbar
 
-            # Handle coth safely for very small and very large arguments
-            # z = hbar * omega / (2 k_B T)
+            # Compute coth term robustly; handle T_K <= 0 by zero-point motion
             if T_K <= 0.0:
-                # Zero temperature -> zero-point motion only: coth(z)->1
                 coth_z = xp.ones_like(omega, dtype=xp.float64)
             else:
                 z = (hbar * omega) / (2.0 * k_B * T_K)
-                # Use series near zero to avoid 1/tanh underflow
                 small = z < 1.0e-6
                 coth_series = (1.0 / z) + (z / 3.0)
                 coth_exact = 1.0 / xp.tanh(z)
                 coth_z = xp.where(small, coth_series, coth_exact)
 
-            # <x^2> in meters^2
+            # Mean-square displacement in meters^2, then convert to position units
             msd_m2 = (hbar / (2.0 * m_kg * omega)) * coth_z
-            # Convert to position units (angstroms if pos_unit_m = 1e-10)
-            sigma_units = xp.sqrt(msd_m2) / pos_unit_m  # shape (N,)
+            sigma_units = xp.sqrt(msd_m2) / pos_unit_m  # per-atom sigma in position units
 
-            # Draw Gaussian displacements with per-atom sigma
+            # Draw per-atom Gaussian noise and cast to match input dtype
             rand = xp.random.standard_normal(size=positions.shape)
             displacements = rand * sigma_units.reshape(-1, 1)
-            # Match dtype of input
             displacements = displacements.astype(positions.dtype, copy=False)
 
+            # Optionally clip each coordinate
             if (max_displacement is not None) and (max_displacement > 0.0):
                 xp.clip(displacements, -max_displacement, max_displacement, out=displacements)
 
             return positions + displacements
 
-        # Unknown distribution keyword
+        # Anything else is unsupported
         raise ValueError("Unknown distribution: {}".format(distribution))
     # -------------------------------------
         
@@ -716,10 +1036,32 @@ class sample:
     # Sample generation
     @staticmethod    
     def compile_parallelepipeds_intersect_batch_cffi():
-        '''
-        C++ code using 15-axis SAT method for determining if a set of cornerpoints intersects
-        with another, made to run a batch operation of corner points against a single reference.
-        '''
+        """Compile the CFFI SAT intersection batch function.
+
+        Builds and verifies a small C module implementing a 15-axis Separating
+        Axis Theorem (SAT) test for parallelepipeds. The compiled module
+        exposes:
+
+            int check_parallelepipeds_intersect_batch(
+                const double *all_pts1,
+                const double *pts2,
+                double eps,
+                int n,
+                int *out_intersect
+            );
+
+        where each shape is represented by 8 corners (24 doubles). The function
+        returns an FFI object and the compiled module handle.
+
+        Returns:
+            tuple[FFI, <cffi.verifier.VerifiedModule>]: ``(ffi_obj, compiled_module)``
+
+        Notes:
+            - The corner ordering must match ``get_unit_corners``.
+            - ``eps`` is used to skip near-degenerate axes in the SAT test.
+        """
+        # C source implementing dot/cross helpers, projection, interval overlap,
+        # single-shape SAT, and a batch wrapper over n shapes.
         c_source = r'''
         #include <math.h>
         #include <stdlib.h> // for malloc/free if needed
@@ -899,6 +1241,7 @@ class sample:
             return 0; // success
         }
         '''
+        # Define the C function signature for the FFI layer
         ffi_obj = FFI()
         ffi_obj.cdef("""int check_parallelepipeds_intersect_batch(
             const double *all_pts1,
@@ -907,7 +1250,11 @@ class sample:
             int n,
             int *out_intersect);
         """)
+
+        # Compile and link the C code at runtime with optimization enabled
         C_mod = ffi_obj.verify(c_source, extra_compile_args=["-O3"], libraries=[])
+
+        # Return both the FFI handle and the compiled module (used to call the function)
         return ffi_obj, C_mod
     # -------------------------------------
     
@@ -915,8 +1262,22 @@ class sample:
     # KNN search
     @staticmethod
     def build_cell_list_count_kernel():
-        '''
-        '''
+        """Build and return the CUDA kernel that counts items per cell.
+
+        Compiles a CUDA C kernel that:
+        1) Computes a cell index for each point given an axis-aligned bounding
+           box and uniform cubic cell size.
+        2) Atomically increments the per-cell count.
+        3) Writes the per-point cell index for use in a second pass.
+
+        Returns:
+            cupy.cuda.function.Function: Compiled CUDA kernel function
+            ``cell_list_count_kernel`` ready to launch.
+
+        Notes:
+            - Requires CuPy with NVCC toolchain available.
+            - The kernel expects positions as a flat float32 array shaped (N, 3).
+        """
         _cell_list_count_kernel = r'''
         extern "C" __global__
         void cell_list_count_kernel(const float* __restrict__ positions,
@@ -959,7 +1320,7 @@ class sample:
             atomicAdd(&cell_counts[cell_id], 1);
         }
         '''
-        # Build raw module
+        # Build the raw CUDA module and fetch the kernel entry point
         kernel_module = cp.RawModule(
             code=_cell_list_count_kernel,
             backend='nvcc',
@@ -969,6 +1330,21 @@ class sample:
 
     @staticmethod
     def build_cell_list_fill_kernel():
+        """Build and return the CUDA kernel that fills sorted cell lists.
+
+        Compiles a CUDA C kernel that:
+        1) Uses the per-point cell index to place each point into a compact,
+           cell-contiguous array using atomic adds on a per-cell write pointer.
+        2) Writes both sorted positions and the original point indices.
+
+        Returns:
+            cupy.cuda.function.Function: Compiled CUDA kernel function
+            ``cell_list_fill_kernel`` ready to launch.
+
+        Notes:
+            - Expects that ``cell_offsets`` already contains the starting offsets
+              for each cell (usually the exclusive prefix sum of counts).
+        """
         _cell_list_fill_kernel = r'''
         extern "C" __global__
         void cell_list_fill_kernel(const float* __restrict__ positions,
@@ -993,7 +1369,7 @@ class sample:
             sorted_indices[pos] = idx;  // keep track of original (unsorted) index
         }
         '''
-        # Build raw module
+        # Build the raw CUDA module and fetch the kernel entry point
         kernel_module = cp.RawModule(
             code=_cell_list_fill_kernel,
             backend='nvcc',
@@ -1006,42 +1382,71 @@ class sample:
     # -------------------------------------
     # General
     def zero_sample_position(self, use_gpu=True):
+        """Center all atom positions by subtracting the current offset.
+
+        Reloads each chunk, subtracts ``self.offset`` from every position, and
+        writes them back to disk. Finally sets ``self._offset`` to zeros.
+
+        Args:
+            use_gpu (bool, optional): If True and CuPy is available, load and
+                process chunks on GPU before saving back to CPU. Defaults to True.
+
+        Raises:
+            ValueError: If ``_offset`` or ``_chunk_total`` is not initialized.
+
+        Returns:
+            None
         """
-        Re-loads each chunk of atomic positions, subtracts the current self.offset
-        from every position (centering them), and writes them back out.
-        Finally sets self.offset to [0,0,0].
-        """
+        # Validate that offset and chunk count are known
         if self._offset is None:
             raise ValueError("Offset is not initialized. Please set self._offset or load metadata first.")
 
         if self._chunk_total is None:
             raise ValueError("Chunk total is not initialized. Please generate sample or import atoms first.")
         
+        # Cache offset as float32 for consistent arithmetic
         offset_np = self.offset.astype(np.float32)
 
         for i in range(self.chunk_total):
+            # Load the i-th chunk (1-based chunk files)
             positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
             
             if cp is not None and isinstance(positions_chunk, cp.ndarray):
+                # GPU path: subtract offset on device, then bring to host for writing
                 positions_chunk -= cp.array(offset_np)
                 positions_chunk_cpu = positions_chunk.get()
                 self.write_chunk_positions(positions_chunk_cpu, i + 1)
             else:
+                # CPU path
                 positions_chunk -= offset_np
                 self.write_chunk_positions(positions_chunk, i + 1)
 
+        # Reset offset to the origin
         self._offset = np.zeros(3, dtype=np.float32)
         print("All atomic positions re-centered. Offset is now [0, 0, 0].")
         
     def zero_sample_rotation(self, use_gpu=True):
+        """Remove the current global rotation from all atom positions.
+
+        Reloads each chunk, right-multiplies all positions by ``self._rotation.T``
+        (the inverse for an orthonormal rotation), writes them back, and then
+        resets ``self._rotation`` to identity.
+
+        Args:
+            use_gpu (bool, optional): If True and CuPy is available, perform the
+                rotation on GPU before saving to CPU. Defaults to True.
+
+        Raises:
+            ValueError: If ``_rotation`` or ``_chunk_total`` is not initialized.
+
+        Returns:
+            None
         """
-        Re-loads each chunk of atomic positions, rotates all chunks by the inverse
-        of the current self._rotation, and writes them back out.
-        Finally sets self._rotation to the 3x3 identity matrix.
-        """
+        # Must have a rotation to undo
         if self._rotation is None:
             raise ValueError("No sample rotation matrix is set. Please initialize or load it first.")
         
+        # Inverse of rotation is its transpose for orthonormal matrices
         R_inv = self._rotation.T.astype(np.float32)
         
         if self._chunk_total is None:
@@ -1051,29 +1456,63 @@ class sample:
             positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
             
             if cp is not None and isinstance(positions_chunk, cp.ndarray):
+                # GPU path: do matrix multiply on device
                 R_inv_cp = cp.asarray(R_inv)
                 positions_chunk = positions_chunk @ R_inv_cp
                 positions_chunk_cpu = positions_chunk.get()
                 self.write_chunk_positions(positions_chunk_cpu, i + 1)
             else:
+                # CPU path
                 positions_chunk = positions_chunk @ R_inv
                 self.write_chunk_positions(positions_chunk, i + 1)
         
+        # Reset rotation to identity
         self._rotation = np.eye(3, dtype=np.float32)
         print("All atomic positions de-rotated. Sample rotation is now the identity matrix.")
         
     def zero_sample(self, use_gpu=True):
+        """Center and de-rotate the sample in-place.
+
+        Calls ``zero_sample_position`` followed by ``zero_sample_rotation``.
+
+        Args:
+            use_gpu (bool, optional): If True and CuPy is available, enable GPU
+                acceleration for both steps. Defaults to True.
+
+        Returns:
+            None
+        """
+        # First center positions at the origin, then remove any global rotation
         self.zero_sample_position(use_gpu=use_gpu)
         self.zero_sample_rotation(use_gpu=use_gpu)
         
     def rotate_sample_relative(self, axis, dangle, degrees=True, use_gpu=True):
+        """Apply an additional rotation to all atoms and update state.
+
+        Computes a rotation matrix for the given axis and angle, applies it to
+        every chunk, writes the results, and left-multiplies the stored
+        ``_rotation`` by the new rotation.
+
+        Args:
+            axis (array-like): 3-vector for the rotation axis.
+            dangle (float): Angle of rotation. Interpreted as degrees if
+                ``degrees=True``, otherwise radians.
+            degrees (bool, optional): If True, convert ``dangle`` from degrees
+                to radians. Defaults to True.
+            use_gpu (bool, optional): If True and CuPy is available, perform the
+                rotation on GPU before saving to CPU. Defaults to True.
+
+        Raises:
+            ValueError: If ``_chunk_total`` is not initialized.
+
+        Returns:
+            None
         """
-        Re-loads each chunk of atomic positions, rotates it according to self.get_rotation(axis, dangle),
-        writes them back out, and then updates self._rotation by left-multiplying with the new rotation.
-        """
+        # Convert to radians if specified in degrees
         if degrees:
             dangle = np.deg2rad(dangle)
         
+        # Build the rotation matrix and ensure float32 for consistency
         R = self.get_rotation(axis, dangle).astype(np.float32)
         
         if self._chunk_total is None:
@@ -1082,39 +1521,57 @@ class sample:
         for i in range(self.chunk_total):
             positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
             if cp is not None and isinstance(positions_chunk, cp.ndarray):
+                # GPU path
                 R_cp = cp.asarray(R)
                 positions_chunk = positions_chunk @ R_cp
                 positions_chunk_cpu = positions_chunk.get()
                 self.write_chunk_positions(positions_chunk_cpu, i + 1)
             else:
+                # CPU path
                 positions_chunk = positions_chunk @ R
                 self.write_chunk_positions(positions_chunk, i + 1)
         
+        # Update the stored global rotation
         self._rotation = R @ self._rotation
         print(f"Sample rotated by {dangle:.4f} radians about axis {axis}. "
               f"Updated sample rotation matrix:\n{self._rotation}")
 
-    def translate_sample_relative(self, offset_vector, use_gpu=True): # update this to use dx, dy, dz
-        """
-        Re-loads each chunk of atomic positions, adds the offset_vector to every position,
-        and writes them back out.
-        Finally adds offset_vector to self._offset.
+    def translate_sample_relative(self, offset_vector, use_gpu=True):  # update this to use dx, dy, dz
+        """Translate the sample by adding an offset to all atom positions.
+
+        Reloads each chunk, adds ``offset_vector`` to every position, writes the
+        results, and updates ``self._offset`` accordingly.
+
+        Args:
+            offset_vector (array-like): Length-3 translation vector in position units.
+            use_gpu (bool, optional): If True and CuPy is available, perform the
+                addition on GPU before saving to CPU. Defaults to True.
+
+        Raises:
+            ValueError: If ``_chunk_total`` is not initialized.
+
+        Returns:
+            None
         """
         if self._chunk_total is None:
             raise ValueError("Chunk total is not initialized. Please generate or import sample data first.")
         
+        # Normalize input to float32 ndarray for consistent math
         offset_np = np.array(offset_vector, dtype=np.float32)
         
         for i in range(self.chunk_total):
             positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
             if cp is not None and isinstance(positions_chunk, cp.ndarray):
+                # GPU path
                 positions_chunk += cp.asarray(offset_np)
                 positions_chunk_cpu = positions_chunk.get()
                 self.write_chunk_positions(positions_chunk_cpu, i + 1)
             else:
+                # CPU path
                 positions_chunk += offset_np
                 self.write_chunk_positions(positions_chunk, i + 1)
         
+        # Update the stored offset
         if self._offset is None:
             self._offset = offset_np
         else:
@@ -1126,13 +1583,32 @@ class sample:
     # -------------------------------------
     # Sample generation
     def _gpu_stream_chunk(self, material, chunk_position, chunk_dimensions, stream):
-        """
-        Compute the selected atomic positions for one geometric chunk entirely on a
-        given CUDA stream, and return:
-        pos_sel_cp : cp.ndarray of shape (M, 3), float32, positions after offset shift
-        idx_sel_cp : cp.ndarray of shape (M,), int64, indices into the flattened atoms
-                    (used to map to species on CPU without building a huge tile)
-        This does not synchronize; it only enqueues work on 'stream'.
+        """Generate, filter, and offset a chunk on a given CUDA stream.
+
+        Builds atomic positions for a single geometric chunk entirely on GPU:
+        1) Computes lattice positions in the sample frame.
+        2) Broadcasts unit-cell atom offsets and flattens to sites.
+        3) Applies an in-box mask against [0, dimensions].
+        4) Shifts to centered coordinates using offset - 0.5 * dimensions.
+
+        Args:
+            material: Object holding lattice info with attributes
+                ``lattice_matrix`` (3x3), ``lattice_atom_cartesian`` (A, 3).
+            chunk_position (array-like): Length-3 chunk origin in sample frame.
+            chunk_dimensions (array-like): Length-3 integer extents in unit cells.
+            stream (cupy.cuda.Stream): CUDA stream to enqueue the work on.
+
+        Returns:
+            tuple[cp.ndarray, cp.ndarray]:
+                - pos_sel_cp: (M, 3) float32 positions in centered sample frame.
+                - idx_sel_cp: (M,) int64 indices into the flattened lattice sites.
+
+        Raises:
+            RuntimeError: If CuPy is not available.
+
+        Notes:
+            This function only enqueues work on the provided stream and does not
+            synchronize. The caller decides when to synchronize.
         """
         if cp is None:
             raise RuntimeError("CuPy is not available but _gpu_stream_chunk was called")
@@ -1170,10 +1646,33 @@ class sample:
         return pos_sel_cp, idx_sel_cp
     
     def get_chunk_positions(self, material):
-        """
-        Compute candidate chunk positions and dimensions, prefilter with a cheap
-        AABB test against the sample box [0..dimensions], then run SAT via CFFI
-        only on the survivors. This greatly reduces SAT calls.
+        """Compute candidate chunk origins and dimensions that intersect the sample.
+
+        Workflow:
+          1) Transform the sample corners into the lattice frame and estimate the
+             number of lattice units spanned by the sample.
+          2) Choose a base uniform chunk size from chunk_volume and lattice_volume,
+             then adjust so chunks tile the spanned region.
+          3) Build candidate chunk origins, convert to the sample frame, and form
+             their 8-corner boxes.
+          4) AABB prefilter against [0, dimensions], then run SAT via CFFI on the
+             survivors to keep only true intersections.
+
+        Args:
+            material: An object with fields:
+                - lattice_matrix: 3x3 matrix (crystal-to-sample). Transposed inside.
+                - lattice_volume: Scalar volume of one lattice unit cell.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]:
+                - chunk_positions (float32, shape (M, 3)): Origins of accepted
+                  chunks in the sample frame.
+                - chunk_dimensions (float32, shape (3,)): Integer-like chunk
+                  sizes in lattice units for each axis.
+
+        Notes:
+            Uses an AABB prefilter for speed and then a robust SAT test through
+            :meth:`parallelepipeds_intersect_cffi`.
         """
         lattice_matrix = material.lattice_matrix.T
         lattice_volume = material.lattice_volume
@@ -1192,6 +1691,7 @@ class sample:
         base_cells = np.floor((self.chunk_volume / lattice_volume) ** (1.0 / 3.0))
         chunk_dimensions = np.zeros(lattice_units.shape, dtype=np.float32) + base_cells
 
+        # Ensure chunk_dimensions are not smaller than the sample span along axes
         size_check = lattice_units > chunk_dimensions
         if not np.all(size_check):
             # Keep dims that are not smaller than sample size, adjust others
@@ -1239,6 +1739,7 @@ class sample:
             (cc_max[:, 2] >= sample_min[2]) & (cc_min[:, 2] <= sample_max[2])
         )
 
+        # No candidates survived the AABB test
         if not np.any(aabb_mask):
             return chunk_positions_S[:0, :], chunk_dimensions
 
@@ -1252,7 +1753,7 @@ class sample:
             eps=1e-12
         )
 
-        # Reconstruct full mask
+        # Reconstruct full mask and select survivors
         full_mask = np.zeros(chunk_positions_S.shape[0], dtype=bool)
         full_mask[np.flatnonzero(aabb_mask)] = sat_mask_sub
 
@@ -1260,33 +1761,60 @@ class sample:
         return chunk_positions_S.astype(np.float32, copy=False), chunk_dimensions.astype(np.float32, copy=False)
         
     def parallelepipeds_intersect_cffi(self, compiled_code, ffi_object, pts1, pts2, eps=1e-12):
+        """Run a batched SAT intersection test via the verified CFFI module.
+
+        Converts input arrays to contiguous float64 buffers, passes them to the
+        C function, and returns a boolean mask of intersections.
+
+        Args:
+            compiled_code: Module returned by ``compile_parallelepipeds_intersect_batch_cffi``
+                exposing ``check_parallelepipeds_intersect_batch``.
+            ffi_object: CFFI FFI instance used to create C views of NumPy buffers.
+            pts1 (np.ndarray): Array of shape (N, 8, 3) or equivalent with the 8
+                corners of N boxes in the same frame as ``pts2``.
+            pts2 (np.ndarray): Array of shape (8, 3) with corners of the reference box.
+            eps (float, optional): Axis-length threshold used by the C code to
+                skip near-degenerate separating axes. Defaults to 1e-12.
+
+        Returns:
+            np.ndarray: Boolean array of shape (N,) where True means the
+            corresponding parallelepiped intersects ``pts2``.
         """
-        Faster CFFI bridge: avoid Python lists and extra copies by passing buffers
-        directly to C. Input arrays are made contiguous float64 and referenced
-        through ffi.from_buffer.
-        """
+        # Ensure contiguous float64 buffers for direct C access
         pts1 = np.ascontiguousarray(pts1, dtype=np.float64)
         pts2 = np.ascontiguousarray(pts2, dtype=np.float64)
         n = int(pts1.shape[0])
 
+        # Output buffer for integer flags from C (0 or 1)
         results_int = np.zeros(n, dtype=np.int32)
 
+        # Build CFFI pointers without copying
         c_all = ffi_object.from_buffer("double[]", pts1)
         c_arr2 = ffi_object.from_buffer("double[]", pts2)
         c_out = ffi_object.cast("int *", results_int.ctypes.data)
 
+        # Call the verified C function
         compiled_code.check_parallelepipeds_intersect_batch(
             c_all, c_arr2, float(eps), n, c_out
         )
+        # Convert 0/1 flags to boolean mask
         return results_int == 1
 
     def get_lattice_positions(self, material, chunk_position, chunk_dimensions, use_gpu=True):
-        '''
-        Gets the location of lattice points in the sample frame in a given chunk.
-        
-        If use_gpu=True and cupy is installed, returns a cp.ndarray.
-        Otherwise returns a np.ndarray.
-        '''
+        """Compute lattice point positions in the sample frame for one chunk.
+
+        Args:
+            material: Object with ``lattice_matrix`` (3x3). Transposed internally.
+            chunk_position (array-like): Length-3 origin for this chunk in the
+                sample frame.
+            chunk_dimensions (array-like): Integer-like extents (cells) per axis.
+            use_gpu (bool, optional): If True and CuPy is available, returns a
+                ``cp.ndarray``; otherwise returns a ``np.ndarray``. Defaults to True.
+
+        Returns:
+            np.ndarray or cp.ndarray: Array of shape (d0*d1*d2, 3), dtype float32,
+            with lattice points transformed into the sample frame.
+        """
         lattice_matrix = material.lattice_matrix.T
 
         if use_gpu and (cp is not None):
@@ -1299,8 +1827,7 @@ class sample:
             return lattice_positions_S
 
         else:
-            # CPU path
-            # Ensure single-precision on CPU
+            # CPU path (single-precision for consistency)
             lattice_matrix_np = lattice_matrix.astype(np.float32)
             chunk_position_np = np.array(chunk_position, dtype=np.float32)
 
@@ -1320,23 +1847,48 @@ class sample:
         offset_gpu=None,
         dim_half_gpu=None
     ):
-        """
-        Gets atom positions and species for one geometric chunk.
+        """Build atom positions and species for a single geometric chunk.
 
-        New optional args:
-        - stream: cp.cuda.Stream to enqueue GPU work on.
-        - return_on_gpu: if True, keeps positions/mask on GPU and returns them
-            along with a site_count so the caller can finish on the host later.
-        - lattice_atom_cartesian_cp, offset_gpu, dim_half_gpu:
-            optional preloaded cp arrays to avoid re-uploading per chunk.
+        On GPU:
+            - Expands lattice points by the unit-cell atom offsets,
+              masks to [0, dimensions], applies centering shift (offset - 0.5*dimensions),
+              and optionally returns GPU arrays without host copies.
+        On CPU:
+            - Performs the equivalent operations using NumPy and returns host arrays.
+
+        Args:
+            material: Object with fields:
+                - lattice_atom_cartesian: (A, 3) array of unit-cell atom offsets.
+                - species: 1-D array-like with A species labels for a unit cell.
+            chunk_position (array-like): Length-3 origin in the sample frame.
+            chunk_dimensions (array-like): Integer-like extents (cells) per axis.
+            use_gpu (bool, optional): Enable CuPy path if available. Defaults to True.
+            stream (cupy.cuda.Stream | None, optional): CUDA stream for queuing work.
+            return_on_gpu (bool, optional): If True, returns GPU arrays
+                (positions_cp, mask_cp, site_count) for deferred host processing.
+            lattice_atom_cartesian_cp (cp.ndarray | None, optional): Preloaded
+                device array of ``material.lattice_atom_cartesian`` to avoid
+                re-uploading per chunk.
+            offset_gpu (cp.ndarray | None, optional): Preloaded device copy of
+                ``self.offset``.
+            dim_half_gpu (cp.ndarray | None, optional): Preloaded device copy of
+                ``self.dimensions * 0.5``.
 
         Returns:
-        if return_on_gpu is False (default): (positions_np, species_np)
-        if return_on_gpu is True:  (positions_cp, mask_cp, site_count)
+            tuple:
+                If ``return_on_gpu`` is False (default):
+                    (positions_np, species_np)
+                If ``return_on_gpu`` is True:
+                    (positions_cp, mask_cp, site_count)
+
+        Notes:
+            This method does not synchronize the provided stream; callers should
+            synchronize as needed when ``return_on_gpu`` is True.
         """
         use_gpu = (use_gpu and (cp is not None))
 
         if use_gpu:
+            # Use provided stream or default null stream
             s = stream if (stream is not None) else cp.cuda.Stream.null
 
             with s:
@@ -1377,13 +1929,14 @@ class sample:
                     site_count = int(lattice_positions_cp.shape[0])
                     return atomic_positions_S, mask, site_count
 
-                # Host path identical to original behavior
+                # Host path: bring back positions and mask, then map species on CPU
                 mask_np = mask.get()
                 positions_np = atomic_positions_S.get()
 
                 atomic_species = np.tile(material.species, int(lattice_positions_cp.shape[0]))
                 atomic_species = atomic_species[mask_np]
 
+                # Free temporary device allocations
                 cp.get_default_memory_pool().free_all_blocks()
                 gc.collect()
                 return positions_np.astype(np.float32, copy=False), atomic_species
@@ -1401,12 +1954,14 @@ class sample:
 
         atomic_species = np.tile(material.species, lattice_positions_np.shape[0])
 
+        # In-box mask on CPU
         mask = (
             (atomic_positions_S[:, 0] >= 0) & (atomic_positions_S[:, 0] <= self.dimensions[0]) &
             (atomic_positions_S[:, 1] >= 0) & (atomic_positions_S[:, 1] <= self.dimensions[1]) &
             (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= self.dimensions[2])
         )
 
+        # Apply mask and center/offset shift
         atomic_positions_S = atomic_positions_S[mask, :].astype(np.float32)
         atomic_species = atomic_species[mask]
 
@@ -1421,14 +1976,38 @@ class sample:
         material,
         flush_size=100000000,
         use_gpu=True,
-        gpu_streams=6,
+        gpu_streams=4,
         writer_threads=3
     ):
-        """
-        Generate and write the sample in fixed-size chunks.
-        - If use_gpu is True and a CUDA device is available, runs a multi-stream GPU pipeline.
-        - If CUDA is unavailable or any GPU error occurs (OOM, runtime error),
-        falls back to a pure-CPU pipeline without losing progress already written.
+        """Generate and persist the sample to disk in fixed-size chunks.
+
+        The function:
+          - Computes geometric chunks once using :meth:`get_chunk_positions`.
+          - Streams generated atoms into CPU buffers of length ``flush_size``.
+          - Writes chunked ``.npy`` files for positions and species via a
+            thread pool to overlap I/O.
+          - Runs a multi-stream GPU path if available; otherwise, or upon GPU
+            failure, it falls back to a pure-CPU path without losing progress.
+
+        Args:
+            material: Object with lattice and unit-cell definitions used by
+                :meth:`get_atomic_data`.
+            flush_size (int, optional): Number of atoms per on-disk chunk.
+                Defaults to 100_000_000.
+            use_gpu (bool, optional): Enable the GPU generation path if CuPy and
+                a CUDA device are available. Defaults to True.
+            gpu_streams (int, optional): Number of concurrent CUDA streams to
+                pipeline GPU work. Defaults to 4.
+            writer_threads (int, optional): Number of I/O worker threads for
+                writing chunks to disk. Defaults to 3.
+
+        Returns:
+            None
+
+        Notes:
+            On success, updates ``self._chunk_total`` with the number of files
+            written. Progress already written is preserved if the GPU path
+            encounters an error and falls back to CPU.
         """
         # 0) Build geometric chunks once
         self._chunk_positions, self._chunk_dimensions = self.get_chunk_positions(material)
@@ -1623,16 +2202,32 @@ class sample:
     # -------------------------------------
     # KNN search
     def build_cell_list_gpu(self, positions, r_cut):
-        """
-        Build a cell list on GPU for the given positions and cutoff r_cut.
+        """Build a GPU cell list for neighbor searches with a cubic cutoff.
+
+        Two-pass algorithm on GPU:
+          1) Count pass assigns each point to a cell and atomically increments
+             per-cell counts.
+          2) Fill pass writes positions and original indices into cell-compacted
+             arrays using per-cell write pointers.
+
+        Args:
+            positions (cp.ndarray): Array of shape (N, 3) with float32 positions
+                on the device.
+            r_cut (float): Desired real-space cutoff; used as the cubic cell size.
+
         Returns:
-        sorted_positions (N, 3) [cp.float32]
-        sorted_indices   (N,)    [cp.int32]
-        cell_start       (num_cells,) [cp.int32]
-        cell_end         (num_cells,) [cp.int32]
-        bounding_box_min (3,)    [cp.float32]
-        cell_size        (float)
-        nx, ny, nz       (int)   # number of cells in each dimension
+            tuple:
+                - sorted_positions (cp.ndarray, shape (N, 3), float32)
+                - sorted_indices (cp.ndarray, shape (N,), int32)
+                - cell_start (cp.ndarray, shape (num_cells,), int32) exclusive starts
+                - cell_end (cp.ndarray, shape (num_cells,), int32) exclusive ends
+                - bounding_box_min (cp.ndarray, shape (3,), float32)
+                - cell_size (float)
+                - nx, ny, nz (int): Number of cells per axis.
+
+        Notes:
+            Requires CuPy, a CUDA device, and kernels built by
+            :meth:`build_cell_list_count_kernel` and :meth:`build_cell_list_fill_kernel`.
         """
         N = positions.shape[0]
         if N == 0:
@@ -1695,7 +2290,7 @@ class sample:
         sorted_positions = cp.zeros_like(positions)
         sorted_indices   = cp.zeros((N,), dtype=cp.int32)
 
-        # 8) We'll do a second pass to fill sorted_positions using an atomicAdd on cell_offsets_copy
+        # 8) Second pass: fill compacted arrays using an atomic write pointer
         cell_offsets_copy = cp.array(cell_start, copy=True)
 
         cell_list_fill_kernel = self.build_cell_list_fill_kernel()
@@ -1723,6 +2318,20 @@ class sample:
     # -------------------------------------
     # Plotting
     def plot_sample(self, elev=0, azim=0):
+        """Plot all chunks of the sample as a 3D scatter.
+
+        Loads each chunk from disk on CPU, then plots the points using Matplotlib.
+
+        Args:
+            elev (float, optional): Elevation angle in degrees for the 3D view.
+                Defaults to 0.
+            azim (float, optional): Azimuth angle in degrees for the 3D view.
+                Defaults to 0.
+
+        Returns:
+            tuple[matplotlib.figure.Figure, matplotlib.axes._subplots.Axes3DSubplot]:
+                The created figure and 3D axes.
+        """
         import matplotlib.pyplot as plt
         fig = plt.figure(figsize=(8, 8))
         ax1 = fig.add_subplot(1, 1, 1, projection='3d')
