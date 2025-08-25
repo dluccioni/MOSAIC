@@ -426,6 +426,260 @@ class optics:
         """
         self._components.append(component)
 
+    def plot_stack_3d(self,
+                    unit='m',
+                    cross_section_m=0.02,
+                    thin_element_thickness_m=1e-3,
+                    bragg_thickness_m=5e-3,
+                    colors=None,
+                    annotate=True,
+                    show=True,
+                    savepath=None,
+                    ax=None):
+        """
+        Plot the optical stack in 3D with components lying along the x axis.
+
+        Parameters
+        ----------
+        unit : str
+            Display unit for the axes and labels. One of:
+            'm', 'cm', 'mm', 'um', 'nm'. Default 'm'.
+        cross_section_m : float
+            Square cross section size (y and z extents) in meters for all boxes.
+            Default 0.02 (2 cm).
+        thin_element_thickness_m : float
+            Fallback thickness in meters for elements without a defined axial length.
+            Default 1e-3 (1 mm).
+        bragg_thickness_m : float
+            Fallback thickness in meters for the bragg magnifier element.
+            Default 5e-3 (5 mm).
+        colors : dict or None
+            Optional map from component kind -> color hex, for example:
+            {'free space':'#cfd8dc', 'lens box':'#ffcc80', 'aperture':'#90caf9'}
+            If None, sensible defaults are used.
+        annotate : bool
+            If True, place text labels above each element.
+        show : bool
+            If True, call plt.show() at the end.
+        savepath : str or None
+            If provided, save the figure to this path.
+        ax : mpl_toolkits.mplot3d.Axes3D or None
+            If provided, draw into this axes; otherwise a new figure and axes are created.
+
+        Returns
+        -------
+        (fig, ax) : matplotlib Figure and 3D Axes
+        """
+        import math
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+        from matplotlib.patches import Patch
+
+        if not hasattr(self, "_components") or len(self._components) == 0:
+            raise ValueError("No components to plot. Add components first.")
+
+        # Display unit scale (meters -> display unit)
+        unit = str(unit).lower()
+        unit_scale = {
+            'm': 1.0,
+            'cm': 1e2,
+            'mm': 1e3,
+            'um': 1e6,
+            'nm': 1e9
+        }
+        if unit not in unit_scale:
+            raise ValueError("unit must be one of: m, cm, mm, um, nm")
+
+        S = unit_scale[unit]
+
+        # Default colors per kind
+        default_colors = {
+            'free space': '#cfd8dc',        # light gray
+            'lens box': '#ffcc80',          # orange-ish
+            'aperture': '#90caf9',          # light blue
+            'bragg magnifier 2b': '#a5d6a7',# light green
+            'custom': "#e93600"             # blue-gray
+        }
+        if colors is None:
+            colors = {}
+        # Merge user colors over defaults
+        merged_colors = dict(default_colors)
+        merged_colors.update(colors)
+
+        # Helper to compute axial length in meters from a component dict
+        def comp_length_m(comp):
+            k = str(comp.get('kind', 'custom')).lower()
+            # Preferred explicit meter fields
+            if 'length_m' in comp:
+                return float(comp['length_m'])
+            if 'thickness_m' in comp:
+                return float(comp['thickness_m'])
+
+            # Known kinds using mm in your current code base
+            if k == 'free space':
+                # 'length' is in mm
+                mm = float(comp.get('length', 0.0))
+                return mm * 1e-3
+            if k == 'lens box':
+                # number * thickness (mm) -> meters
+                t_mm = float(comp.get('thickness', 0.0))
+                n = int(comp.get('number', 1))
+                L = n * t_mm * 1e-3
+                return L if L > 0 else thin_element_thickness_m
+            if k == 'aperture':
+                # optional thickness_mm
+                if 'thickness_mm' in comp:
+                    return float(comp['thickness_mm']) * 1e-3
+                return thin_element_thickness_m
+            if k == 'bragg magnifier 2b':
+                return bragg_thickness_m
+
+            # Generic fallbacks using mm fields if present
+            if 'length' in comp:
+                return float(comp['length']) * 1e-3
+            if 'thickness' in comp:
+                return float(comp['thickness']) * 1e-3
+
+            return thin_element_thickness_m
+
+        # Helper to format a label
+        def comp_label(comp):
+            k = str(comp.get('kind', 'custom'))
+            kl = k.lower()
+            if kl == 'free space':
+                Lm = comp_length_m(comp)
+                return f"free space, L={Lm:.4g} m"
+            if kl == 'lens box':
+                n = comp.get('number', None)
+                fmm = comp.get('focal_length', None)
+                if n is not None and fmm is not None:
+                    return f"lens box, N={int(n)}, f={float(fmm):.4g} mm"
+                return "lens box"
+            if kl == 'aperture':
+                wmm = comp.get('width', None)
+                shape = comp.get('type', comp.get('shape', 'square'))
+                if wmm is not None:
+                    return f"aperture, {shape}, w={float(wmm):.4g} mm"
+                return f"aperture, {shape}"
+            if kl == 'bragg magnifier 2b':
+                mx = comp.get('magnification_x', None)
+                my = comp.get('magnification_y', None)
+                if (mx is not None) and (my is not None):
+                    return f"bragg magnifier 2b, Mx={float(mx):.3g}, My={float(my):.3g}"
+                return "bragg magnifier 2b"
+            # Custom
+            name = comp.get('name', comp.get('kind', 'custom'))
+            return str(name)
+
+        # Build drawable segments with positions in meters
+        segments = []  # each: dict(x0_m, x1_m, kind, color, label)
+        x_cursor = 0.0
+        for comp in self._components:
+            kind = str(comp.get('kind', 'custom'))
+            k_lower = kind.lower()
+            Lm = comp_length_m(comp)
+            if Lm < 0:
+                raise ValueError(f"Negative length encountered for component {kind}.")
+            x0 = x_cursor
+            x1 = x_cursor + Lm
+            color = merged_colors.get(k_lower, merged_colors['custom'])
+            label = comp_label(comp)
+            segments.append({
+                'x0_m': x0,
+                'x1_m': x1,
+                'kind': k_lower,
+                'color': color,
+                'label': label
+            })
+            x_cursor = x1
+
+        total_length_m = x_cursor
+        if total_length_m <= 0:
+            raise ValueError("Total stack length is zero.")
+
+        # Prepare axes
+        new_fig = False
+        if ax is None:
+            fig = plt.figure(figsize=(10, 3.5))
+            ax = fig.add_subplot(111, projection='3d')
+            new_fig = True
+        else:
+            fig = ax.figure
+
+        # Convert cross section and coordinates to display units
+        cs_u = cross_section_m * S
+
+        def draw_box(ax, x0_m, x1_m, color, edgecolor='k', alpha=0.9):
+            x0 = x0_m * S
+            x1 = x1_m * S
+            y0 = -0.5 * cs_u
+            y1 = +0.5 * cs_u
+            z0 = -0.5 * cs_u
+            z1 = +0.5 * cs_u
+
+            verts = [
+                # bottom (z0)
+                [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0)],
+                # top (z1)
+                [(x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)],
+                # front (y0)
+                [(x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)],
+                # back (y1)
+                [(x0, y1, z0), (x1, y1, z0), (x1, y1, z1), (x0, y1, z1)],
+                # left (x0)
+                [(x0, y0, z0), (x0, y1, z0), (x0, y1, z1), (x0, y0, z1)],
+                # right (x1)
+                [(x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1)],
+            ]
+            box = Poly3DCollection(verts, facecolors=color, edgecolors=edgecolor, linewidths=0.6, alpha=alpha)
+            ax.add_collection3d(box)
+
+        # Draw all boxes
+        legend_kinds = []
+        for seg in segments:
+            draw_box(ax, seg['x0_m'], seg['x1_m'], seg['color'])
+            if annotate:
+                xc = 0.5 * (seg['x0_m'] + seg['x1_m']) * S
+                ax.text(xc, 0.0, 0.6 * cs_u, seg['label'],
+                        ha='center', va='bottom', fontsize=8, zdir=None)
+            if seg['kind'] not in legend_kinds:
+                legend_kinds.append(seg['kind'])
+
+        # Axes limits and labels
+        ax.set_xlabel(f"x [{unit}]")
+        ax.set_ylabel(f"y [{unit}]")
+        ax.set_zlabel(f"z [{unit}]")
+
+        Lx_u = total_length_m * S
+        pad_x = max(0.02 * Lx_u, 0.1 * cs_u)
+        ax.set_xlim(-0.02 * Lx_u, Lx_u + pad_x)
+        ax.set_ylim(-0.6 * cs_u, 0.6 * cs_u)
+        ax.set_zlim(-0.6 * cs_u, 0.8 * cs_u)
+
+        # Make proportions reasonable: emphasize axial length
+        ax.set_box_aspect((max(Lx_u, cs_u), cs_u, cs_u))
+        ax.view_init(elev=15, azim=-60)
+        ax.grid(True, which='both', alpha=0.3)
+
+        # Legend
+        legend_handles = []
+        for k in legend_kinds:
+            color = merged_colors.get(k, merged_colors['custom'])
+            label = k
+            legend_handles.append(Patch(facecolor=color, edgecolor='k', label=label))
+        if legend_handles:
+            ax.legend(handles=legend_handles, loc='upper right', framealpha=0.9)
+
+        fig.tight_layout()
+
+        if savepath:
+            fig.savefig(savepath, dpi=150, bbox_inches='tight')
+
+        if show and new_fig:
+            plt.show()
+
+        return fig, ax
+
     @property
     def components(self):
         """
