@@ -2352,6 +2352,262 @@ class sample:
                 c='b', marker='.'
             )
         return fig, ax1
+    
+    def plot_sample_exterior(
+        self,
+        voxels=100,
+        voxel_size=None,
+        engine="auto",
+        decimate=1,
+        max_quads=500000,
+        face_alpha=0.15,
+        show_edges=True,
+        elev=20,
+        azim=-60,
+        figsize=(8, 8)
+    ):
+        """
+        Plot exterior voxels as complete cubes (6 faces per voxel) instead of only
+        plotting boundary faces.
+
+        Steps:
+        1) Build an occupancy grid by streaming atom chunks.
+        2) Identify exterior voxels (occupied cells touching an empty neighbor or
+            lying on the domain boundary).
+        3) Assemble 6 quads per selected exterior voxel, honoring decimation and
+            max_quads budget.
+        4) Render as a Poly3DCollection.
+
+        Notes:
+            - decimate applies at the voxel level (keep every nth exterior voxel).
+            - max_quads caps total faces; since each voxel contributes 6 faces,
+            the effective voxel cap is floor(max_quads/6).
+        """
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection as _Poly3DCollection
+
+        # ---- validation
+        if self._chunk_total is None or int(self._chunk_total) <= 0:
+            raise ValueError("No on-disk chunks found. Generate or import sample first.")
+        if self._dimensions is None or self._offset is None:
+            raise ValueError("Sample dimensions/offset are not initialized.")
+
+        # ---- choose backend
+        use_gpu = False
+        if engine not in ("auto", "gpu", "cpu"):
+            engine = "auto"
+        if engine in ("auto", "gpu") and (cp is not None):
+            try:
+                use_gpu = (int(cp.cuda.runtime.getDeviceCount()) > 0)
+            except Exception:
+                use_gpu = False
+
+        # ---- grid setup
+        dims = np.asarray(self.dimensions, dtype=np.float32)
+        if np.any(dims <= 0):
+            raise ValueError("Invalid sample dimensions.")
+        box_min = np.asarray(self.offset - 0.5 * dims, dtype=np.float32)
+        box_max = box_min + dims
+
+        if voxel_size is not None and float(voxel_size) > 0.0:
+            nx, ny, nz = np.ceil(dims / float(voxel_size)).astype(np.int64)
+        else:
+            scale = float(voxels) / float(dims.max())
+            nx, ny, nz = np.ceil(dims * scale).astype(np.int64)
+
+        nx = int(max(nx, 1))
+        ny = int(max(ny, 1))
+        nz = int(max(nz, 1))
+        hx, hy, hz = dims[0] / nx, dims[1] / ny, dims[2] / nz
+
+        if use_gpu:
+            occ = cp.zeros((nx, ny, nz), dtype=cp.bool_)
+            box_min_xp = cp.asarray(box_min, dtype=cp.float32)
+        else:
+            occ = np.zeros((nx, ny, nz), dtype=np.bool_)
+            box_min_xp = box_min  # numpy
+
+        # ---- stream chunks -> fill voxel occupancy
+        def _accumulate_voxels_gpu(pos_cp):
+            if pos_cp.size == 0:
+                return
+            idxf = (pos_cp - box_min_xp) / cp.asarray([hx, hy, hz], dtype=cp.float32)
+            idx = cp.floor(idxf).astype(cp.int64)
+            idx[:, 0] = cp.clip(idx[:, 0], 0, nx - 1)
+            idx[:, 1] = cp.clip(idx[:, 1], 0, ny - 1)
+            idx[:, 2] = cp.clip(idx[:, 2], 0, nz - 1)
+            lin = (idx[:, 0] * (ny * nz) + idx[:, 1] * nz + idx[:, 2]).astype(cp.int64)
+            lin = cp.unique(lin)
+            occ.ravel()[lin] = True
+
+        def _accumulate_voxels_cpu(pos_np):
+            if pos_np.size == 0:
+                return
+            idxf = (pos_np - box_min) / np.array([hx, hy, hz], dtype=np.float32)
+            idx = np.floor(idxf).astype(np.int64)
+            idx[:, 0] = np.clip(idx[:, 0], 0, nx - 1)
+            idx[:, 1] = np.clip(idx[:, 1], 0, ny - 1)
+            idx[:, 2] = np.clip(idx[:, 2], 0, nz - 1)
+            lin = (idx[:, 0] * (ny * nz) + idx[:, 1] * nz + idx[:, 2]).astype(np.int64)
+            lin = np.unique(lin)
+            occ.ravel()[lin] = True
+
+        for i in range(int(self.chunk_total)):
+            try:
+                pos = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
+            except Exception:
+                if use_gpu:
+                    # fallback to CPU for this chunk
+                    pos = self.load_chunk_positions(i + 1, use_gpu=False)
+                    _accumulate_voxels_cpu(pos)
+                    continue
+                else:
+                    raise
+            if use_gpu and isinstance(pos, cp.ndarray):
+                _accumulate_voxels_gpu(pos)
+                try:
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+            else:
+                _accumulate_voxels_cpu(pos)
+
+        # ---- identify exterior voxels (occupied and touching empty or domain)
+        if use_gpu:
+            lib = cp
+        else:
+            lib = np
+
+        o = occ
+        ext_mask = lib.zeros_like(o, dtype=bool)
+
+        # neighbors along x
+        ext_mask[:-1, :, :] |= o[:-1, :, :] & ~o[1:, :, :]
+        ext_mask[1:,  :, :] |= o[1:,  :, :] & ~o[:-1, :, :]
+        # neighbors along y
+        ext_mask[:, :-1, :] |= o[:, :-1, :] & ~o[:, 1:, :]
+        ext_mask[:, 1:,  :] |= o[:, 1:,  :] & ~o[:, :-1, :]
+        # neighbors along z
+        ext_mask[:, :, :-1] |= o[:, :, :-1] & ~o[:, :, 1:]
+        ext_mask[:, :, 1:]  |= o[:, :, 1:]  & ~o[:, :, :-1]
+
+        # domain boundaries (occupied at boundary is exterior)
+        ext_mask[0,   :, :] |= o[0,   :, :]
+        ext_mask[-1,  :, :] |= o[-1,  :, :]
+        ext_mask[:, 0,  :] |= o[:, 0,  :]
+        ext_mask[:, -1, :] |= o[:, -1, :]
+        ext_mask[:, :, 0] |= o[:, :, 0]
+        ext_mask[:, :, -1] |= o[:, :, -1]
+
+        # gather exterior voxel indices to host
+        ext_idx = lib.argwhere(ext_mask)
+        if use_gpu:
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+            ext_idx = ext_idx.get()
+        ext_idx = np.asarray(ext_idx, dtype=np.int64)
+
+        # decimate at voxel level
+        if int(decimate) > 1 and ext_idx.shape[0] > 0:
+            ext_idx = ext_idx[::int(decimate), :]
+
+        # enforce face budget via voxel cap (6 faces per voxel)
+        total_voxels_before = int(ext_idx.shape[0])
+        total_quads_before = 6 * total_voxels_before
+        if max_quads is not None and int(max_quads) >= 0 and total_voxels_before > 0:
+            voxel_cap = int(max_quads) // 6
+            if voxel_cap > 0 and total_voxels_before > voxel_cap:
+                sel = np.linspace(0, total_voxels_before - 1, voxel_cap, dtype=np.int64)
+                ext_idx = ext_idx[sel, :]
+            elif voxel_cap == 0:
+                ext_idx = ext_idx[:0, :]
+
+        M = int(ext_idx.shape[0])
+        if M == 0:
+            # Nothing exterior; draw empty box for reference
+            fig = plt.figure(figsize=figsize)
+            ax = fig.add_subplot(1, 1, 1, projection="3d")
+            ax.set_xlim([box_min[0], box_max[0]])
+            ax.set_ylim([box_min[1], box_max[1]])
+            ax.set_zlim([box_min[2], box_max[2]])
+            ax.view_init(elev=elev, azim=azim)
+            ax.set_proj_type("ortho")
+            ax.set_title("No exterior voxels detected")
+            return fig, ax, {
+                "grid_shape": (nx, ny, nz),
+                "voxel_size": (hx, hy, hz),
+                "quads_kept": 0,
+                "quads_total_before_decimate": int(total_quads_before),
+            }
+
+        # ---- build 6 faces per selected voxel (vectorized on CPU)
+        i = ext_idx[:, 0]
+        j = ext_idx[:, 1]
+        k = ext_idx[:, 2]
+
+        x0 = box_min[0] + i.astype(np.float64) * hx
+        x1 = x0 + hx
+        y0 = box_min[1] + j.astype(np.float64) * hy
+        y1 = y0 + hy
+        z0 = box_min[2] + k.astype(np.float64) * hz
+        z1 = z0 + hz
+
+        # helper to stack corners for a face
+        def _face(a0, b0, c0, a1, b1, c1, a2, b2, c2, a3, b3, c3):
+            v0 = np.stack([a0, b0, c0], axis=1)
+            v1 = np.stack([a1, b1, c1], axis=1)
+            v2 = np.stack([a2, b2, c2], axis=1)
+            v3 = np.stack([a3, b3, c3], axis=1)
+            return np.stack([v0, v1, v2, v3], axis=1)
+
+        # six faces per voxel
+        f_x0 = _face(x0, y0, z0,  x0, y1, z0,  x0, y1, z1,  x0, y0, z1)
+        f_x1 = _face(x1, y0, z0,  x1, y0, z1,  x1, y1, z1,  x1, y1, z0)
+        f_y0 = _face(x0, y0, z0,  x1, y0, z0,  x1, y0, z1,  x0, y0, z1)
+        f_y1 = _face(x0, y1, z0,  x0, y1, z1,  x1, y1, z1,  x1, y1, z0)
+        f_z0 = _face(x0, y0, z0,  x0, y1, z0,  x1, y1, z0,  x1, y0, z0)
+        f_z1 = _face(x0, y0, z1,  x1, y0, z1,  x1, y1, z1,  x0, y1, z1)
+
+        quads = np.concatenate([f_x0, f_x1, f_y0, f_y1, f_z0, f_z1], axis=0).astype(np.float32)
+
+        # safety trim in case of rounding up
+        if quads.shape[0] > int(max_quads):
+            step = int(np.ceil(quads.shape[0] / max(1, int(max_quads))))
+            quads = quads[::step, :]
+
+        # ---- plot
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(1, 1, 1, projection="3d")
+
+        quads_plot = quads.get() if hasattr(quads, "get") else quads
+        poly = _Poly3DCollection(quads_plot, linewidths=(0.2 if show_edges else 0.0))
+        poly.set_edgecolor("k" if show_edges else (0, 0, 0, 0))
+        poly.set_facecolor((0.7, 0.8, 1.0, float(face_alpha)) if face_alpha > 0 else (0, 0, 0, 0))
+        ax.add_collection3d(poly)
+
+        ax.set_xlim([box_min[0], box_max[0]])
+        ax.set_ylim([box_min[1], box_max[1]])
+        ax.set_zlim([box_min[2], box_max[2]])
+        try:
+            ax.set_box_aspect(dims)
+        except Exception:
+            pass
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_proj_type("ortho")
+        plt.tight_layout()
+
+        info = {
+            "grid_shape": (nx, ny, nz),
+            "voxel_size": (hx, hy, hz),
+            "quads_kept": int(quads.shape[0]),
+            "quads_total_before_decimate": int(total_quads_before),
+        }
+        return fig, ax, info
     # -------------------------------------
     
     ## Properties
