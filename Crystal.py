@@ -4,18 +4,34 @@
 import numpy as np
 import json
 import os
+from Logging import logging
 from pymatgen.core import Structure
 
 # -----------------------------------------------------------------------------
 # Class
 # -----------------------------------------------------------------------------
-class crystal:
+class crystal(logging):
+    
+    # -------------------------------------------------------------------------
+    # Logging configuration
+    # -------------------------------------------------------------------------
+    __log_top__ = (
+        "get_lattice_from_cif",
+        "read_crystal_metadata",
+        "write_crystal_metadata",
+        "to_conventional",
+        "to_primitive",
+        "align_axes",
+        "rotate_crystal",
+        "get_dhkl",
+    )
     
     # -----------------------------------------------------------------------------
     # Functions
     # -----------------------------------------------------------------------------
     ## Initialization
     def __init__(self,filepath):
+        super().__init__(log_name="crystal")
         self.filepath = filepath
         self._lattice_matrix = None
         self._lattice_corners = None

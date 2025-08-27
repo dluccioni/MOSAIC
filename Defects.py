@@ -8,17 +8,29 @@ except ImportError:
     cp = None
 import json
 import os
+from Logging import logging
 
 # -----------------------------------------------------------------------------
 # Class
 # -----------------------------------------------------------------------------
-class defects:
+class defects(logging):
+    
+    # -------------------------------------------------------------------------
+    # Logging configuration
+    # -------------------------------------------------------------------------
+    __log_top__ = (
+        "read_defect_metadata",
+        "write_defect_metadata",
+        "add_stacking_faults",
+        "add_cracks",
+    )
     
     # -----------------------------------------------------------------------------
     # Functions
     # -----------------------------------------------------------------------------
     ## Initialization
     def __init__(self,directory=None):
+        super().__init__(log_name="defects")
         self.directory = directory
         if self.directory is not None and not os.path.isdir(self.directory):
             os.makedirs(self.directory)
@@ -141,13 +153,24 @@ class defects:
     # -------------------------------------------------------------------------
     # Sub-Classes
     # -------------------------------------------------------------------------
-    class stacking_fault():
+    class stacking_fault(logging):
+        
+        # -------------------------------------------------------------------------
+        # Logging configuration
+        # -------------------------------------------------------------------------
+        __log_top__ = (
+            "generate_global_positions",
+            "apply_to_sample",
+            "plot_global_positions",
+            "apply_stacking_fault_chunk",
+        )
         
         # -----------------------------------------------------------------------------
         # Functions
         # -----------------------------------------------------------------------------
         ## Initialization
         def __init__(self,directory,fault_number,fault_offset,fault_normal,interfault_spacing,burgers_vector,fault_orientation,fault_gap):
+            super().__init__(log_name="stacking fault")
             self.directory = directory
             self.fault_number = fault_number
             self.fault_offset = fault_offset
@@ -331,7 +354,16 @@ class defects:
                     - self.rotated_fault_normal * self.fault_gap * self.fault_number/2
                 return positions_chunk
         
-    class crack():
+    class crack(logging):
+        
+        # -------------------------------------------------------------------------
+        # Logging configuration
+        # -------------------------------------------------------------------------
+        __log_top__ = (
+            "apply_to_sample",
+            "apply_crack_chunk",
+            "plot_crack_geometry",
+        )
         
         # -----------------------------------------------------------------------------
         # Functions
@@ -345,6 +377,7 @@ class defects:
                 Coordinates defining the exterior of a convex hull in 3D.
                 The hull is assumed to be convex.
             """
+            super().__init__(log_name="crack")
             self.directory = directory
             from scipy.spatial import ConvexHull
             # Store input points

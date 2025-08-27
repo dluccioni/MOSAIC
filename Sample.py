@@ -5,6 +5,7 @@ import numpy as np
 import os
 import gc
 import json
+from Logging import logging
 try:
     import cupy as cp
 except ImportError:
@@ -14,7 +15,26 @@ from cffi import FFI
 # -----------------------------------------------------------------------------
 # Class
 # -----------------------------------------------------------------------------
-class sample:
+class sample(logging):
+    
+    # -------------------------------------------------------------------------
+    # Logging configuration
+    # -------------------------------------------------------------------------
+    __log_top__ = (
+        "generate_sample",
+        "import_atomic_data",
+        "get_chunk_positions",
+        "create_sample",
+        "read_sample_metadata",
+        "write_sample_metadata",
+        "zero_sample",
+        "zero_sample_position",
+        "zero_sample_rotation",
+        "rotate_sample_relative",
+        "translate_sample_relative",
+        "plot_sample",
+        "plot_sample_exterior",
+    )
     
     # -----------------------------------------------------------------------------
     # Functions
@@ -35,7 +55,7 @@ class sample:
             Geometry and data are not created here. Use `create_sample`,
             `import_atomic_data`, or `generate_sample` to populate files.
         """
-        # Core directory and lazily initialized fields
+        super().__init__(log_name="sample")
         self.directory = directory
         self._dimensions = None
         self._offset = None

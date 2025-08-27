@@ -7,6 +7,7 @@ import json
 import os
 import gc
 import threading
+from Logging import logging
 try:
     import cupy as cp
 except ImportError:
@@ -18,8 +19,25 @@ import importlib.resources as pkg_resources
 # -----------------------------------------------------------------------------
 # Class
 # -----------------------------------------------------------------------------
-class beam:
+class beam(logging):
     
+    # -------------------------------------------------------------------------
+    # Logging configuration
+    # -------------------------------------------------------------------------
+    __log_top__ = (
+        "atomic_scattering_kinematic",
+        "atomic_scattering_dynamical",
+        "atomic_transmission",
+        "atomic_direct_interaction",
+        "interact_beam_gpu",
+        "interact_beam_cpu",
+        "precompute_depth_ein_all_chunks",
+        "wavefield_propagation",
+        "create_beam",
+        "read_beam_metadata",
+        "write_beam_metadata"
+    )
+
     # -----------------------------------------------------------------------------
     # Functions
     # -----------------------------------------------------------------------------
@@ -38,6 +56,7 @@ class beam:
             light c, elementary charge q) and caches h/q for fast eV-to-wavelength
             conversion.
         """
+        super().__init__(log_name="beam")
         self.directory = directory
         self._direction = None
         self._energy = None
@@ -257,8 +276,6 @@ class beam:
         if hasattr(self, "_init_beam_grid"):
             self._init_beam_grid()
 
-        print(f"Beam metadata loaded from {metadata_filename}.")
-
     ## Data Handling Functions    
     def write_beam_metadata(self, override_directory=None):
         """
@@ -312,7 +329,6 @@ class beam:
 
         with open(metadata_filename, "w") as f:
             json.dump(beam_metadata, f, indent=4)
-        print(f"Beam metadata written to {metadata_filename} in JSON format.")
 
     ## Static Functions
     # -------------------------------------
@@ -944,13 +960,12 @@ class beam:
             dict with keys:
                 'use_series' (bool), 'N' (int), 't_max' (float)
         """
-        import math
         # Guard wavelength and k
         if getattr(self, "_wavelength", None) is None or self._wavelength <= 0.0:
             # Cannot determine, fall back to EXACT
             return dict(use_series=False, N=0, t_max=float("inf"))
 
-        k_val = 2.0 * math.pi / float(self._wavelength)  # rad/m
+        k_val = 2.0 * np.pi / float(self._wavelength)  # rad/m
 
         if R0_min_m <= 0.0:
             return dict(use_series=False, N=0, t_max=float("inf"))
@@ -1023,12 +1038,10 @@ class beam:
         self._global_use_series (bool)
         self._series_terms (int)
         """
-        import numpy as _np
-
         # Sample half-diagonal radius (meters)
-        dims_A = _np.asarray(sample.dimensions, dtype=float)
+        dims_A = np.asarray(sample.dimensions, dtype=float)
         half_A = 0.5 * dims_A
-        a_max_A = float(_np.sqrt(_np.sum(half_A**2)))
+        a_max_A = float(np.sqrt(np.sum(half_A**2)))
         a_max_m = a_max_A * 1e-10
 
         # Closest detector pixel distance (meters)
@@ -1036,8 +1049,8 @@ class beam:
         if (cp is not None) and isinstance(pix, cp.ndarray):
             pix_cpu = pix.get()
         else:
-            pix_cpu = _np.asarray(pix)
-        r2_min_A2 = float(_np.min(_np.sum(pix_cpu * pix_cpu, axis=0)))
+            pix_cpu = np.asarray(pix)
+        r2_min_A2 = float(np.min(np.sum(pix_cpu * pix_cpu, axis=0)))
         R0_min_m = (r2_min_A2 ** 0.5) * 1e-10
 
         # Phase tolerance
@@ -1059,8 +1072,6 @@ class beam:
 
         if verbose:
             mode_str = "SERIES" if use_series else "EXACT"
-            print("[beam] Geometric mode: {0} (N={1}, phi_tol={2:.3g} rad, a_max={3:.3e} m, R0_min={4:.3e} m, |t|max={5:.3g})"
-                .format(mode_str, self._series_terms, phi_tol, a_max_m, R0_min_m, t_max))
 
     def build_interaction_kernel(self, series_terms: int | None = None, force_mode: str | None = None):
         """
@@ -2372,7 +2383,7 @@ class beam:
             - The Ein definition relies on the beam grid, entrance E0, and the
             global depth window [s_min, s_max] along the beam direction.
         """
-        import hashlib, json, os, gc, threading
+        import hashlib, threading
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         # Backend selection
@@ -2857,7 +2868,7 @@ class beam:
             - The forward component toggle should be consistent with transmission
             to avoid double-counting the forward-scattered term.
         """
-        import hashlib, json, os
+        import hashlib
         Nx, Ny = measurement_shape
 
         # Load scattering databases once
@@ -3153,7 +3164,7 @@ class beam:
             incident E0(u,v) on the GPU with Ein=0 outside the beam grid.
         """
         if cp is None:
-            print("[beam] CuPy not installed, falling back to CPU.")
+            self._log("normal", "[beam] CuPy not installed, falling back to CPU.")
             return self.interact_beam_cpu(
                 sample,
                 measurement_positions,
@@ -3170,7 +3181,7 @@ class beam:
 
         n_gpus = cp.cuda.runtime.getDeviceCount()
         if n_gpus < 1:
-            print("[beam] No GPUs found, falling back to CPU.")
+            self._log("normal", "[beam] No GPUs found, falling back to CPU.")
             return self.interact_beam_cpu(
                 sample,
                 measurement_positions,
@@ -3185,8 +3196,8 @@ class beam:
                 apply_spherical_decay=spherical_decay
             )
 
-        import hashlib, json, os
-        print(f"[beam] Found {n_gpus} GPU(s).")
+        import hashlib
+        self._log("normal", f"[beam] Found {n_gpus} GPU(s).")
 
         class _TmpDet:
             def __init__(self, pix): self.pixel_coordinates = pix
@@ -3215,7 +3226,7 @@ class beam:
         T_pin = self.allocate_pinned_array(stage.translation)
 
         chunk_total = int(sample.chunk_total or 0)
-        print(f"[beam] Total of {chunk_total} chunk(s) to process.")
+        self._log("normal", f"[beam] Total of {chunk_total} chunk(s) to process.")
         if chunk_total == 0:
             return np.zeros((Ny, Nx), dtype=np.complex64)
 
@@ -3250,7 +3261,7 @@ class beam:
                 if recompute_cache or (not os.path.isfile(p)):
                     missing.append(cid)
             if missing:
-                print(f"[beam] Precomputing Ein for {len(missing)} chunk(s).")
+                self._log("verbose", f"[beam] Precomputing Ein for {len(missing)} chunk(s).")
                 self.precompute_depth_ein_all_chunks(
                     sample, stage,
                     use_gpu=True,
@@ -3472,7 +3483,7 @@ class beam:
         else:
             # CPU path; optionally warn if GPU was requested but not available
             if cp is None and use_gpu:
-                print("[beam] Cupy not installed, running CPU mode.")
+                self._log("normal", "[beam] Cupy not installed, running CPU mode.")
             final_field = self.interact_beam_cpu(
                 sample,
                 measurement_positions,
@@ -3519,8 +3530,6 @@ class beam:
             - tau is lower-bounded at 0 after blur to avoid unphysical gain.
             - Units: positions and spacings are in Angstrom.
         """
-        import numpy as _np
-
         # Constants (angstrom)
         r_e_A = 2.81794092e-5
         lam_A = self._wavelength * 1e10
@@ -3531,8 +3540,8 @@ class beam:
         A_pix_A2 = du * dv
 
         # Accumulate column sums of forward factors (real and imag parts)
-        sum_real = _np.zeros((NyB, NzB), _np.float32)  # sum of f0(0)+f1
-        sum_imag = _np.zeros((NyB, NzB), _np.float32)  # sum of f2
+        sum_real = np.zeros((NyB, NzB), np.float32)  # sum of f0(0)+f1
+        sum_imag = np.zeros((NyB, NzB), np.float32)  # sum of f2
 
         # Databases
         f1f2_dict      = self.parse_f1f2_db_all("f1f2_CromerLiberman.dat")
@@ -3544,7 +3553,7 @@ class beam:
 
         def _tsc_w(d):
             # 1D TSC weights for distances in pixel units (centered on integer indices)
-            w = _np.zeros_like(d, dtype=_np.float32)
+            w = np.zeros_like(d, dtype=np.float32)
             m0 = d <= 0.5
             w[m0] = 0.75 - d[m0]*d[m0]
             m1 = (~m0) & (d <= 1.5)
@@ -3554,7 +3563,7 @@ class beam:
 
         for cid in range(1, sample.chunk_total + 1):
             spc = sample.load_chunk_species(cid, use_gpu=False)
-            pos = sample.load_chunk_positions(cid, use_gpu=False).astype(_np.float32)  # Angstrom
+            pos = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float32)  # Angstrom
             if pos.size == 0:
                 continue
 
@@ -3563,10 +3572,10 @@ class beam:
             pos += stage.translation
 
             nA = pos.shape[0]
-            f1  = _np.zeros(nA, _np.float32)
-            f2  = _np.zeros(nA, _np.float32)
-            f0z = _np.zeros(nA, _np.float32)
-            for el in _np.unique(spc):
+            f1  = np.zeros(nA, np.float32)
+            f2  = np.zeros(nA, np.float32)
+            f0z = np.zeros(nA, np.float32)
+            for el in np.unique(spc):
                 el_s = str(el)
                 m = (spc == el_s)
                 f0z[m] = float(f0_zero_dict.get(el_s, 0.0))
@@ -3583,18 +3592,18 @@ class beam:
             iv = av/dv + self._beam_vc
 
             inb = (iu >= 0.0) & (iu <= (NyB - 1)) & (iv >= 0.0) & (iv <= (NzB - 1))
-            if not _np.any(inb):
+            if not np.any(inb):
                 continue
 
             iu = iu[inb]; iv = iv[inb]
-            fr = (f0z[inb] + f1[inb]).astype(_np.float32)  # real forward factor
-            fi = (f2[inb]).astype(_np.float32)             # imag forward factor
+            fr = (f0z[inb] + f1[inb]).astype(np.float32)  # real forward factor
+            fi = (f2[inb]).astype(np.float32)             # imag forward factor
 
-            ic = _np.floor(iu + 0.5).astype(_np.int64)
-            jc = _np.floor(iv + 0.5).astype(_np.int64)
+            ic = np.floor(iu + 0.5).astype(np.int64)
+            jc = np.floor(iv + 0.5).astype(np.int64)
 
-            du_m1 = _np.abs(iu - (ic - 1)); du_0 = _np.abs(iu - ic); du_p1 = _np.abs(iu - (ic + 1))
-            dv_m1 = _np.abs(iv - (jc - 1)); dv_0 = _np.abs(iv - jc); dv_p1 = _np.abs(iv - (jc + 1))
+            du_m1 = np.abs(iu - (ic - 1)); du_0 = np.abs(iu - ic); du_p1 = np.abs(iu - (ic + 1))
+            dv_m1 = np.abs(iv - (jc - 1)); dv_0 = np.abs(iv - jc); dv_p1 = np.abs(iv - (jc + 1))
 
             wu_m1, wu_0, wu_p1 = _tsc_w(du_m1), _tsc_w(du_0), _tsc_w(du_p1)
             wv_m1, wv_0, wv_p1 = _tsc_w(dv_m1), _tsc_w(dv_0), _tsc_w(dv_p1)
@@ -3604,11 +3613,11 @@ class beam:
 
             def _push(ii, jj, fac, val):
                 mask = (ii >= 0) & (ii < NyB) & (jj >= 0) & (jj < NzB) & (fac > 0.0)
-                if not _np.any(mask):
+                if not np.any(mask):
                     return
                 rows = ii[mask]; cols = jj[mask]
-                idx  = (rows * NzB + cols).astype(_np.int64)
-                w    = (val[mask] * fac[mask]).astype(_np.float32)
+                idx  = (rows * NzB + cols).astype(np.int64)
+                w    = (val[mask] * fac[mask]).astype(np.float32)
                 return idx, w
 
             # 3x3 TSC deposition for both real and imaginary forward sums
@@ -3626,39 +3635,39 @@ class beam:
                         idx_list_I.append(r[0]); w_list_I.append(r[1])
 
             if idx_list_R:
-                idxR = _np.concatenate(idx_list_R); wR = _np.concatenate(w_list_R)
-                idxI = _np.concatenate(idx_list_I); wI = _np.concatenate(w_list_I)
-                _np.add.at(sum_real.ravel(), idxR, wR)
-                _np.add.at(sum_imag.ravel(), idxI, wI)
+                idxR = np.concatenate(idx_list_R); wR = np.concatenate(w_list_R)
+                idxI = np.concatenate(idx_list_I); wI = np.concatenate(w_list_I)
+                np.add.at(sum_real.ravel(), idxR, wR)
+                np.add.at(sum_imag.ravel(), idxI, wI)
 
         # Convert forward sums -> total phase/attenuation (column integrals)
         # phi = -k*delta_int, tau = k*beta_int, with:
         # delta_int = (r_e * lambda^2 / (2*pi) / A_pix) * sum_real
         # beta_int  = (r_e * lambda^2 / (2*pi) / A_pix) * sum_imag
-        two_pi = 2.0 * _np.pi
+        two_pi = 2.0 * np.pi
         C = (r_e_A * (lam_A * lam_A)) / (two_pi * A_pix_A2)  # dimensionless
-        delta_int = C * sum_real.astype(_np.float32)
-        beta_int  = C * sum_imag.astype(_np.float32)
+        delta_int = C * sum_real.astype(np.float32)
+        beta_int  = C * sum_imag.astype(np.float32)
 
         kA = two_pi / lam_A
-        phi = (-kA * delta_int).astype(_np.float32)
-        tau = ( kA * beta_int ).astype(_np.float32)
+        phi = (-kA * delta_int).astype(np.float32)
+        tau = ( kA * beta_int ).astype(np.float32)
 
         # Numerical safety: never allow gain
-        tau = _np.maximum(tau, _np.float32(0.0))
+        tau = np.maximum(tau, np.float32(0.0))
 
         # Optional blur (same as before)
         if kernel_radius > 0:
             rad = int(kernel_radius); sig = rad / 2.0
-            y, x = _np.ogrid[-rad:rad+1, -rad:rad+1]
-            k = _np.exp(-(x*x + y*y) / (2.0*sig*sig)).astype(_np.float32)
+            y, x = np.ogrid[-rad:rad+1, -rad:rad+1]
+            k = np.exp(-(x*x + y*y) / (2.0*sig*sig)).astype(np.float32)
             k /= k.sum()
-            Fk = _np.fft.fft2(k, s=phi.shape)
-            phi = _np.fft.ifft2(_np.fft.fft2(phi) * Fk).real.astype(_np.float32)
-            tau = _np.fft.ifft2(_np.fft.fft2(tau) * Fk).real.astype(_np.float32)
-            tau = _np.maximum(tau, _np.float32(0.0))  # keep no-gain after blur
+            Fk = np.fft.fft2(k, s=phi.shape)
+            phi = np.fft.ifft2(np.fft.fft2(phi) * Fk).real.astype(np.float32)
+            tau = np.fft.ifft2(np.fft.fft2(tau) * Fk).real.astype(np.float32)
+            tau = np.maximum(tau, np.float32(0.0))  # keep no-gain after blur
 
-        A_map = _np.exp(-tau + 1j * phi).astype(_np.complex64)
+        A_map = np.exp(-tau + 1j * phi).astype(np.complex64)
         return A_map
 
     def _compute_beam_column_A_map_gpu(self, sample, stage, kernel_radius=0):
@@ -4652,9 +4661,6 @@ class beam:
                 final_result -= offset
             return final_result
 
-        print(f"[beam] Using GPU dynamical scattering with up to {n_bounces} bounce(s).")
-        print(f"[beam] Total of {chunk_total} chunk(s) to process.")
-
         db_f0   = self.parse_f0_db_all('f0_WaasKirf.dat')
         db_f1f2 = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
 
@@ -4985,52 +4991,177 @@ class beam:
                                 transmission=True, transmission_params=[0.0],
                                 use_gpu=True):
         """
-        Combine scattering and transmission contributions and write to detector.
-
-        Behavior:
-        - If scattering is True, calls atomic_scattering_kinematic (optionally subtracting
-            the forward term when transmission is also computed).
-        - If transmission is True, calls atomic_transmission.
-        - The final complex field is written back into detector via detector.input_pixel_values.
+        Combine scattering and transmission contributions and write the result to the detector.
 
         Args:
-            sample: Sample object with chunk accessors.
-            detector: Detector with 'shape', 'pixel_coordinates', and 'input_pixel_values(field)'.
-            stage: Stage with 'rotation' (3x3) and 'translation' (3,) arrays.
-            scattering (bool): Include kinematic scattering.
-            scattering_params (list): [offset, use_depth_ein].
-                offset (np.ndarray or None): Optional complex field to subtract.
-                use_depth_ein (bool): Enable depth-dependent entrance amplitude.
-            transmission (bool): Include transmission term.
-            transmission_params (list): [kernel_radius], Gaussian blur radius (pixels) for A(u,v).
-            use_gpu (bool): If True and CuPy available, use GPU code paths.
+            sample: Sample object with chunk accessors required by the backends.
+            detector: Detector object exposing:
+                - shape -> (Nx, Ny)
+                - pixel_coordinates
+                - input_pixel_values(array)
+            stage: Stage object with:
+                - rotation (3x3)
+                - translation (3,)
+            scattering (bool): If True, include the kinematic scattering term.
+            scattering_params (list | tuple | dict | None): Configuration for the
+                scattering call. The following forms are accepted.
+
+                List/tuple form (backward compatible):
+                    [offset=None,
+                    use_depth_ein=False,
+                    ein_cache_dir=None,
+                    recompute_cache=False,
+                    apply_polarization=False,
+                    spherical_decay=False,
+                    remove_forward=None,
+                    use_gpu=None]
+
+                    Notes:
+                    - remove_forward=None means: default to transmission being True.
+                    - use_gpu (if provided) overrides the function-level use_gpu for the
+                    scattering call.
+
+                Dict form (preferred):
+                    {
+                    "offset": np.ndarray | None,
+                    "use_depth_ein": bool,
+                    "ein_cache_dir": str | None,
+                    "recompute_cache": bool,
+                    "apply_polarization": bool,
+                    "spherical_decay": bool,
+                    "remove_forward": bool | None,
+                    "use_gpu": bool | None
+                    }
+
+            transmission (bool): If True, include the transmission term.
+            transmission_params (list | tuple | dict | None): Configuration for the
+                transmission call. Accepted forms:
+
+                List/tuple form (backward compatible):
+                    [kernel_radius=0.0,
+                    padding_mode="edge",
+                    pad_constant=0.0,
+                    use_gpu=None]
+
+                Dict form:
+                    {
+                    "kernel_radius": float,
+                    "padding_mode": str,      # "edge" or "constant"
+                    "pad_constant": float,
+                    "use_gpu": bool | None
+                    }
+
+            use_gpu (bool): Global GPU preference. Each sub-call may override this via
+                its own "...params" value. If CuPy is unavailable, CPU paths are used.
 
         Returns:
-            None. The combined complex field is written into detector.
+            None: The combined complex field is written to
+            detector.input_pixel_values(field).
+
+        Notes:
+            - If both scattering and transmission are enabled and remove_forward is
+            not explicitly provided, the forward f0(0) term is removed from the
+            scattering call to avoid double counting.
+            - All GPU toggles honor CuPy availability; when CuPy is not present,
+            CPU implementations are used regardless of requested GPU usage.
         """
         Nx, Ny = detector.shape
         final_field = np.zeros((Ny, Nx), dtype=np.complex64)
 
-        # Parse scattering params
-        sc_offset = scattering_params[0] if (len(scattering_params) >= 1) else None
-        use_depth_ein = scattering_params[1] if len(scattering_params) >= 2 else False
+        # -------- Parse scattering params (list/tuple or dict) --------
+        sc_offset = None
+        sc_use_depth_ein = False
+        sc_ein_cache_dir = None
+        sc_recompute_cache = False
+        sc_apply_polarization = False
+        sc_spherical_decay = False
+        sc_remove_forward = None   # None -> default to bool(transmission)
+        sc_use_gpu_override = None
 
+        if isinstance(scattering_params, dict):
+            sc_offset = scattering_params.get("offset", sc_offset)
+            sc_use_depth_ein = bool(scattering_params.get("use_depth_ein", sc_use_depth_ein))
+            sc_ein_cache_dir = scattering_params.get("ein_cache_dir", sc_ein_cache_dir)
+            sc_recompute_cache = bool(scattering_params.get("recompute_cache", sc_recompute_cache))
+            sc_apply_polarization = bool(scattering_params.get("apply_polarization", sc_apply_polarization))
+            sc_spherical_decay = bool(scattering_params.get("spherical_decay", sc_spherical_decay))
+            sc_remove_forward = scattering_params.get("remove_forward", sc_remove_forward)
+            if "use_gpu" in scattering_params:
+                sc_use_gpu_override = bool(scattering_params["use_gpu"])
+        else:
+            sp = list(scattering_params) if scattering_params is not None else []
+            if len(sp) >= 1: sc_offset = sp[0]
+            if len(sp) >= 2: sc_use_depth_ein = bool(sp[1])
+            if len(sp) >= 3: sc_ein_cache_dir = sp[2]
+            if len(sp) >= 4: sc_recompute_cache = bool(sp[3])
+            if len(sp) >= 5: sc_apply_polarization = bool(sp[4])
+            if len(sp) >= 6: sc_spherical_decay = bool(sp[5])
+            if len(sp) >= 7: sc_remove_forward = sp[6]
+            if len(sp) >= 8: sc_use_gpu_override = bool(sp[7])
+
+        # Choose remove_forward default if not provided
+        if sc_remove_forward is None:
+            sc_remove_forward_flag = bool(transmission)
+        else:
+            sc_remove_forward_flag = bool(sc_remove_forward)
+
+        sc_use_gpu_final = bool(
+            sc_use_gpu_override if sc_use_gpu_override is not None
+            else (use_gpu and (cp is not None))
+        )
+
+        # -------- Parse transmission params (list/tuple or dict) --------
+        tr_kernel_radius = 0.0
+        tr_padding_mode = "edge"
+        tr_pad_constant = 0.0
+        tr_use_gpu_override = None
+
+        if isinstance(transmission_params, dict):
+            tr_kernel_radius = transmission_params.get("kernel_radius", tr_kernel_radius)
+            tr_padding_mode = transmission_params.get("padding_mode", tr_padding_mode)
+            tr_pad_constant = transmission_params.get("pad_constant", tr_pad_constant)
+            if "use_gpu" in transmission_params:
+                tr_use_gpu_override = bool(transmission_params["use_gpu"])
+        else:
+            tp = list(transmission_params) if transmission_params is not None else []
+            if len(tp) >= 1: tr_kernel_radius = tp[0]
+            if len(tp) >= 2: tr_padding_mode = tp[1]
+            if len(tp) >= 3: tr_pad_constant = tp[2]
+            if len(tp) >= 4: tr_use_gpu_override = bool(tp[3])
+
+        tr_use_gpu_final = bool(
+            tr_use_gpu_override if tr_use_gpu_override is not None
+            else (use_gpu and (cp is not None))
+        )
+
+        # -------- Compute and combine terms --------
         if scattering:
-            sc = self.atomic_scattering_kinematic(
-                sample, detector, stage,
-                offset=sc_offset, use_gpu=bool(use_gpu and (cp is not None)),
-                remove_forward=bool(transmission),      # remove forward if also transmitting
-                use_depth_ein=bool(use_depth_ein)
+            sc_field = self.atomic_scattering_kinematic(
+                sample,
+                detector,
+                stage,
+                offset=sc_offset,
+                use_gpu=sc_use_gpu_final,
+                remove_forward=sc_remove_forward_flag,
+                use_depth_ein=bool(sc_use_depth_ein),
+                ein_cache_dir=sc_ein_cache_dir,
+                recompute_cache=bool(sc_recompute_cache),
+                apply_polarization=bool(sc_apply_polarization),
+                spherical_decay=bool(sc_spherical_decay),
             )
-            final_field += np.asarray(sc, dtype=np.complex64)
+            final_field += np.asarray(sc_field, dtype=np.complex64)
 
         if transmission:
-            tx = self.atomic_transmission(
-                sample, detector, stage,
-                use_gpu=bool(use_gpu and (cp is not None)),
-                kernel_radius=transmission_params[0]
+            tx_field = self.atomic_transmission(
+                sample,
+                detector,
+                stage,
+                use_gpu=tr_use_gpu_final,
+                kernel_radius=tr_kernel_radius,
+                padding_mode=str(tr_padding_mode),
+                pad_constant=float(tr_pad_constant),
             )
-            final_field += np.asarray(tx, dtype=np.complex64)
+            final_field += np.asarray(tx_field, dtype=np.complex64)
 
         detector.input_pixel_values(final_field)
     # -------------------------------------

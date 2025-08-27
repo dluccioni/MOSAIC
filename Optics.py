@@ -1,9 +1,10 @@
 # -----------------------------------------------------------------------------
 # Modules
 # -----------------------------------------------------------------------------
-import numpy as np
 import os
 import gc
+from Logging import logging
+import numpy as np
 try:
     import cupy as cp
 except ImportError:
@@ -12,13 +13,28 @@ except ImportError:
 # -----------------------------------------------------------------------------
 # Class
 # -----------------------------------------------------------------------------
-class optics:
-
+class optics(logging):
+    
+    # -------------------------------------------------------------------------
+    # Logging configuration
+    # -------------------------------------------------------------------------
+    __log_top__ = (
+        "add_free_space",
+        "add_CRL_box",
+        "add_bragg_magnifier_2b",
+        "add_aperture",
+        "add_custom_component",
+        "plot_stack_3d",
+        "read_optics_metadata",
+        "write_optics_metadata",
+    )
+    
     # -----------------------------------------------------------------------------
     # Functions
     # -----------------------------------------------------------------------------
     ## Initialization
     def __init__(self, directory=None):
+        super().__init__(log_name="optics")
         self.directory = directory
         if self.directory is not None and not os.path.isdir(self.directory):
             os.makedirs(self.directory)

@@ -9,11 +9,28 @@ except ImportError:
     cp = None
 import os
 import json
+from Logging import logging
 
 # -----------------------------------------------------------------------------
 # Class
 # -----------------------------------------------------------------------------
-class stage:
+class stage(logging):
+    
+    # -------------------------------------------------------------------------
+    # Logging configuration
+    # -------------------------------------------------------------------------
+    __log_top__ = (
+        "create_stage",
+        "read_stage_metadata",
+        "write_stage_metadata",
+        "set_motor_value_relative",
+        "set_motor_value_absolute",
+        "set_single_motor_value_relative",
+        "set_single_motor_value_absolute",
+        "zero_stage",
+        "display_motor_values",
+        "plot_stage",
+    )
     
     # -----------------------------------------------------------------------------
     # Functions
@@ -30,6 +47,7 @@ class stage:
             directory (str, optional): Directory where metadata may be saved/loaded.
                 Defaults to the current working directory.
         """
+        super().__init__(log_name="stage")
         self.directory = directory
         self._name = None
         self._motor_name = None

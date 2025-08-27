@@ -8,12 +8,31 @@ except ImportError:
     cp = None
 import json
 import os
+from Logging import logging
 
 # -----------------------------------------------------------------------------
 # Class
 # -----------------------------------------------------------------------------
-class detector:
+class detector(logging):
 
+    # -------------------------------------------------------------------------
+    # Logging configuration
+    # -------------------------------------------------------------------------
+    __log_top__ = (
+        "create_detector",
+        "read_detector_metadata",
+        "write_detector_metadata",
+        "write_Efield_values",
+        "read_Efield_values",
+        "position_detector_relative",
+        "position_detector_absolute",
+        "plot_detector",
+        "plot_detector_angles",
+        "plot_detector_position",
+        "get_detector_axis",
+        "coordinate_conversion",
+    )
+    
     # -----------------------------------------------------------------------------
     # Functions
     # -----------------------------------------------------------------------------
@@ -26,6 +45,7 @@ class detector:
             to the current working directory. The directory is created if it
             does not exist.
         """
+        super().__init__(log_name="detector")
         self.directory = directory
         self._shape = None
         self._pixel_size = None

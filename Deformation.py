@@ -1,10 +1,11 @@
 # -----------------------------------------------------------------------------
 # Modules
 # -----------------------------------------------------------------------------
-import numpy as np
 import os
 import gc
 import json
+from Logging import logging
+import numpy as np
 try:
     import cupy as cp  # Optional GPU backend
 except ImportError:
@@ -16,22 +17,24 @@ from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
 # -----------------------------------------------------------------------------
 # Class
 # -----------------------------------------------------------------------------
-class deformation:
-    """Utility class for importing, transforming, clipping, and applying
-    deformation fields and finite-element (FE) nodal data.
+class deformation(logging):
 
-    The class provides CPU implementations using NumPy and optional GPU
-    accelerations using CuPy and custom CUDA kernels (if CuPy is available).
-    Most methods accept a `use_gpu` flag to select the backend.
-
-    Attributes:
-        directory (str or None): Optional output directory to create on init.
-        _Xref (ndarray or None): Reference nodal coordinates, shape (N, 3).
-        _Xcurr (ndarray or None): Current nodal coordinates, shape (N, 3).
-        _elem_nodes (ndarray or None): Element connectivity, shape (E, k),
-            using 0-based node indices.
-    """
-
+    # -------------------------------------------------------------------------
+    # Logging configuration
+    # -------------------------------------------------------------------------
+    __log_top__ = (
+        "import_deformation_field",
+        "clip_field",
+        "clip_field_to_sample",
+        "apply_deformation_chunked",
+        "import_fe_nodal_field",
+        "import_fe_connectivity",
+        "apply_fe_nodal_field",
+        "transform_fe_nodal_field",
+        "plot_field_and_sample_edges_3d",
+        "plot_mesh_and_sample_edges_3d",
+    )
+    
     # -------------------------------------------------------------------------
     # Functions
     # -------------------------------------------------------------------------
@@ -43,6 +46,7 @@ class deformation:
             directory (str or None): Optional directory. If provided and it
                 does not exist, it is created.
         """
+        super().__init__(log_name="deformation")
         self.directory = directory
         self._Xref = None         # shape (N, 3) reference nodal coordinates
         self._Xcurr = None        # shape (N, 3) current nodal coordinates

@@ -5,18 +5,26 @@ import os
 import sys
 import json
 import time
-import logging
+from Logging import logging
 import numpy as np
 import cupy as cp
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
-logging.basicConfig(level=logging.DEBUG)
-
 # -----------------------------------------------------------------------------
 # Class
 # -----------------------------------------------------------------------------
-class analysis:
+class analysis(logging):
+    
+    # -------------------------------------------------------------------------
+    # Logging configuration
+    # -------------------------------------------------------------------------
+    __log_top__ = (
+        "distance_fft_dependance",
+        "integrate_detector_along_axis",
+        "surf_plot",
+        "line_plot",
+    )
     
     # -----------------------------------------------------------------------------
     # Functions
@@ -29,13 +37,10 @@ class analysis:
         Args:
             directory (str, optional): Path where analysis results will be stored. Defaults to current working directory.
         """
-        try:
-            self.directory = directory
-            if not os.path.isdir(self.directory):
-                os.makedirs(self.directory)
-        except Exception as e:
-            logging.error(f"Initialization failed: {e}")
-            raise
+        super().__init__(log_name="analysis")
+        self.directory = directory
+        if not os.path.isdir(self.directory):
+            os.makedirs(self.directory)
 
     # Static Function
     @staticmethod
@@ -229,7 +234,7 @@ class analysis:
             return X_fft, Y_fft, Z_fft_amp, Z_fft_pha, pixel_values_list
         return X_fft, Y_fft, Z_fft_amp, Z_fft_pha
     
-    def integrate_detector_along_axis(self, detector, data_type="Intensity", axis="x", system="cartesian", degrees=True, bins=200, aggregator="mean", plot=True, title="Integrated Detector Data", xlabel=None, ylabel="Integrated Value", figsize=(8, 6)):
+    def integrate_detector_along_axis(self, detector, data_type="Intensity", axis="x", system="cartesian", degrees=True, bins=200, aggregator="mean", plot=True, save_plot=False, title="Integrated Detector Data", xlabel=None, ylabel="Integrated Value", figsize=(8, 6)):
         """
         Integrate detector data along a specified axis.
 
@@ -288,7 +293,8 @@ class analysis:
                 ax.set_title(title)
                 ax.set_xlabel(xlabel or axis)
                 ax.set_ylabel(ylabel)
-                self._save_figure(fig, f"Integrated_{data_type}_{axis}.png")
+                if save_plot:
+                    self._save_figure(fig, f"Integrated_{data_type}_{axis}.png")
 
             return bin_centers, hist
         except Exception as e:
