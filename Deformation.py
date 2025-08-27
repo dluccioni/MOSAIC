@@ -2460,6 +2460,7 @@ class deformation:
                 halo = float(cell_size * max(0, int(cell_pad_cells)))
                 xmn = xmn - halo
                 xmx = xmx + halo
+
                 cs = float(cell_size)
                 nxv, nyv, nzv = int(nx), int(ny), int(nz)
 
@@ -2474,14 +2475,24 @@ class deformation:
                 cz1 = _clamp_int(cp.floor((xmx[2] - bb_min[2]) / cs).get(), 0, nzv - 1)
 
                 segs = []
-                for cz in range(cx0, cx1 + 1):
+                n_cells = int(cell_start.shape[0])  # robust bound for cid
+                for cz in range(cz0, cz1 + 1):
                     base_z = cz * (nxv * nyv)
                     for cy in range(cy0, cy1 + 1):
                         base_y = base_z + cy * nxv
                         for cx in range(cx0, cx1 + 1):
                             cid = base_y + cx
+                            # Robust bounds check to avoid any stray OOB
+                            if cid < 0 or cid >= n_cells:
+                                continue
                             s = int(cell_start[cid].get())
                             e = int(cell_end[cid].get())
+                            # Additional robustness against malformed cell ranges
+                            if s < 0:
+                                s = 0
+                            if e < s:
+                                continue
+                            e = min(e, int(sortedIdx.shape[0]))
                             if e > s:
                                 segs.append(sortedIdx[s:e])
                 if len(segs) == 0:
@@ -2504,7 +2515,7 @@ class deformation:
                     idx, d2 = _knn_gpu(X, P)
 
                 Uadd = _interp_gpu(idx, d2, U)
-                _add_inplace_gpu(Uadd, X)   # in-place add
+                _add_inplace_gpu(Uadd, X)
 
                 # Update global AABB on host.
                 cmin = cp.min(X, axis=0).get()
@@ -2527,7 +2538,7 @@ class deformation:
                 sample._offset = new_offs
                 sample._matrix = np.diag(sample._dimensions.astype(np.float32))
                 sample._corners = (sample.get_unit_corners() @ sample._matrix) - (sample._dimensions * 0.5) + sample._offset
-            return  # GPU path done
+            return
 
         # ----------------------------- CPU fallback ------------------------------
         def _knn_tiled(P_sub, X, k, cap_bytes=800_000_000):
