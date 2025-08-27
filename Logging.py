@@ -19,7 +19,7 @@ class logging:
     _LOG_LEVELS = {"silent": 0, "normal": 1, "verbose": 2, "debug": 3}
 
     def __init__(self, log_name: str | None = None, *args, **kwargs):
-        # If you use multiple inheritance, this keeps MRO happy:
+        # For multiple inheritance, this keeps MRO happy:
         try:
             super().__init__(*args, **kwargs)
         except Exception:
@@ -30,7 +30,7 @@ class logging:
         self._logging_wrapped = False
         self._wrapped_methods = set()
 
-    # ---------- public API (kept compatible with your current calls) ----------
+    # ---------- public API ----------
     def set_logging(self, level: str = "normal", auto_instrument: bool = True):
         """
         Set logging verbosity and (optionally) wrap methods to emit start/stop
@@ -46,7 +46,7 @@ class logging:
                 self._install_logging_wrappers()
                 self._logging_wrapped = True
             except Exception:
-                # Instrumentation should never crash your flow
+                # Instrumentation should never crash flow
                 pass
         self._log("normal", f"set_logging: level set to {lvl} (was {self._level_name(prev)})")
 
@@ -84,7 +84,7 @@ class logging:
         - Idempotent per-instance via _wrapped_methods.
         """
 
-        # ----- configuration per-class (optional) -----
+        # ----- configuration per-class -----
         top_names = tuple(getattr(self, "__log_top__", ()))
         exclude = set(getattr(self, "__log_exclude__", ())) | {
             "_install_logging_wrappers", "_log", "_level_name", "set_logging"
@@ -192,11 +192,11 @@ class logging:
 
             return _wrapper
 
-        # Iterate over the *class* dictionary to avoid triggering properties
+        # Iterate over the class dictionary to avoid triggering properties
         for name in dir(type(self)):
             if name in exclude:
                 continue
-            # Skip attributes we already wrapped
+            # Skip wrapped attributes
             if name in getattr(self, "_wrapped_methods", set()):
                 continue
             # Pull the attribute from the class (not instance) and test callability
@@ -216,5 +216,4 @@ class logging:
                 setattr(self, name, types.MethodType(wrapper, self))
                 self._wrapped_methods.add(name)
             except Exception:
-                # Never let logging instrumentation break your object
                 continue
