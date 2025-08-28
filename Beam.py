@@ -29,8 +29,6 @@ class beam(logging):
         "atomic_scattering_dynamical",
         "atomic_transmission",
         "atomic_direct_interaction",
-        "interact_beam_gpu",
-        "interact_beam_cpu",
         "precompute_depth_ein_all_chunks",
         "wavefield_propagation",
         "create_beam",
