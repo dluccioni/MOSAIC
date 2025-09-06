@@ -21,9 +21,9 @@ class sample(logging):
     # Logging configuration
     # -------------------------------------------------------------------------
     __log_top__ = (
-        "generate_sample",
+        "generate_sample_single",
+        "generate_sample_poly",
         "import_atomic_data",
-        "get_chunk_positions",
         "create_sample",
         "read_sample_metadata",
         "write_sample_metadata",
@@ -34,6 +34,7 @@ class sample(logging):
         "translate_sample_relative",
         "plot_sample",
         "plot_sample_exterior",
+        "plot_grains",
     )
     
     # -----------------------------------------------------------------------------
@@ -53,7 +54,7 @@ class sample(logging):
 
         Notes:
             Geometry and data are not created here. Use `create_sample`,
-            `import_atomic_data`, or `generate_sample` to populate files.
+            `import_atomic_data`, or `generate_sample_single` to populate files.
         """
         super().__init__(log_name="sample")
         self.directory = directory
@@ -64,6 +65,10 @@ class sample(logging):
         self._chunk_total = None 
         self._matrix = None
         self._corners = None
+        self._sample_type = None
+        self._grain_seeds = None
+        self._grain_orientations = None
+        self._grain_count = None
 
         # Temperature/displacement configuration (disabled by default)
         self.enable_temp = False
@@ -83,7 +88,7 @@ class sample(logging):
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
             
-    def create_sample(self, dimensions, offset=[0, 0, 0], chunk_volume=12500000):
+    def create_sample(self, dimensions, offset=[0, 0, 0], chunk_volume=12500000, sample_type="single"):
         """Create an axis-aligned sample box and precompute helpers.
 
         Sets dimensions, offset, an identity rotation, and a diagonal matrix
@@ -98,8 +103,10 @@ class sample(logging):
                 [0, 0, 0].
             chunk_volume (int or float, optional): Target approximate number of
                 sites per output chunk. This is stored and later used to pick
-                chunking in `get_chunk_positions`/`generate_sample`. Defaults to
+                chunking in `get_chunk_positions`/`generate_sample_single`. Defaults to
                 12_500_000.
+            sample_type (str, optional): "single" (default) or "poly". Controls
+                whether subsequent generation is single crystal or polycrystal.
 
         Returns:
             None
@@ -118,13 +125,16 @@ class sample(logging):
         # Corners are unit-cube corners scaled by dimensions and shifted by offset
         # Slightly rewritten for small overhead reduction (no functional change)
         self._corners = (self.get_unit_corners() @ self.matrix) - (self.dimensions * 0.5) + self.offset
-        
+
+        # Sample type and poly state
+        self._sample_type = sample_type
+            
     def read_sample_metadata(self):
         """Load JSON metadata from disk and restore core state.
 
         Reads `sample_metadata.json` from `self.directory` (or from a provided
         override path in the writer) and restores `_dimensions`, `_offset`,
-        `_rotation`, and `_chunk_total` if present.
+        `_rotation`, `_chunk_total`, and `_sample_type` if present.
 
         Raises:
             FileNotFoundError: If the JSON metadata file does not exist.
@@ -150,6 +160,8 @@ class sample(logging):
             self._rotation = np.array(sample_metadata["rotation"], dtype=np.float32)
         if sample_metadata["chunk_total"] is not None:
             self._chunk_total = int(sample_metadata["chunk_total"])
+        if sample_metadata["sample_type"] is not None:
+            self._sample_type = sample_metadata["sample_type"]
         
     ## Data Handling Functions
     # -------------------------------------
@@ -208,8 +220,7 @@ class sample(logging):
         """Serialize critical fields to a JSON metadata file on disk.
 
         Writes `sample_metadata.json` containing `dimensions`, `offset`,
-        `rotation`, and `chunk_total`. NumPy arrays are converted to lists so
-        they are JSON serializable.
+        `rotation`, `chunk_total`, and `sample_type`.
 
         Args:
             override_directory (str, optional): If provided, write the JSON to
@@ -224,6 +235,7 @@ class sample(logging):
             "offset": self._offset.tolist() if self._offset is not None else None,
             "rotation": self._rotation.tolist() if self._rotation is not None else None,
             "chunk_total": int(self._chunk_total) if self._chunk_total is not None else None,
+            "sample_type": self._sample_type if self._sample_type is not None else None,
         }
 
         # Choose the output directory and filename
@@ -1991,7 +2003,7 @@ class sample(logging):
         gc.collect()
         return atomic_positions_S, atomic_species
 
-    def generate_sample(
+    def generate_sample_single(
         self,
         material,
         flush_size=100000000,
@@ -2217,6 +2229,581 @@ class sample(logging):
         # 7) Update metadata
         self._chunk_total = int(file_chunk_index)
         return
+
+    def input_voronoi_seed(self, seeds):
+        """Set user-provided Voronoi seed map.
+
+        Args:
+            seeds (array-like): shape (G, 3) array of seed positions in the same
+                coordinate frame as saved atomic positions (i.e., with the sample
+                centered at `offset - 0.5*dimensions`).
+
+        Returns:
+            np.ndarray: stored seeds (G, 3), float32
+        """
+        seeds = np.asarray(seeds, dtype=np.float32).reshape(-1, 3)
+        if seeds.shape[0] == 0:
+            raise ValueError("input_voronoi_seed: empty seed array")
+        self._grain_seeds = seeds
+        self._grain_count = int(seeds.shape[0])
+        return self._grain_seeds
+
+    def input_grain_orientation(self, orientation_matrices):
+        """Set user-provided grain orientation map.
+
+        Args:
+            orientation_matrices (array-like): shape (G, 3, 3). Each 3x3 is a
+                rotation/transform matrix applied to the crystal lattice of each grain.
+
+        Returns:
+            np.ndarray: stored orientation matrices (G, 3, 3), float32
+        """
+        R = np.asarray(orientation_matrices, dtype=np.float32)
+        if R.ndim != 3 or R.shape[1:] != (3, 3):
+            raise ValueError("input_grain_orientation expects array of shape (G, 3, 3)")
+        if (self._grain_count is not None) and (int(R.shape[0]) != int(self._grain_count)):
+            raise ValueError("orientation count does not match number of seeds")
+        self._grain_orientations = R
+        self._grain_count = int(R.shape[0])
+        return self._grain_orientations
+
+    def generate_voronoi_seeds(self, n_grains, method="uniform", random_seed=None):
+        """Generate Voronoi seeds inside the sample box.
+
+        Two methods:
+        - 'uniform': build a near-cubic grid, place one seed per cell center,
+                    then jitter each within its cell without crossing borders.
+        - 'random' : sample uniform i.i.d. seed positions in the box.
+
+        Args:
+            n_grains (int): number of grains (seeds).
+            method (str): 'uniform' (default) or 'random'.
+            random_seed (int|None): RNG seed for reproducibility.
+
+        Returns:
+            np.ndarray: seeds (G, 3) in world coordinates, dtype float32.
+        """
+        if n_grains is None or int(n_grains) <= 0:
+            raise ValueError("generate_voronoi_seeds: n_grains must be positive")
+
+        rng = np.random.RandomState(None if random_seed is None else int(random_seed))
+
+        dims = np.asarray(self.dimensions, dtype=np.float32)
+        box_min = (self.offset - 0.5 * dims).astype(np.float32)
+        box_max = box_min + dims
+
+        if method not in ("uniform", "random"):
+            method = "uniform"
+
+        if method == "uniform":
+            # Choose integer grid dims close to cube root
+            g = int(np.round(n_grains ** (1.0 / 3.0)))
+            if g < 1: g = 1
+            # Expand to reach or exceed n_grains
+            nx = g
+            ny = g
+            nz = int(np.ceil(float(n_grains) / float(nx * ny)))
+            while nx * ny * nz < n_grains:
+                # Grow the smallest dimension
+                if nx <= ny and nx <= nz:
+                    nx += 1
+                elif ny <= nx and ny <= nz:
+                    ny += 1
+                else:
+                    nz += 1
+
+            hx, hy, hz = dims[0] / nx, dims[1] / ny, dims[2] / nz
+            # cell centers
+            cx = box_min[0] + (np.arange(nx, dtype=np.float32) + 0.5) * hx
+            cy = box_min[1] + (np.arange(ny, dtype=np.float32) + 0.5) * hy
+            cz = box_min[2] + (np.arange(nz, dtype=np.float32) + 0.5) * hz
+            X, Y, Z = np.meshgrid(cx, cy, cz, indexing="ij")
+            seeds = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1).astype(np.float32)
+
+            # jitter within each cell but keep uniqueness per cell
+            jitter_scale = np.array([0.45 * hx, 0.45 * hy, 0.45 * hz], dtype=np.float32)
+            jitter = (rng.rand(seeds.shape[0], 3).astype(np.float32) * 2.0 - 1.0) * jitter_scale
+            seeds = seeds + jitter
+
+            # Trim to exact count if grid overshoots
+            if seeds.shape[0] > n_grains:
+                sel = rng.choice(seeds.shape[0], size=int(n_grains), replace=False)
+                seeds = seeds[sel, :]
+
+        else:
+            # Pure random uniform sampling
+            seeds = rng.uniform(low=box_min, high=box_max, size=(int(n_grains), 3)).astype(np.float32)
+
+        self._grain_seeds = seeds
+        self._grain_count = int(seeds.shape[0])
+        return self._grain_seeds
+
+    @staticmethod
+    def _random_rotation_matrix(rng):
+        """Shoemake-style random rotation matrix (uniform on SO(3))."""
+        u1, u2, u3 = rng.rand(3)
+        q1 = np.sqrt(1.0 - u1) * np.sin(2.0 * np.pi * u2)
+        q2 = np.sqrt(1.0 - u1) * np.cos(2.0 * np.pi * u2)
+        q3 = np.sqrt(u1)       * np.sin(2.0 * np.pi * u3)
+        q4 = np.sqrt(u1)       * np.cos(2.0 * np.pi * u3)
+        # quaternion to rotation
+        x, y, z, w = q1, q2, q3, q4
+        R = np.array([
+            [1 - 2*(y*y + z*z),     2*(x*y - z*w),       2*(x*z + y*w)],
+            [2*(x*y + z*w),         1 - 2*(x*x + z*z),   2*(y*z - x*w)],
+            [2*(x*z - y*w),         2*(y*z + x*w),       1 - 2*(x*x + y*y)]
+        ], dtype=np.float32)
+        return R
+
+    @staticmethod
+    def _align_rotation_from_to(a, b):
+        """Rotation aligning vector a to b (both 3, any length)."""
+        a = np.asarray(a, dtype=np.float64)
+        b = np.asarray(b, dtype=np.float64)
+        a = a / (np.linalg.norm(a) + 1e-20)
+        b = b / (np.linalg.norm(b) + 1e-20)
+        v = np.cross(a, b)
+        c = np.dot(a, b)
+        if c > 1.0: c = 1.0
+        if c < -1.0: c = -1.0
+        s = np.linalg.norm(v)
+        if s < 1e-12:
+            # vectors are parallel (or antiparallel)
+            if c > 0:
+                return np.eye(3, dtype=np.float32)
+            # 180 deg: pick any orthogonal axis
+            axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            if abs(a[0]) > 0.9:
+                axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            axis = axis - a * np.dot(axis, a)
+            axis = axis / (np.linalg.norm(axis) + 1e-20)
+            return sample.get_rotation(axis, np.pi).astype(np.float32)
+        kmat = np.array([[    0, -v[2],  v[1]],
+                        [ v[2],     0, -v[0]],
+                        [-v[1],  v[0],     0]], dtype=np.float64)
+        R = np.eye(3) + kmat + (kmat @ kmat) * ((1.0 - c) / (s * s + 1e-20))
+        return R.astype(np.float32)
+
+    def _orientation_matrices_from_mode(self, n_grains, mode="random",
+                                        texture_axis=(0.0, 0.0, 1.0),
+                                        spread_deg=5.0,
+                                        random_seed=None):
+        """Build per-grain orientation matrices."""
+        rng = np.random.RandomState(None if random_seed is None else int(random_seed))
+        R = np.zeros((int(n_grains), 3, 3), dtype=np.float32)
+        if mode not in ("random", "textured"):
+            mode = "random"
+
+        if mode == "random":
+            for g in range(int(n_grains)):
+                R[g] = self._random_rotation_matrix(rng)
+            return R
+
+        # textured: align lattice z to texture_axis, then apply small-angle Gaussian tilt and random twist
+        t = np.asarray(texture_axis, dtype=np.float64)
+        if np.linalg.norm(t) < 1e-12:
+            t = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        t = t / np.linalg.norm(t)
+        R0 = self._align_rotation_from_to(np.array([0.0, 0.0, 1.0], dtype=np.float64), t).astype(np.float32)
+
+        # build two orthonormal vectors spanning plane perp to t
+        tmp = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(np.dot(tmp, t)) > 0.9:
+            tmp = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        e1 = tmp - t * np.dot(tmp, t)
+        e1 = e1 / (np.linalg.norm(e1) + 1e-20)
+        e2 = np.cross(t, e1)
+
+        spread_rad = float(spread_deg) * np.pi / 180.0
+        for g in range(int(n_grains)):
+            # random twist about t
+            twist = rng.uniform(0.0, 2.0*np.pi)
+            Rt = sample.get_rotation(t, twist).astype(np.float32)
+
+            # small tilt around axis in plane perp to t
+            phi = rng.uniform(0.0, 2.0*np.pi)
+            axis = (np.cos(phi) * e1 + np.sin(phi) * e2)
+            angle = abs(rng.normal(loc=0.0, scale=spread_rad))
+            Rtilt = sample.get_rotation(axis, angle).astype(np.float32)
+
+            R[g] = (Rtilt @ R0 @ Rt).astype(np.float32)
+        return R
+
+    @staticmethod
+    def _rotate_material_like(material, R):
+        """Construct a lightweight material-like object with rotated lattice."""
+        # R is 3x3 in sample frame
+        mat = type("MatLike", (), {})()
+        # rotate lattice vectors (columns) -> R @ lattice_matrix
+        mat.lattice_matrix = (R @ np.asarray(material.lattice_matrix, dtype=np.float32)).astype(np.float32)
+        # rotate unit cell atom offsets
+        mat.lattice_atom_cartesian = (np.asarray(material.lattice_atom_cartesian, dtype=np.float32) @ R.T).astype(np.float32)
+        # copy-through scalars/arrays
+        mat.lattice_volume = getattr(material, "lattice_volume", None)
+        mat.species = np.asarray(getattr(material, "species", []))
+        return mat
+
+    @staticmethod
+    def _voronoi_min_index_cpu(positions_np, seeds_np):
+        """Return argmin seed index for each position (CPU; streaming over seeds)."""
+        N = positions_np.shape[0]
+        G = seeds_np.shape[0]
+        min_d2 = np.full((N,), np.inf, dtype=np.float64)
+        min_idx = np.full((N,), -1, dtype=np.int32)
+        # loop seeds to keep memory O(N)
+        for g in range(G):
+            d = positions_np - seeds_np[g, :][None, :]
+            d2 = np.sum(d * d, axis=1, dtype=np.float64)
+            mask = d2 < min_d2
+            min_idx[mask] = g
+            min_d2[mask] = d2[mask]
+        return min_idx
+
+    @staticmethod
+    def _voronoi_min_index_gpu(positions_cp, seeds_cp, seed_tile=512, pos_tile=None):
+        """
+        Argmin over seeds using GEMM tiles:
+        d2 = ||p||^2[:,None] + ||s||^2[None,:] - 2 * P @ S^T
+        Tiles over seeds and positions to control memory.
+        """
+        N = int(positions_cp.shape[0])
+        G = int(seeds_cp.shape[0])
+
+        # tile positions too if N is huge
+        if pos_tile is None or pos_tile <= 0:
+            pos_tile = N
+
+        best_d2 = cp.full((N,), cp.inf, dtype=cp.float32)
+        best_idx = cp.full((N,), -1, dtype=cp.int32)
+
+        # Precompute norms once
+        p2 = cp.sum(positions_cp * positions_cp, axis=1).astype(cp.float32)  # (N,)
+        s2 = cp.sum(seeds_cp * seeds_cp, axis=1).astype(cp.float32)          # (G,)
+
+        for p0 in range(0, N, pos_tile):
+            p1 = min(p0 + pos_tile, N)
+            P = positions_cp[p0:p1, :]                    # (nP, 3)
+            p2_blk = p2[p0:p1]                            # (nP,)
+            # local best for this position tile
+            lbest_d2 = cp.full((p1 - p0,), cp.inf, dtype=cp.float32)
+            lbest_idx = cp.full((p1 - p0,), -1, dtype=cp.int32)
+
+            for s0 in range(0, G, seed_tile):
+                s1 = min(s0 + seed_tile, G)
+                S = seeds_cp[s0:s1, :]                    # (nS, 3)
+                # (nP, nS) via cuBLAS
+                PS = P @ S.T                              # float32 GEMM
+                # d2_block = p2 + s2 - 2·PS (broadcasted)
+                d2_blk = (p2_blk[:, None] + s2[s0:s1][None, :] - 2.0 * PS)
+
+                # argmin across seeds in this tile
+                idx_local = cp.argmin(d2_blk, axis=1)             # (nP,)
+                d2_local  = d2_blk[cp.arange(p1 - p0), idx_local]
+
+                # keep better results
+                mask = d2_local < lbest_d2
+                lbest_d2 = cp.where(mask, d2_local, lbest_d2)
+                lbest_idx = cp.where(mask, (idx_local + s0).astype(cp.int32), lbest_idx)
+
+            # commit tile results to global
+            better = lbest_d2 < best_d2[p0:p1]
+            best_d2[p0:p1] = cp.where(better, lbest_d2, best_d2[p0:p1])
+            best_idx[p0:p1] = cp.where(better, lbest_idx, best_idx[p0:p1])
+
+        return best_idx
+    
+    def generate_sample_poly(
+        self,
+        material,
+        n_grains=None,
+        voronoi_method="uniform",
+        randomness_seed=None,
+        orientation_mode="random",
+        texture_axis=(0.0, 0.0, 1.0),
+        texture_spread_deg=5.0,
+        flush_size=100000000,
+        use_gpu=True,
+        gpu_streams=4,
+        grain_workers=None,
+        writer_threads=3
+    ):
+        """Generate and persist a polycrystalline sample using Voronoi grains.
+
+        Each grain gets:
+        - a Voronoi cell (from seeds provided or generated),
+        - an orientation (random or textured),
+        - its own lattice generation over the sample,
+        - masking to the Voronoi region.
+
+        Generation is streamed to disk in fixed-size chunks exactly like
+        `generate_sample_single`. CPU path uses per-grain threads; GPU path uses
+        multi-stream pipelining and robustly falls back to CPU if needed.
+
+        Args:
+            material: object with lattice/unit-cell, see `generate_sample_single`.
+            n_grains (int|None): if provided, defines or overrides number of grains.
+                If seeds already exist via `input_voronoi_seed`, this may be None.
+                If neither is set, defaults to 8.
+            voronoi_method (str): 'uniform' (default) or 'random' when generating seeds.
+            randomness_seed (int|None): RNG seed for reproducibility of seeds and, if
+                needed, random orientations.
+            orientation_mode (str): 'random' (default) or 'textured'.
+            texture_axis (3,): for 'textured' mode, principal texture axis.
+            texture_spread_deg (float): Gaussian stddev (degrees) of misorientation
+                cone around `texture_axis` (small angle approx).
+            flush_size (int): atoms per on-disk chunk.
+            use_gpu (bool): enable GPU path if CuPy + device available.
+            gpu_streams (int): CUDA streams per grain in GPU path.
+            grain_workers (int|None): CPU worker threads; default=min(G, os.cpu_count()).
+            writer_threads (int): I/O worker threads.
+
+        Returns:
+            None (writes chunked arrays and metadata to disk).
+        """
+
+        self._sample_type = "poly"
+
+        # 1) Seeds
+        if self._grain_seeds is None:
+            G = int(8 if (n_grains is None) else n_grains)
+            self.generate_voronoi_seeds(G, method=voronoi_method, random_seed=randomness_seed)
+        else:
+            G = int(self._grain_seeds.shape[0])
+            if n_grains is not None and int(n_grains) != G:
+                raise ValueError("n_grains does not match existing seed map")
+        seeds_np = np.asarray(self._grain_seeds, dtype=np.float32)
+
+        # 2) Orientations
+        if self._grain_orientations is None:
+            R = self._orientation_matrices_from_mode(
+                G,
+                mode=orientation_mode,
+                texture_axis=texture_axis,
+                spread_deg=texture_spread_deg,
+                random_seed=randomness_seed
+            )
+            self._grain_orientations = R
+        else:
+            R = np.asarray(self._grain_orientations, dtype=np.float32)
+            if R.shape[0] != G:
+                raise ValueError("orientation map size does not match number of seeds")
+
+        # 3) Writer and global accumulation buffers (same pattern as generate_sample_single)
+        from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
+        import threading
+
+        flush_size = int(flush_size)
+
+        def _write_chunk(idx, pos_arr, spc_arr):
+            self.write_chunk_positions(pos_arr, idx)
+            self.write_chunk_species(spc_arr, idx)
+            return idx
+
+        writer_pool = ThreadPoolExecutor(
+            max_workers=max(1, int(writer_threads)),
+            thread_name_prefix="writer"
+        )
+        pending_writes = []
+
+        buf_pos = None
+        buf_spc = None
+        fill = 0
+        file_chunk_index = 0
+        lock = threading.Lock()
+
+        def _accumulate_to_buffers(pos_np, spc_np):
+            nonlocal buf_pos, buf_spc, fill, file_chunk_index, pending_writes
+            n = int(pos_np.shape[0])
+            if n == 0:
+                return
+            with lock:
+                if buf_pos is None:
+                    buf_pos = np.empty((flush_size, 3), dtype=pos_np.dtype)
+                    buf_spc = np.empty((flush_size,), dtype=np.asarray(spc_np).dtype)
+
+                start = 0
+                while start < n:
+                    space = flush_size - fill
+                    take = (n - start) if (n - start) < space else space
+
+                    buf_pos[fill:fill + take] = pos_np[start:start + take]
+                    buf_spc[fill:fill + take] = spc_np[start:start + take]
+
+                    fill += take
+                    start += take
+
+                    if fill == flush_size:
+                        file_chunk_index += 1
+                        pending_writes.append(
+                            writer_pool.submit(_write_chunk, file_chunk_index, buf_pos.copy(), buf_spc.copy())
+                        )
+                        fill = 0  # reset
+
+        def _flush_tail():
+            nonlocal fill, file_chunk_index, pending_writes
+            with lock:
+                if fill > 0:
+                    file_chunk_index += 1
+                    pending_writes.append(
+                        writer_pool.submit(_write_chunk, file_chunk_index, buf_pos[:fill].copy(), buf_spc[:fill].copy())
+                    )
+                    fill = 0
+
+        # 4) Decide if GPU is available
+        gpu_ok = False
+        if use_gpu and (cp is not None):
+            try:
+                gpu_ok = (int(cp.cuda.runtime.getDeviceCount()) > 0)
+            except Exception:
+                gpu_ok = False
+
+        # 5) Grain worker functions
+        def _process_grain_cpu(g_idx):
+            # Rotate material for this grain
+            mat_g = self._rotate_material_like(material, R[g_idx])
+
+            # Build geometric chunking for this grain
+            chunk_positions, chunk_dims = self.get_chunk_positions(mat_g)
+
+            # Stream all chunks on CPU
+            for i in range(int(chunk_positions.shape[0])):
+                pos_np, spc_np = self.get_atomic_data(
+                    mat_g,
+                    chunk_positions[i, :],
+                    chunk_dims,
+                    use_gpu=False
+                )
+                if pos_np.shape[0] == 0:
+                    continue
+                # Voronoi membership on CPU
+                min_idx = self._voronoi_min_index_cpu(pos_np, seeds_np)
+                keep = (min_idx == int(g_idx))
+                if not np.any(keep):
+                    continue
+                _accumulate_to_buffers(pos_np[keep, :], spc_np[keep])
+
+        def _process_grain_gpu(g_idx):
+            # Rotate material for this grain
+            mat_g = self._rotate_material_like(material, R[g_idx])
+
+            # Geometric chunks (host math)
+            chunk_positions, chunk_dims = self.get_chunk_positions(mat_g)
+            num_geom = int(chunk_positions.shape[0])
+            if num_geom == 0:
+                return
+
+            try:
+                n_streams = max(1, int(gpu_streams))
+                streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
+
+                # Invariants on device
+                lattice_atom_cartesian_cp = cp.asarray(mat_g.lattice_atom_cartesian, dtype=cp.float32)
+                offset_gpu = cp.asarray(self.offset, dtype=cp.float32)
+                dim_half_gpu = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
+                seeds_cp = cp.asarray(seeds_np, dtype=cp.float32)
+
+                inflight = []
+                enqueue_idx = 0
+
+                def _enqueue(i, s):
+                    with s:
+                        pos_cp, mask_cp, site_count = self.get_atomic_data(
+                            mat_g,
+                            chunk_positions[i, :],
+                            chunk_dims,
+                            use_gpu=True,
+                            stream=s,
+                            return_on_gpu=True,
+                            lattice_atom_cartesian_cp=lattice_atom_cartesian_cp,
+                            offset_gpu=offset_gpu,
+                            dim_half_gpu=dim_half_gpu
+                        )
+                    ev = cp.cuda.Event()
+                    ev.record(s)
+                    inflight.append({
+                        "event": ev,
+                        "pos_cp": pos_cp,
+                        "mask_cp": mask_cp,
+                        "site_count": int(site_count)
+                    })
+
+                def _drain_one():
+                    task = inflight.pop(0)
+                    task["event"].synchronize()
+
+                    pos_cp = task["pos_cp"]
+                    if pos_cp.size == 0:
+                        # no atoms in sample for this chunk
+                        return
+
+                    # Voronoi membership on GPU
+                    min_idx = self._voronoi_min_index_gpu(pos_cp, seeds_cp)
+                    keep_gpu = (min_idx == int(g_idx))
+                    if not bool(cp.any(keep_gpu)):
+                        return
+
+                    pos_keep = pos_cp[keep_gpu, :].get()
+
+                    # Species mapping on CPU:
+                    # 1) mask_cp -> inside-sample mask for flattened sites
+                    # 2) keep_gpu -> voronoi mask for the already-filtered positions
+                    mask_np = task["mask_cp"].get()
+                    spc_all = np.tile(mat_g.species, task["site_count"])
+                    spc_sample = spc_all[mask_np]
+                    keep_np = keep_gpu.get()
+                    spc_keep = spc_sample[keep_np]
+
+                    _accumulate_to_buffers(pos_keep, spc_keep)
+
+                    # Cleanup to return memory
+                    del pos_keep, spc_keep, spc_sample, spc_all, mask_np, keep_np, pos_cp, keep_gpu, min_idx, task
+
+                # Fill-drain
+                while (enqueue_idx < num_geom) or inflight:
+                    while (enqueue_idx < num_geom) and (len(inflight) < n_streams):
+                        s = streams[enqueue_idx % n_streams]
+                        _enqueue(enqueue_idx, s)
+                        enqueue_idx += 1
+                    if inflight:
+                        _drain_one()
+
+                try:
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+
+            except (cp.cuda.memory.OutOfMemoryError, cp.cuda.runtime.CUDARuntimeError, RuntimeError, ValueError):
+                # GPU error -> fallback to CPU for this grain
+                try:
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+                _process_grain_cpu(g_idx)
+
+        # 6) Dispatch grains
+        if gpu_ok:
+            # GPU path: process grains sequentially (each uses multi-stream pipeline)
+            for g_idx in range(G):
+                _process_grain_gpu(g_idx)
+        else:
+            # CPU path: per-grain threads
+            if grain_workers is None or int(grain_workers) <= 0:
+                try:
+                    grain_workers = min(G, os.cpu_count() or 1)
+                except Exception:
+                    grain_workers = min(G, 4)
+            with ThreadPoolExecutor(max_workers=int(grain_workers), thread_name_prefix="grain") as pool:
+                futs = [pool.submit(_process_grain_cpu, g) for g in range(G)]
+                wait(futs, return_when=ALL_COMPLETED)
+
+        # 7) Flush and finalize
+        _flush_tail()
+        wait(pending_writes, return_when=ALL_COMPLETED)
+        writer_pool.shutdown(wait=True)
+
+        # update metadata
+        self._chunk_total = int(file_chunk_index)
+        return
     # -------------------------------------
     
     # -------------------------------------
@@ -2406,13 +2993,13 @@ class sample(logging):
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d.art3d import Poly3DCollection as _Poly3DCollection
 
-        # ---- validation
+        # validation
         if self._chunk_total is None or int(self._chunk_total) <= 0:
             raise ValueError("No on-disk chunks found. Generate or import sample first.")
         if self._dimensions is None or self._offset is None:
             raise ValueError("Sample dimensions/offset are not initialized.")
 
-        # ---- choose backend
+        # choose backend
         use_gpu = False
         if engine not in ("auto", "gpu", "cpu"):
             engine = "auto"
@@ -2422,7 +3009,7 @@ class sample(logging):
             except Exception:
                 use_gpu = False
 
-        # ---- grid setup
+        # grid setup
         dims = np.asarray(self.dimensions, dtype=np.float32)
         if np.any(dims <= 0):
             raise ValueError("Invalid sample dimensions.")
@@ -2447,7 +3034,7 @@ class sample(logging):
             occ = np.zeros((nx, ny, nz), dtype=np.bool_)
             box_min_xp = box_min  # numpy
 
-        # ---- stream chunks -> fill voxel occupancy
+        # stream chunks -> fill voxel occupancy
         def _accumulate_voxels_gpu(pos_cp):
             if pos_cp.size == 0:
                 return
@@ -2492,7 +3079,7 @@ class sample(logging):
             else:
                 _accumulate_voxels_cpu(pos)
 
-        # ---- identify exterior voxels (occupied and touching empty or domain)
+        # identify exterior voxels (occupied and touching empty or domain)
         if use_gpu:
             lib = cp
         else:
@@ -2562,7 +3149,7 @@ class sample(logging):
                 "quads_total_before_decimate": int(total_quads_before),
             }
 
-        # ---- build 6 faces per selected voxel (vectorized on CPU)
+        # build 6 faces per selected voxel (vectorized on CPU)
         i = ext_idx[:, 0]
         j = ext_idx[:, 1]
         k = ext_idx[:, 2]
@@ -2597,7 +3184,7 @@ class sample(logging):
             step = int(np.ceil(quads.shape[0] / max(1, int(max_quads))))
             quads = quads[::step, :]
 
-        # ---- plot
+        # plot
         fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(1, 1, 1, projection="3d")
 
@@ -2628,6 +3215,448 @@ class sample(logging):
             "quads_total_before_decimate": int(total_quads_before),
         }
         return fig, ax, info
+    
+    def plot_grains(
+        self,
+        voxels=120,
+        voxel_size=None,
+        engine="auto",
+        decimate=1,
+        max_quads=800000,
+        face_alpha=0.35,
+        show_edges=False,
+        show_seeds=True,
+        label_orientations=True,
+        elev=20,
+        azim=-60,
+        figsize=(12, 8),
+        cmap_name="tab20"
+    ):
+        """Plot Voronoi grains (cells) as colored surfaces inside the sample box.
+
+        The volume is discretized to a regular grid; each voxel center is assigned
+        to the nearest Voronoi seed; inter-voxel boundaries between different grain
+        ids are surfaced and colored by grain id. If there are < 10 grains and
+        label_orientations=True, a label is placed near each seed showing the
+        grain's number. Each orientation is then displayed in a legend as Euler ZYX 
+        (yaw, pitch, roll) in degrees.
+
+        Args:
+            voxels (int): Target voxels across the longest box edge (ignored if
+                voxel_size provided). Higher gives finer cell surfaces.
+            voxel_size (float | None): If given, edge length of voxels in position units.
+            engine (str): "auto" (default), "gpu", or "cpu" for the seed assignment step.
+            decimate (int): Keep every nth face during plotting. 1 = keep all.
+            max_quads (int): Global cap on number of quads to draw.
+            face_alpha (float): Face opacity in [0,1].
+            show_edges (bool): Draw polygon edges.
+            show_seeds (bool): Plot seed markers.
+            label_orientations (bool): If True and grain_count < 10, annotate Euler angles.
+            elev, azim (float): Matplotlib 3D view angles in degrees.
+            figsize (tuple): Figure size (width, height).
+            cmap_name (str): Name of matplotlib colormap for grain colors.
+
+        Returns:
+            (fig, ax, info) where:
+                - fig: matplotlib Figure
+                - ax:  3D Axes
+                - info: dict with details (grid_shape, voxel_size, grains, faces_kept, engine_used)
+
+        Raises:
+            ValueError: If seeds are missing or sample geometry is not initialized.
+        """
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection as _Poly3DCollection
+        import matplotlib.cm as cm
+        import matplotlib.patches as mpatches
+
+        # validations
+        if not hasattr(self, "_dimensions") or self._dimensions is None or not hasattr(self, "_offset") or self._offset is None:
+            raise ValueError("Sample dimensions/offset not initialized. Create or load metadata first.")
+        if not hasattr(self, "_grain_seeds") or self._grain_seeds is None:
+            raise ValueError("No Voronoi seeds present. Call generate_voronoi_seeds(...) or input_voronoi_seed(...).")
+
+        seeds_np = np.asarray(self._grain_seeds, dtype=np.float32).reshape(-1, 3)
+        G = int(seeds_np.shape[0])
+
+        use_gpu = False
+        if engine not in ("auto", "gpu", "cpu"):
+            engine = "auto"
+        if engine in ("auto", "gpu") and (cp is not None):
+            try:
+                use_gpu = (int(cp.cuda.runtime.getDeviceCount()) > 0)
+            except Exception:
+                use_gpu = False
+
+        dims = np.asarray(self.dimensions, dtype=np.float32)
+        box_min = (self.offset - 0.5 * dims).astype(np.float32)
+        box_max = box_min + dims
+
+        # grid setup (nx, ny, nz)
+        if voxel_size is not None and float(voxel_size) > 0.0:
+            nx, ny, nz = np.ceil(dims / float(voxel_size)).astype(np.int64)
+        else:
+            scale = float(voxels) / float(dims.max())
+            nx, ny, nz = np.ceil(dims * scale).astype(np.int64)
+
+        nx = int(max(nx, 1))
+        ny = int(max(ny, 1))
+        nz = int(max(nz, 1))
+        hx, hy, hz = dims[0] / nx, dims[1] / ny, dims[2] / nz
+
+        # nearest seed argmin (streaming over seeds)
+        def _argmin_seeds_cpu(positions_np, seeds_np_local):
+            N = int(positions_np.shape[0])
+            min_d2 = np.full((N,), np.inf, dtype=np.float64)
+            min_idx = np.full((N,), -1, dtype=np.int32)
+            for g in range(seeds_np_local.shape[0]):
+                d = positions_np - seeds_np_local[g][None, :]
+                d2 = d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1] + d[:, 2] * d[:, 2]
+                mask = d2 < min_d2
+                min_idx[mask] = g
+                min_d2[mask] = d2[mask]
+            return min_idx
+
+        def _argmin_seeds_gpu(positions_cp, seeds_np_local):
+            seeds_cp = cp.asarray(seeds_np_local, dtype=cp.float32)
+            N = int(positions_cp.shape[0])
+            min_d2 = cp.full((N,), cp.inf, dtype=cp.float32)
+            min_idx = cp.full((N,), -1, dtype=cp.int32)
+            for g in range(int(seeds_cp.shape[0])):
+                d = positions_cp - seeds_cp[g, :][None, :]
+                d2 = cp.sum(d * d, axis=1, dtype=cp.float32)
+                mask = d2 < min_d2
+                min_idx = cp.where(mask, g, min_idx)
+                min_d2 = cp.where(mask, d2, min_d2)
+            return min_idx
+
+        # voxel centers to Voronoi id per cell
+        if use_gpu:
+            centers_ijk = self.get_flat_grid((nx, ny, nz), use_gpu=True)
+            centers = centers_ijk * cp.asarray([hx, hy, hz], dtype=cp.float32) + \
+                    (cp.asarray(box_min, dtype=cp.float32) + cp.asarray([0.5*hx, 0.5*hy, 0.5*hz], dtype=cp.float32))
+            try:
+                gids_flat = _argmin_seeds_gpu(centers, seeds_np)
+            except Exception:
+                centers_np = centers.get()
+                gids_flat = _argmin_seeds_cpu(centers_np, seeds_np)
+                use_gpu = False
+            else:
+                gids_flat = gids_flat.get()
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+        else:
+            centers_ijk = self.get_flat_grid((nx, ny, nz), use_gpu=False)
+            centers = centers_ijk * np.array([hx, hy, hz], dtype=np.float32) + \
+                    (box_min + np.array([0.5*hx, 0.5*hy, 0.5*hz], dtype=np.float32))
+            gids_flat = _argmin_seeds_cpu(centers, seeds_np)
+
+        labels = gids_flat.reshape(nx, ny, nz)
+
+        # face assembly utilities
+        def _group_quads_by_grain(gids, quads_arr):
+            out = {}
+            if gids.size == 0:
+                return out
+            u = np.unique(gids)
+            for gr in u:
+                sel = (gids == gr)
+                out[int(gr)] = quads_arr[sel, :, :]
+            return out
+
+        def _merge_group(dst, src):
+            for k, v in src.items():
+                if k in dst:
+                    dst[k] = np.concatenate([dst[k], v], axis=0)
+                else:
+                    dst[k] = v
+
+        def _faces_x_different(labels3d):
+            m = labels3d[:-1, :, :] != labels3d[1:, :, :]
+            i0, j0, k0 = np.where(m)
+            if i0.size == 0:
+                return {}
+            g = labels3d[i0, j0, k0]
+            xp = box_min[0] + (i0.astype(np.float64) + 1.0) * hx
+            y0 = box_min[1] + j0.astype(np.float64) * hy
+            y1 = y0 + hy
+            z0 = box_min[2] + k0.astype(np.float64) * hz
+            z1 = z0 + hz
+            v0 = np.stack([xp, y0, z0], axis=1)
+            v1 = np.stack([xp, y1, z0], axis=1)
+            v2 = np.stack([xp, y1, z1], axis=1)
+            v3 = np.stack([xp, y0, z1], axis=1)
+            quads = np.stack([v0, v1, v2, v3], axis=1).astype(np.float32)
+            return _group_quads_by_grain(g, quads)
+
+        def _faces_y_different(labels3d):
+            m = labels3d[:, :-1, :] != labels3d[:, 1:, :]
+            i0, j0, k0 = np.where(m)
+            if i0.size == 0:
+                return {}
+            g = labels3d[i0, j0, k0]
+            yp = box_min[1] + (j0.astype(np.float64) + 1.0) * hy
+            x0 = box_min[0] + i0.astype(np.float64) * hx
+            x1 = x0 + hx
+            z0 = box_min[2] + k0.astype(np.float64) * hz
+            z1 = z0 + hz
+            v0 = np.stack([x0, yp, z0], axis=1)
+            v1 = np.stack([x1, yp, z0], axis=1)
+            v2 = np.stack([x1, yp, z1], axis=1)
+            v3 = np.stack([x0, yp, z1], axis=1)
+            quads = np.stack([v0, v1, v2, v3], axis=1).astype(np.float32)
+            return _group_quads_by_grain(g, quads)
+
+        def _faces_z_different(labels3d):
+            m = labels3d[:, :, :-1] != labels3d[:, :, 1:]
+            i0, j0, k0 = np.where(m)
+            if i0.size == 0:
+                return {}
+            g = labels3d[i0, j0, k0]
+            zp = box_min[2] + (k0.astype(np.float64) + 1.0) * hz
+            x0 = box_min[0] + i0.astype(np.float64) * hx
+            x1 = x0 + hx
+            y0 = box_min[1] + j0.astype(np.float64) * hy
+            y1 = y0 + hy
+            v0 = np.stack([x0, y0, zp], axis=1)
+            v1 = np.stack([x1, y0, zp], axis=1)
+            v2 = np.stack([x1, y1, zp], axis=1)
+            v3 = np.stack([x0, y1, zp], axis=1)
+            quads = np.stack([v0, v1, v2, v3], axis=1).astype(np.float32)
+            return _group_quads_by_grain(g, quads)
+
+        def _faces_domain_boundaries(labels3d):
+            out = {}
+            # x min
+            if nx > 0:
+                i = 0
+                j_idx, k_idx = np.indices((ny, nz))
+                g = labels3d[i, j_idx.ravel(), k_idx.ravel()]
+                x = np.full(g.size, box_min[0], dtype=np.float64)
+                y0 = box_min[1] + j_idx.ravel().astype(np.float64) * hy
+                y1 = y0 + hy
+                z0 = box_min[2] + k_idx.ravel().astype(np.float64) * hz
+                z1 = z0 + hz
+                v0 = np.stack([x, y0, z0], axis=1)
+                v1 = np.stack([x, y1, z0], axis=1)
+                v2 = np.stack([x, y1, z1], axis=1)
+                v3 = np.stack([x, y0, z1], axis=1)
+                quads = np.stack([v0, v1, v2, v3], axis=1).astype(np.float32)
+                _merge_group(out, _group_quads_by_grain(g, quads))
+            # x max
+            if nx > 0:
+                i = nx - 1
+                j_idx, k_idx = np.indices((ny, nz))
+                g = labels3d[i, j_idx.ravel(), k_idx.ravel()]
+                x = np.full(g.size, box_min[0] + nx * hx, dtype=np.float64)
+                y0 = box_min[1] + j_idx.ravel().astype(np.float64) * hy
+                y1 = y0 + hy
+                z0 = box_min[2] + k_idx.ravel().astype(np.float64) * hz
+                z1 = z0 + hz
+                v0 = np.stack([x, y0, z0], axis=1)
+                v1 = np.stack([x, y0, z1], axis=1)
+                v2 = np.stack([x, y1, z1], axis=1)
+                v3 = np.stack([x, y1, z0], axis=1)
+                quads = np.stack([v0, v1, v2, v3], axis=1).astype(np.float32)
+                _merge_group(out, _group_quads_by_grain(g, quads))
+            # y min
+            if ny > 0:
+                j = 0
+                i_idx, k_idx = np.indices((nx, nz))
+                g = labels3d[i_idx.ravel(), j, k_idx.ravel()]
+                y = np.full(g.size, box_min[1], dtype=np.float64)
+                x0 = box_min[0] + i_idx.ravel().astype(np.float64) * hx
+                x1 = x0 + hx
+                z0 = box_min[2] + k_idx.ravel().astype(np.float64) * hz
+                z1 = z0 + hz
+                v0 = np.stack([x0, y, z0], axis=1)
+                v1 = np.stack([x1, y, z0], axis=1)
+                v2 = np.stack([x1, y, z1], axis=1)
+                v3 = np.stack([x0, y, z1], axis=1)
+                quads = np.stack([v0, v1, v2, v3], axis=1).astype(np.float32)
+                _merge_group(out, _group_quads_by_grain(g, quads))
+            # y max
+            if ny > 0:
+                j = ny - 1
+                i_idx, k_idx = np.indices((nx, nz))
+                g = labels3d[i_idx.ravel(), j, k_idx.ravel()]
+                y = np.full(g.size, box_min[1] + ny * hy, dtype=np.float64)
+                x0 = box_min[0] + i_idx.ravel().astype(np.float64) * hx
+                x1 = x0 + hx
+                z0 = box_min[2] + k_idx.ravel().astype(np.float64) * hz
+                z1 = z0 + hz
+                v0 = np.stack([x0, y, z0], axis=1)
+                v1 = np.stack([x0, y, z1], axis=1)
+                v2 = np.stack([x1, y, z1], axis=1)
+                v3 = np.stack([x1, y, z0], axis=1)
+                quads = np.stack([v0, v1, v2, v3], axis=1).astype(np.float32)
+                _merge_group(out, _group_quads_by_grain(g, quads))
+            # z min
+            if nz > 0:
+                k = 0
+                i_idx, j_idx = np.indices((nx, ny))
+                g = labels3d[i_idx.ravel(), j_idx.ravel(), k]
+                z = np.full(g.size, box_min[2], dtype=np.float64)
+                x0 = box_min[0] + i_idx.ravel().astype(np.float64) * hx
+                x1 = x0 + hx
+                y0 = box_min[1] + j_idx.ravel().astype(np.float64) * hy
+                y1 = y0 + hy
+                v0 = np.stack([x0, y0, z], axis=1)
+                v1 = np.stack([x1, y0, z], axis=1)
+                v2 = np.stack([x1, y1, z], axis=1)
+                v3 = np.stack([x0, y1, z], axis=1)
+                quads = np.stack([v0, v1, v2, v3], axis=1).astype(np.float32)
+                _merge_group(out, _group_quads_by_grain(g, quads))
+            # z max
+            if nz > 0:
+                k = nz - 1
+                i_idx, j_idx = np.indices((nx, ny))
+                g = labels3d[i_idx.ravel(), j_idx.ravel(), k]
+                z = np.full(g.size, box_min[2] + nz * hz, dtype=np.float64)
+                x0 = box_min[0] + i_idx.ravel().astype(np.float64) * hx
+                x1 = x0 + hx
+                y0 = box_min[1] + j_idx.ravel().astype(np.float64) * hy
+                y1 = y0 + hy
+                v0 = np.stack([x0, y0, z], axis=1)
+                v1 = np.stack([x0, y1, z], axis=1)
+                v2 = np.stack([x1, y1, z], axis=1)
+                v3 = np.stack([x1, y0, z], axis=1)
+                quads = np.stack([v0, v1, v2, v3], axis=1).astype(np.float32)
+                _merge_group(out, _group_quads_by_grain(g, quads))
+            return out
+
+        faces_by_grain = {}
+        _merge_group(faces_by_grain, _faces_x_different(labels))
+        _merge_group(faces_by_grain, _faces_y_different(labels))
+        _merge_group(faces_by_grain, _faces_z_different(labels))
+        _merge_group(faces_by_grain, _faces_domain_boundaries(labels))
+
+        # Decimate and cap faces
+        def _count_faces(d):
+            return int(sum(arr.shape[0] for arr in d.values()))
+        total_faces = _count_faces(faces_by_grain)
+
+        if int(decimate) > 1:
+            step = int(decimate)
+            for gk in list(faces_by_grain.keys()):
+                faces_by_grain[gk] = faces_by_grain[gk][::step, :, :]
+
+        total_faces = _count_faces(faces_by_grain)
+        if max_quads is not None and int(max_quads) >= 0 and total_faces > int(max_quads):
+            step = int(np.ceil(total_faces / float(int(max_quads))))
+            for gk in list(faces_by_grain.keys()):
+                faces_by_grain[gk] = faces_by_grain[gk][::step, :, :]
+            total_faces = _count_faces(faces_by_grain)
+
+        # ---- plot
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(1, 1, 1, projection="3d")
+        try:
+            ax.set_box_aspect(dims)
+        except Exception:
+            pass
+        ax.set_xlim([box_min[0], box_max[0]])
+        ax.set_ylim([box_min[1], box_max[1]])
+        ax.set_zlim([box_min[2], box_max[2]])
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_proj_type("ortho")
+
+        cmap = cm.get_cmap(cmap_name, max(G, 1))
+        def _color_for_gid(gid):
+            return cmap(int(gid) % max(G, 1))
+
+        # draw faces per grain
+        for gk, quads in faces_by_grain.items():
+            if quads.size == 0:
+                continue
+            poly = _Poly3DCollection(quads, linewidths=(0.2 if show_edges else 0.0))
+            poly.set_edgecolor("k" if show_edges else (0, 0, 0, 0))
+            base = _color_for_gid(gk)
+            rgba = (base[0], base[1], base[2], float(face_alpha))
+            poly.set_facecolor(rgba)
+            ax.add_collection3d(poly)
+
+        # seed markers
+        if show_seeds:
+            ax.scatter(seeds_np[:, 0], seeds_np[:, 1], seeds_np[:, 2], c="k", s=12, marker="o", depthshade=False, label="seeds")
+
+        # arrows for [100],[010],[001] from each seed using orientation matrices
+        # arrow length scaled to box size
+        arrow_len = 0.08 * float(np.max(dims))
+        have_R = hasattr(self, "_grain_orientations") and (self._grain_orientations is not None) \
+                and (int(np.shape(self._grain_orientations)[0]) == G)
+        I3 = np.eye(3, dtype=np.float32)
+
+        for gid in range(G):
+            p = seeds_np[gid]
+            Rg = np.asarray(self._grain_orientations[gid], dtype=np.float32).reshape(3, 3) if have_R else I3
+
+            # Sample-frame directions for crystal axes
+            d100 = (Rg @ np.array([1.0, 0.0, 0.0], dtype=np.float32))
+            d010 = (Rg @ np.array([0.0, 1.0, 0.0], dtype=np.float32))
+            d001 = (Rg @ np.array([0.0, 0.0, 1.0], dtype=np.float32))
+
+            ax.quiver(float(p[0]), float(p[1]), float(p[2]),
+                    float(d100[0]), float(d100[1]), float(d100[2]),
+                    length=arrow_len, normalize=True, color="r", linewidth=1.0)
+            ax.quiver(float(p[0]), float(p[1]), float(p[2]),
+                    float(d010[0]), float(d010[1]), float(d010[2]),
+                    length=arrow_len, normalize=True, color="g", linewidth=1.0)
+            ax.quiver(float(p[0]), float(p[1]), float(p[2]),
+                    float(d001[0]), float(d001[1]), float(d001[2]),
+                    length=arrow_len, normalize=True, color="b", linewidth=1.0)
+
+        def _euler_zyx_from_R(R):
+            r00, r01, r02 = R[0, 0], R[0, 1], R[0, 2]
+            r10, r11, r12 = R[1, 0], R[1, 1], R[1, 2]
+            r20, r21, r22 = R[2, 0], R[2, 1], R[2, 2]
+            pitch = np.arcsin(np.clip(-r20, -1.0, 1.0))
+            cpitch = np.cos(pitch)
+            if abs(cpitch) > 1e-7:
+                roll = np.arctan2(r21, r22)
+                yaw = np.arctan2(r10, r00)
+            else:
+                roll = 0.0
+                yaw = np.arctan2(-r01, r11)
+            return yaw, pitch, roll
+
+        if label_orientations and (G < 10):
+            handles = []
+            labels_out = []
+
+            for gid in range(G):
+                p = seeds_np[gid]
+
+                # in-plot numeric label (1-based)
+                ax.text(float(p[0]), float(p[1]), float(p[2] + 0.02 * dims[2]),
+                        f"{gid + 1}", fontsize=9, color="k", ha="center", va="bottom")
+
+                # legend line with Euler angles
+                Rg = np.asarray(self._grain_orientations[gid], dtype=np.float64).reshape(3, 3) if have_R else np.eye(3, dtype=np.float64)
+                yaw, pitch, roll = _euler_zyx_from_R(Rg)
+                yd = float(np.degrees(yaw))
+                pd = float(np.degrees(pitch))
+                rd = float(np.degrees(roll))
+                grain_color = _color_for_gid(gid)
+                handle = mpatches.Patch(facecolor=grain_color, edgecolor="k", linewidth=0.5)
+                label_txt = f"{gid + 1}: yaw={yd:.1f}, pitch={pd:.1f}, roll={rd:.1f}"
+                handles.append(handle)
+                labels_out.append(label_txt)
+
+            # park the legend outside on the right; reserve space
+            plt.tight_layout(rect=[0.0, 0.0, 0.5, 1.0])
+            ax.legend(handles=handles, labels=labels_out,
+                    loc="center left", bbox_to_anchor=(1.15, 0.5),
+                    frameon=True, title="Grain orientation (deg)", fontsize=8)
+        else:
+            plt.tight_layout()
+        
+        return fig, ax
     # -------------------------------------
     
     ## Properties
@@ -2711,3 +3740,12 @@ class sample(logging):
         if self._chunk_total is None:
             print("self._chunk_total has not been initialized yet")
         return self._chunk_total
+
+    @property
+    def sample_type(self):
+        """
+        Return the current sample type: 'single' or 'poly'.
+        """
+        if not hasattr(self, "_sample_type"):
+            self._sample_type = "single"
+        return self._sample_type
