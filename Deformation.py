@@ -2267,163 +2267,253 @@ class deformation(logging):
         self._elem_nodes = En_new
 
         return self._Xref, (self._Xcurr if self._Xcurr is not None else None), self._elem_nodes
-
+    
     # FE apply (atoms) -----------------------------------------------------------
+    def _estimate_mls_batch_bytes(self, n_rows, k, dtype):
+        """Heuristic helper for sizing MLS mini-batches.
+
+        Not used outside this module. Returns a conservative per-row byte estimate
+        to keep temporary arrays (B, A, b, neighbors, weights) under a few hundred MB.
+        """
+        bytes_per = 8 if np.dtype(dtype) == np.float64 else 4
+        m = 10  # quadratic basis size in 3D
+        # Crude per-row accounting: B(M,k,m) + A(M,m,m) + b(M,m,3) + neighbors/weights
+        per_row = bytes_per * (k * m + m * m + m * 3 + k * 4)
+        return int(max(1, per_row))
+    
+    def _mls_quadratic_displacement(self,
+                                    Xq,          # (M,3) query points
+                                    P_nodes,     # (N,3) nodal positions
+                                    U_nodes,     # (N,3) nodal displacements
+                                    idx,         # (M,k) neighbor indices per query
+                                    d2,          # (M,k) neighbor squared distances
+                                    power=2.0,
+                                    eps=1e-12,
+                                    reg=1e-6,
+                                    use_gpu=True,
+                                    dtype=None):
+        """Compute MLS-quadratic displacement per query from nodal data.
+
+        The fit is performed in query-centered coordinates. For each query i,
+        define shifts s_ij = P_nodes[idx[i,j]] - Xq[i], and the 10-term basis
+        p(s) = [1, sx, sy, sz, sx^2, sy^2, sz^2, sx*sy, sx*sz, sy*sz].
+        With weights w_ij = 1 / (sqrt(d2_ij) + eps)^power, the normal equations are:
+            A_i a_i = b_i
+        where
+            A_i = sum_j w_ij * p(s_ij) p(s_ij)^T   (shape 10x10)
+            b_i = sum_j w_ij * p(s_ij) U_ij^T      (shape 10x3)
+        The predicted displacement at the query is a_i[0,:] (constant term).
+
+        Exact-hit handling:
+        If any distance is <= eps for a query, return that neighbor's U directly.
+
+        Args:
+            Xq (ndarray): Query points, shape (M,3).
+            P_nodes (ndarray): Node positions, shape (N,3).
+            U_nodes (ndarray): Node displacements, shape (N,3).
+            idx (ndarray): Neighbor indices, shape (M,k), int32/64.
+            d2 (ndarray): Squared distances, shape (M,k).
+            power (float): Inverse-distance weight power.
+            eps (float): Small constant for stability.
+            reg (float): Tikhonov regularization scaling applied as
+                        A_i += (reg * sum_j w_ij) * I.
+            use_gpu (bool): Use CuPy if True and available, else NumPy.
+            dtype (dtype or None): Floating dtype to enforce.
+
+        Returns:
+            ndarray: Predicted displacements at queries, shape (M,3).
+        """
+        import numpy as np
+        try:
+            import cupy as cp
+        except Exception:
+            cp = None
+
+        xp = cp if (use_gpu and (cp is not None)) else np
+        T = np.dtype(dtype or np.float32)
+
+        # Gather neighbors and distances
+        Pn = P_nodes[idx]                    # (M,k,3)
+        Un = U_nodes[idx]                    # (M,k,3)
+        d2 = d2.astype(T, copy=False)        # (M,k)
+        d = xp.sqrt(d2 + T.type(eps))        # (M,k)
+        w = T.type(1.0) / xp.power(d + T.type(eps), T.type(power))  # (M,k)
+        wsum = xp.maximum(w.sum(axis=1), T.type(1e-20))             # (M,)
+
+        # Identify exact hits and prebuild a mask
+        zero = (d2 <= T.type(eps) * T.type(eps))
+        rows_zero = zero.any(axis=1)  # (M,)
+
+        # Query-centered coordinates and per-row normalization
+        M = Xq.shape[0]
+        s = Pn - Xq[:, None, :]                    # (M,k,3)
+        # h: robust local scale (median neighbor distance)
+        h = xp.median(d, axis=1)                   # (M,)
+        h = xp.maximum(h, T.type(1e-9))            # avoid div-by-zero
+        invh = T.type(1.0) / h
+        sN = s * invh[:, None, None]               # normalized local coords
+
+        sx = sN[:, :, 0]; sy = sN[:, :, 1]; sz = sN[:, :, 2]
+        # Build 10-term quadratic basis in normalized coords
+        B = xp.stack([
+            xp.ones_like(sx),
+            sx, sy, sz,
+            sx*sx, sy*sy, sz*sz,
+            sx*sy, sx*sz, sy*sz
+        ], axis=2)                                 # (M,k,10)
+
+        # Weighted normal equations: A = B^T W B, b = B^T W U
+        # Use einsum available in NumPy/CuPy
+        A = xp.einsum('mki,mk,mkj->mij', B, w, B)  # (M,10,10)
+        b = xp.einsum('mki,mk,mkq->miq', B, w, Un) # (M,10,3)
+
+        # Scale-aware regularization
+        I = xp.eye(10, dtype=T)[None, :, :]
+        A = A + (T.type(reg) * wsum)[:, None, None] * I
+
+        # Solve; fall back to IDW if needed
+        U_pred = xp.empty((M, 3), dtype=T)
+        solved_mask = xp.ones((M,), dtype=bool if xp is np else cp.bool_)
+        try:
+            coef = xp.linalg.solve(A, b)           # (M,10,3)
+            U_pred[:] = coef[:, 0, :]              # constant term at query
+        except Exception:
+            # Mark all rows as unsolved; fallback below
+            if xp is np:
+                solved_mask[:] = False
+            else:
+                solved_mask = cp.zeros((M,), dtype=cp.bool_)
+
+        # Fallback for any failed rows or rows with NaN/Inf in result
+        if xp is np:
+            bad = (~solved_mask) | (~np.isfinite(U_pred).all(axis=1))
+        else:
+            bad = (~solved_mask) | (~cp.isfinite(U_pred).all(axis=1))
+        if (xp is np and bad.any()) or (xp is cp and bool(cp.any(bad))):
+            # Simple IDW average of neighbor displacements
+            w_idw = w[bad, :]
+            wsum_idw = xp.maximum(w_idw.sum(axis=1, keepdims=True), T.type(1e-20))
+            U_pred_bad = (Un[bad, :, :] * w_idw[:, :, None]).sum(axis=1) / wsum_idw
+            U_pred = U_pred.copy()  # ensure we can assign even on CuPy view
+            U_pred[bad, :] = U_pred_bad
+
+        # Clamp clearly nonphysical predictions using local envelope
+        # u_cap = factor * max neighbor displacement magnitude
+        norms = xp.linalg.norm(Un, axis=2)                 # (M,k)
+        u_cap = T.type(8.0) * xp.maximum(norms.max(axis=1), T.type(1e-9))  # (M,)
+        up_norm = xp.linalg.norm(U_pred, axis=1)           # (M,)
+        if xp is np:
+            mask = up_norm > u_cap
+            if mask.any():
+                scale = (u_cap[mask] / (up_norm[mask] + T.type(1e-20)))[:, None]
+                U_pred[mask, :] *= scale
+        else:
+            mask = up_norm > u_cap
+            if bool(cp.any(mask)):
+                scale = (u_cap[mask] / (up_norm[mask] + T.type(1e-20)))[:, None]
+                U_pred[mask, :] *= scale
+
+        # Exact-hit override: if a node coincides with the query, use its nodal U
+        if (xp is np and rows_zero.any()) or (xp is cp and bool(cp.any(rows_zero))):
+            if xp is np:
+                row_ids = np.where(rows_zero)[0]
+                zpos = zero[rows_zero, :].argmax(axis=1)
+                direct_ids = idx[rows_zero, :][np.arange(row_ids.shape[0]), zpos]
+                U_pred[row_ids, :] = U_nodes[direct_ids, :]
+            else:
+                row_ids = cp.where(rows_zero)[0]
+                zpos = cp.argmax(zero[rows_zero, :], axis=1)
+                idx_rows = idx[rows_zero, :]
+                rr = cp.arange(idx_rows.shape[0], dtype=cp.int32)
+                direct_ids = idx_rows[rr, zpos]
+                U_pred[row_ids, :] = U_nodes[direct_ids, :]
+
+        return U_pred.astype(T, copy=False)
+
     def apply_fe_nodal_field(self, sample, use_gpu=True):
-        """Apply FE nodal mapping to atom positions chunk by chunk.
+        """Apply FE nodal mapping to atom positions using an MLS quadratic fit.
 
-        Strategy:
-            - Build a cell list over FE nodes (Xref) to cull candidates quickly.
-            - For each atom chunk:
-                * collect nearby FE nodes via the cell list (chunk AABB + halo),
-                * kNN on those candidates,
-                * inverse-distance weighted interpolation of nodal displacement
-                  U = Xcurr - Xref,
-                * add interpolated displacement to atom positions,
-                * write updated positions back to the original chunk file.
-            - Uses CUDA kernels on GPU; robust tiled kNN on CPU.
+        Uses a moving-least-squares (MLS) quadratic fit of the nodal
+        displacement field U = Xcurr - Xref. The MLS fit is performed in query-
+        centered coordinates using the 10-term quadratic basis:
+            [1, x, y, z, x2, y2, z2, xy, xz, yz].
+        Evaluating at the query origin (the atom) returns the constant coefficient
+        of the fit, which is the predicted displacement at that atom.
 
-        After deforming and writing all chunks, compute the global min/max over
-        deformed coordinates and update:
-            sample._dimensions,
-            sample._offset,
-            sample._matrix,
-            sample._corners.
+        Strategy (high level):
+        1) Build a cell list over FE nodes (Xref) to cull candidates quickly.
+        2) For each atom chunk (and further mini-batches inside the chunk):
+            - kNN on culled nodes (GPU kernel if available).
+            - MLS quadratic fit per atom using weighted normal equations:
+                (P^T W P) a = P^T W U_neighbors,  with W from inverse-distance weights.
+            The predicted displacement at the query is the constant term a[0].
+            - Add the predicted displacement to the atom positions.
+        3) Write deformed chunk and update the global AABB and sample metadata.
 
         Args:
             sample (object): Provides chunked IO for positions and cell-list helpers.
-            use_gpu (bool): If True and CuPy available, use GPU path.
+            use_gpu (bool): If True and CuPy is available, prefer GPU path.
 
         Returns:
             None
 
         Raises:
-            ValueError: If nodal field or sample is not initialized.
+            ValueError: If FE nodal field or sample metadata is not initialized.
+
+        Notes:
+            - This remains a drop-in replacement: same signature and return type.
+            - Internally uses more neighbors and a higher-order fit for smoother results.
+            - Mini-batching keeps memory bounded on both GPU and CPU paths.
         """
-        # Validate required nodal data and sample metadata.
+        # Validate inputs
         if self._Xref is None or self._Xcurr is None:
             raise ValueError("FE nodal field is not initialized. Call import_fe_nodal_field(...) first.")
         if sample is None or sample.chunk_total is None:
             raise ValueError("Sample is not initialized. Ensure sample metadata is loaded.")
 
-        # Configuration parameters for IDW and neighborhood selection.
-        k = 16
+        # Parameters
+        k = 48
         power = 2.0
-        cell_pad_cells = 1
         eps = 1e-12
+        reg = 1e-6
+        cell_pad_cells = 2
 
-        # Backend and dtype.
         gpu_ok = (use_gpu and (cp is not None))
         xp = cp if gpu_ok else np
-        dtype = self._Xref.dtype if hasattr(self._Xref, "dtype") else np.float32
-        dtype = np.dtype(dtype)
+        dtype = np.dtype(self._Xref.dtype if hasattr(self._Xref, "dtype") else np.float32)
 
-        # Nodal positions and displacements.
+        # Nodes and displacements
         Xr = xp.asarray(self._Xref, dtype=dtype)
         Xc = xp.asarray(self._Xcurr, dtype=dtype)
         U  = (Xc - Xr).astype(dtype, copy=False)
         P  = Xr
 
-        # Guard neighbor count.
         if k <= 0 or k > int(P.shape[0]):
-            k = int(min(max(1, P.shape[0]), 32))
+            k = int(min(max(1, P.shape[0]), 64))
 
-        # Global AABB accumulators (host side).
+        # Global AABB on host
         gmin = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
         gmax = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
 
-        # --------------------------- GPU fast path ------------------------------
+        # ---------------- GPU path ----------------
         if gpu_ok:
-            # Build a cell list on nodes (float32 for helper).
-            bb = cp.max(P, axis=0) - cp.min(P, axis=0)
-            vol = float((bb[0] * bb[1] * bb[2]).get()) if P.shape[0] > 0 else 1.0
-            mean_spacing = (vol / max(1, int(P.shape[0]))) ** (1.0 / 3.0)
-            r_cut = max(1.0, 3.0 * mean_spacing)
+            # Build a cell list on nodes for culling
+            if P.shape[0] > 0:
+                bb = xp.max(P, axis=0) - xp.min(P, axis=0)
+                vol = float((bb[0] * bb[1] * bb[2]).get())
+                mean_spacing = (vol / max(1, int(P.shape[0]))) ** (1.0 / 3.0)
+                r_cut = max(1.0, 3.0 * mean_spacing)
+            else:
+                r_cut = 1.0
 
             P32 = P.astype(cp.float32, copy=False)
             (sortedP32, sortedIdx, cell_start, cell_end,
             bb_min32, cell_size, nx, ny, nz) = sample.build_cell_list_gpu(P32, float(r_cut))
 
             bb_min = bb_min32.astype(dtype, copy=False)
-            sortedP = sortedP32.astype(dtype, copy=False)
 
-            # Prepare or reuse kernels for nodal IDW path.
-            def _ensure_nodal_kernels(dtype, k):
-                key = ("nodal_kernels", np.dtype(dtype).name, int(k))
-                if hasattr(self, "_nodal_kernels") and key in self._nodal_kernels:
-                    return
-                if not hasattr(self, "_nodal_kernels"):
-                    self._nodal_kernels = {}
-                T = "double" if np.dtype(dtype) == np.float64 else "float"
-                POW = "pow" if np.dtype(dtype) == np.float64 else "powf"
-                SQRT = "sqrt" if np.dtype(dtype) == np.float64 else "sqrtf"
-                src_w3 = r'''
-                extern "C" __global__
-                void weighted_sum_V3_knn(const int* __restrict__ idx,
-                                        const %(T)s* __restrict__ d2,
-                                        const %(T)s* __restrict__ U, // (Nnodes,3)
-                                        const int M,
-                                        const %(T)s power,
-                                        const %(T)s eps,
-                                        %(T)s* __restrict__ Uout)    // (M,3)
-                {
-                    int i = blockDim.x * blockIdx.x + threadIdx.x;
-                    if (i >= M) return;
-                    %(T)s eps2 = eps * eps;
-                    bool has_zero = false; int z = -1;
-                    for (int j=0; j<%(K)d; ++j){
-                        if (d2[i*%(K)d + j] <= eps2){ has_zero = true; z = j; break; }
-                    }
-                    %(T)s s0=0, s1=0, s2=0, wsum=0;
-                    if (has_zero){
-                        int id = idx[i*%(K)d + z];
-                        const %(T)s* u = &U[id*3];
-                        s0=u[0]; s1=u[1]; s2=u[2]; wsum=1;
-                    } else {
-                        for (int j=0; j<%(K)d; ++j){
-                            int id = idx[i*%(K)d + j];
-                            %(T)s dij = %(SQRT)s(d2[i*%(K)d + j]);
-                            %(T)s w = (%(T)s)1 / %(POW)s(dij + eps, power);
-                            const %(T)s* u = &U[id*3];
-                            s0 += w * u[0]; s1 += w * u[1]; s2 += w * u[2];
-                            wsum += w;
-                        }
-                    }
-                    %(T)s inv = (wsum > (%(T)s)0) ? ((%(T)s)1/wsum) : (%(T)s)0;
-                    Uout[3*i+0] = s0*inv;
-                    Uout[3*i+1] = s1*inv;
-                    Uout[3*i+2] = s2*inv;
-                }
-                ''' % {"T": T, "K": int(k), "POW": POW, "SQRT": SQRT}
-
-                src_add = r'''
-                extern "C" __global__
-                void add_vec3_inplace(const %(T)s* __restrict__ disp,
-                                    %(T)s* __restrict__ pos,
-                                    const int n)
-                {
-                    int i = blockDim.x * blockIdx.x + threadIdx.x;
-                    if (i >= n) return;
-                    pos[3*i+0] += disp[3*i+0];
-                    pos[3*i+1] += disp[3*i+1];
-                    pos[3*i+2] += disp[3*i+2];
-                }
-                ''' % {"T": T}
-
-                self._nodal_kernels[key] = {
-                    "weighted_sum_V3_knn": cp.RawKernel(src_w3, "weighted_sum_V3_knn"),
-                    "add_vec3_inplace": cp.RawKernel(src_add, "add_vec3_inplace"),
-                    "dtype": np.dtype(dtype),
-                    "k": int(k),
-                }
-
-            def _get_nodal_kernels(dtype, k):
-                _ensure_nodal_kernels(dtype, k)
-                return self._nodal_kernels[("nodal_kernels", np.dtype(dtype).name, int(k))]
-
+            # kNN kernels
             knn_kerns = self._get_field_cuda_kernels(dtype=dtype, k=k)
-            nod_kerns = _get_nodal_kernels(dtype, k)
-
             sizeof_T = 8 if dtype == np.float64 else 4
             block = 128
 
@@ -2433,38 +2523,21 @@ class deformation(logging):
                 d2  = cp.empty((M, k), dtype=dtype)
                 grid = (M + block - 1) // block
                 smem = 3 * block * sizeof_T
-                knn_kerns["knn_topk_sqdist"]((grid,), (block,),
+                knn_kerns["knn_topk_sqdist"](
+                    (grid,), (block,),
                     (P_sub.ravel(), np.int32(N),
                     X.ravel(), np.int32(M),
                     idx.ravel(), d2.ravel()),
-                    shared_mem=smem)
+                    shared_mem=smem
+                )
                 return idx, d2
 
-            def _interp_gpu(idx, d2, Ufield):
-                M = int(idx.shape[0])
-                Uout = cp.empty((M, 3), dtype=dtype)
-                grid = (M + block - 1) // block
-                nod_kerns["weighted_sum_V3_knn"]((grid,), (block,),
-                    (idx.ravel(), d2.ravel(), Ufield.ravel(), np.int32(M),
-                    dtype.type(float(power)), dtype.type(float(eps)),
-                    Uout.ravel()))
-                return Uout
-
-            def _add_inplace_gpu(Uadd, X):
-                M = int(X.shape[0])
-                grid = (M + block - 1) // block
-                nod_kerns["add_vec3_inplace"]((grid,), (block,),
-                    (Uadd.ravel(), X.ravel(), np.int32(M)))
-                return X
-
             def _candidate_indices_from_chunk_AABB(X_chunk):
-                # Compute overlapping cells for chunk AABB plus halo.
                 xmn = cp.min(X_chunk, axis=0)
                 xmx = cp.max(X_chunk, axis=0)
                 halo = float(cell_size * max(0, int(cell_pad_cells)))
                 xmn = xmn - halo
                 xmx = xmx + halo
-
                 cs = float(cell_size)
                 nxv, nyv, nzv = int(nx), int(ny), int(nz)
 
@@ -2479,23 +2552,19 @@ class deformation(logging):
                 cz1 = _clamp_int(cp.floor((xmx[2] - bb_min[2]) / cs).get(), 0, nzv - 1)
 
                 segs = []
-                n_cells = int(cell_start.shape[0])  # robust bound for cid
+                n_cells = int(cell_start.shape[0])
                 for cz in range(cz0, cz1 + 1):
                     base_z = cz * (nxv * nyv)
                     for cy in range(cy0, cy1 + 1):
                         base_y = base_z + cy * nxv
                         for cx in range(cx0, cx1 + 1):
                             cid = base_y + cx
-                            # Robust bounds check to avoid any stray OOB
                             if cid < 0 or cid >= n_cells:
                                 continue
                             s = int(cell_start[cid].get())
                             e = int(cell_end[cid].get())
-                            # Additional robustness against malformed cell ranges
-                            if s < 0:
-                                s = 0
-                            if e < s:
-                                continue
+                            if s < 0: s = 0
+                            if e < s: continue
                             e = min(e, int(sortedIdx.shape[0]))
                             if e > s:
                                 segs.append(sortedIdx[s:e])
@@ -2503,50 +2572,73 @@ class deformation(logging):
                     return cp.zeros((0,), dtype=cp.int32)
                 return cp.concatenate(segs, axis=0)
 
-            # Iterate over chunk files; deform in-place; write back on CPU.
+            def _mls_batch_size(n_rows, dtype, k):
+                bytes_per = 8 if dtype == np.float64 else 4
+                budget = 320 * 1024 * 1024
+                per_row = max(1, bytes_per * (k * 10 + 10 * 10 + k * 3 + k))
+                return max(2048, min(n_rows, budget // per_row))
+
             for chunk_i in range(1, int(sample.chunk_total) + 1):
                 X = sample.load_chunk_positions(chunk_i, use_gpu=True).astype(dtype, copy=False)
                 if X.ndim != 2 or X.shape[1] != 3 or X.shape[0] == 0:
                     sample.write_chunk_positions(X.get(), chunk_i)
                     continue
 
+                # Candidate culling
                 cand_idx = _candidate_indices_from_chunk_AABB(X)
-                if cand_idx.size >= k:
-                    P_sub = P[cand_idx]
-                    idx_local, d2 = _knn_gpu(X, P_sub)
-                    idx = cp.take(cand_idx, idx_local)
-                else:
-                    idx, d2 = _knn_gpu(X, P)
+                P_sub = P if cand_idx.size < k else P[cand_idx]
 
-                Uadd = _interp_gpu(idx, d2, U)
-                _add_inplace_gpu(Uadd, X)
+                rows = int(X.shape[0])
+                bs = int(_mls_batch_size(rows, dtype, k))
+                out = cp.empty_like(X)
 
-                # Update global AABB on host.
-                cmin = cp.min(X, axis=0).get()
-                cmax = cp.max(X, axis=0).get()
+                for s0 in range(0, rows, bs):
+                    Xe = X[s0:s0+bs]
+                    idx_loc, d2 = _knn_gpu(Xe, P_sub)
+                    # map local idx to global if needed
+                    if P_sub is not P:
+                        idx_glob = cp.take(cand_idx, idx_loc)
+                    else:
+                        idx_glob = idx_loc
+                    Uadd = self._mls_quadratic_displacement(
+                        Xe, P, U, idx_glob, d2,
+                        power=power, eps=eps, reg=reg,
+                        use_gpu=True, dtype=dtype
+                    )
+                    # Nonfinite guard
+                    bad = ~cp.isfinite(Uadd).all(axis=1)
+                    if bool(cp.any(bad)):
+                        Uadd = Uadd.copy()
+                        Uadd[bad, :] = 0
+                    out[s0:s0+bs] = Xe + Uadd
+
+                # Update global AABB (host)
+                cmin = cp.min(out, axis=0).get()
+                cmax = cp.max(out, axis=0).get()
                 gmin = np.minimum(gmin, cmin)
                 gmax = np.maximum(gmax, cmax)
 
-                # Save back to disk (sample writer expects CPU ndarray).
-                sample.write_chunk_positions(X.get(), chunk_i)
+                # Save positions to disk
+                sample.write_chunk_positions(out.get(), chunk_i)
 
-                # Free per-chunk device temps.
-                del X, Uadd
+                del X, out
                 cp.get_default_memory_pool().free_all_blocks()
 
-            # Finalize metadata after GPU loop.
+            # Finalize metadata
             if np.all(np.isfinite(gmin)) and np.all(np.isfinite(gmax)):
                 new_dims = (gmax - gmin).astype(np.float32)
                 new_offs = ((gmin + gmax) * 0.5).astype(np.float32)
                 sample._dimensions = new_dims
                 sample._offset = new_offs
                 sample._matrix = np.diag(sample._dimensions.astype(np.float32))
-                sample._corners = (sample.get_unit_corners() @ sample._matrix) - (sample._dimensions * 0.5) + sample._offset
+                sample._corners = (sample.get_unit_corners() @ sample._matrix) - (sample._dimensions * 0.5) + sample._offset  # :contentReference[oaicite:5]{index=5}
             return
 
-        # ----------------------------- CPU fallback ------------------------------
+        # ---------------- CPU path ----------------
+        P_np = np.asarray(P, dtype=dtype)
+        U_np = np.asarray(U, dtype=dtype)
+
         def _knn_tiled(P_sub, X, k, cap_bytes=800_000_000):
-            # Tiled kNN to bound memory on CPU.
             M = X.shape[0]
             best_d2 = np.full((M, k), np.inf, dtype=dtype)
             best_idx = np.full((M, k), -1, dtype=np.int32)
@@ -2566,29 +2658,13 @@ class deformation(logging):
                 sel = np.argpartition(all_d2, kth=k-1, axis=1)[:, :k]
                 best_d2 = all_d2[row_idx, sel]
                 best_idx = all_idx[row_idx, sel]
-            return best_idx, np.sqrt(best_d2, dtype=dtype)
+            return best_idx, best_d2
 
-        def _interp_idw(idx, dists, U_field, power=2.0, eps=1e-12):
-            # Standard IDW with zero-distance handling.
-            M = idx.shape[0]
-            w = 1.0 / (np.power(dists + eps, power, dtype=np.float64))
-            w = w.astype(dtype, copy=False)
-            zero = dists <= eps
-            if zero.any():
-                row_has_zero = zero.any(axis=1)
-                w[row_has_zero, :] = 0
-                zpos = zero[row_has_zero, :].argmax(axis=1)
-                for r, c in zip(np.where(row_has_zero)[0], zpos):
-                    w[r, int(c)] = 1.0
-            U_neighbors = U_field[idx]
-            wsum = np.sum(w, axis=1, keepdims=True)
-            Uw = (U_neighbors * w[..., None]).sum(axis=1)
-            Uw = Uw / np.maximum(wsum, eps)
-            return Uw.astype(dtype, copy=False)
-
-        # Precompute host nodal arrays for CPU path.
-        P_np = np.asarray(P, dtype=dtype)
-        U_np = np.asarray(U, dtype=dtype)
+        def _mls_batch_size_cpu(n_rows, dtype, k):
+            bytes_per = 8 if dtype == np.float64 else 4
+            budget = 640 * 1024 * 1024
+            per_row = max(1, bytes_per * (k * 10 + 10 * 10 + k * 3 + k))
+            return max(4096, min(n_rows, budget // per_row))
 
         for chunk_i in range(1, int(sample.chunk_total) + 1):
             X = sample.load_chunk_positions(chunk_i, use_gpu=False).astype(dtype, copy=False)
@@ -2596,41 +2672,61 @@ class deformation(logging):
                 sample.write_chunk_positions(X, chunk_i)
                 continue
 
-            # AABB-based node culling with a heuristic halo.
+            # AABB-based node culling similar to GPU path
             mn = X.min(axis=0); mx = X.max(axis=0)
-            bb = P_np.max(axis=0) - P_np.min(axis=0)
-            vol = float(bb[0] * bb[1] * bb[2]) if P_np.shape[0] > 0 else 1.0
-            mean_spacing = (vol / max(1, int(P_np.shape[0]))) ** (1.0 / 3.0)
-            halo = 3.0 * mean_spacing
+            if P_np.shape[0] > 0:
+                bb = P_np.max(axis=0) - P_np.min(axis=0)
+                vol = float(bb[0] * bb[1] * bb[2])
+                mean_spacing = (vol / max(1, int(P_np.shape[0]))) ** (1.0 / 3.0)
+                halo = 3.0 * mean_spacing
+            else:
+                halo = 1.0
             mn_h = mn - halo; mx_h = mx + halo
             mask = ((P_np[:, 0] >= mn_h[0]) & (P_np[:, 0] <= mx_h[0]) &
                     (P_np[:, 1] >= mn_h[1]) & (P_np[:, 1] <= mx_h[1]) &
                     (P_np[:, 2] >= mn_h[2]) & (P_np[:, 2] <= mx_h[2]))
-            P_sub = P_np[mask]; U_sub = U_np[mask]
-            if P_sub.shape[0] < k:
-                P_sub = P_np; U_sub = U_np
+            P_sub = P_np[mask] if int(np.count_nonzero(mask)) >= k else P_np
 
-            idx, d = _knn_tiled(P_sub, X, int(min(k, max(1, P_sub.shape[0]))))
-            Uadd = _interp_idw(idx.astype(np.int32), d.astype(dtype), U_sub, power=power, eps=eps)
-            X = (X + Uadd).astype(dtype, copy=False)
+            rows = int(X.shape[0])
+            bs = int(_mls_batch_size_cpu(rows, dtype, k))
+            out = np.empty_like(X)
 
-            # Update global AABB on host.
-            cmin = X.min(axis=0).astype(np.float64, copy=False)
-            cmax = X.max(axis=0).astype(np.float64, copy=False)
+            for s0 in range(0, rows, bs):
+                Xe = X[s0:s0+bs]
+                idx_local, d2 = _knn_tiled(P_sub, Xe, int(min(k, max(1, P_sub.shape[0]))))
+                if P_sub is not P_np:
+                    global_ids = np.flatnonzero(mask)
+                    idx_glob = global_ids[idx_local]
+                else:
+                    idx_glob = idx_local
+                d2 = d2.astype(dtype, copy=False)
+                Uadd = self._mls_quadratic_displacement(
+                    Xe, P_np, U_np, idx_glob, d2,
+                    power=power, eps=eps, reg=reg,
+                    use_gpu=False, dtype=dtype
+                )
+                # Nonfinite guard
+                bad = ~np.isfinite(Uadd).all(axis=1)
+                if bad.any():
+                    Uadd = Uadd.copy()
+                    Uadd[bad, :] = 0
+                out[s0:s0+bs] = Xe + Uadd
+
+            # Update global AABB and write
+            cmin = out.min(axis=0).astype(np.float64, copy=False)
+            cmax = out.max(axis=0).astype(np.float64, copy=False)
             gmin = np.minimum(gmin, cmin)
             gmax = np.maximum(gmax, cmax)
+            sample.write_chunk_positions(out, chunk_i)
 
-            sample.write_chunk_positions(X, chunk_i)
-
-        # Finalize metadata after CPU loop.
+        # Finalize metadata
         if np.all(np.isfinite(gmin)) and np.all(np.isfinite(gmax)):
             new_dims = (gmax - gmin).astype(np.float32)
             new_offs = ((gmin + gmax) * 0.5).astype(np.float32)
             sample._dimensions = new_dims
             sample._offset = new_offs
             sample._matrix = np.diag(sample._dimensions.astype(np.float32))
-            sample._corners = (sample.get_unit_corners() @ sample._matrix) - (sample._dimensions * 0.5) + sample._offset
-
+            sample._corners = (sample.get_unit_corners() @ sample._matrix) - (sample._dimensions * 0.5) + sample._offset  # :contentReference[oaicite:6]{index=6}
         return
 
     # FE plotting ---------------------------------------------------------------
