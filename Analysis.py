@@ -61,7 +61,6 @@ class analysis(logging):
         Returns:
             tuple: matplotlib Figure and Axes3DSubplot objects.
         """
-        start_time = time.perf_counter()
         try:
             fig = plt.figure(figsize=figsize)
             ax = fig.add_subplot(111, projection='3d')
@@ -75,11 +74,7 @@ class analysis(logging):
             fig.colorbar(surf, shrink=0.5, aspect=8)
             return fig, ax
         except Exception as e:
-            logging.error(f"Error in surf_plot: {e}")
-            raise
-        finally:
-            end_time = time.perf_counter()
-            logging.debug(f"Execution time for surf_plot: {end_time - start_time:.4f} s")
+            raise e
 
     @staticmethod
     def line_plot(x, y, title, xlabel="Detector X", ylabel="Pixel Value", figsize=(12, 12)):
@@ -97,7 +92,6 @@ class analysis(logging):
         Returns:
             tuple: matplotlib Figure and AxesSubplot objects.
         """
-        start_time = time.perf_counter()
         try:
             fig = plt.figure(figsize=figsize)
             ax = fig.add_subplot(111)
@@ -107,11 +101,7 @@ class analysis(logging):
             ax.set_ylabel(ylabel)
             return fig, ax
         except Exception as e:
-            logging.error(f"Error in line_plot: {e}")
-            raise
-        finally:
-            end_time = time.perf_counter()
-            logging.debug(f"Execution time for line_plot: {end_time - start_time:.4f} s")
+            raise e
 
     def _save_figure(self, fig, filename):
         """
@@ -125,9 +115,7 @@ class analysis(logging):
             fig.savefig(os.path.join(self.directory, filename))
             plt.close(fig)
         except Exception as e:
-            logging.error(f"Failed to save figure {filename}: {e}")
-            raise
-    
+            raise e
     ## Main Functions
     def distance_fft_dependance(self,sample,beam,stage,detector,distance_array,plot_prefix="Test",output_pixel_values=False,offset_list=None):
         """
@@ -255,7 +243,6 @@ class analysis(logging):
         Returns:
             tuple: Bin centers and integrated values.
         """
-        start_time = time.perf_counter()
         try:
             data_map = {
                 "Intensity": detector.pixel_intensity,
@@ -298,8 +285,4 @@ class analysis(logging):
 
             return bin_centers, hist
         except Exception as e:
-            logging.error(f"Error in integrate_detector_along_axis: {e}")
-            raise
-        finally:
-            end_time = time.perf_counter()
-            logging.debug(f"Execution time for integrate_detector_along_axis: {end_time - start_time:.4f} s")
+            raise e
