@@ -2,6 +2,7 @@
 # Modules
 # -----------------------------------------------------------------------------
 import numpy as np
+import pandas as pd
 try:
     import cupy as cp
 except ImportError:
@@ -316,88 +317,86 @@ class detector(logging):
         
     ## Main Functions     
     def position_detector_relative(self, distance, two_theta, eta, degrees=True):
-        """Move the detector by relative increments.
+        """
+        Move the detector by relative increments in distance, 2theta, and eta.
 
-        Applies additional rotations and translation to the current state.
-        Order of operations matches get_rotation_detector: rotate by
-        +two_theta about +y, then by +eta about +x, then translate along the
-        detector normal so that the center is at the requested distance.
+        Internally, this computes the new absolute pose and reuses
+        position_detector_absolute to apply it robustly.
 
         Args:
-          distance (float): Additional distance to add to the current distance.
-          two_theta (float): Additional angle. Degrees if degrees=True.
-          eta (float): Additional angle. Degrees if degrees=True.
-          degrees (bool, optional): If True, inputs are in degrees; they are
-            converted to radians internally. Default True.
+            distance (float): Relative change to distance (same units as stored).
+            two_theta (float): Relative change to 2theta (deg if degrees=True else rad).
+            eta (float): Relative change to eta (deg if degrees=True else rad).
+            degrees (bool): Interpret the angular increments in degrees if True.
 
         Returns:
-          None
+            None
         """
-        if degrees:
-            two_theta = np.deg2rad(two_theta)
-            eta = np.deg2rad(eta)
-        self._two_theta += two_theta
-        self._eta += eta
-        self._distance  += distance
+        # Current absolute angles are stored in radians
+        dtt = np.deg2rad(two_theta) if degrees else float(two_theta)
+        det = np.deg2rad(eta) if degrees else float(eta)
 
-        # Compute the incremental rotation and apply it to the normal and pixel plane
-        detector_rotation_np = self.get_rotation_detector(two_theta, eta)
-        self._direction = detector_rotation_np @ self._direction
+        new_distance = float(self._distance) + float(distance)
+        new_two_theta = float(self._two_theta) + dtt
+        new_eta = float(self._eta) + det
 
-        # Update center location based on the accumulated orientation and distance
-        self._center = self._distance * np.array([
-            np.cos(self._two_theta),
-            np.sin(self._two_theta) * np.sin(self._eta),
-            np.sin(self._two_theta) * np.cos(self._eta)
-        ])
-
-        # Rotate and translate all pixel coordinates
-        self._pixel_coordinates = detector_rotation_np @ self._pixel_coordinates + self._center[:, None]
+        # Reuse absolute setter to avoid compounding transforms
+        self.position_detector_absolute(new_distance, new_two_theta, new_eta, degrees=False)
         
     def position_detector_absolute(self, distance, two_theta, eta, degrees=True):
-        """Set an absolute detector pose, rebuilding the pixel plane first.
+        """
+        Set the detector to an absolute pose given (distance, two_theta, eta).
 
-        Recreates the base pixel layout via create_detector using the current
-        shape and pixel_size, then sets absolute values of distance, two_theta,
-        and eta. The pixel plane is then rotated and translated to the final
-        pose.
+        This rebuilds the base pixel grid using the detector's current geometry
+        (rectangular or ring), then applies the absolute rotation and translation.
+        Angles are interpreted in degrees if degrees=True.
 
         Args:
-          distance (float): Absolute distance to set.
-          two_theta (float): Absolute angle. Degrees if degrees=True.
-          eta (float): Absolute angle. Degrees if degrees=True.
-          degrees (bool, optional): If True, inputs are in degrees; they are
-            converted to radians internally. Default True.
-
-        Notes:
-          - This method calls create_detector(self.shape, self.pixel_size) with
-            default arguments. If you require a "ring" geometry, call
-            create_detector with geometry="ring" prior to calling this method.
+            distance (float): Absolute sample-to-detector-center distance.
+            two_theta (float): Absolute 2theta.
+            eta (float): Absolute eta.
+            degrees (bool): Interpret angles as degrees if True.
 
         Returns:
-          None
+            None
         """
-        self.create_detector(self.shape, self.pixel_size)
+        if self._shape is None or self._pixel_size is None:
+            raise ValueError(
+                "Detector shape/pixel_size are not initialized. "
+                "Call create_detector(...) before positioning."
+            )
+
+        # Convert to radians if needed
         if degrees:
             two_theta = np.deg2rad(two_theta)
             eta = np.deg2rad(eta)
-        self._two_theta = two_theta
-        self._eta = eta
-        self._distance  = distance
 
-        # Compute the absolute rotation and apply it to the normal and pixel plane
-        detector_rotation_np = self.get_rotation_detector(self._two_theta, self._eta)
-        self._direction = detector_rotation_np @ self._direction
+        # Rebuild the base grid in its canonical plane, preserving geometry
+        geometry = self._geometry if self._geometry is not None else "rectangular"
+        self.create_detector(self.shape, self.pixel_size, geometry=geometry)
 
-        # Update center location based on the absolute orientation and distance
+        # Record absolute state
+        self._two_theta = float(two_theta)
+        self._eta = float(eta)
+        self._distance = float(distance)
+
+        # Absolute rotation for this pose
+        R = self.get_rotation_detector(self._two_theta, self._eta)
+
+        # Update the detector normal (start from +x after create_detector)
+        base_normal = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        self._direction = R @ base_normal
+
+        # Center on the 2theta/eta sphere at the requested distance
         self._center = self._distance * np.array([
             np.cos(self._two_theta),
             np.sin(self._two_theta) * np.sin(self._eta),
             np.sin(self._two_theta) * np.cos(self._eta)
-        ])
+        ], dtype=np.float32)
 
-        # Rotate and translate all pixel coordinates
-        self._pixel_coordinates = detector_rotation_np @ self._pixel_coordinates + self._center[:, None]
+        # Rotate the base pixel grid and translate to the absolute center
+        self._pixel_coordinates = R @ self._pixel_coordinates + self._center[:, None]
+        self.display_detector_values(degrees=True)
         
     def get_rotation_detector(self, two_theta, eta):
         """Composite rotation used by this detector.
@@ -538,6 +537,46 @@ class detector(logging):
             return coords_reshaped[axis]
         else:
             return coords_reshaped
+        
+    def display_detector_values(self, degrees=True):
+        """
+        Print a table of key detector values (distance, angles, center, normal).
+
+        Args:
+            degrees (bool): If True, angles are shown in degrees; otherwise radians.
+
+        Returns:
+            None
+        """
+        tt = float(self._two_theta) if self._two_theta is not None else 0.0
+        et = float(self._eta) if self._eta is not None else 0.0
+        if degrees:
+            tt_out = np.rad2deg(tt)
+            et_out = np.rad2deg(et)
+            tt_label = "two_theta_deg"
+            et_label = "eta_deg"
+        else:
+            tt_out = tt
+            et_out = et
+            tt_label = "two_theta_rad"
+            et_label = "eta_rad"
+
+        print("Detector State:")
+        cols = [
+            "distance", tt_label, et_label
+        ]
+        vals = [[
+            float(self._distance if self._distance is not None else 0.0), float(tt_out), float(et_out)
+        ]]
+        if pd is not None:
+            df = pd.DataFrame(vals, columns=cols)
+            df.index = ["Values"]
+            print(df)
+        else:
+            # Fallback plain-text table if pandas is unavailable
+            row = vals[0]
+            for c, v in zip(cols, row):
+                print(f"  {c:>12s}: {v:.6g}")
         
     def plot_detector(
         self,
