@@ -293,6 +293,117 @@ class optics(logging):
             im = out.real * sph + out.imag * cph
             out = amp * (re + 1j * im)
             return out.astype(np.complex64)
+        
+    def _apply_angular_filter_kspace(self, field, dx, dy, filt, wavelength, use_gpu=True):
+        """
+        Analyzer-like angular pupil in k-space.
+
+        This matches beam.analyser_mode semantics:
+        - rolloff='tophat'  : amplitude = 1 inside half-angle, else 0
+        - rolloff='darwin'  : amplitude = 1 / (1 + (delta / halfwidth)^2)
+
+        Notes
+        -----
+        - delta is the small-angle deviation (radians) in the paraxial limit:
+            delta = sqrt((theta_x - cx)^2 + (theta_y - cy)^2) for circular 2D
+        For 'elliptical' we use the normalized radius r^2 = (tpar/hx)^2 + (tperp/hy)^2
+        and apply the same laws with r in place of delta/hw.
+        - 'mode' can be '2d' (default) or '1d' (slit). In '1d', acceptance is along the
+        rolled pass axis only: delta = |tpar|.
+        - half_angle_x_mrad is interpreted as:
+            * top-hat: acceptance half-angle (radians)
+            * darwin : Darwin halfwidth (radians)
+        which matches the GPU analyser's accept_angle_rad and darwin_halfwidth_rad.
+        """
+        if wavelength is None:
+            raise ValueError("wavelength must be provided to _apply_angular_filter_kspace")
+
+        on_gpu = bool(use_gpu and (cp is not None))
+        xp = cp if on_gpu else np
+
+        Ny, Nx = int(field.shape[0]), int(field.shape[1])
+        k0 = (2.0 * np.pi) / float(wavelength)
+
+        # Spatial frequency axes -> small angles theta = k_perp / k0 (dimensionless)
+        kx = (2.0 * np.pi) * xp.fft.fftfreq(Nx, d=float(dx)).astype(xp.float32)
+        ky = (2.0 * np.pi) * xp.fft.fftfreq(Ny, d=float(dy)).astype(xp.float32)
+        tx = (kx / k0)[xp.newaxis, :]            # (1, Nx)
+        ty = (ky / k0)[:, xp.newaxis]            # (Ny, 1)
+
+        # Parameters
+        cx = float(filt.get('center_x_mrad', 0.0)) * 1e-3
+        cy = float(filt.get('center_y_mrad', 0.0)) * 1e-3
+        hx = float(filt.get('half_angle_x_mrad', 0.0)) * 1e-3
+        hy = float(filt.get('half_angle_y_mrad', hx * 1e3)) * 1e-3  # default hy=hx
+        mode = str(filt.get('mode', filt.get('dimension', '2d'))).lower()
+        shape = str(filt.get('shape', 'circular')).lower()
+        rolloff = str(filt.get('rolloff', 'tophat')).lower()
+        roll_deg = float(filt.get('roll_deg', 0.0))
+        phi = float(np.deg2rad(roll_deg))
+
+        # Shift to center and rotate axes so tpar aligns with acceptance axis
+        tX = tx - cx
+        tY = ty - cy
+        cph = float(np.cos(phi))
+        sph = float(np.sin(phi))
+        tpar  = cph * tX + sph * tY    # along rolled pass axis
+        tperp = -sph * tX + cph * tY   # orthogonal to it
+
+        # Build amplitude mask H consistent with analyser_mode
+        eps = 1e-30
+        if mode == '1d':
+            # Slit: unlimited in tperp, accept along tpar
+            s = tpar / max(hx, eps)  # dimensionless
+            if rolloff == 'darwin':
+                H = 1.0 / (1.0 + (s * s))   # amplitude
+            elif rolloff == 'tophat':
+                H = (xp.abs(s) <= 1.0).astype(xp.float32)
+            else:
+                # Keep Butterworth as a soft 1D slit (not part of analyser, but useful)
+                order = max(1, int(filt.get('order', 4)))
+                H = 1.0 / xp.sqrt(1.0 + xp.power(xp.abs(s), 2 * order))
+        else:
+            # 2D acceptance
+            if shape == 'elliptical':
+                # Normalized radius
+                u = tpar  / max(hx, eps)
+                v = tperp / max(hy, eps)
+                r2 = u * u + v * v
+                if rolloff == 'darwin':
+                    H = 1.0 / (1.0 + r2)     # amplitude
+                elif rolloff == 'tophat':
+                    H = (r2 <= 1.0).astype(xp.float32)
+                else:
+                    order = max(1, int(filt.get('order', 4)))
+                    H = 1.0 / xp.sqrt(1.0 + xp.power(r2, order))
+            else:
+                # Circular: delta is the isotropic small-angle deviation
+                delta = xp.sqrt(tX * tX + tY * tY)
+                if rolloff == 'darwin':
+                    hw = max(hx, eps)
+                    H = 1.0 / (1.0 + (delta / hw) * (delta / hw))   # amplitude
+                elif rolloff == 'tophat':
+                    H = (delta <= max(hx, eps)).astype(xp.float32)
+                else:
+                    order = max(1, int(filt.get('order', 4)))
+                    H = 1.0 / xp.sqrt(1.0 + xp.power(delta / max(hx, eps), 2 * order))
+
+        # Peak transmission and uniform phase (amplitude model, like the analyser)
+        amp_peak = float(filt.get('transmission', 1.0))
+        amp = float(np.sqrt(max(amp_peak, 0.0)))
+        phase = float(filt.get('phase_shift', 0.0))
+        cph0 = float(np.cos(phase))
+        sph0 = float(np.sin(phase))
+        phasor = (cph0 + 1j * sph0)
+
+        # FFT -> mask -> iFFT
+        E = xp.asarray(field, dtype=xp.complex64)
+        F = xp.fft.fft2(E)
+        F = F * H.astype(xp.complex64)
+        Eo = xp.fft.ifft2(F) * amp * phasor
+
+        out = Eo.get() if on_gpu else np.asarray(Eo)
+        return out.astype(np.complex64)
 
     def _apply_aperture(self, field, dx, dy, aperture_data, use_gpu=True):
         """
@@ -424,6 +535,63 @@ class optics(logging):
             'order': int(order),
             'pad_mode': str(pad_mode),
             'conserve_energy': bool(conserve_energy),
+        })
+        
+    def add_angular_filter(self,
+                        half_angle_mrad,
+                        center_x_mrad=0.0,
+                        center_y_mrad=0.0,
+                        shape='circular',
+                        half_angle_y_mrad=None,
+                        rolloff='tophat',
+                        order=4,
+                        transmission=1.0,
+                        phase_shift=0.0,
+                        mode='2d',
+                        roll_deg=0.0):
+        """
+        Analyzer-like k-space angular filter.
+
+        Semantics aligned with beam.analyser_mode:
+        - rolloff='tophat' : half_angle_mrad is the acceptance half-angle (mrad).
+        - rolloff='darwin' : half_angle_mrad is the Darwin halfwidth (mrad).
+        The mask is applied to the field's Fourier spectrum as an amplitude filter.
+
+        Parameters
+        ----------
+        center_x_mrad, center_y_mrad : float
+            Analyzer axis offset in milliradians relative to the optical axis.
+        mode : '2d' or '1d'
+            '2d' circular/elliptical acceptance; '1d' slit along the rolled pass axis.
+        shape : 'circular' or 'elliptical'
+            Only used for '2d'. 'circular' matches the isotropic analyser in beam.
+        roll_deg : float
+            Roll angle of the acceptance axes (degrees). 0 aligns pass axis with +x.
+        transmission : float
+            Peak intensity transmission (0..1). Amplitude factor sqrt(transmission) is applied.
+        phase_shift : float
+            Uniform phase (radians) applied after the mask.
+        order : int
+            Only used for 'butterworth' soft edges (not part of analyser), defaults to 4.
+        """
+        if shape.lower() not in ('circular', 'elliptical'):
+            shape = 'circular'
+        if half_angle_y_mrad is None:
+            half_angle_y_mrad = half_angle_mrad
+
+        self._components.append({
+            'kind'              : 'angular filter',
+            'shape'             : shape.lower(),
+            'center_x_mrad'     : float(center_x_mrad),
+            'center_y_mrad'     : float(center_y_mrad),
+            'half_angle_x_mrad' : float(half_angle_mrad),
+            'half_angle_y_mrad' : float(half_angle_y_mrad),
+            'rolloff'           : str(rolloff).lower(),
+            'order'             : int(order),
+            'transmission'      : float(transmission),
+            'phase_shift'       : float(phase_shift),
+            'mode'              : str(mode).lower(),
+            'roll_deg'          : float(roll_deg),
         })
 
     def add_aperture(self, width_mm, shape='square'):
