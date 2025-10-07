@@ -467,6 +467,85 @@ class optics(logging):
                     if (abs(xx) > half) or (abs(yy) > half):
                         E_out[iy, ix] = 0.0
         return E_out
+    
+    def apply_stack(
+        self,
+        field,
+        dx,
+        dy,
+        wavelength,
+        propagate_free_space,
+        use_gpu=True
+    ):
+        """
+        Apply all components in this optics stack to 'field' in-order.
+
+        Parameters
+        ----------
+        field : array-like (Ny, Nx), complex64
+            Input complex field (NumPy). If the free-space propagator returns a
+            CuPy array, this function will fetch it back to host automatically.
+        dx, dy : float
+            Pixel sizes along x and y in meters.
+        wavelength : float
+            Wavelength in meters. Required by some components (e.g., angular filter, lenses).
+        propagate_free_space : callable
+            Function with signature:
+                out = propagate_free_space(field, dx, dy, z)
+            It should apply free-space propagation over distance 'z' (meters)
+            and return a NumPy complex64 array (or a CuPy array, which will be
+            converted to NumPy here).
+        use_gpu : bool
+            Whether to request GPU-accelerated paths for optics-internal
+            operations when available.
+
+        Returns
+        -------
+        np.ndarray (Ny, Nx), complex64
+            Field after applying all components.
+        """
+        if wavelength is None:
+            raise ValueError("wavelength must be provided to optics.apply_stack")
+
+        E = np.asarray(field, dtype=np.complex64)
+        dx = float(dx)
+        dy = float(dy)
+
+        for elem in self.components:
+            kind = str(elem.get("kind", "")).lower()
+
+            if kind == "free space":
+                z = float(elem.get("length", 0.0)) * 1e-3
+                E = propagate_free_space(E, dx, dy, z)
+                # Ensure NumPy on return so downstream ops are consistent
+                if cp is not None and hasattr(cp, "ndarray") and isinstance(E, cp.ndarray):
+                    E = E.get()
+                E = np.asarray(E, dtype=np.complex64)
+
+            elif kind == "lens box":
+                E = self._apply_thin_lens_box(
+                    E, dx, dy, elem, wavelength=wavelength, use_gpu=use_gpu
+                )
+
+            elif kind == "bragg magnifier 2b":
+                E = self._apply_bragg_magnifier_2b(
+                    E, dx, dy, elem, use_gpu=use_gpu
+                )
+
+            elif kind == "angular filter":
+                E = self._apply_angular_filter_kspace(
+                    E, dx, dy, elem, wavelength=wavelength, use_gpu=use_gpu
+                )
+
+            elif kind == "aperture":
+                E = self._apply_aperture(
+                    E, dx, dy, elem, use_gpu=use_gpu
+                )
+
+            else:
+                raise ValueError(f'Unknown optics element "{kind}"')
+
+        return np.asarray(E, dtype=np.complex64)
 
     def read_optics_metadata(self):
         """
