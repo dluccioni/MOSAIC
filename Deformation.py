@@ -1778,9 +1778,35 @@ class deformation(logging):
             FileNotFoundError: If file is missing.
             ValueError: On invalid columns or data.
         """
-        import os
         if not os.path.isfile(filepath):
             raise FileNotFoundError("File not found: {}".format(filepath))
+        
+        # Fast-path: binary .npy/.npz produced by generate_nodal_field(file_format="npy"/"npz")
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in (".npy", ".npz"):
+            if ext == ".npy":
+                arr = np.load(filepath)
+            else:
+                z = np.load(filepath)
+                # prefer stable keys, else take the first array
+                for k in ("xyzu", "nodes", "array"):
+                    if k in z.files:
+                        arr = z[k]
+                        break
+                else:
+                    arr = z[z.files[0]]
+            arr = np.asarray(arr)
+            if arr.ndim != 2 or arr.shape[1] != 6:
+                raise ValueError("binary nodes file must be shape (N,6) with columns x y z u1 u2 u3")
+            Xref = arr[:, 0:3].astype(dtype, copy=False)
+            U    = arr[:, 3:6].astype(dtype, copy=False)
+            Xcurr = Xref + U
+            if use_gpu and (cp is not None):
+                Xref = cp.asarray(Xref, dtype=dtype)
+                Xcurr = cp.asarray(Xcurr, dtype=dtype)
+            self._Xref = Xref
+            self._Xcurr = Xcurr
+            return Xref, Xcurr
 
         PRESETS = {
             "comsol_nodes_csv": {
@@ -1915,9 +1941,25 @@ class deformation(logging):
             FileNotFoundError: If file is missing.
             ValueError: On invalid format or content.
         """
-        import os
         if not os.path.isfile(filepath):
             raise FileNotFoundError("File not found: {}".format(filepath))
+        
+        # Fast-path: binary .npy/.npz connectivity (0-based inside the file)
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in (".npy", ".npz"):
+            if ext == ".npy":
+                arr = np.load(filepath)
+            else:
+                z = np.load(filepath)
+                arr = z["tet4"] if "tet4" in z.files else z[z.files[0]]
+            arr = np.asarray(arr)
+            if arr.ndim != 2 or arr.shape[1] != 4:
+                raise ValueError("binary connectivity must be shape (E,4)")
+            elem_nodes = arr.astype(dtype, copy=False)  # already 0-based
+            if use_gpu and (cp is not None):
+                elem_nodes = cp.asarray(elem_nodes, dtype=dtype)
+            self._elem_nodes = elem_nodes
+            return elem_nodes
 
         if preset == "comsol_mesh_txt":
             # Read entire file to parse COMSOL metadata and element blocks.
@@ -2076,6 +2118,76 @@ class deformation(logging):
         return elem_nodes
 
     # FE transforms --------------------------------------------------------------
+    def zero_fe_nodal_field(self, center_mode="bbox", return_shift=False):
+        """Translate the FE nodal field so that its center is at the origin.
+
+        The center is computed from the reference nodal coordinates (self._Xref)
+        and the same translation is applied to the current coordinates
+        (self._Xcurr) if present, preserving displacements.
+
+        Args:
+            center_mode (str): Either "bbox" for the axis-aligned bounding-box
+                center (default) or "mean" for the arithmetic mean.
+            return_shift (bool): If True, also return the 3-vector shift applied
+                as a NumPy array of dtype float.
+
+        Returns:
+            tuple:
+                (Xref_out, Xcurr_out) or
+                (Xref_out, Xcurr_out, shift) if return_shift is True.
+
+        Raises:
+            ValueError: If the FE nodal field is not initialized or shapes are invalid.
+        """
+        if self._Xref is None:
+            raise ValueError("FE nodal field is not initialized. Call import_fe_nodal_field(...) first.")
+
+        # Select backend from existing storage (do not move data between CPU/GPU).
+        xp = cp if ((cp is not None) and isinstance(self._Xref, cp.ndarray)) else np
+        Xr = self._Xref
+
+        if Xr.ndim != 2 or Xr.shape[1] != 3:
+            raise ValueError("Xref must have shape (N,3)")
+
+        mode = str(center_mode).strip().lower()
+        if mode == "bbox":
+            mn = xp.min(Xr, axis=0)
+            mx = xp.max(Xr, axis=0)
+            c = (mn + mx) * 0.5
+        elif mode == "mean":
+            c = xp.mean(Xr, axis=0)
+        else:
+            raise ValueError('center_mode must be "bbox" or "mean"')
+
+        # Convert to plain Python floats so we can reuse the same shift for both backends.
+        if xp is np:
+            cx, cy, cz = float(c[0]), float(c[1]), float(c[2])
+        else:
+            cx, cy, cz = float(c[0].item()), float(c[1].item()), float(c[2].item())
+
+        def _shift_for(arr):
+            # Build a shift vector with the correct backend and dtype for 'arr'.
+            if (cp is not None) and isinstance(arr, cp.ndarray):
+                return cp.asarray([cx, cy, cz], dtype=arr.dtype)
+            else:
+                return np.asarray([cx, cy, cz], dtype=arr.dtype if hasattr(arr, "dtype") else np.float32)
+
+        # Apply translation to reference and current nodes.
+        shift_ref = _shift_for(self._Xref)
+        Xref_out = self._Xref - shift_ref
+        self._Xref = Xref_out
+
+        Xcurr_out = None
+        if self._Xcurr is not None:
+            shift_cur = _shift_for(self._Xcurr)
+            Xcurr_out = self._Xcurr - shift_cur
+            self._Xcurr = Xcurr_out
+
+        if return_shift:
+            shift_np = np.array([cx, cy, cz], dtype=float)
+            return self._Xref, self._Xcurr, shift_np
+        return self._Xref, self._Xcurr
+    
     def transform_fe_nodal_field(self,
                                  Xref,
                                  Xcur,
