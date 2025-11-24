@@ -35,6 +35,7 @@ class sample(logging):
         "plot_sample",
         "plot_sample_exterior",
         "plot_grains",
+        "build_cell_list_gpu",
     )
     
     # -----------------------------------------------------------------------------
