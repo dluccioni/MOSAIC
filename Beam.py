@@ -1903,149 +1903,489 @@ class beam(logging):
     @staticmethod
     def build_expand_paths_kernel():
         """
-        Build a CUDA kernel that expands scattering paths using neighbor data.
+        Q-aware path expansion kernel.
 
-        The kernel performs, for each incoming path and each of its neighbors:
-        - Multiply the amplitude by exp(i*phase) using the neighbor phase.
-        - Multiply by a per-bounce complex factor s0[j] ~= f0(0) + f1 + i*f2 when
-            the neighbor atom j is local to the chunk; otherwise use 1.
-        - Write the neighbor atom position (meters) if local; write NaN and index
-            -1 if not local, so the host can filter non-expandable paths.
-        - Pass through the neighbor wave-vector components (neighborKx/Ky/Kz).
-        - Write the neighbor species code for later lookups.
-
-        Returns:
-            cupy.RawKernel: Compiled kernel handle named "expand_paths_kernel".
+        For each incoming path i (at atom 'src'):
+        - For each neighbor j of src:
+            * A1 = Ain * exp(i * neighborPhase[src->j])
+            * Compute Q using incoming k_in (rad/m) and neighbor K direction.
+                - neighborK from NN tables is rad/Angstrom; we normalize for direction
+                    and convert the stored K to rad/m when writing out.
+                - Q = k * sqrt(2 * (1 - dot(k_in_hat, k_out_hat))).
+            * s(Q) = f0(Q) + (f1 + i f2) from species code of j
+            * A2 = A1 * s(Q)
+            * Write out:
+                position of j (meters) if local else NaN and out_idx = -1,
+                k_out components in rad/m,
+                A2, and neighbor species code.
+        The out buffer capacity is maxPaths; the last element of out_idx holds the count.
         """
+        if cp is None:
+            raise RuntimeError("CuPy is required for build_expand_paths_kernel")
+
         code = r'''
         #include <math.h>
         extern "C" {
 
-        __device__ __forceinline__ float2 cplx_expf(float phase)
+        __device__ __forceinline__ float2 cplx_expf_fast(float phase)
         {
-            float s, c;
-            __sincosf(phase, &s, &c);
-            float2 v; v.x = c; v.y = s;
-            return v;
+            float s, c; __sincosf(phase, &s, &c);
+            float2 v; v.x = c; v.y = s; return v;
+        }
+
+        __device__ __forceinline__ float get_f0_from_params(float Q_val, const float* params)
+        {
+            const float PI_F   = 3.14159265358979323846f;
+            const float K_SCALE= 0.25f * 1.0e-10f / PI_F;  // [m^-1] -> [Ang^-1]
+            float s  = K_SCALE * Q_val;
+            float ss = s * s;
+            float f0 = params[5];
+            #pragma unroll
+            for (int i=0;i<5;++i) {
+                float ai = params[i];
+                float bi = params[6+i];
+                f0 += ai * __expf(-bi * ss);
+            }
+            return f0;
         }
 
         __global__
         void expand_paths_kernel(
-            // Incoming paths (size = numIncomingPaths)
-            const float*  in_x,
-            const float*  in_y,
-            const float*  in_z,
-            const float*  in_kx,
-            const float*  in_ky,
-            const float*  in_kz,
+            // incoming paths (size = numIncomingPaths)
+            const float*  in_x_m,
+            const float*  in_y_m,
+            const float*  in_z_m,
+            const float*  in_kx_m,   // rad/m
+            const float*  in_ky_m,
+            const float*  in_kz_m,
             const float2* in_amp,
-            const int*    in_atomIndex,
+            const int*    in_atomIndex,  // source atom index within chunk
 
-            // Neighbor info (per-atom, flattened)
+            // neighbor lists (flattened)
             const int*    neighborStart,
             const int*    neighborCount,
-            const float*  neighborPhase,
-            const float*  neighborKx,
-            const float*  neighborKy,
-            const float*  neighborKz,
-            const int*    neighborIdxAtom,  // neighbor index j (may be out of chunk)
-            const int*    neighborSpc,      // int32 species code per neighbor
+            const float*  neighborPhase, // phase for src->nbr in radians (rad)
+            const float*  neighborKx_A,  // rad/Angstrom
+            const float*  neighborKy_A,
+            const float*  neighborKz_A,
+            const int*    neighborIdxAtom, // index j; -1 if out of local range
+            const int*    neighborSpc,     // species code of j
 
-            // Global size
+            // global size
             const int     numIncomingPaths,
 
-            // Local-chunk lookups (positions in meters, s0 ~= f0(0)+anom)
+            // local-chunk geometry (meters) for j
             const float*  atom_x_m,
             const float*  atom_y_m,
             const float*  atom_z_m,
-            const float2* s0_per_atom,      // length = nAtomsLocal
             const int     nAtomsLocal,
 
-            // Outputs (capacity = maxPaths)
-            float*  out_x,
-            float*  out_y,
-            float*  out_z,
-            float*  out_kx,
-            float*  out_ky,
-            float*  out_kz,
-            float2* out_amp,
-            int*    out_atomIndex,
-            int*    out_spc,
+            // species LUTs
+            const float*  f0_params_by_code,  // (nCodes*11)
+            const float2* anom_by_code,       // (nCodes)
 
-            const int     maxPaths
+            // physics
+            const float   k_val_m,            // rad/m
+
+            // outputs (capacity = maxPaths; out_count in out_idx[maxPaths])
+            float*  out_x_m,
+            float*  out_y_m,
+            float*  out_z_m,
+            float*  out_kx_m,
+            float*  out_ky_m,
+            float*  out_kz_m,
+            float2* out_amp,
+            int*    out_idx,   // index of j (or -1). out_idx[maxPaths] is the counter.
+            int*    out_spc,
+            const int   maxPaths
         )
         {
             int idx = blockDim.x * blockIdx.x + threadIdx.x;
             if (idx >= numIncomingPaths) return;
 
-            float2 AmpIn = in_amp[idx];
-            int    src   = in_atomIndex[idx];
+            float2 Ain = in_amp[idx];
+            int src    = in_atomIndex[idx];
+
+            // incoming k unit vector for Q
+            float kix = in_kx_m[idx], kiy = in_ky_m[idx], kiz = in_kz_m[idx];
+            float kmag = sqrtf(kix*kix + kiy*kiy + kiz*kiz);
+            float ikx = 1.0f, iky = 0.0f, ikz = 0.0f;
+            if (kmag > 0.0f) { float invk = 1.0f / kmag; ikx = kix*invk; iky = kiy*invk; ikz = kiz*invk; }
 
             int startN = neighborStart[src];
             int countN = neighborCount[src];
+            const float rE_F = 2.81794092e-15f;
 
             for (int n = 0; n < countN; ++n) {
                 int gN = startN + n;
 
-                // Phase and per-bounce scatter
+                // phase propagation
                 float  ph  = neighborPhase[gN];
-                float2 eip = cplx_expf(ph);
-
-                // Multiply by exp(i*phase)
+                float2 eip = cplx_expf_fast(ph);
                 float2 A1;
-                A1.x = AmpIn.x * eip.x - AmpIn.y * eip.y;
-                A1.y = AmpIn.x * eip.y + AmpIn.y * eip.x;
+                A1.x = fmaf(-Ain.y, eip.y, Ain.x * eip.x);
+                A1.y = fmaf( Ain.x, eip.y, Ain.y * eip.x);
 
-                // Neighbor atom index
-                int j = neighborIdxAtom[gN];
+                // neighbor atom j and species code
+                int j   = neighborIdxAtom[gN];
+                int sc  = neighborSpc[gN];
 
-                // Multiply by s0[j] if local; otherwise s0 = 1
-                float2 s0 = make_float2(1.f, 0.f);
-                if (j >= 0 && j < nAtomsLocal) {
-                    s0 = s0_per_atom[j];
-                }
+                // neighbor direction unit and rad/m write-out
+                const float K_ANG2M = 1.0e10f; // rad/Ang -> rad/m
+                float koxA = neighborKx_A[gN];
+                float koyA = neighborKy_A[gN];
+                float kozA = neighborKz_A[gN];
+
+                // direction for Q (unit)
+                float knmag = sqrtf(koxA*koxA + koyA*koyA + kozA*kozA);
+                float okx = 1.0f, oky = 0.0f, okz = 0.0f;
+                if (knmag > 0.0f) { float inv = 1.0f / knmag; okx = koxA*inv; oky = koyA*inv; okz = kozA*inv; }
+
+                // Q from angle between incoming and outgoing directions
+                float cosang = fminf(1.0f, fmaxf(-1.0f, ikx*okx + iky*oky + ikz*okz));
+                float tmp = 2.0f * (1.0f - cosang);
+                if (tmp < 0.0f) tmp = 0.0f;
+                float Q_val = k_val_m * __fsqrt_rn(tmp);
+
+                // s(Q) from species code
+                const float* f0p = &f0_params_by_code[sc * 11];
+                float2 anm = anom_by_code[sc];
+                float f0v = get_f0_from_params(Q_val, f0p);
+
+                float s_re = f0v + anm.x;
+                float s_im = anm.y;
 
                 float2 A2;
-                A2.x = A1.x * s0.x - A1.y * s0.y;
-                A2.y = A1.x * s0.y + A1.y * s0.x;
+                A2.x = fmaf(-A1.y, s_im, A1.x * s_re) * rE_F;
+                A2.y = fmaf( A1.x, s_im, A1.y * s_re) * rE_F;
 
-                // Append to output buffer
-                int outPos = atomicAdd((unsigned int*)&out_atomIndex[maxPaths], 1);
+                // append to output
+                int outPos = atomicAdd((unsigned int*)&out_idx[maxPaths], 1);
                 if (outPos < maxPaths) {
-                    // Write neighbor position (meters) if local, else mark invalid
                     if (j >= 0 && j < nAtomsLocal) {
-                        out_x[outPos] = atom_x_m[j];
-                        out_y[outPos] = atom_y_m[j];
-                        out_z[outPos] = atom_z_m[j];
-                        out_atomIndex[outPos] = j;
+                        out_x_m[outPos] = atom_x_m[j];
+                        out_y_m[outPos] = atom_y_m[j];
+                        out_z_m[outPos] = atom_z_m[j];
+                        out_idx[outPos] = j;
                     } else {
-                        float nanv = __int_as_float(0x7fffffff); // qNaN bit pattern
-                        out_x[outPos] = nanv;
-                        out_y[outPos] = nanv;
-                        out_z[outPos] = nanv;
-                        out_atomIndex[outPos] = -1;
+                        float nanv = __int_as_float(0x7fffffff);
+                        out_x_m[outPos] = nanv;
+                        out_y_m[outPos] = nanv;
+                        out_z_m[outPos] = nanv;
+                        out_idx[outPos] = -1;
                     }
 
-                    // Carry neighbor direction (units as provided)
-                    out_kx[outPos] = neighborKx[gN];
-                    out_ky[outPos] = neighborKy[gN];
-                    out_kz[outPos] = neighborKz[gN];
+                    // store outgoing k in rad/m
+                    out_kx_m[outPos] = koxA * K_ANG2M;
+                    out_ky_m[outPos] = koyA * K_ANG2M;
+                    out_kz_m[outPos] = kozA * K_ANG2M;
 
-                    out_amp[outPos] = A2;
-                    out_spc[outPos] = neighborSpc[gN];
+                    out_amp[outPos]  = A2;
+                    out_spc[outPos]  = sc;
                 }
             }
         }
         } // extern "C"
-        '''
+        ''';
+
+        mod = cp.RawModule(code=code, backend='nvcc',
+                        options=('-O3', '--ftz=true', '--fmad=true', '--gpu-architecture=native'))
+        return mod.get_function('expand_paths_kernel')
+
+    def build_scatter_paths_to_detector_kernel_dyn(self):
+        """
+        CUDA kernel to accumulate a set of paths on the detector with per-path Q.
+
+        Each path p provides:
+        - position (meters),
+        - incoming wave-vector components k_in (rad/m) for direction,
+        - complex amplitude,
+        - species code (used to look up f0 params and anomalous terms).
+
+        For every detector pixel:
+        - Compute unit vector r_hat to the pixel and per-pixel Q_cut (like kinematic).
+        - For each path:
+            Q = k * sqrt(2 * (1 - dot(k_in_hat, r_hat)))
+            s(Q) = f0(Q) + (f1 + i f2)  via W-K params and anomalous table
+            optional forward removal: s(Q) -= f0(0) + (f1 + i f2) for Q < Q_cut
+            polarization factor using dot(k_in_hat, r_hat)
+            phase accumulation uses the same reduced-argument strategy and R0-relative form.
+        Spherical-decay is available but left disabled by the caller for dynamical.
+        """
+        if cp is None:
+            raise RuntimeError("CuPy is required for build_scatter_paths_to_detector_kernel_dyn")
+
+        src = r'''
+        #include <math.h>
+
+        #ifndef N_SERIES
+        #define N_SERIES 2
+        #endif
+        #if N_SERIES < 1
+        #undef N_SERIES
+        #define N_SERIES 1
+        #endif
+        #if N_SERIES > 32
+        #undef N_SERIES
+        #define N_SERIES 32
+        #endif
+
+        #define CHUNK_SIZE 128
+        #define rE_F 2.81794092e-15f
+
+        // robust FP32 argument reduction pieces
+        #define TWOPI_H 6.2831854820251465f
+        #define TWOPI_L -1.748455531469517e-07f
+        #define INV_TWOPI_H 0.15915493667125702f
+        #define PI_H 3.1415927410125732f
+
+        extern "C" {
+
+        __device__ __forceinline__ void two_prod_fma(float a, float b, float& p, float& e)
+        {
+            p = a * b;
+            e = fmaf(a, b, -p);
+        }
+
+        __device__ __forceinline__ void sincos_k_times_reduced(float k, float s, float& sn, float& cs)
+        {
+            float xh, xl;
+            two_prod_fma(k, s, xh, xl);
+            float q = nearbyintf(fmaf(xh, INV_TWOPI_H, xl * INV_TWOPI_H));
+            float r = fmaf(-q, TWOPI_H, xh);
+            r = fmaf(-q, TWOPI_L, r);
+            r = r + xl;
+            if (r > PI_H)       r = fmaf(-1.0f, TWOPI_H, r);
+            else if (r < -PI_H) r = fmaf( 1.0f, TWOPI_H, r);
+            __sincosf(r, &sn, &cs);
+        }
+
+        __device__ __forceinline__ float sqrt1pm1_series(float t)
+        {
+            float coeff = 0.5f;    // C1
+            float tk    = t;       // t^1
+            float poly  = coeff * tk;
+            #pragma unroll
+            for (int k = 2; k <= N_SERIES; ++k) {
+                float kf  = (float)k;
+                float num = 0.5f - (kf - 1.0f);
+                coeff = coeff * (num / kf);
+                tk    = tk * t;
+                poly  = fmaf(coeff, tk, poly);
+            }
+            return poly;
+        }
+
+        __device__ __forceinline__ float get_f0_from_params(float Q_val, const float* params)
+        {
+            // Q [1/m] -> s [1/Angstrom] via s = Q / (4*pi) in Ang^-1
+            const float PI_F   = 3.14159265358979323846f;
+            const float K_SCALE= 0.25f * 1.0e-10f / PI_F;  // [m^-1] -> [Ang^-1]
+            float s  = K_SCALE * Q_val;
+            float ss = s * s;
+            float f0 = params[5];  // c
+            #pragma unroll
+            for (int i = 0; i < 5; ++i) {
+                float ai = params[i];
+                float bi = params[6 + i];
+                f0 += ai * __expf(-bi * ss);
+            }
+            return f0;
+        }
+
+        __global__ void scatter_paths_to_detector_kernel(
+            // paths
+            const int    nPaths,
+            const float* __restrict__ kx_in,
+            const float* __restrict__ ky_in,
+            const float* __restrict__ kz_in,
+            const float* __restrict__ px_m,
+            const float* __restrict__ py_m,
+            const float* __restrict__ pz_m,
+            const float2*__restrict__ amp_in,
+            const int*   __restrict__ spc_code,
+
+            // species LUTs (by code)
+            const float*  __restrict__ f0_params_by_code,  // (nCodes*11)
+            const float2* __restrict__ anom_by_code,       // (nCodes)
+            const float*  __restrict__ f0_zero_by_code,    // (nCodes)
+
+            // detector geometry
+            const int Nx, const int Ny,
+            const float* __restrict__ x_coords_m,
+            const float* __restrict__ y_coords_m,
+            const float* __restrict__ z_coords_m,
+
+            // physics
+            const float k_val,                // rad/m
+            const int   remove_forward,       // 0/1
+            const int   apply_polarization,   // 0/1
+            const int   apply_spherical_decay,// 0/1
+            const float pol_perp_rate,        // rho_perp in [0,1]
+
+            // output
+            float2* __restrict__ detector_field
+        )
+        {
+            int ix = blockIdx.x * blockDim.x + threadIdx.x;
+            int iy = blockIdx.y * blockDim.y + threadIdx.y;
+            if (ix >= Nx || iy >= Ny) return;
+            const int pidx = iy * Nx + ix;
+
+            // pixel vector and base phasor like kinematic kernel
+            float tx = x_coords_m[pidx];
+            float ty = y_coords_m[pidx];
+            float tz = z_coords_m[pidx];
+
+            float R0 = sqrtf(tx*tx + ty*ty + tz*tz);
+            float invR0 = 0.0f, ux=0.0f, uy=0.0f, uz=0.0f;
+            if (R0 > 0.0f) {
+                invR0 = 1.0f / R0;
+                ux = tx * invR0; uy = ty * invR0; uz = tz * invR0;
+            }
+
+            float sb, cb;
+            sincos_k_times_reduced(k_val, R0, sb, cb);
+
+            // per-pixel Q_cut (diagonal half width)
+            float Q_cut = 0.0f;
+            {
+                int n_right = (ix + 1 < Nx) ? (pidx + 1) : ((ix > 0) ? (pidx - 1) : pidx);
+                int n_up    = (iy + 1 < Ny) ? (pidx + Nx) : ((iy > 0) ? (pidx - Nx) : pidx);
+
+                float rx = x_coords_m[n_right];
+                float ry = y_coords_m[n_right];
+                float rz = z_coords_m[n_right];
+                float Rr = sqrtf(rx*rx + ry*ry + rz*rz);
+                float urx=0.0f, ury=0.0f, urz=0.0f;
+                if (Rr > 0.0f) { float invRr = 1.0f / Rr; urx = rx*invRr; ury = ry*invRr; urz = rz*invRr; }
+                float cos_dx = fminf(1.0f, fmaxf(-1.0f, ux*urx + uy*ury + uz*urz));
+                float Qx = k_val * __fsqrt_rn(fmaxf(0.0f, 2.0f * (1.0f - cos_dx)));
+
+                float ux2 = x_coords_m[n_up];
+                float uy2 = y_coords_m[n_up];
+                float uz2 = z_coords_m[n_up];
+                float Ru = sqrtf(ux2*ux2 + uy2*uy2 + uz2*uz2);
+                float vux=0.0f, vuy=0.0f, vuz=0.0f;
+                if (Ru > 0.0f) { float invRu = 1.0f / Ru; vux = ux2*invRu; vuy = uy2*invRu; vuz = uz2*invRu; }
+                float cos_dy = fminf(1.0f, fmaxf(-1.0f, ux*vux + uy*vuy + uz*vuz));
+                float Qy = k_val * __fsqrt_rn(fmaxf(0.0f, 2.0f * (1.0f - cos_dy)));
+
+                float Qhx = 0.5f * Qx;
+                float Qhy = 0.5f * Qy;
+                Q_cut = __fsqrt_rn(Qhx*Qhx + Qhy*Qhy);
+            }
+
+            float2 sum_rel; sum_rel.x = 0.0f; sum_rel.y = 0.0f;
+
+            for (int a = 0; a < nPaths; ++a) {
+                float ax = px_m[a];
+                float ay = py_m[a];
+                float az = pz_m[a];
+
+                float dx = tx - ax;
+                float dy = ty - ay;
+                float dz = tz - az;
+                float r_det = sqrtf(dx*dx + dy*dy + dz*dz);
+                if (!(r_det > 0.0f)) continue;
+
+                // unit outgoing direction
+                float inv_rd = 1.0f / r_det;
+                float rux = dx * inv_rd;
+                float ruy = dy * inv_rd;
+                float ruz = dz * inv_rd;
+
+                // unit incoming k for this path
+                float kix = kx_in[a], kiy = ky_in[a], kiz = kz_in[a];
+                float kmag = sqrtf(kix*kix + kiy*kiy + kiz*kiz);
+                float ikx = 1.0f, iky = 0.0f, ikz = 0.0f; // default +x if degenerate
+                if (kmag > 0.0f) { float invk = 1.0f / kmag; ikx = kix*invk; iky = kiy*invk; ikz = kiz*invk; }
+
+                // per-path Q
+                float cosang = fminf(1.0f, fmaxf(-1.0f, ikx*rux + iky*ruy + ikz*ruz));
+                float tmp = 2.0f * (1.0f - cosang);
+                if (tmp < 0.0f) tmp = 0.0f;
+                float Q_val = k_val * __fsqrt_rn(tmp);
+
+                // species lookup
+                int code = spc_code[a];
+                if (code < 0) continue;
+                const float* f0p = &f0_params_by_code[code * 11];
+                float2 anm = anom_by_code[code];
+                float f00 = f0_zero_by_code[code];
+
+                float f0v = get_f0_from_params(Q_val, f0p);
+                float s_re = f0v + anm.x;
+                float s_im = anm.y;
+
+                // optional forward removal under pixel Q_cut
+                if (remove_forward && (Q_val < Q_cut)) {
+                    s_re -= (f00 + anm.x);
+                    s_im -= anm.y;
+                }
+
+                // multiply by path amplitude
+                float2 Ain = amp_in[a];
+                float t_re = fmaf(-Ain.y, s_im, Ain.x * s_re);
+                float t_im = fmaf( Ain.x, s_im, Ain.y * s_re);
+
+                // relative phase using series like the kinematic kernel
+                float delta_r;
+                if (R0 > 0.0f) {
+                    float sproj = fmaf(uz, az, fmaf(uy, ay, ux*ax));     // u dot a
+                    float a2    = fmaf(az, az, fmaf(ay, ay, ax*ax));     // |a|^2
+                    float tval  = -2.0f * sproj * invR0 + a2 * (invR0 * invR0);
+                    delta_r = R0 * sqrt1pm1_series(tval);
+                } else {
+                    delta_r = r_det; // degenerate fallback
+                }
+
+                float s_rel, c_rel;
+                sincos_k_times_reduced(k_val, ax + delta_r, s_rel, c_rel);
+
+                float2 val;
+                val.x = t_re * c_rel - t_im * s_rel;
+                val.y = t_re * s_rel + t_im * c_rel;
+
+                if (apply_polarization) {
+                    float P = pol_perp_rate + (1.0f - pol_perp_rate) * (cosang * cosang);
+                    P = fminf(1.0f, fmaxf(0.0f, P));
+                    float sc = __fsqrt_rn(P);
+                    val.x *= sc; val.y *= sc;
+                }
+
+                if (apply_spherical_decay) {
+                    float amp_rel = (R0 > 0.0f) ? (R0 / r_det) : 1.0f;
+                    val.x *= amp_rel; val.y *= amp_rel;
+                }
+
+                sum_rel.x += val.x * rE_F;
+                sum_rel.y += val.y * rE_F;
+            }
+
+            // rotate by base phasor
+            float2 sum_rot;
+            sum_rot.x = sum_rel.x * cb - sum_rel.y * sb;
+            sum_rot.y = sum_rel.x * sb + sum_rel.y * cb;
+
+            // accumulate
+            float2 oldv = detector_field[pidx];
+            oldv.x += sum_rot.x;
+            oldv.y += sum_rot.y;
+            detector_field[pidx] = oldv;
+        } // kernel
+
+        } // extern "C"
+        ''';
 
         mod = cp.RawModule(
-            code=code,
-            options=('-O3', '--ftz=true', '--fmad=true'),
-            backend='nvcc'
+            code=src,
+            backend='nvcc',
+            options=('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true',
+                    f'-DN_SERIES={int(getattr(self, "_series_terms", 2))}')
         )
-        return mod.get_function('expand_paths_kernel')
-    
+        return mod.get_function('scatter_paths_to_detector_kernel')
+
     @staticmethod
     def _next_pow_two(n) -> int:
         """
@@ -5204,24 +5544,20 @@ class beam(logging):
                                     sub_chunk_size=100_000,
                                     apply_polarization: bool = False):
         """
-        Compute multi-bounce (dynamical) scattering on GPU and return the field.
+        Sequence:
+        bounce 0:
+            paths := all atoms in chunk with amp = 1 and k_in = +x (rad/m)
+            scatter(paths -> detector) using per-path Q
+            if n_bounces == 0: next chunk
+        for b = 1..n_bounces:
+            paths := expand(paths) using Q-dependent scatter factors to neighbors
+            scatter(paths -> detector) using per-path Q
+            if b < n_bounces: prepare paths for next expansion
 
-        Paths are expanded up to `n_bounces` using precomputed neighbor lists, with
-        per-bounce scattering factors applied. Contributions are accumulated on the
-        detector grid. Polarization scaling can be enabled.
-
-        Args:
-            sample: Sample object with chunks and neighbor data on disk.
-            detector: Detector object with `shape` and `pixel_coordinates`.
-            stage: Stage object with `rotation` (3x3) and `translation` (3,) arrays.
-            n_bounces (int): Number of secondary bounces to simulate (>= 0).
-            offset (np.ndarray or None): Optional complex field to subtract at the end.
-            use_gpu (bool): Must be True; raises if CuPy is not available.
-            sub_chunk_size (int): Max number of expanded paths processed per batch.
-            apply_polarization (bool): If True, apply polarization factor in kernels.
-
-        Returns:
-            np.ndarray: Complex64 array of shape (Ny, Nx) with the scattered field.
+        Notes:
+        - This function no longer uses build_interaction_kernel.
+        - Forward removal remains disabled by default (set remove_forward_flag=1 to enable).
+        - Spherical decay is disabled here to match prior dynamical behavior; flip the flag to enable.
         """
         if (not use_gpu) or (cp is None):
             raise RuntimeError("GPU-based dynamical code requires CuPy and use_gpu=True.")
@@ -5230,23 +5566,23 @@ class beam(logging):
         if n_gpus < 1:
             raise RuntimeError("No GPUs found for dynamical scattering.")
 
-        chunk_total = sample.chunk_total
-        if not chunk_total:
-            final_result = np.zeros(detector.shape[::-1], dtype=np.complex64)
+        chunk_total = int(sample.chunk_total or 0)
+        Nx, Ny = detector.shape
+        final_result = np.zeros((Ny, Nx), dtype=np.complex64)
+        if chunk_total == 0:
             if offset is not None:
                 final_result -= offset
             return final_result
 
+        # Preload species DBs and LUTs
         db_f0   = self.parse_f0_db_all('f0_WaasKirf.dat')
         db_f1f2 = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
 
-        # Initialize species code maps if needed
         if not hasattr(self, "_species_code_map"):
             self._species_code_map = {}
             self._species_decode   = []
 
         def _ensure_codes_from(arr):
-            # Ensure species code mapping for all labels in `arr`
             out = np.empty(arr.shape, dtype=np.int32)
             for i, v in enumerate(arr):
                 if isinstance(v, (str, np.str_)):
@@ -5264,7 +5600,6 @@ class beam(logging):
                 out[i] = code
             return out
 
-        # Build LUTs for codes -> scattering parameters
         n_codes = len(self._species_decode)
         code_to_f0_params = np.zeros((max(1, n_codes), 11), np.float32)
         code_to_f0_zero   = np.zeros((max(1, n_codes),),   np.float32)
@@ -5279,9 +5614,7 @@ class beam(logging):
             if tbl is not None:
                 code_to_anom[code] = self.get_f1f2_from_params(self._energy, tbl)
 
-        Nx, Ny = detector.shape
-        final_result = np.zeros((Ny, Nx), dtype=np.complex64)
-
+        # detector pixel coordinates (meters) in pinned memory
         mp = detector.pixel_coordinates
         px_pin = self.allocate_pinned_array(mp[0, :].astype(np.float32) / 1e10)
         py_pin = self.allocate_pinned_array(mp[1, :].astype(np.float32) / 1e10)
@@ -5290,26 +5623,36 @@ class beam(logging):
         R_stage_pin = self.allocate_pinned_array(stage.rotation)
         T_stage_pin = self.allocate_pinned_array(stage.translation)
 
+        # distribute chunks
         chunk_per_gpu = chunk_total // n_gpus
         remainder     = chunk_total % n_gpus
         partial_results = [None] * n_gpus
 
-        interaction_kernel = self.build_interaction_kernel()
-        expand_kernel      = self.build_expand_paths_kernel()
-        remove_forward_flag = 0  # keep anomalous term
+        # kernels
+        scatter_kernel = self.build_scatter_paths_to_detector_kernel_dyn()
+        expand_kernel  = self.build_expand_paths_kernel()
+
+        # physics flags
+        remove_forward_flag    = 0  # keep forward term by default
+        apply_spherical_decay  = 0  # keep off to match prior dynamical behavior
+        pol_rate = float(getattr(self, "_pol_perp_rate", 0.5))
+
+        # constants
+        k_val_m = np.float32(2.0 * np.pi / float(self._wavelength))  # rad/m
 
         def gpu_worker(gpu_id, chunk_list, out_idx):
             cp.cuda.Device(gpu_id).use()
 
             Rg = cp.asarray(R_stage_pin, dtype=cp.float32)
             Tg = cp.asarray(T_stage_pin, dtype=cp.float32)
-            pxg = cp.asarray(px_pin); pyg = cp.asarray(py_pin); pzg = cp.asarray(pz_pin)
+            xg = cp.asarray(px_pin); yg = cp.asarray(py_pin); zg = cp.asarray(pz_pin)
 
             lut_f0p = cp.asarray(code_to_f0_params)
             lut_f0z = cp.asarray(code_to_f0_zero)
             lut_anm = cp.asarray(code_to_anom)
 
             dfield_gpu = cp.zeros((Nx * Ny,), dtype=cp.complex64)
+
             block2d = (16, 16)
             grid2d  = ((Nx + block2d[0] - 1) // block2d[0],
                     (Ny + block2d[1] - 1) // block2d[1])
@@ -5321,64 +5664,75 @@ class beam(logging):
                 if nA == 0:
                     continue
 
+                # ensure codes exist and rebuild LUTs if new species were discovered
                 codes_host = _ensure_codes_from(spc_host)
-                codes_gpu  = cp.asarray(codes_host, dtype=cp.int32)
+                if len(self._species_decode) != n_codes:
+                    # extend LUTs and rebuild device copies
+                    new_n = len(self._species_decode)
+                    _f0p = np.zeros((new_n, 11), np.float32)
+                    _f0z = np.zeros((new_n,),     np.float32)
+                    _anm = np.zeros((new_n,),     np.complex64)
+                    for code, sym in enumerate(self._species_decode):
+                        f0p = db_f0.get(sym)
+                        if f0p is not None:
+                            _f0p[code, :] = f0p
+                            _f0z[code] = float(f0p[5] + f0p[0] + f0p[1] + f0p[2] + f0p[3] + f0p[4])
+                        tbl = db_f1f2.get(sym)
+                        if tbl is not None:
+                            _anm[code] = self.get_f1f2_from_params(self._energy, tbl)
+                    lut_f0p.set(_f0p); lut_f0z.set(_f0z); lut_anm.set(_anm)
 
+                codes_gpu = cp.asarray(codes_host, dtype=cp.int32)
+
+                # atom positions -> stage -> meters
                 pos = cp.array(sample.load_chunk_positions(cidx, use_gpu=True), dtype=cp.float32)
                 pos = pos @ Rg; pos += Tg
-
                 px_at = (pos[:, 0] / 1e10).astype(cp.float32)
                 py_at = (pos[:, 1] / 1e10).astype(cp.float32)
                 pz_at = (pos[:, 2] / 1e10).astype(cp.float32)
 
-                f0z_gpu = lut_f0z[codes_gpu]
-                anm_gpu = lut_anm[codes_gpu]
-                s0_gpu  = (f0z_gpu + anm_gpu).astype(cp.complex64)
+                # bounce 0: scatter to detector using per-path Q (k_in = +x)
+                amp0 = cp.ones((nA,), dtype=cp.complex64)
+                kx0  = cp.full((nA,), self._kx_scalar, dtype=cp.float32)
+                ky0  = cp.full((nA,), self._ky_scalar, dtype=cp.float32)
+                kz0  = cp.full((nA,), self._kz_scalar, dtype=cp.float32)
 
-                # Bounce 0
-                f0_params_gpu = lut_f0p[codes_gpu]
-                anom_gpu0     = anm_gpu
-                f0_zero_gpu   = f0z_gpu
-
-                kx_atom_gpu = cp.full((nA,), self._kx_scalar, dtype=cp.float32)
-                ky_atom_gpu = cp.full((nA,), self._ky_scalar, dtype=cp.float32)
-                kz_atom_gpu = cp.full((nA,), self._kz_scalar, dtype=cp.float32)
-                amp_atom_gpu= cp.ones((nA,), dtype=cp.complex64)
-
-                # Updated signature: pass apply_spherical_decay=0
-                interaction_kernel(
+                scatter_kernel(
                     grid2d, block2d,
                     (
                         np.int32(nA),
-                        kx_atom_gpu, ky_atom_gpu, kz_atom_gpu,
+                        kx0, ky0, kz0,
                         px_at, py_at, pz_at,
-                        amp_atom_gpu,
-                        anom_gpu0,
-                        f0_params_gpu,
-                        f0_zero_gpu,
-                        pxg, pyg, pzg,
-                        dfield_gpu,
-                        np.int32(Nx),
-                        np.int32(Ny),
+                        amp0,
+                        codes_gpu,
+                        lut_f0p,
+                        lut_anm.view(cp.float32).reshape((-1,2)),
+                        lut_f0z,
+                        np.int32(Nx), np.int32(Ny),
+                        xg, yg, zg,
+                        np.float32(k_val_m),
                         np.int32(remove_forward_flag),
                         np.int32(1 if apply_polarization else 0),
-                        np.int32(0),
-                        np.float32(self._pol_perp_rate)
+                        np.int32(apply_spherical_decay),
+                        np.float32(pol_rate),
+                        dfield_gpu
                     )
                 )
                 cp.cuda.stream.get_current_stream().synchronize()
 
+                # stop here if no further bounces
                 if n_bounces < 1:
                     cp.get_default_memory_pool().free_all_blocks()
                     continue
 
+                # neighbor tables
                 ph_flat,  offs_ph = sample.load_chunk_nn_phase(cidx)
                 kx_flat, ky_flat, kz_flat, offs_kv = sample.load_chunk_nn_scatter(cidx)
                 idx_flat, offs_ix = sample.load_chunk_nn_indices(cidx)
                 spc_flat, offs_sp = sample.load_chunk_nn_species(cidx)
 
                 neighborPhase_gpu = cp.asarray(ph_flat,  dtype=cp.float32)
-                neighborKx_gpu    = cp.asarray(kx_flat,  dtype=cp.float32)
+                neighborKx_gpu    = cp.asarray(kx_flat,  dtype=cp.float32)  # rad/Ang
                 neighborKy_gpu    = cp.asarray(ky_flat,  dtype=cp.float32)
                 neighborKz_gpu    = cp.asarray(kz_flat,  dtype=cp.float32)
                 neighborIdx_gpu   = cp.asarray(idx_flat, dtype=cp.int32)
@@ -5387,71 +5741,61 @@ class beam(logging):
                 neighborStart_gpu = cp.asarray(offs_ph[:-1].astype(np.int32))
                 neighborCount_gpu = cp.asarray((offs_ph[1:] - offs_ph[:-1]).astype(np.int32))
 
+                # inputs for first expansion
                 cur_size   = nA
                 in_x_gpu   = px_at.copy()
                 in_y_gpu   = py_at.copy()
                 in_z_gpu   = pz_at.copy()
-                in_kx_gpu  = kx_atom_gpu.copy()
-                in_ky_gpu  = ky_atom_gpu.copy()
-                in_kz_gpu  = kz_atom_gpu.copy()
-                in_amp_gpu = amp_atom_gpu.copy()
+                in_kx_gpu  = kx0.copy()
+                in_ky_gpu  = ky0.copy()
+                in_kz_gpu  = kz0.copy()
+                in_amp_gpu = amp0.copy()
                 in_idx_gpu = cp.arange(nA, dtype=cp.int32)
 
                 expand_max = int(sub_chunk_size)
 
-                def process_subchunk(sbStart, sbEnd,
-                                    out_x_gpu, out_y_gpu, out_z_gpu,
-                                    out_kx_gpu, out_ky_gpu, out_kz_gpu,
-                                    out_amp_gpu, out_idx_gpu, out_spc_gpu):
-                    # Process a subset of newly expanded paths and accumulate on detector
-                    sub_x  = out_x_gpu[sbStart:sbEnd]
-                    sub_y  = out_y_gpu[sbStart:sbEnd]
-                    sub_z  = out_z_gpu[sbStart:sbEnd]
-                    sub_kx = out_kx_gpu[sbStart:sbEnd]
-                    sub_ky = out_ky_gpu[sbStart:sbEnd]
-                    sub_kz = out_kz_gpu[sbStart:sbEnd]
-                    sub_amp= out_amp_gpu[sbStart:sbEnd]
-                    sub_idx= out_idx_gpu[sbStart:sbEnd]
-                    sub_spc= out_spc_gpu[sbStart:sbEnd]
-
-                    valid = (sub_idx >= 0) & (sub_idx < nA)
-                    if not bool(valid.any()):
+                def scatter_subpaths(sbStart, sbEnd,
+                                    out_x, out_y, out_z,
+                                    out_kx, out_ky, out_kz,
+                                    out_amp, out_spc):
+                    # accumulate [sbStart, sbEnd) subset to detector
+                    sub_x   = out_x[sbStart:sbEnd]
+                    sub_y   = out_y[sbStart:sbEnd]
+                    sub_z   = out_z[sbStart:sbEnd]
+                    sub_kx  = out_kx[sbStart:sbEnd]
+                    sub_ky  = out_ky[sbStart:sbEnd]
+                    sub_kz  = out_kz[sbStart:sbEnd]
+                    sub_amp = out_amp[sbStart:sbEnd]
+                    sub_spc = out_spc[sbStart:sbEnd]
+                    if int(sub_x.size) == 0:
                         return 0
 
-                    sub_x   = sub_x[valid];   sub_y   = sub_y[valid];   sub_z   = sub_z[valid]
-                    sub_kx  = sub_kx[valid];  sub_ky  = sub_ky[valid];  sub_kz  = sub_kz[valid]
-                    sub_amp = sub_amp[valid]; sub_spc = sub_spc[valid]
-
-                    f0p_paths = lut_f0p[sub_spc]
-                    f0z_paths = lut_f0z[sub_spc]
-                    anm_paths = lut_anm[sub_spc]
-
-                    # Updated signature: pass apply_spherical_decay=0
-                    interaction_kernel(
+                    scatter_kernel(
                         grid2d, block2d,
                         (
                             np.int32(int(sub_x.size)),
                             sub_kx, sub_ky, sub_kz,
                             sub_x,  sub_y,  sub_z,
                             sub_amp,
-                            anm_paths,
-                            f0p_paths,
-                            f0z_paths,
-                            pxg, pyg, pzg,
-                            dfield_gpu,
-                            np.int32(Nx),
-                            np.int32(Ny),
+                            sub_spc,
+                            lut_f0p,
+                            lut_anm.view(cp.float32).reshape((-1,2)),
+                            lut_f0z,
+                            np.int32(Nx), np.int32(Ny),
+                            xg, yg, zg,
+                            np.float32(k_val_m),
                             np.int32(remove_forward_flag),
                             np.int32(1 if apply_polarization else 0),
-                            np.int32(0),
-                            np.float32(self._pol_perp_rate)
+                            np.int32(apply_spherical_decay),
+                            np.float32(pol_rate),
+                            dfield_gpu
                         )
                     )
                     cp.cuda.stream.get_current_stream().synchronize()
                     return int(sub_x.size)
 
-                for bounce_i in range(1, n_bounces + 1):
-                    # Buffers for expanded paths (capacity limited by `expand_max`)
+                for b in range(1, n_bounces + 1):
+                    # allocate expansion buffers
                     out_x_gpu   = cp.empty((expand_max,), dtype=cp.float32)
                     out_y_gpu   = cp.empty((expand_max,), dtype=cp.float32)
                     out_z_gpu   = cp.empty((expand_max,), dtype=cp.float32)
@@ -5462,7 +5806,6 @@ class beam(logging):
                     out_idx_gpu = cp.empty((expand_max + 1,), dtype=cp.int32)
                     out_spc_gpu = cp.empty((expand_max,), dtype=cp.int32)
 
-                    # Last element holds the number of expansions written
                     out_idx_gpu[expand_max] = 0
 
                     nBlocks = (cur_size + block1d - 1) // block1d
@@ -5486,7 +5829,12 @@ class beam(logging):
                             np.int32(cur_size),
 
                             px_at, py_at, pz_at,
-                            s0_gpu, np.int32(nA),
+                            np.int32(nA),
+
+                            lut_f0p,
+                            lut_anm.view(cp.float32).reshape((-1,2)),
+
+                            np.float32(k_val_m),
 
                             out_x_gpu, out_y_gpu, out_z_gpu,
                             out_kx_gpu, out_ky_gpu, out_kz_gpu,
@@ -5500,25 +5848,26 @@ class beam(logging):
                     if expansions_written == 0:
                         break
 
-                    # Accumulate in sub-batches
+                    # Filter to paths with valid next atom index (for next expansion),
+                    # but scatter all expanded paths to detector first.
+                    # Scatter in sub-batches to limit memory pressure.
                     batchSize = expand_max
                     nSubBatches = (expansions_written + batchSize - 1) // batchSize
                     for sb in range(nSubBatches):
                         sbStart = sb * batchSize
                         sbEnd   = min(sbStart + batchSize, expansions_written)
-                        _ = process_subchunk(sbStart, sbEnd,
-                                            out_x_gpu, out_y_gpu, out_z_gpu,
-                                            out_kx_gpu, out_ky_gpu, out_kz_gpu,
-                                            out_amp_gpu, out_idx_gpu, out_spc_gpu)
+                        scatter_subpaths(sbStart, sbEnd,
+                                        out_x_gpu, out_y_gpu, out_z_gpu,
+                                        out_kx_gpu, out_ky_gpu, out_kz_gpu,
+                                        out_amp_gpu, out_spc_gpu)
 
-                    # Prepare inputs for next bounce
-                    if bounce_i < n_bounces:
+                    # Prepare inputs for next bounce (only those with a valid local atom index)
+                    if b < n_bounces:
                         valid_next = (out_idx_gpu[:expansions_written] >= 0) & \
                                     (out_idx_gpu[:expansions_written] < nA)
                         if not bool(valid_next.any()):
                             break
                         sel = valid_next.nonzero()[0]
-
                         in_x_gpu   = out_x_gpu[sel]
                         in_y_gpu   = out_y_gpu[sel]
                         in_z_gpu   = out_z_gpu[sel]
@@ -5533,11 +5882,13 @@ class beam(logging):
 
                 cp.get_default_memory_pool().free_all_blocks()
 
+            # write partial image
             partial_results[out_idx] = dfield_gpu.reshape((Ny, Nx)).get()
-            del pxg, pyg, pzg, dfield_gpu
+            del xg, yg, zg, dfield_gpu
             cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
 
+        # spawn workers
         threads = []
         start = 1
         for gid in range(n_gpus):
@@ -5553,10 +5904,8 @@ class beam(logging):
         for part in partial_results:
             if part is not None:
                 final_result += part
-
         if offset is not None:
             final_result -= offset
-
         return final_result
     # -------------------------------------
     
