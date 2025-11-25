@@ -4,6 +4,7 @@
 import os
 import gc
 import json
+import threading
 from Logging import logging
 import numpy as np
 try:
@@ -54,7 +55,7 @@ class deformation(logging):
         if self.directory is not None and not os.path.isdir(self.directory):
             os.makedirs(self.directory)
 
-    # Deformation Gradient Field ------------------------------------------------
+    # Deformation Gradient Field
     def import_deformation_field(
         self,
         filepath,
@@ -244,7 +245,7 @@ class deformation(logging):
 
         return pos, F
 
-    # Field transforms (CPU/GPU) -------------------------------------------------
+    # Field transforms (CPU/GPU)
     def _select_backend(self, use_gpu):
         """Select numpy or cupy module.
 
@@ -275,7 +276,7 @@ class deformation(logging):
             return F.dtype
         return np.float32
 
-    # ---------------------- rotation utilities ---------------------------------
+    # rotation utilities
     def build_rotation_matrix(
         self,
         rotate_axis=None,
@@ -352,7 +353,7 @@ class deformation(logging):
         R[2, 2] = c + d1*z*z
         return R
 
-    # ---------------------- positions transforms -------------------------------
+    # positions transforms
     def scale_positions(self, positions, scale=1.0, use_gpu=True, dtype=None, copy=True):
         """Scale positions isotropically.
 
@@ -423,7 +424,7 @@ class deformation(logging):
         t = xp.asarray(translate, dtype=dtype).reshape(1, 3)
         return P + t
 
-    # ---------------------- F tensor transforms ---------------------------------
+    # F tensor transforms
     def scale_F_about_identity(self, F, alpha=None, use_gpu=True, dtype=None, copy=True):
         """Scale deformation gradients about identity: F' = I + alpha * (F - I).
 
@@ -478,7 +479,7 @@ class deformation(logging):
         Fm = xp.matmul(Fm, R)
         return Fm.reshape(N, 9)
 
-    # ---------------------- clipping -------------------------------------------
+    # clipping
     def _parse_clip_bounds(self, clip_bounds):
         """Normalize clip bounds to (xmin, xmax, ymin, ymax, zmin, zmax).
 
@@ -888,6 +889,472 @@ class deformation(logging):
         self._ensure_field_cuda_kernels(dtype=dtype, k=k)
         return self._field_kernels[("field_kernels", np.dtype(dtype).name, int(k))]
 
+    def _ensure_fe_nodal_cuda_kernels(self, dtype=np.float32, k=48):
+        """Compile and cache optimized CUDA kernels for FE nodal field operations.
+
+        Creates highly optimized kernels targeting:
+        - Bitonic sort-based kNN
+        - GPU-native cell culling
+        - Fused MLS basis + weighted normal equations
+        - Custom batched 10x10 Cholesky solver
+
+        Args:
+            dtype (numpy dtype): Floating dtype (np.float32 or np.float64).
+            k (int): Number of neighbors (up to 64 recommended).
+        """
+        if cp is None:
+            return
+        dt = np.dtype(dtype)
+        key = ("fe_nodal_kernels", dt.name, int(k))
+        if hasattr(self, "_fe_nodal_kernels") and key in self._fe_nodal_kernels:
+            return
+        if not hasattr(self, "_fe_nodal_kernels"):
+            self._fe_nodal_kernels = {}
+
+        T = "double" if dt == np.float64 else "float"
+        POW = "pow" if dt == np.float64 else "powf"
+        SQRT = "sqrt" if dt == np.float64 else "sqrtf"
+        INF = "1e300" if dt == np.float64 else "1e30f"
+        K = int(k)
+
+        # Bitonic sort-based kNN kernel
+        src_knn_bitonic = r'''
+        extern "C" __global__
+        void knn_bitonic_sqdist(const %(T)s* __restrict__ P, const int N,
+                                const %(T)s* __restrict__ X, const int M,
+                                int* __restrict__ out_idx,
+                                %(T)s* __restrict__ out_d2)
+        {
+            int tid = threadIdx.x;
+            int q = blockIdx.x * blockDim.x + tid;
+
+            %(T)s qx = 0, qy = 0, qz = 0;
+            if (q < M) {
+                qx = X[3*q+0];
+                qy = X[3*q+1];
+                qz = X[3*q+2];
+            }
+
+            extern __shared__ unsigned char smem_raw[];
+            %(T)s* sPx = (%(T)s*)smem_raw;
+            %(T)s* sPy = sPx + blockDim.x;
+            %(T)s* sPz = sPy + blockDim.x;
+
+            const %(T)s INFV = (%(INF)s);
+            %(T)s best_d[%(K)d];
+            int   best_i[%(K)d];
+            #pragma unroll
+            for (int a=0; a<%(K)d; ++a) { best_d[a] = INFV; best_i[a] = -1; }
+
+            for (int j0 = 0; j0 < N; j0 += blockDim.x) {
+                int pj = j0 + tid;
+                if (pj < N) {
+                    sPx[tid] = P[3*pj+0];
+                    sPy[tid] = P[3*pj+1];
+                    sPz[tid] = P[3*pj+2];
+                }
+                __syncthreads();
+
+                int tileCount = min(blockDim.x, N - j0);
+                if (q < M) {
+                    for (int t=0; t<tileCount; ++t) {
+                        %(T)s dx = qx - sPx[t];
+                        %(T)s dy = qy - sPy[t];
+                        %(T)s dz = qz - sPz[t];
+                        %(T)s d2 = dx*dx + dy*dy + dz*dz;
+                        int id = j0 + t;
+
+                        // Bitonic insertion: find position and shift
+                        if (d2 < best_d[%(K)d-1]) {
+                            best_d[%(K)d-1] = d2;
+                            best_i[%(K)d-1] = id;
+
+                            // Bitonic sort network for k elements
+                            #pragma unroll
+                            for (int stage = 1; stage < %(K)d; stage *= 2) {
+                                #pragma unroll
+                                for (int stride = stage; stride > 0; stride /= 2) {
+                                    #pragma unroll
+                                    for (int i = 0; i < %(K)d; i++) {
+                                        int j = i ^ stride;
+                                        if (j > i) {
+                                            bool ascending = ((i & stage) == 0);
+                                            bool swap = (best_d[i] > best_d[j]) == ascending;
+                                            if (swap) {
+                                                %(T)s tmp_d = best_d[i];
+                                                int tmp_i = best_i[i];
+                                                best_d[i] = best_d[j];
+                                                best_i[i] = best_i[j];
+                                                best_d[j] = tmp_d;
+                                                best_i[j] = tmp_i;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (q < M) {
+                #pragma unroll
+                for (int a=0; a<%(K)d; ++a) {
+                    out_idx[q*%(K)d + a] = best_i[a];
+                    out_d2[q*%(K)d + a] = best_d[a];
+                }
+            }
+        }
+        ''' % {"T": T, "K": K, "INF": INF}
+
+        # GPU cell culling kernel
+        src_cell_cull = r'''
+        extern "C" __global__
+        void gather_cell_candidates(
+            const int* __restrict__ sortedIdx,
+            const int* __restrict__ cell_start,
+            const int* __restrict__ cell_end,
+            const int cx0, const int cy0, const int cz0,
+            const int cx1, const int cy1, const int cz1,
+            const int nx, const int ny, const int nz,
+            const int n_cells_total,
+            int* __restrict__ out_indices,
+            int* __restrict__ out_count)
+        {
+            int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+            int ncx = cx1 - cx0 + 1;
+            int ncy = cy1 - cy0 + 1;
+            int ncz = cz1 - cz0 + 1;
+            int total_cells = ncx * ncy * ncz;
+
+            if (tid >= total_cells) return;
+
+            // Compute 3D cell indices
+            int local_cx = tid % ncx;
+            int local_cy = (tid / ncx) % ncy;
+            int local_cz = tid / (ncx * ncy);
+
+            int cx = cx0 + local_cx;
+            int cy = cy0 + local_cy;
+            int cz = cz0 + local_cz;
+
+            int cid = cz * (nx * ny) + cy * nx + cx;
+
+            if (cid < 0 || cid >= n_cells_total) return;
+
+            int s = cell_start[cid];
+            int e = cell_end[cid];
+
+            if (s < 0 || e < s) return;
+
+            // Atomic append to output
+            int write_pos = atomicAdd(out_count, e - s);
+            for (int i = s; i < e; i++) {
+                out_indices[write_pos + (i - s)] = sortedIdx[i];
+            }
+        }
+        '''
+
+        # Fused MLS basis + weighted normal equations kernel
+        src_mls_fused = r'''
+        extern "C" __global__
+        void mls_fused_weighted_neq(
+            const %(T)s* __restrict__ Xq,      // (M, 3) query points
+            const %(T)s* __restrict__ P_nodes, // (N, 3) node positions
+            const %(T)s* __restrict__ U_nodes, // (N, 3) node displacements
+            const int* __restrict__ idx,       // (M, k) neighbor indices
+            const %(T)s* __restrict__ d2,      // (M, k) squared distances
+            const %(T)s power,
+            const %(T)s eps,
+            const %(T)s reg,
+            const int M,
+            const int N,
+            %(T)s* __restrict__ A_out,         // (M, 10, 10) normal equation matrices
+            %(T)s* __restrict__ b_out)         // (M, 10, 3) RHS vectors
+        {
+            int i = blockIdx.x * blockDim.x + threadIdx.x;
+            if (i >= M) return;
+
+            %(T)s qx = Xq[3*i+0];
+            %(T)s qy = Xq[3*i+1];
+            %(T)s qz = Xq[3*i+2];
+
+            // Compute median distance for normalization
+            %(T)s d_sorted[%(K)d];
+            #pragma unroll
+            for (int j = 0; j < %(K)d; j++) {
+                d_sorted[j] = %(SQRT)s(d2[i*%(K)d + j] + eps);
+            }
+
+            // Simple bubble sort for median (small k)
+            #pragma unroll
+            for (int pass = 0; pass < %(K)d/2; pass++) {
+                #pragma unroll
+                for (int j = 0; j < %(K)d-1; j++) {
+                    if (d_sorted[j] > d_sorted[j+1]) {
+                        %(T)s tmp = d_sorted[j];
+                        d_sorted[j] = d_sorted[j+1];
+                        d_sorted[j+1] = tmp;
+                    }
+                }
+            }
+            %(T)s h = d_sorted[%(K)d/2];
+            h = (h > (%(T)s)1e-9) ? h : (%(T)s)1e-9;
+            %(T)s invh = (%(T)s)1 / h;
+
+            // Initialize accumulators for A (10x10 symmetric) and b (10x3)
+            %(T)s A[55]; // Upper triangle of 10x10 symmetric matrix
+            %(T)s b[30]; // 10x3 matrix
+            %(T)s wsum = 0;
+
+            #pragma unroll
+            for (int a = 0; a < 55; a++) A[a] = 0;
+            #pragma unroll
+            for (int a = 0; a < 30; a++) b[a] = 0;
+
+            // Check for exact hits
+            %(T)s eps2 = eps * eps;
+            bool has_zero = false;
+            int zero_idx = -1;
+
+            #pragma unroll
+            for (int j = 0; j < %(K)d; j++) {
+                if (d2[i*%(K)d + j] <= eps2) {
+                    has_zero = true;
+                    zero_idx = j;
+                    break;
+                }
+            }
+
+            if (!has_zero) {
+                // Accumulate weighted normal equations
+                #pragma unroll
+                for (int j = 0; j < %(K)d; j++) {
+                    int nid = idx[i*%(K)d + j];
+                    if (nid < 0 || nid >= N) continue;
+
+                    %(T)s px = P_nodes[3*nid+0];
+                    %(T)s py = P_nodes[3*nid+1];
+                    %(T)s pz = P_nodes[3*nid+2];
+
+                    %(T)s ux = U_nodes[3*nid+0];
+                    %(T)s uy = U_nodes[3*nid+1];
+                    %(T)s uz = U_nodes[3*nid+2];
+
+                    // Normalized local coordinates
+                    %(T)s sx = (px - qx) * invh;
+                    %(T)s sy = (py - qy) * invh;
+                    %(T)s sz = (pz - qz) * invh;
+
+                    // 10-term quadratic basis
+                    %(T)s basis[10];
+                    basis[0] = 1;
+                    basis[1] = sx;
+                    basis[2] = sy;
+                    basis[3] = sz;
+                    basis[4] = sx*sx;
+                    basis[5] = sy*sy;
+                    basis[6] = sz*sz;
+                    basis[7] = sx*sy;
+                    basis[8] = sx*sz;
+                    basis[9] = sy*sz;
+
+                    // Weight
+                    %(T)s dij = %(SQRT)s(d2[i*%(K)d + j]);
+                    %(T)s w = (%(T)s)1 / %(POW)s(dij + eps, power);
+                    wsum += w;
+
+                    // A += w * basis * basis^T (upper triangle only)
+                    int idx_a = 0;
+                    #pragma unroll
+                    for (int row = 0; row < 10; row++) {
+                        #pragma unroll
+                        for (int col = row; col < 10; col++) {
+                            A[idx_a++] += w * basis[row] * basis[col];
+                        }
+                    }
+
+                    // b += w * basis * U^T
+                    #pragma unroll
+                    for (int row = 0; row < 10; row++) {
+                        b[row*3 + 0] += w * basis[row] * ux;
+                        b[row*3 + 1] += w * basis[row] * uy;
+                        b[row*3 + 2] += w * basis[row] * uz;
+                    }
+                }
+
+                // Add regularization to diagonal
+                %(T)s reg_val = reg * wsum;
+                int diag_indices[10] = {0, 10, 19, 27, 34, 40, 45, 49, 52, 54};
+                #pragma unroll
+                for (int d = 0; d < 10; d++) {
+                    A[diag_indices[d]] += reg_val;
+                }
+            } else {
+                // Exact hit: set identity for A, U for b
+                int nid = idx[i*%(K)d + zero_idx];
+                %(T)s ux = U_nodes[3*nid+0];
+                %(T)s uy = U_nodes[3*nid+1];
+                %(T)s uz = U_nodes[3*nid+2];
+
+                // A = identity (upper triangle)
+                int idx_a = 0;
+                #pragma unroll
+                for (int row = 0; row < 10; row++) {
+                    #pragma unroll
+                    for (int col = row; col < 10; col++) {
+                        A[idx_a++] = (row == col) ? (%(T)s)1 : (%(T)s)0;
+                    }
+                }
+
+                // b = [U, 0, 0, ...]
+                b[0] = ux; b[1] = uy; b[2] = uz;
+                #pragma unroll
+                for (int a = 3; a < 30; a++) b[a] = 0;
+            }
+
+            // Write out A (expand upper triangle to full 10x10)
+            int idx_a = 0;
+            #pragma unroll
+            for (int row = 0; row < 10; row++) {
+                #pragma unroll
+                for (int col = row; col < 10; col++) {
+                    A_out[i*100 + row*10 + col] = A[idx_a];
+                    if (row != col) {
+                        A_out[i*100 + col*10 + row] = A[idx_a];
+                    }
+                    idx_a++;
+                }
+            }
+
+            // Write out b
+            #pragma unroll
+            for (int a = 0; a < 30; a++) {
+                b_out[i*30 + a] = b[a];
+            }
+        }
+        ''' % {"T": T, "K": K, "POW": POW, "SQRT": SQRT}
+
+        # Custom batched 10x10 Cholesky solver kernel
+        src_cholesky_10x10 = r'''
+        extern "C" __global__
+        void batched_cholesky_solve_10x10(
+            const %(T)s* __restrict__ A,  // (M, 10, 10)
+            const %(T)s* __restrict__ b,  // (M, 10, 3)
+            const int M,
+            %(T)s* __restrict__ x_out)    // (M, 10, 3)
+        {
+            int i = blockIdx.x * blockDim.x + threadIdx.x;
+            if (i >= M) return;
+
+            // Local copies
+            %(T)s L[100]; // 10x10 lower triangular
+            %(T)s rhs[30]; // 10x3
+            %(T)s y[30]; // 10x3 intermediate
+            %(T)s x[30]; // 10x3 solution
+
+            // Load A and b
+            #pragma unroll
+            for (int a = 0; a < 100; a++) L[a] = A[i*100 + a];
+            #pragma unroll
+            for (int a = 0; a < 30; a++) rhs[a] = b[i*30 + a];
+
+            // Cholesky decomposition: A = L * L^T
+            bool success = true;
+            #pragma unroll
+            for (int j = 0; j < 10; j++) {
+                %(T)s sum = L[j*10 + j];
+                #pragma unroll
+                for (int k = 0; k < j; k++) {
+                    sum -= L[j*10 + k] * L[j*10 + k];
+                }
+                if (sum <= (%(T)s)0) {
+                    success = false;
+                    break;
+                }
+                L[j*10 + j] = %(SQRT)s(sum);
+
+                #pragma unroll
+                for (int i_row = j + 1; i_row < 10; i_row++) {
+                    sum = L[i_row*10 + j];
+                    #pragma unroll
+                    for (int k = 0; k < j; k++) {
+                        sum -= L[i_row*10 + k] * L[j*10 + k];
+                    }
+                    L[i_row*10 + j] = sum / L[j*10 + j];
+                }
+            }
+
+            if (success) {
+                // Forward substitution: L * y = b (for each of 3 columns)
+                #pragma unroll
+                for (int col = 0; col < 3; col++) {
+                    #pragma unroll
+                    for (int i_row = 0; i_row < 10; i_row++) {
+                        %(T)s sum = rhs[i_row*3 + col];
+                        #pragma unroll
+                        for (int k = 0; k < i_row; k++) {
+                            sum -= L[i_row*10 + k] * y[k*3 + col];
+                        }
+                        y[i_row*3 + col] = sum / L[i_row*10 + i_row];
+                    }
+                }
+
+                // Backward substitution: L^T * x = y (for each of 3 columns)
+                #pragma unroll
+                for (int col = 0; col < 3; col++) {
+                    #pragma unroll
+                    for (int i_row = 9; i_row >= 0; i_row--) {
+                        %(T)s sum = y[i_row*3 + col];
+                        #pragma unroll
+                        for (int k = i_row + 1; k < 10; k++) {
+                            sum -= L[k*10 + i_row] * x[k*3 + col];
+                        }
+                        x[i_row*3 + col] = sum / L[i_row*10 + i_row];
+                    }
+                }
+            } else {
+                // Fallback: return zeros
+                #pragma unroll
+                for (int a = 0; a < 30; a++) x[a] = 0;
+            }
+
+            // Write output
+            #pragma unroll
+            for (int a = 0; a < 30; a++) {
+                x_out[i*30 + a] = x[a];
+            }
+        }
+        ''' % {"T": T, "SQRT": SQRT}
+
+        # Compile all kernels
+        kernels = {
+            "knn_bitonic": cp.RawKernel(src_knn_bitonic, "knn_bitonic_sqdist"),
+            "cell_cull": cp.RawKernel(src_cell_cull, "gather_cell_candidates"),
+            "mls_fused": cp.RawKernel(src_mls_fused, "mls_fused_weighted_neq"),
+            "cholesky_solve": cp.RawKernel(src_cholesky_10x10, "batched_cholesky_solve_10x10"),
+            "dtype": dt,
+            "k": K,
+        }
+        self._fe_nodal_kernels[key] = kernels
+
+    def _get_fe_nodal_cuda_kernels(self, dtype, k):
+        """Retrieve compiled optimized CUDA kernels for FE nodal operations.
+
+        Args:
+            dtype (numpy dtype): Floating dtype.
+            k (int): Neighbor count for kNN.
+
+        Returns:
+            dict or None: Kernel bundle if CuPy available; else None.
+        """
+        if cp is None:
+            return None
+        self._ensure_fe_nodal_cuda_kernels(dtype=dtype, k=k)
+        return self._fe_nodal_kernels[("fe_nodal_kernels", np.dtype(dtype).name, int(k))]
+
     def apply_deformation_chunked(
         self,
         field_positions,
@@ -899,7 +1366,7 @@ class deformation(logging):
         use_gpu=True,
         power=2.0,
         threads=None,
-        tile_size=None,        # kept for API compatibility; unused on CUDA path
+        tile_size=None,        # kept for API compatibility; unused on CUDA path, need to update CPU
         yield_chunks=False,
         dtype=None,
         clip_to_sample=True,
@@ -983,7 +1450,7 @@ class deformation(logging):
         origin = xp.asarray(origin, dtype=dtype).reshape(3)
         eps = dtype.type(1e-12)
 
-        # ----------------------------- CUDA path --------------------------------
+        # CUDA path
         if use_gpu:
             kern = self._get_field_cuda_kernels(dtype=dtype, k=k)
             sizeof_T = 8 if dtype == np.float64 else 4
@@ -1133,7 +1600,7 @@ class deformation(logging):
                 return cp.concatenate(outs, axis=0)
             return outs
 
-        # ----------------------------- CPU fallback ------------------------------
+        # CPU fallback
         # Heuristic tile size for distance tiles (rows * tile controls temp memory).
         def _auto_tile(rows):
             bytes_per = 8 if dtype == np.float64 else 4
@@ -2571,11 +3038,6 @@ class deformation(logging):
 
         Raises:
             ValueError: If FE nodal field or sample metadata is not initialized.
-
-        Notes:
-            - This remains a drop-in replacement: same signature and return type.
-            - Internally uses more neighbors and a higher-order fit for smoother results.
-            - Mini-batching keeps memory bounded on both GPU and CPU paths.
         """
         # Validate inputs
         if self._Xref is None or self._Xcurr is None:
@@ -2607,134 +3069,292 @@ class deformation(logging):
         gmin = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
         gmax = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
 
-        # ---------------- GPU path ----------------
+        # GPU path (Multi-GPU + Multi-Stream)
         if gpu_ok:
-            # Build a cell list on nodes for culling
-            if P.shape[0] > 0:
-                bb = xp.max(P, axis=0) - xp.min(P, axis=0)
-                vol = float((bb[0] * bb[1] * bb[2]).get())
-                mean_spacing = (vol / max(1, int(P.shape[0]))) ** (1.0 / 3.0)
-                r_cut = max(1.0, 3.0 * mean_spacing)
-            else:
-                r_cut = 1.0
+            # Detect available GPUs
+            n_gpus = cp.cuda.runtime.getDeviceCount()
+            streams_per_gpu = 8
+            total_workers = n_gpus * streams_per_gpu
 
-            P32 = P.astype(cp.float32, copy=False)
-            (sortedP32, sortedIdx, cell_start, cell_end,
-            bb_min32, cell_size, nx, ny, nz) = sample.build_cell_list_gpu(P32, float(r_cut))
+            # Create streams for each GPU
+            gpu_streams = []
+            for gpu_id in range(n_gpus):
+                with cp.cuda.Device(gpu_id):
+                    gpu_streams.append([
+                        cp.cuda.Stream(non_blocking=True) for _ in range(streams_per_gpu)
+                    ])
 
-            bb_min = bb_min32.astype(dtype, copy=False)
+            # Thread-safe AABB updates
+            aabb_lock = threading.Lock()
 
-            # kNN kernels
-            knn_kerns = self._get_field_cuda_kernels(dtype=dtype, k=k)
-            sizeof_T = 8 if dtype == np.float64 else 4
-            block = 128
+            # Build a cell list on nodes for culling (on GPU 0)
+            with cp.cuda.Device(0):
+                if P.shape[0] > 0:
+                    bb = xp.max(P, axis=0) - xp.min(P, axis=0)
+                    vol = float((bb[0] * bb[1] * bb[2]).get())
+                    mean_spacing = (vol / max(1, int(P.shape[0]))) ** (1.0 / 3.0)
+                    r_cut = max(1.0, 3.0 * mean_spacing)
+                else:
+                    r_cut = 1.0
 
-            def _knn_gpu(X, P_sub):
-                M = int(X.shape[0]); N = int(P_sub.shape[0])
-                idx = cp.empty((M, k), dtype=cp.int32)
-                d2  = cp.empty((M, k), dtype=dtype)
-                grid = (M + block - 1) // block
-                smem = 3 * block * sizeof_T
-                knn_kerns["knn_topk_sqdist"](
-                    (grid,), (block,),
-                    (P_sub.ravel(), np.int32(N),
-                    X.ravel(), np.int32(M),
-                    idx.ravel(), d2.ravel()),
-                    shared_mem=smem
-                )
-                return idx, d2
+                P32 = P.astype(cp.float32, copy=False)
+                (sortedP32, sortedIdx, cell_start, cell_end,
+                bb_min32, cell_size, nx, ny, nz) = sample.build_cell_list_gpu(P32, float(r_cut))
 
-            def _candidate_indices_from_chunk_AABB(X_chunk):
-                xmn = cp.min(X_chunk, axis=0)
-                xmx = cp.max(X_chunk, axis=0)
-                halo = float(cell_size * max(0, int(cell_pad_cells)))
-                xmn = xmn - halo
-                xmx = xmx + halo
-                cs = float(cell_size)
-                nxv, nyv, nzv = int(nx), int(ny), int(nz)
+                bb_min = bb_min32.astype(dtype, copy=False)
 
-                def _clamp_int(a, lo, hi):
-                    return max(lo, min(hi, int(a)))
+                # Get optimized kernels
+                opt_kerns = self._get_fe_nodal_cuda_kernels(dtype=dtype, k=k)
+                sizeof_T = 8 if dtype == np.float64 else 4
+                block = 256
+                max_batch_size = 65536*2  # Conservative for RTX 4090
 
-                cx0 = _clamp_int(cp.floor((xmn[0] - bb_min[0]) / cs).get(), 0, nxv - 1)
-                cy0 = _clamp_int(cp.floor((xmn[1] - bb_min[1]) / cs).get(), 0, nyv - 1)
-                cz0 = _clamp_int(cp.floor((xmn[2] - bb_min[2]) / cs).get(), 0, nzv - 1)
-                cx1 = _clamp_int(cp.floor((xmx[0] - bb_min[0]) / cs).get(), 0, nxv - 1)
-                cy1 = _clamp_int(cp.floor((xmx[1] - bb_min[1]) / cs).get(), 0, nyv - 1)
-                cz1 = _clamp_int(cp.floor((xmx[2] - bb_min[2]) / cs).get(), 0, nzv - 1)
+            # Copy cell list data to all GPUs
+            cell_list_data = {}
+            for gpu_id in range(n_gpus):
+                with cp.cuda.Device(gpu_id):
+                    cell_list_data[gpu_id] = {
+                        'P': cp.array(P) if gpu_id != 0 else P,
+                        'U': cp.array(U) if gpu_id != 0 else U,
+                        'sortedP32': cp.array(sortedP32) if gpu_id != 0 else sortedP32,
+                        'sortedIdx': cp.array(sortedIdx) if gpu_id != 0 else sortedIdx,
+                        'cell_start': cp.array(cell_start) if gpu_id != 0 else cell_start,
+                        'cell_end': cp.array(cell_end) if gpu_id != 0 else cell_end,
+                        'bb_min': cp.array(bb_min) if gpu_id != 0 else bb_min,
+                    }
 
-                segs = []
-                n_cells = int(cell_start.shape[0])
-                for cz in range(cz0, cz1 + 1):
-                    base_z = cz * (nxv * nyv)
-                    for cy in range(cy0, cy1 + 1):
-                        base_y = base_z + cy * nxv
-                        for cx in range(cx0, cx1 + 1):
-                            cid = base_y + cx
-                            if cid < 0 or cid >= n_cells:
-                                continue
-                            s = int(cell_start[cid].get())
-                            e = int(cell_end[cid].get())
-                            if s < 0: s = 0
-                            if e < s: continue
-                            e = min(e, int(sortedIdx.shape[0]))
-                            if e > s:
-                                segs.append(sortedIdx[s:e])
-                if len(segs) == 0:
-                    return cp.zeros((0,), dtype=cp.int32)
-                return cp.concatenate(segs, axis=0)
+            def process_chunk_worker(chunk_i, gpu_id, stream_idx):
+                """Worker function to process a single chunk on a specific GPU and stream."""
+                nonlocal gmin, gmax
 
-            def _mls_batch_size(n_rows, dtype, k):
-                bytes_per = 8 if dtype == np.float64 else 4
-                budget = 320 * 1024 * 1024
-                per_row = max(1, bytes_per * (k * 10 + 10 * 10 + k * 3 + k))
-                return max(2048, min(n_rows, budget // per_row))
+                # Set device and stream
+                device = cp.cuda.Device(gpu_id)
+                stream = gpu_streams[gpu_id][stream_idx]
 
-            for chunk_i in range(1, int(sample.chunk_total) + 1):
-                X = sample.load_chunk_positions(chunk_i, use_gpu=True).astype(dtype, copy=False)
-                if X.ndim != 2 or X.shape[1] != 3 or X.shape[0] == 0:
-                    sample.write_chunk_positions(X.get(), chunk_i)
-                    continue
+                with device:
+                    with stream:
+                        # Get cell list data for this GPU
+                        P_gpu = cell_list_data[gpu_id]['P']
+                        U_gpu = cell_list_data[gpu_id]['U']
+                        sortedIdx_gpu = cell_list_data[gpu_id]['sortedIdx']
+                        cell_start_gpu = cell_list_data[gpu_id]['cell_start']
+                        cell_end_gpu = cell_list_data[gpu_id]['cell_end']
+                        bb_min_gpu = cell_list_data[gpu_id]['bb_min']
 
-                # Candidate culling
-                cand_idx = _candidate_indices_from_chunk_AABB(X)
-                P_sub = P if cand_idx.size < k else P[cand_idx]
+                        # Pre-allocate buffers for this stream
+                        buf_idx = cp.empty((max_batch_size, k), dtype=cp.int32)
+                        buf_d2 = cp.empty((max_batch_size, k), dtype=dtype)
+                        buf_A = cp.empty((max_batch_size, 100), dtype=dtype)
+                        buf_b = cp.empty((max_batch_size, 30), dtype=dtype)
+                        buf_coef = cp.empty((max_batch_size, 30), dtype=dtype)
+                        buf_cand = cp.empty((int(P_gpu.shape[0]),), dtype=cp.int32)
+                        buf_count = cp.zeros((1,), dtype=cp.int32)
 
-                rows = int(X.shape[0])
-                bs = int(_mls_batch_size(rows, dtype, k))
-                out = cp.empty_like(X)
+                        def _knn_gpu_optimized(X, P_sub):
+                            """Optimized kNN using bitonic sort kernel."""
+                            M = int(X.shape[0]); N = int(P_sub.shape[0])
+                            idx = buf_idx[:M] if M <= max_batch_size else cp.empty((M, k), dtype=cp.int32)
+                            d2 = buf_d2[:M] if M <= max_batch_size else cp.empty((M, k), dtype=dtype)
+                            grid = (M + block - 1) // block
+                            smem = 3 * block * sizeof_T
+                            opt_kerns["knn_bitonic"](
+                                (grid,), (block,),
+                                (P_sub.ravel(), np.int32(N),
+                                X.ravel(), np.int32(M),
+                                idx.ravel(), d2.ravel()),
+                                shared_mem=smem
+                            )
+                            return idx, d2
 
-                for s0 in range(0, rows, bs):
-                    Xe = X[s0:s0+bs]
-                    idx_loc, d2 = _knn_gpu(Xe, P_sub)
-                    # map local idx to global if needed
-                    if P_sub is not P:
-                        idx_glob = cp.take(cand_idx, idx_loc)
-                    else:
-                        idx_glob = idx_loc
-                    Uadd = self._mls_quadratic_displacement(
-                        Xe, P, U, idx_glob, d2,
-                        power=power, eps=eps, reg=reg,
-                        use_gpu=True, dtype=dtype
-                    )
-                    # Nonfinite guard
-                    bad = ~cp.isfinite(Uadd).all(axis=1)
-                    if bool(cp.any(bad)):
-                        Uadd = Uadd.copy()
-                        Uadd[bad, :] = 0
-                    out[s0:s0+bs] = Xe + Uadd
+                        def _candidate_indices_gpu(X_chunk):
+                            """GPU-native cell culling using optimized kernel."""
+                            xmn = cp.min(X_chunk, axis=0)
+                            xmx = cp.max(X_chunk, axis=0)
+                            halo = float(cell_size * max(0, int(cell_pad_cells)))
+                            xmn = xmn - halo
+                            xmx = xmx + halo
+                            cs = float(cell_size)
+                            nxv, nyv, nzv = int(nx), int(ny), int(nz)
 
-                # Update global AABB (host)
-                cmin = cp.min(out, axis=0).get()
-                cmax = cp.max(out, axis=0).get()
-                gmin = np.minimum(gmin, cmin)
-                gmax = np.maximum(gmax, cmax)
+                            # Compute cell bounds on GPU
+                            cx0_f = cp.floor((xmn[0] - bb_min_gpu[0]) / cs)
+                            cy0_f = cp.floor((xmn[1] - bb_min_gpu[1]) / cs)
+                            cz0_f = cp.floor((xmn[2] - bb_min_gpu[2]) / cs)
+                            cx1_f = cp.floor((xmx[0] - bb_min_gpu[0]) / cs)
+                            cy1_f = cp.floor((xmx[1] - bb_min_gpu[1]) / cs)
+                            cz1_f = cp.floor((xmx[2] - bb_min_gpu[2]) / cs)
 
-                # Save positions to disk
-                sample.write_chunk_positions(out.get(), chunk_i)
+                            # Single GPU->CPU transfer
+                            cell_bounds = cp.stack([cx0_f, cy0_f, cz0_f, cx1_f, cy1_f, cz1_f]).get()
+                            cx0 = max(0, min(nxv - 1, int(cell_bounds[0])))
+                            cy0 = max(0, min(nyv - 1, int(cell_bounds[1])))
+                            cz0 = max(0, min(nzv - 1, int(cell_bounds[2])))
+                            cx1 = max(0, min(nxv - 1, int(cell_bounds[3])))
+                            cy1 = max(0, min(nyv - 1, int(cell_bounds[4])))
+                            cz1 = max(0, min(nzv - 1, int(cell_bounds[5])))
 
-                del X, out
-                cp.get_default_memory_pool().free_all_blocks()
+                            ncx = cx1 - cx0 + 1
+                            ncy = cy1 - cy0 + 1
+                            ncz = cz1 - cz0 + 1
+                            total_cells = ncx * ncy * ncz
+
+                            if total_cells == 0:
+                                return cp.zeros((0,), dtype=cp.int32)
+
+                            # Reset count
+                            buf_count[0] = 0
+
+                            # Launch GPU cell culling kernel
+                            grid_cells = (total_cells + block - 1) // block
+                            n_cells_total = int(cell_start_gpu.shape[0])
+
+                            opt_kerns["cell_cull"](
+                                (grid_cells,), (block,),
+                                (sortedIdx_gpu, cell_start_gpu, cell_end_gpu,
+                                 np.int32(cx0), np.int32(cy0), np.int32(cz0),
+                                 np.int32(cx1), np.int32(cy1), np.int32(cz1),
+                                 np.int32(nxv), np.int32(nyv), np.int32(nzv),
+                                 np.int32(n_cells_total),
+                                 buf_cand, buf_count)
+                            )
+
+                            count = int(buf_count.get())
+                            if count == 0:
+                                return cp.zeros((0,), dtype=cp.int32)
+                            return buf_cand[:count].copy()
+
+                        def _mls_batch_size_optimized(n_rows):
+                            """Optimized batch size for fused kernels."""
+                            return min(n_rows, max_batch_size)
+
+                        def _mls_displacement_optimized(Xe, P_all, U_all, idx_glob, d2):
+                            """Compute MLS displacement using fused kernel + custom solver."""
+                            M = int(Xe.shape[0])
+                            N = int(P_all.shape[0])
+
+                            # Use pre-allocated buffers
+                            A = buf_A[:M] if M <= max_batch_size else cp.empty((M, 100), dtype=dtype)
+                            b = buf_b[:M] if M <= max_batch_size else cp.empty((M, 30), dtype=dtype)
+                            coef = buf_coef[:M] if M <= max_batch_size else cp.empty((M, 30), dtype=dtype)
+
+                            # Fused MLS basis + weighted normal equations kernel
+                            grid_mls = (M + block - 1) // block
+                            opt_kerns["mls_fused"](
+                                (grid_mls,), (block,),
+                                (Xe.ravel(), P_all.ravel(), U_all.ravel(),
+                                 idx_glob.ravel(), d2.ravel(),
+                                 dtype.type(power), dtype.type(eps), dtype.type(reg),
+                                 np.int32(M), np.int32(N),
+                                 A.ravel(), b.ravel())
+                            )
+
+                            # Custom batched 10x10 Cholesky solver
+                            opt_kerns["cholesky_solve"](
+                                (grid_mls,), (block,),
+                                (A.ravel(), b.ravel(), np.int32(M), coef.ravel())
+                            )
+
+                            # Extract constant term (first row of coefficient matrix)
+                            U_pred = coef.reshape(M, 10, 3)[:, 0, :]
+
+                            # Clamp nonphysical predictions
+                            Un = U_all[idx_glob]
+                            norms = cp.linalg.norm(Un, axis=2)
+                            u_cap = dtype.type(8.0) * cp.maximum(norms.max(axis=1), dtype.type(1e-9))
+                            up_norm = cp.linalg.norm(U_pred, axis=1)
+                            mask = up_norm > u_cap
+                            if bool(cp.any(mask)):
+                                scale = (u_cap[mask] / (up_norm[mask] + dtype.type(1e-20)))[:, None]
+                                U_pred = U_pred.copy()
+                                U_pred[mask, :] *= scale
+
+                            return U_pred
+
+                        # Load chunk on this GPU
+                        X = sample.load_chunk_positions(chunk_i, use_gpu=True).astype(dtype, copy=False)
+                        X = cp.asarray(X)
+
+                        if X.ndim != 2 or X.shape[1] != 3 or X.shape[0] == 0:
+                            sample.write_chunk_positions(X.get(), chunk_i)
+                            return
+
+                        # GPU-accelerated candidate culling
+                        cand_idx = _candidate_indices_gpu(X)
+                        P_sub = P_gpu if cand_idx.size < k else P_gpu[cand_idx]
+
+                        rows = int(X.shape[0])
+                        bs = int(_mls_batch_size_optimized(rows))
+                        out = cp.empty_like(X)
+
+                        for s0 in range(0, rows, bs):
+                            Xe = X[s0:s0+bs]
+                            idx_loc, d2 = _knn_gpu_optimized(Xe, P_sub)
+
+                            # Map local idx to global if needed
+                            if P_sub is not P_gpu:
+                                idx_glob = cp.take(cand_idx, idx_loc)
+                            else:
+                                idx_glob = idx_loc
+
+                            # Optimized MLS computation
+                            Uadd = _mls_displacement_optimized(Xe, P_gpu, U_gpu, idx_glob, d2)
+
+                            # Nonfinite guard
+                            bad = ~cp.isfinite(Uadd).all(axis=1)
+                            if bool(cp.any(bad)):
+                                Uadd = Uadd.copy()
+                                Uadd[bad, :] = 0
+                            out[s0:s0+bs] = Xe + Uadd
+
+                        # Synchronize stream before AABB update and write
+                        stream.synchronize()
+
+                        # Update global AABB (thread-safe)
+                        cmin = cp.min(out, axis=0).get()
+                        cmax = cp.max(out, axis=0).get()
+                        with aabb_lock:
+                            gmin = np.minimum(gmin, cmin)
+                            gmax = np.maximum(gmax, cmax)
+
+                        # Save positions to disk
+                        sample.write_chunk_positions(out.get(), chunk_i)
+
+                        # Clean up chunk-specific buffers
+                        del X, out, buf_idx, buf_d2, buf_A, buf_b, buf_coef, buf_cand, buf_count
+
+            # Distribute chunks across GPUs and streams using ThreadPoolExecutor
+            chunk_indices = list(range(1, int(sample.chunk_total) + 1))
+
+            with ThreadPoolExecutor(max_workers=total_workers) as executor:
+                futures = []
+                for idx, chunk_i in enumerate(chunk_indices):
+                    # Round-robin distribution across GPUs and streams
+                    worker_id = idx % total_workers
+                    gpu_id = worker_id // streams_per_gpu
+                    stream_idx = worker_id % streams_per_gpu
+
+                    future = executor.submit(process_chunk_worker, chunk_i, gpu_id, stream_idx)
+                    futures.append(future)
+
+                # Wait for all chunks to complete
+                wait(futures, return_when=ALL_COMPLETED)
+
+                # Check for exceptions
+                for future in futures:
+                    if future.exception() is not None:
+                        raise future.exception()
+
+            # Synchronize all streams before cleanup
+            for gpu_id in range(n_gpus):
+                with cp.cuda.Device(gpu_id):
+                    for stream in gpu_streams[gpu_id]:
+                        stream.synchronize()
+
+            # Clean up cell list data
+            for gpu_id in range(n_gpus):
+                with cp.cuda.Device(gpu_id):
+                    del cell_list_data[gpu_id]
+                    cp.get_default_memory_pool().free_all_blocks()
 
             # Finalize metadata
             if np.all(np.isfinite(gmin)) and np.all(np.isfinite(gmax)):
@@ -2743,10 +3363,10 @@ class deformation(logging):
                 sample._dimensions = new_dims
                 sample._offset = new_offs
                 sample._matrix = np.diag(sample._dimensions.astype(np.float32))
-                sample._corners = (sample.get_unit_corners() @ sample._matrix) - (sample._dimensions * 0.5) + sample._offset  # :contentReference[oaicite:5]{index=5}
+                sample._corners = (sample.get_unit_corners() @ sample._matrix) - (sample._dimensions * 0.5) + sample._offset
             return
 
-        # ---------------- CPU path ----------------
+        # CPU path
         P_np = np.asarray(P, dtype=dtype)
         U_np = np.asarray(U, dtype=dtype)
 
@@ -2841,7 +3461,7 @@ class deformation(logging):
             sample._corners = (sample.get_unit_corners() @ sample._matrix) - (sample._dimensions * 0.5) + sample._offset  # :contentReference[oaicite:6]{index=6}
         return
 
-    # FE plotting ---------------------------------------------------------------
+    # FE plotting
     def plot_mesh_and_sample_edges_3d(self,
                                       sample,
                                       Xnodes=None,
@@ -2985,7 +3605,7 @@ class deformation(logging):
         plt.tight_layout()
         return fig, ax
 
-    # Properties -----------------------------------------------------------------
+    # Properties
     @property
     def Xref(self):
         """Reference nodal coordinates.
