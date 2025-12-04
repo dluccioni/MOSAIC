@@ -119,8 +119,26 @@ class analysis(logging):
     ## Main Functions
     def distance_fft_dependance(self,sample,beam,stage,detector,distance_array,plot_prefix="Test",output_pixel_values=False,offset_list=None):
         """
-        Computes amplitude/phase summations and their FFTs at various detector
-        distances, plots them, and saves all generated figures to self.directory.
+        Compute amplitude/phase summations and their FFTs at various detector distances.
+
+        Moves the detector to each distance in distance_array, computes scattering,
+        generates 1D and 2D plots for amplitude/phase, and creates combined 3D surface
+        plots. All figures are saved to self.directory.
+
+        Args:
+            sample: Sample object for scattering computation.
+            beam: Beam object for atomic direct interaction.
+            stage: Stage object for positioning.
+            detector: Detector object to capture scattering data.
+            distance_array (ndarray): Array of detector distances to iterate over.
+            plot_prefix (str): Prefix for saved plot filenames. Defaults to "Test".
+            output_pixel_values (bool): If True, return pixel values list. Defaults to False.
+            offset_list (list, optional): List of offset arrays to subtract from pixel values
+                at each distance. Defaults to None.
+
+        Returns:
+            tuple: If output_pixel_values is False, returns (X_fft, Y_fft, Z_fft_amp, Z_fft_pha).
+                If output_pixel_values is True, returns (X_fft, Y_fft, Z_fft_amp, Z_fft_pha, pixel_values_list).
         """
         freq_array = None
         real_amplitude_list = []
@@ -227,21 +245,24 @@ class analysis(logging):
         Integrate detector data along a specified axis.
 
         Args:
-            detector: Detector object.
-            data_type (str): Data type to integrate ("Intensity", "Amplitude", etc).
-            axis (str): Axis along which to integrate.
-            system (str): Coordinate system ("cartesian" or "angular").
-            degrees (bool): If True, output angular units in degrees.
-            bins (int): Number of bins for integration.
-            aggregator (str): Aggregation method ("mean" or "sum").
-            plot (bool): Whether to generate a plot.
-            title (str): Plot title.
-            xlabel (str): X-axis label.
-            ylabel (str): Y-axis label.
-            figsize (tuple): Size of the figure.
+            detector: Detector object containing pixel data and coordinates.
+            data_type (str): Data type to integrate ("Intensity", "Amplitude", or "Phase").
+                Defaults to "Intensity".
+            axis (str): Axis along which to integrate ("x", "y", "z" for cartesian,
+                or "eta", "2theta", "distance" for angular). Defaults to "x".
+            system (str): Coordinate system ("cartesian" or "angular"). Defaults to "cartesian".
+            degrees (bool): If True, output angular units in degrees. Defaults to True.
+            bins (int): Number of bins for integration. Defaults to 200.
+            aggregator (str): Aggregation method ("mean" or "sum"). Defaults to "mean".
+            plot (bool): Whether to generate a plot. Defaults to True.
+            save_plot (bool): Whether to save the plot to file. Defaults to False.
+            title (str): Plot title. Defaults to "Integrated Detector Data".
+            xlabel (str, optional): X-axis label. Defaults to axis name if None.
+            ylabel (str): Y-axis label. Defaults to "Integrated Value".
+            figsize (tuple): Size of the figure. Defaults to (8, 6).
 
         Returns:
-            tuple: Bin centers and integrated values.
+            tuple: Bin centers (ndarray) and integrated values (ndarray).
         """
         try:
             data_map = {
