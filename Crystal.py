@@ -47,6 +47,13 @@ class crystal(logging):
         self._default_filenames = np.array(["crystal_metadata.npy"]) #sample_metadata will be a struct
     
     def get_lattice_from_cif(self):
+        """
+        Load crystal structure from the CIF file and initialize all lattice properties.
+
+        Reads the CIF file at self.filepath, converts to primitive cell for internal
+        storage, then extracts lattice vectors, atom positions, species, and also
+        computes the conventional cell representation.
+        """
         self.structure = Structure.from_file(self.filepath)
         self.to_primitive()
         self._lattice_matrix = (self.structure.lattice.matrix) #.T
@@ -66,8 +73,14 @@ class crystal(logging):
         
     def read_crystal_metadata(self, override_directory=None):
         """
-        Reads the crystal_metadata.json file from disk and restores this crystal 
-        object's internal fields.
+        Read crystal_metadata.json from disk and restore internal fields.
+
+        Args:
+            override_directory (str or None, optional): Directory to read from.
+                If None, uses the directory of self.filepath. Defaults to None.
+
+        Raises:
+            FileNotFoundError: If the metadata file does not exist.
         """
         if override_directory is not None:
             base_dir = override_directory
@@ -111,10 +124,16 @@ class crystal(logging):
             self._cumulative_rotation = np.array(data["cumulative_rotation"], dtype=np.float64)
         
     ## Data Saving Functions
-    def write_crystal_metadata(self, override_directory=None): 
+    def write_crystal_metadata(self, override_directory=None):
         """
-        Serializes the crystal object's critical internal fields to disk 
-        as human-readable JSON so that the state can be restored later.
+        Serialize crystal internal fields to disk as human-readable JSON.
+
+        Writes all critical crystal state to crystal_metadata.json so that
+        it can be restored later via read_crystal_metadata.
+
+        Args:
+            override_directory (str or None, optional): Directory to write to.
+                If None, uses the directory of self.filepath. Defaults to None.
         """
         if override_directory is not None:
             base_dir = override_directory
@@ -152,6 +171,13 @@ class crystal(logging):
     ## Static Functions
     @staticmethod
     def get_unit_corners():
+        """
+        Return the 8 corner positions of a unit cube in fractional coordinates.
+
+        Returns:
+            np.ndarray: Array of shape (8, 3) with corner positions ranging
+                from [0,0,0] to [1,1,1].
+        """
         unit_corners = np.array([
         [0, 0, 0],
         [1, 0, 0],
@@ -166,8 +192,14 @@ class crystal(logging):
     @staticmethod
     def get_rotation(axis, angle):
         """
-        Return the 3x3 rotation matrix for rotation by 'angle' radians
-        around the (normalized) 'axis'.
+        Compute a 3x3 rotation matrix using the Rodrigues formula.
+
+        Args:
+            axis (array_like): Rotation axis vector (will be normalized internally).
+            angle (float): Rotation angle in radians.
+
+        Returns:
+            np.ndarray: 3x3 rotation matrix for rotation by angle around axis.
         """
         axis = axis / np.linalg.norm(axis)
         c = np.cos(angle)
@@ -178,7 +210,19 @@ class crystal(logging):
                          [d*y*x + z*s,   c + d*y*y,     d*y*z - x*s],
                          [d*z*x - y*s,   d*z*y + x*s,   c + d*z*z]])
     
-    def get_rotation_matrix_vector_to_vector(self,vector1, vector2, eps=1e-8):
+    def get_rotation_matrix_vector_to_vector(self, vector1, vector2, eps=1e-8):
+        """
+        Compute rotation matrix that rotates vector1 to align with vector2.
+
+        Args:
+            vector1 (array_like): Source unit vector (3,).
+            vector2 (array_like): Target unit vector (3,).
+            eps (float, optional): Tolerance for detecting parallel/antiparallel
+                vectors. Defaults to 1e-8.
+
+        Returns:
+            np.ndarray: 3x3 rotation matrix R such that R @ vector1 aligns with vector2.
+        """
         # 1) Compute cos(theta) from the dot product
         cos_theta = np.dot(vector1, vector2)
 
@@ -205,7 +249,27 @@ class crystal(logging):
         angle = np.arctan2(sin_theta, cos_theta)
         return self.get_rotation(axis, angle)
     
-    def get_rotation_matrix_vector_to_plane(self,rotation_axis, vector1, plane1, angle_selection='small', eps=1e-12):
+    def get_rotation_matrix_vector_to_plane(self, rotation_axis, vector1, plane1, angle_selection='small', eps=1e-12):
+        """
+        Compute rotation matrix to bring vector1 into a plane by rotating about an axis.
+
+        Finds the rotation about rotation_axis that makes vector1 orthogonal to
+        plane1's normal (i.e., brings vector1 into the plane).
+
+        Args:
+            rotation_axis (array_like): Axis to rotate around (3,).
+            vector1 (array_like): Vector to rotate into the plane (3,).
+            plane1 (array_like): Normal vector of the target plane (3,).
+            angle_selection (str, optional): 'small' to pick the smaller angle,
+                'large' to pick the larger angle. Defaults to 'small'.
+            eps (float, optional): Tolerance for degenerate cases. Defaults to 1e-12.
+
+        Returns:
+            np.ndarray: 3x3 rotation matrix.
+
+        Raises:
+            ValueError: If no solution exists for the given geometry.
+        """
         # 1) Normalize the axis
         rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)
 
@@ -246,14 +310,34 @@ class crystal(logging):
         return self.get_rotation(rotation_axis, theta)
     
     def to_conventional(self):
+        """
+        Convert the internal pymatgen Structure to its conventional cell.
+        """
         self.structure = self.structure.to_conventional()
-        
+
     def to_primitive(self):
+        """
+        Convert the internal pymatgen Structure to its primitive cell.
+        """
         self.structure = self.structure.to_primitive()
-    
-    def align_axes(self,orientation_array,alignment_array=np.array([[0,0,1],[0,1,0]]).T):
-        #Normalize alignment array
-        alignment_array = alignment_array/np.linalg.norm(alignment_array, axis=0, keepdims=True)
+
+    def align_axes(self, orientation_array, alignment_array=np.array([[0, 0, 1], [0, 1, 0]]).T):
+        """
+        Align crystal axes to specified laboratory directions.
+
+        Performs a two-step rotation: first aligns the primary crystal direction
+        with the primary alignment direction, then rotates around that axis to
+        bring the secondary direction into the specified plane.
+
+        Args:
+            orientation_array (np.ndarray): Shape (3, 2) array of Miller indices.
+                Column 0 is the primary direction, column 1 is the secondary.
+            alignment_array (np.ndarray, optional): Shape (3, 2) array of target
+                lab directions. Column 0 is the primary axis, column 1 defines
+                the plane. Defaults to [[0,0,1],[0,1,0]].T (z-axis primary, y-plane).
+        """
+        # Normalize alignment array
+        alignment_array = alignment_array / np.linalg.norm(alignment_array, axis=0, keepdims=True)
         #Align first orientation_array axis with first alignment_array axis
         orientation_array_1 = self.lattice_matrix_conventional@orientation_array
         orientation_array_1 = orientation_array_1/np.linalg.norm(orientation_array_1, axis=0, keepdims=True)
@@ -265,9 +349,17 @@ class crystal(logging):
         rotation_matrix_2 = self.get_rotation_matrix_vector_to_plane(alignment_array[:,0],orientation_array_2[:,1],alignment_array[:,1])
         self.rotate_crystal(rotation_matrix_2)
      
-    def rotate_crystal(self, rotation_matrix,eps=1e-15):
+    def rotate_crystal(self, rotation_matrix, eps=1e-15):
         """
-        Rotate the entire structure (atoms + lattice) using the computed rotation matrix.
+        Rotate the entire crystal structure using a rotation matrix.
+
+        Applies the rotation to all lattice vectors, atom positions, and updates
+        the cumulative rotation tracker. Small values below eps are zeroed.
+
+        Args:
+            rotation_matrix (np.ndarray): 3x3 rotation matrix to apply.
+            eps (float, optional): Threshold below which matrix elements are
+                set to zero. Defaults to 1e-15.
         """
         rotation_matrix[np.abs(rotation_matrix)<eps] = 0
         self._lattice_matrix = rotation_matrix@self.lattice_matrix
@@ -278,137 +370,192 @@ class crystal(logging):
         self._lattice_orientation = np.linalg.inv(self.lattice_matrix_conventional)/np.linalg.norm(np.linalg.inv(self.lattice_matrix_conventional), axis=0, keepdims=True)
         self._cumulative_rotation = rotation_matrix@self.cumulative_rotation
     
-    def get_dhkl(self,target_plane):
+    def get_dhkl(self, target_plane):
         """
-        Return the interplanar spacing d for the (h,k,l) plane 
-        given the direct lattice vectors.
+        Calculate the interplanar spacing for a given Miller plane.
+
+        Computes d_hkl using the reciprocal lattice vectors derived from
+        the conventional cell.
+
+        Args:
+            target_plane (array_like): Miller indices (h, k, l) of the plane.
+
+        Returns:
+            float: Interplanar spacing d_hkl in Angstroms.
         """
         reciprocal_lattice_vectors = [np.cross(self.lattice_matrix_conventional[(i+1)%3], self.lattice_matrix_conventional[(i+2)%3]) / self.lattice_volume_conventional for i in range(3)]
         G = sum(target_plane[i] * reciprocal_lattice_vectors[i] for i in range(3))
         return 1/np.linalg.norm(G)
     
-    ## Properties  
+    ## Properties
     @property
     def default_filenames(self):
         """
-        Return the default output filename.
+        Return the default output filenames.
+
+        Returns:
+            np.ndarray: Array of default filename strings for metadata.
         """
         if self._default_filenames is None:
             print("self._default_filenames has not been initialized yet")
         return self._default_filenames
-    
+
     @property
     def lattice_matrix(self):
         """
-        Return the 3x3 lattice matrix (as a NumPy array).
+        Return the primitive cell lattice matrix.
+
+        Returns:
+            np.ndarray: 3x3 lattice matrix with row vectors a, b, c in Angstroms.
         """
         if self._lattice_matrix is None:
             print("self._lattice_matrix has not been initialized yet")
         return self._lattice_matrix
-    
+
     @property
     def lattice_corners(self):
         """
-        Return the 8x3 lattice corner positions (as a NumPy array).
+        Return the corner positions of the primitive cell.
+
+        Returns:
+            np.ndarray: 8x3 array of corner positions in Angstroms.
         """
         if self._lattice_corners is None:
             print("self._lattice_corners has not been initialized yet")
         return self._lattice_corners
-    
+
     @property
     def lattice_center(self):
         """
-        Return the center position of the lattice cell (in Angstroms).
+        Return the center position of the lattice cell.
+
+        Returns:
+            np.ndarray: 3x3 array representing half the lattice matrix in Angstroms.
         """
         if self._lattice_center is None:
             print("self._lattice_center has not been initialized yet")
         return self._lattice_center
-    
+
     @property
     def lattice_lengths(self):
         """
-        Return the lengths of the a, b, c lattice vectors (in Angstroms).
+        Return the primitive cell lattice vector lengths.
+
+        Returns:
+            np.ndarray: Array of (a, b, c) lengths in Angstroms.
         """
         if self._lattice_lengths is None:
             print("self._lattice_lengths has not been initialized yet")
         return self._lattice_lengths
-    
+
     @property
     def lattice_volume(self):
         """
-        Return the lattice volume (in Angstroms^3).
+        Return the primitive cell volume.
+
+        Returns:
+            float: Lattice volume in Angstroms^3.
         """
         if self._lattice_volume is None:
             print("lattice_volume has not been initialized yet")
         return self._lattice_volume
-    
+
     @property
     def lattice_atom_fractional(self):
         """
-        Return the nx3 fractional positions of the atoms.
+        Return the fractional coordinates of atoms in the primitive cell.
+
+        Returns:
+            np.ndarray: Shape (n_atoms, 3) array of fractional coordinates.
         """
         if self._lattice_atom_fractional is None:
             print("self._lattice_atom_fractional has not been initialized yet")
         return self._lattice_atom_fractional
-    
+
     @property
     def lattice_atom_cartesian(self):
         """
-        Return the nx3 cartesian positions of the atoms. (in Angstroms).
+        Return the Cartesian coordinates of atoms in the primitive cell.
+
+        Returns:
+            np.ndarray: Shape (n_atoms, 3) array of positions in Angstroms.
         """
         if self._lattice_atom_cartesian is None:
             print("self._lattice_atom_cartesian has not been initialized yet")
         return self._lattice_atom_cartesian
-    
+
     @property
     def species(self):
         """
-        Return the ordered atomic species of atoms in the primitve cell.
+        Return the atomic species of atoms in the primitive cell.
+
+        Returns:
+            np.ndarray: Array of element symbol strings in site order.
         """
         if self._species is None:
             print("self._species has not been initialized yet")
         return self._species
-    
+
     @property
     def lattice_matrix_conventional(self):
         """
-        Return the lattice matrix of the conventional cell. (in Angstroms).
+        Return the conventional cell lattice matrix.
+
+        Returns:
+            np.ndarray: 3x3 lattice matrix with row vectors in Angstroms.
         """
         if self._lattice_matrix_conventional is None:
             print("self._lattice_matrix_conventional has not been initialized yet")
         return self._lattice_matrix_conventional
-    
+
     @property
     def lattice_lengths_conventional(self):
         """
-        Return the lengths of the a, b, c conventional lattice vectors (in Angstroms).
+        Return the conventional cell lattice vector lengths.
+
+        Returns:
+            np.ndarray: Array of (a, b, c) lengths in Angstroms.
         """
         if self._lattice_lengths_conventional is None:
             print("self._lattice_lengths_conventional has not been initialized yet")
         return self._lattice_lengths_conventional
-    
+
     @property
     def lattice_volume_conventional(self):
         """
-        Return the conventional lattice volume (in Angstroms^3).
+        Return the conventional cell volume.
+
+        Returns:
+            float: Lattice volume in Angstroms^3.
         """
         if self._lattice_volume_conventional is None:
             print("self._lattice_volume_conventional has not been initialized yet")
         return self._lattice_volume_conventional
-    
+
     @property
     def lattice_orientation(self):
         """
-        Return the cartesian axis directions in the crystal system w.r.t. conventional cell.
+        Return the crystal axis directions in Cartesian coordinates.
+
+        The orientation is computed from the inverse of the conventional
+        lattice matrix, normalized column-wise.
+
+        Returns:
+            np.ndarray: 3x3 array of unit vectors for crystal axes.
         """
         if self._lattice_orientation is None:
             print("self._lattice_orientation has not been initialized yet")
         return self._lattice_orientation
-    
+
     @property
     def cumulative_rotation(self):
         """
-        Return the cumulative rotation applied to the lattice compared to the original CIF.
+        Return the cumulative rotation matrix applied to the crystal.
+
+        Tracks all rotations applied since loading from the CIF file.
+
+        Returns:
+            np.ndarray: 3x3 rotation matrix (identity if no rotations applied).
         """
         if self._cumulative_rotation is None:
             print("self._cumulative_rotation has not been initialized yet")
