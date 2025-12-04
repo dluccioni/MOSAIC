@@ -39,7 +39,8 @@ class detector(logging):
     # -----------------------------------------------------------------------------
     ## Initialization
     def __init__(self,directory=os.getcwd()):
-        """Initialize a detector object.
+        """
+        Initialize a detector object.
 
         Args:
           directory (str, optional): Folder used for I/O operations. Defaults
@@ -65,7 +66,8 @@ class detector(logging):
             os.makedirs(self.directory)
         
     def create_detector(self, shape, pixel_size, geometry='rectangular'):
-        """Create the pixel layout on the y-z plane.
+        """
+        Create the pixel layout on the y-z plane.
 
         Creates a detector pixel grid in either a rectangular or ring layout.
         The initial plane lies on x = 0, so the initial detector normal points
@@ -132,7 +134,8 @@ class detector(logging):
             raise ValueError(f"Unknown geometry '{geometry}'. Choose 'rectangular' or 'ring'.")
         
     def read_detector_metadata(self, override_directory=None):
-        """Restore detector metadata from disk.
+        """
+        Restore detector metadata from disk.
 
         Reads a JSON file named "detector_metadata.json" and restores fields
         that describe the detector state. Pixel arrays (coordinates or values)
@@ -180,7 +183,8 @@ class detector(logging):
         
     ## Data Handling Functions
     def write_detector_metadata(self, override_directory=None):
-        """Write detector metadata to a JSON file.
+        """
+        Write detector metadata to a JSON file.
 
         Serializes key fields (shape, pixel_size, center, direction, two_theta,
         eta, distance, geometry) to "detector_metadata.json". Pixel arrays are
@@ -216,7 +220,8 @@ class detector(logging):
         print(f"Detector metadata written to {metadata_filename} in JSON format.")
         
     def write_Efield_values(self, field=None, filename="Efield_values.npy", override_directory=None):
-        """Save complex per-pixel field values to a .npy file.
+        """
+        Save complex per-pixel field values to a .npy file.
 
         By default the method saves the current internal pixel values. If
         a NumPy or CuPy array is provided through the 'field' argument, that
@@ -237,6 +242,10 @@ class detector(logging):
         Returns:
           None
         """
+        if override_directory is not None:
+            outfile = os.path.join(override_directory, filename)
+        else:
+            outfile = os.path.join(self.directory, filename)
         if field == None:
             if self._pixel_values is None:
                 raise ValueError("Pixel values are not initialized; cannot save them.")
@@ -248,14 +257,11 @@ class detector(logging):
         # Convert CuPy arrays back to host memory before saving ---------------
         if cp is not None and isinstance(pxvals, cp.ndarray):
             pxvals = pxvals.get()
-        if override_directory is not None:
-            outfile = os.path.join(override_directory, filename)
-        else:
-            outfile = os.path.join(self.directory, filename)
         np.save(outfile, pxvals) 
         
     def read_Efield_values(self, internal=True, filename="Efield_values.npy", override_directory=None):
-        """Load complex per-pixel field values from a .npy file.
+        """
+        Load complex per-pixel field values from a .npy file.
 
         If 'internal' is True, the loaded values are assigned to the detector
         and derived quantities (phase, amplitude, intensity) are updated.
@@ -294,7 +300,8 @@ class detector(logging):
     ## Static Functions
     @staticmethod
     def get_rotation(axis,angle):
-        """Compute a 3x3 right-handed rotation matrix.
+        """
+        Compute a 3x3 right-handed rotation matrix.
 
         Uses Rodrigues' formula to rotate by 'angle' radians about 'axis'. The
         input axis is normalized internally.
@@ -399,7 +406,8 @@ class detector(logging):
         self.display_detector_values(degrees=True)
         
     def get_rotation_detector(self, two_theta, eta):
-        """Composite rotation used by this detector.
+        """
+        Composite rotation used by this detector.
 
         Returns a matrix that applies +two_theta about +y and then +eta about
         +x. The order matches the convention used throughout this class.
@@ -416,7 +424,8 @@ class detector(logging):
         return eta_matrix @ two_theta_matrix
         
     def get_detector_position_cartesian(self):
-        """Return the detector center and normal vector.
+        """
+        Return the detector center and normal vector.
 
         Returns:
           tuple[np.ndarray, np.ndarray]: (center, direction), where each has
@@ -425,7 +434,8 @@ class detector(logging):
         return self._center,self._direction
     
     def input_pixel_values(self,pixel_values):
-        """Assign complex pixel values and update derived fields.
+        """
+        Assign complex pixel values and update derived fields.
 
         Args:
           pixel_values (np.ndarray): Complex array matching the detector pixel
@@ -440,7 +450,8 @@ class detector(logging):
         self._pixel_intensity = self.pixel_amplitude**2
 
     def coordinate_conversion(self,data,input_system="cartesian",output_system="angular",units="deg"):
-        """Convert between Cartesian and angular coordinate systems.
+        """
+        Convert between Cartesian and angular coordinate systems.
 
         The angular representation uses:
           - component 0: eta
@@ -499,7 +510,8 @@ class detector(logging):
         units="deg", 
         axis=None
     ):
-        """Return detector coordinates arranged on the pixel grid.
+        """
+        Return detector coordinates arranged on the pixel grid.
 
         Retrieves pixel coordinates, optionally converts to angular space, and
         reshapes to a 3D array suitable for plotting or analysis.
@@ -588,7 +600,8 @@ class detector(logging):
         figsize=(8, 6), 
         cmap="gist_gray"
     ):
-        """Display a 2D image of pixel values on the detector plane.
+        """
+        Display a 2D image of pixel values on the detector plane.
 
         Uses imshow with the detector extent computed from shape * pixel_size.
         The method supports plotting Intensity, Phase, or Amplitude.
@@ -666,7 +679,8 @@ class detector(logging):
         xlim=None,ylim=None,
         marker_size=2
     ):
-        """Scatter plot of pixel values in diffraction-angle space.
+        """
+        Scatter plot of pixel values in diffraction-angle space.
 
         The x-axis is eta and the y-axis is two_theta. Values are drawn from
         Intensity, Phase, or Amplitude.
@@ -757,7 +771,8 @@ class detector(logging):
         return fig, ax
 
     def plot_detector_position(self,elev=0,azim=90,figsize=(8, 8),title="Detector Position"):
-        """Visualize detector center and pixels in 3D.
+        """
+        Visualize detector center and pixels in 3D.
 
         Produces a simple 3D scatter plot with the origin in red and pixels
         in blue.
