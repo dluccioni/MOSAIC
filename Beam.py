@@ -934,11 +934,11 @@ class beam(logging):
     
     def set_phase_tolerance(self, phi_tol_rad: float):
         """
-        Set the target maximum phase error (radians) for choosing the series order N.
-        Default (if never set) is 1e-6 rad.
+        Set the target maximum phase error for choosing the series order N.
 
         Args:
-            phi_tol_rad (float): desired maximum phase error per contribution in radians.
+            phi_tol_rad (float): Desired maximum phase error per contribution in radians.
+                Default (if never set) is 1e-6 rad.
         """
         try:
             val = float(phi_tol_rad)
@@ -950,13 +950,21 @@ class beam(logging):
         
     def _estimate_required_series_terms(self, a_max_m: float, R0_min_m: float, phi_tol_rad: float):
         """
-        Estimate the minimum N for the series delta_r = R0 * (sqrt(1+t) - 1),
-        such that k * |err_r| <= phi_tol_rad, using worst-case |t| and the
-        next-omitted-term bound: err_r ≈ R0 * |C_{N+1}| * |t|^{N+1}.
+        Estimate the minimum N for the series delta_r = R0 * (sqrt(1+t) - 1).
+
+        Uses worst-case |t| and the next-omitted-term bound to ensure
+        k * |err_r| <= phi_tol_rad, where err_r ≈ R0 * |C_{N+1}| * |t|^{N+1}.
+
+        Args:
+            a_max_m (float): Maximum atom displacement from origin in meters.
+            R0_min_m (float): Minimum detector pixel distance from origin in meters.
+            phi_tol_rad (float): Target maximum phase error in radians.
 
         Returns:
-            dict with keys:
-                'use_series' (bool), 'N' (int), 't_max' (float)
+            dict: Dictionary with keys:
+                - 'use_series' (bool): Whether series expansion is appropriate.
+                - 'N' (int): Number of series terms to use.
+                - 't_max' (float): Worst-case dimensionless parameter |t|.
         """
         # Guard wavelength and k
         if getattr(self, "_wavelength", None) is None or self._wavelength <= 0.0:
@@ -1023,18 +1031,24 @@ class beam(logging):
     def _select_series_mode_once(self, sample, detector, safety_t_thresh=0.5, verbose=True):
         """
         Decide global mode (SERIES vs EXACT) and the series order N automatically.
-        Prints the chosen mode and N.
 
-        Uses:
-        - sample.dimensions: (Lx, Ly, Lz) in Angstrom, centered at 0
-        - detector.pixel_coordinates: (3, Nx*Ny) in Angstrom
-        - wavelength from self._wavelength
-        - phase tolerance from self._phase_tol_rad (default 1e-2 rad if unset)
-        - safety_t_thresh for convergence margin (default 0.5)
+        Analyzes the sample geometry and detector configuration to determine whether
+        series expansion is appropriate and, if so, how many terms to use.
 
-        Sets:
-        self._global_use_series (bool)
-        self._series_terms (int)
+        Args:
+            sample: Object providing dimensions (Lx, Ly, Lz) in Angstrom, centered at 0.
+            detector: Object providing pixel_coordinates of shape (3, Nx*Ny) in Angstrom.
+            safety_t_thresh (float, optional): Convergence margin threshold for |t|.
+                Defaults to 0.5.
+            verbose (bool, optional): If True, prints the chosen mode and N.
+                Defaults to True.
+
+        Note:
+            Sets the following instance attributes:
+                - self._global_use_series (bool): Whether to use series expansion.
+                - self._series_terms (int): Number of series terms to use.
+
+            Uses self._wavelength and self._phase_tol_rad (default 1e-2 rad if unset).
         """
         # Sample half-diagonal radius (meters)
         dims_A = np.asarray(sample.dimensions, dtype=float)
@@ -1075,18 +1089,33 @@ class beam(logging):
         """
         Build and cache the FP32-only kinematic interaction CUDA kernel.
 
-        New: optional analyser and an apply_spherical_decay switch baked as runtime args.
+        Compiles a CUDA kernel for kinematic scattering with optional analyser
+        and spherical decay support baked as runtime arguments.
 
-        Analyser parameters (runtime args passed at launch):
-            apply_analyser       : int (0/1)
-            analyser_kind        : int (0=off, 1=top_hat, 2=darwin)
-            centre_dir           : float3, unit vector (origin -> detector centre)
-            accept_angle_rad     : float
-            darwin_halfwidth_rad : float
+        Args:
+            series_terms (int or None, optional): Number of series terms for the
+                sqrt(1+t)-1 expansion. If None, uses self._series_terms.
+                Clamped to [1, 32].
+            force_mode (str or None, optional): If "series", forces series mode;
+                if "exact", forces exact mode. If None, uses self._global_use_series.
 
-        The kernel scales each event's complex amplitude by:
-            - top_hat: 1 if angle(out_dir, centre_dir) <= accept_angle_rad else 0
-            - darwin : 1 / (1 + (delta / darwin_halfwidth_rad)^2)
+        Returns:
+            cupy.RawKernel: Compiled CUDA kernel handle for the interaction kernel.
+
+        Raises:
+            RuntimeError: If CuPy is not available.
+
+        Note:
+            Analyser parameters are passed at kernel launch time:
+                - apply_analyser: int (0/1)
+                - analyser_kind: int (0=off, 1=top_hat, 2=darwin)
+                - centre_dir: float3, unit vector (origin -> detector centre)
+                - accept_angle_rad: float
+                - darwin_halfwidth_rad: float
+
+            The kernel scales each event's complex amplitude by:
+                - top_hat: 1 if angle(out_dir, centre_dir) <= accept_angle_rad else 0
+                - darwin: 1 / (1 + (delta / darwin_halfwidth_rad)^2)
         """
         if cp is None:
             raise RuntimeError("CuPy is required for GPU scattering kernels.")
@@ -1618,13 +1647,16 @@ class beam(logging):
         """
         Build a CuPy RawKernel for intra-chunk neighbor search.
 
-        This kernel finds neighbors of each atom within the same chunk and records
-        for each neighbor:
+        Compiles a CUDA kernel that finds neighbors of each atom within the same
+        chunk using a cell list and records for each neighbor pair:
             - phase = k_val * mod(distance, wavelength)
             - wave vector components (kx, ky, kz)
 
         Returns:
             cupy.RawKernel: Compiled kernel handle named "intra_neighbor_search_kernel".
+
+        Raises:
+            RuntimeError: If CuPy is not available (implicit via cp.RawModule).
         """
         _intra_neighbor_search_kernel = r'''
         #include <math.h>
@@ -1764,11 +1796,15 @@ class beam(logging):
         """
         Build a CuPy RawKernel for inter-chunk neighbor search.
 
-        The kernel finds neighbors across two boundary sets (chunk i and chunk j),
-        records phase and (kx, ky, kz), and excludes i->i or j->j pairs.
+        Compiles a CUDA kernel that finds neighbors across two boundary sets
+        (chunk i and chunk j), records phase and wave vector (kx, ky, kz),
+        and excludes same-chunk pairs (i->i or j->j).
 
         Returns:
             cupy.RawKernel: Compiled kernel handle named "inter_neighbor_search_kernel".
+
+        Raises:
+            RuntimeError: If CuPy is not available (implicit via cp.RawModule).
         """
         _inter_neighbor_search_kernel = r'''
         #include <math.h>
@@ -1903,22 +1939,28 @@ class beam(logging):
     @staticmethod
     def build_expand_paths_kernel():
         """
-        Q-aware path expansion kernel.
+        Build Q-aware path expansion kernel for dynamical scattering.
 
-        For each incoming path i (at atom 'src'):
-        - For each neighbor j of src:
-            * A1 = Ain * exp(i * neighborPhase[src->j])
-            * Compute Q using incoming k_in (rad/m) and neighbor K direction.
-                - neighborK from NN tables is rad/Angstrom; we normalize for direction
-                    and convert the stored K to rad/m when writing out.
-                - Q = k * sqrt(2 * (1 - dot(k_in_hat, k_out_hat))).
-            * s(Q) = f0(Q) + (f1 + i f2) from species code of j
-            * A2 = A1 * s(Q)
-            * Write out:
-                position of j (meters) if local else NaN and out_idx = -1,
-                k_out components in rad/m,
-                A2, and neighbor species code.
-        The out buffer capacity is maxPaths; the last element of out_idx holds the count.
+        Compiles a CUDA kernel that expands each incoming path by scattering
+        to all neighbors of the source atom.
+
+        Returns:
+            cupy.RawKernel: Compiled kernel handle named "expand_paths_kernel".
+
+        Raises:
+            RuntimeError: If CuPy is not available.
+
+        Note:
+            For each incoming path i (at atom 'src') and each neighbor j of src:
+                - A1 = Ain * exp(i * neighborPhase[src->j])
+                - Q = k * sqrt(2 * (1 - dot(k_in_hat, k_out_hat))) using k_in (rad/m)
+                  and neighbor K direction (normalized from rad/Angstrom).
+                - s(Q) = f0(Q) + (f1 + i*f2) from species code of j
+                - A2 = A1 * s(Q)
+                - Outputs: position of j (meters, or NaN if non-local), k_out (rad/m),
+                  A2, and neighbor species code.
+
+            The output buffer capacity is maxPaths; out_idx[maxPaths] holds the count.
         """
         if cp is None:
             raise RuntimeError("CuPy is required for build_expand_paths_kernel")
@@ -2094,23 +2136,28 @@ class beam(logging):
 
     def build_scatter_paths_to_detector_kernel_dyn(self):
         """
-        CUDA kernel to accumulate a set of paths on the detector with per-path Q.
+        Build CUDA kernel to accumulate paths on the detector with per-path Q.
 
-        Each path p provides:
-        - position (meters),
-        - incoming wave-vector components k_in (rad/m) for direction,
-        - complex amplitude,
-        - species code (used to look up f0 params and anomalous terms).
+        Compiles a kernel for dynamical scattering that processes multiple paths,
+        each providing position (meters), incoming wave-vector k_in (rad/m),
+        complex amplitude, and species code for f0/anomalous lookups.
 
-        For every detector pixel:
-        - Compute unit vector r_hat to the pixel and per-pixel Q_cut (like kinematic).
-        - For each path:
-            Q = k * sqrt(2 * (1 - dot(k_in_hat, r_hat)))
-            s(Q) = f0(Q) + (f1 + i f2)  via W-K params and anomalous table
-            optional forward removal: s(Q) -= f0(0) + (f1 + i f2) for Q < Q_cut
-            polarization factor using dot(k_in_hat, r_hat)
-            phase accumulation uses the same reduced-argument strategy and R0-relative form.
-        Spherical-decay is available but left disabled by the caller for dynamical.
+        Returns:
+            cupy.RawKernel: Compiled kernel handle for scatter_paths_to_detector_kernel.
+
+        Raises:
+            RuntimeError: If CuPy is not available.
+
+        Note:
+            For every detector pixel, the kernel:
+                - Computes unit vector r_hat to the pixel and per-pixel Q_cut.
+                - For each path: computes Q = k * sqrt(2 * (1 - dot(k_in_hat, r_hat))),
+                  evaluates s(Q) = f0(Q) + (f1 + i*f2) via W-K params.
+                - Optionally removes forward component: s(Q) -= f0(0) + (f1 + i*f2) for Q < Q_cut.
+                - Applies polarization factor using dot(k_in_hat, r_hat).
+                - Uses reduced-argument phase accumulation and R0-relative form.
+
+            Spherical-decay is available but typically disabled for dynamical scattering.
         """
         if cp is None:
             raise RuntimeError("CuPy is required for build_scatter_paths_to_detector_kernel_dyn")
@@ -3802,12 +3849,42 @@ class beam(logging):
         analyser_darwin_halfwidth_rad: float = 0.0
     ):
         """
-        Top-level convenience wrapper for single-bounce scattering.
+        Top-level convenience wrapper for single-bounce kinematic scattering.
 
-        New optional analyser controls:
-            analyser_mode: "off" | "top_hat" | "darwin" or 0|1|2
-            analyser_acceptance_angle_rad: float (radians)
-            analyser_darwin_halfwidth_rad: float (radians), used when mode="darwin"
+        Computes the scattered field on the detector using either GPU or CPU path,
+        with optional depth-dependent entrance amplitudes and analyser filtering.
+
+        Args:
+            sample: Sample object providing chunked atom positions and species.
+            detector: Detector object with pixel_coordinates (3, Nx*Ny) in Angstrom
+                and shape (Nx, Ny).
+            stage: Stage object with rotation (3x3) and translation (3,) arrays.
+            offset (np.ndarray or None, optional): If provided, subtracted from the
+                final field. Defaults to None.
+            use_gpu (bool, optional): If True and CuPy is available, use GPU path.
+                Defaults to True.
+            remove_forward (bool, optional): If True, subtract f0(0) from f0(Q) to
+                remove the forward component. Defaults to False.
+            use_depth_ein (bool, optional): If True, use cached per-atom Ein values.
+                Defaults to False.
+            ein_cache_dir (str or None, optional): Directory for Ein cache files.
+                Defaults to None.
+            recompute_cache (bool, optional): If True, recompute Ein cache even if
+                present. Defaults to False.
+            apply_polarization (bool, optional): If True, apply polarization factor.
+                Defaults to False.
+            spherical_decay (bool, optional): If True, apply 1/R spherical decay.
+                Defaults to False.
+            analyser_mode (str or int, optional): Analyser filtering mode.
+                "off"/0, "top_hat"/1, or "darwin"/2. Defaults to "off".
+            analyser_acceptance_angle_rad (float, optional): Acceptance angle for
+                top_hat mode in radians. Defaults to 0.0.
+            analyser_darwin_halfwidth_rad (float, optional): Half-width for darwin
+                mode in radians. Defaults to 0.0.
+
+        Returns:
+            np.ndarray or cupy.ndarray: Complex field on detector of shape (Ny, Nx),
+                optionally with offset subtracted.
         """
         measurement_positions = detector.pixel_coordinates  # (3, Nx*Ny) in Angstrom
         Nx, Ny = detector.shape
@@ -3857,61 +3934,37 @@ class beam(logging):
     # Direct transmission
     def _compute_beam_slice_integrals_cpu(self, sample, stage, slice_edges_A, kernel_radius=0):
         """
-        CPU: per‑slice forward integrals on the beam grid (Å‑units).
+        Compute per-slice forward integrals on the beam grid using CPU (Angstrom units).
 
-        For a set of depth slices bounded by `slice_edges_A` (in Å) along the beam
-        direction, accumulate two slice‑wise “column integrals” on the (NyB, NzB)
-        beam grid:
+        For depth slices bounded by slice_edges_A along the beam direction,
+        accumulates two slice-wise column integrals on the (NyB, NzB) beam grid:
+            - delta_int[k](u,v) = C * sum_atoms_in_slice (f0(0) + f1) * W_TSC
+            - beta_int[k](u,v)  = C * sum_atoms_in_slice (f2) * W_TSC
 
-            delta_int[k](u,v) =  C * Σ_atoms_in_slice (f0(0) + f1) · W_TSC(u,v|atom)
-            beta_int[k](u,v)  =  C * Σ_atoms_in_slice (f2)         · W_TSC(u,v|atom)
+        where C = r_e * lambda^2 / (2*pi * A_pix), W_TSC is the TSC deposition kernel.
 
-        where C = r_e * λ^2 / (2π · A_pix), r_e is the classical electron radius (Å),
-        λ is the wavelength (Å), A_pix = du·dv is the beam‑pixel area (Å²), and
-        W_TSC(·) is the separable triangular‑shaped‑cloud (TSC) deposition kernel
-        over the nearest 3×3 grid neighborhood. These integrals are related to per‑slice
-        phase/attenuation increments via:
+        Args:
+            sample: Chunked sample object providing chunk_total,
+                load_chunk_positions(cid, use_gpu=False) -> (Ni, 3) in Angstrom,
+                and load_chunk_species(cid, use_gpu=False) -> (Ni,).
+            stage: Rigid transform object with rotation (3x3) and translation (3,)
+                arrays applied in Angstrom before deposition.
+            slice_edges_A (array_like): Shape (n_slices+1,). Monotonic depth edges
+                [s0, ..., sN] in Angstrom along the unit beam direction. Atom with
+                depth s goes to slice k where s in [edges[k], edges[k+1]).
+            kernel_radius (int, optional): Gaussian blur radius (pixels) applied
+                per slice to delta_int/beta_int. Defaults to 0 (disabled).
 
-            ϕ_k(u,v)  = −k_A · delta_int[k](u,v)
-            τ_k(u,v)  =  k_A · beta_int[k](u,v)
+        Returns:
+            tuple: (delta_int_list, beta_int_list) where each is a list of n_slices
+                float32 arrays of shape (NyB, NzB) in Angstrom units.
 
-        with k_A = 2π/λ (in Å⁻¹). After optional blurring, τ_k is clamped ≥ 0 to
-        disallow unphysical gain.
-
-        Parameters
-        ----------
-        sample : object
-            Chunked sample; must provide `chunk_total`, `load_chunk_positions(cid, use_gpu=False)`
-            → (Ni, 3) in Å, and `load_chunk_species(cid, use_gpu=False)` → (Ni,).
-        stage : object
-            Rigid transform with `rotation` (3×3) and `translation` (3,) arrays
-            applied in Å before deposition.
-        slice_edges_A : array_like, shape (n_slices+1,)
-            Monotonic depth edges [s0, …, sN] in Å along the unit beam direction.
-            An atom with depth s goes to slice k such that s ∈ [edges[k], edges[k+1]).
-        kernel_radius : int, optional
-            Gaussian blur radius (pixels) applied **per slice** to the resulting
-            delta_int/beta_int (default 0 → disabled). The same FFT‑based blur is
-            used for both; τ_k is re‑clamped ≥ 0 afterwards.
-
-        Returns
-        -------
-        delta_int_list : list[np.ndarray]
-            Length = n_slices; each element is float32 array (NyB, NzB) in Å.
-        beta_int_list : list[np.ndarray]
-            Same shape/type; absorption‑related integrals in Å.
-
-        Notes
-        -----
-        • Species databases:
-            - f0(0) is computed from Waasmaier–Kirfel parameters.
-            - (f1,f2)(E) are taken from Cromer–Liberman and linearly interpolated
-            at the current beam energy.
-        • Slicing is performed along the *current* beam direction after applying
-        the stage transform.
-        • Deposition uses separable 1D TSC weights in u and v (3×3 stencil).
-        • Complexity is linear in total atom count; accumulation uses NumPy’s
-        indexed adds and stays numerically stable in float32.
+        Note:
+            - f0(0) computed from Waasmaier-Kirfel parameters.
+            - (f1, f2)(E) from Cromer-Liberman, linearly interpolated at beam energy.
+            - Slicing performed along beam direction after stage transform.
+            - Uses separable 1D TSC weights in u and v (3x3 stencil).
+            - tau_k is clamped >= 0 after optional blurring to prevent unphysical gain.
         """
         # Constants in Angstrom
         r_e_A = 2.81794092e-5
@@ -4044,31 +4097,31 @@ class beam(logging):
 
     def _compute_beam_slice_integrals_gpu(self, sample, stage, slice_edges_A, kernel_radius=0):
         """
-        GPU: per‑slice forward integrals on the beam grid (Å‑units), with safe CPU fallback.
+        Compute per-slice forward integrals on the beam grid using GPU (Angstrom units).
+
         Semantics match the CPU version:
+            - delta_int[k] = C * sum (f0(0) + f1) * W_TSC
+            - beta_int[k]  = C * sum (f2) * W_TSC
+        where phi_k = -k_A * delta_int[k], tau_k = k_A * beta_int[k] (with tau_k >= 0).
 
-            delta_int[k] =  C * Σ (f0(0) + f1) · W_TSC
-            beta_int[k]  =  C * Σ (f2)         · W_TSC
+        Args:
+            sample: Chunked sample object (same as CPU version).
+            stage: Rigid transform object with rotation and translation (Angstrom).
+            slice_edges_A (array_like): Shape (n_slices+1,). Monotonic depth edges
+                in Angstrom (same as CPU version).
+            kernel_radius (int, optional): Gaussian blur radius in pixels. Defaults to 0.
 
-        and `ϕ_k = −k_A * delta_int[k]`, `τ_k = k_A * beta_int[k]` (with τ_k ≥ 0).
+        Returns:
+            tuple: (delta_int_list, beta_int_list) where each is a list of n_slices
+                float32 arrays of shape (NyB, NzB). Elements are CuPy arrays on GPU,
+                or NumPy arrays if falling back to CPU.
 
-        Parameters
-        ----------
-        sample, stage, slice_edges_A, kernel_radius
-            Same meaning and units as the CPU version.
-        Returns
-        -------
-        delta_int_list, beta_int_list : list
-            Length = n_slices; each element is (NyB, NzB) float32. Elements are
-            CuPy arrays when a GPU is used; otherwise NumPy arrays from the CPU path.
-
-        Implementation Notes
-        --------------------
-        • Atom‑wise forward factors are assembled on host, then transferred once.
-        • Depth binning uses `cp.searchsorted` on the edges (Å).
-        • TSC deposition is vectorized; per‑slice adds are done with
-        `_safe_bincount_gpu` (guards empty inputs / NaNs / OOB).
-        • Optional per‑slice Gaussian blur uses cuFFT; τ_k is clamped ≥ 0 afterward.
+        Note:
+            - Falls back to CPU if CuPy is unavailable or no GPU is detected.
+            - Atom-wise forward factors assembled on host, then transferred once.
+            - Depth binning uses cp.searchsorted on edges (Angstrom).
+            - TSC deposition vectorized; per-slice adds via _safe_bincount_gpu.
+            - Optional per-slice Gaussian blur uses cuFFT; tau_k clamped >= 0.
         """
         if (cp is None) or (cp.cuda.runtime.getDeviceCount() < 1):
             # Fallback to CPU and return NumPy arrays
@@ -4223,58 +4276,36 @@ class beam(logging):
         """
         Choose the number of projection slices so each slice stays in the linear regime.
 
-        The goal is to ensure every thin-slice update A_k(u,v) = exp(−τ_k + iϕ_k)
-        is “small”, i.e.
+        Ensures every thin-slice update A_k(u,v) = exp(-tau_k + i*phi_k) satisfies
+        max(|phi_k(u,v)|, tau_k(u,v)) <= target_step across all slices and pixels.
 
-            max_{k,u,v} max(|ϕ_k(u,v)|, τ_k(u,v))  ≤  target_step       (default 0.1)
+        Args:
+            sample: Chunked sample object. Stage transform is applied (Angstrom).
+            stage: Rigid transform object with rotation and translation arrays.
+            kernel_radius (int, optional): Gaussian blur radius (pixels) forwarded
+                to the per-slice integrals. Defaults to 0.
+            target_step (float, optional): Maximum allowed per-slice change
+                (radians or unitless attenuation). Defaults to 0.1.
+            use_gpu (bool, optional): If True and CuPy is available, use GPU path
+                for A(u,v) and per-slice integrals. Defaults to True.
+            max_slices (int, optional): Hard cap on slice count to avoid runaway
+                refinement. Defaults to 2048.
+            n_init (int or None, optional): If provided, start refinement from this
+                value instead of the computed lower bound n0.
 
-        Strategy
-        --------
-        1) Fast lower bound: compute the full‑thickness column map A(u,v) once and set
+        Returns:
+            tuple: (n_final, edges_A, delta_list, beta_list, info) where:
+                - n_final (int): Chosen number of slices (>= 1).
+                - edges_A (np.ndarray): Shape (n_final+1,), depth edges in Angstrom.
+                - delta_list (list): Per-slice delta integrals (CuPy or NumPy arrays).
+                - beta_list (list): Per-slice beta integrals (CuPy or NumPy arrays).
+                - info (dict): Diagnostics with keys 'phi_max', 'tau_max', 'n0'.
 
-            n0 = ceil( max( max|angle(A)|, max( −log|A| ) ) / target_step ),
-
-        which lower‑bounds the slice count.
-        2) Refinement loop: partition [s_min, s_max] into `n` equal‑depth bins,
-        compute per‑slice integrals (GPU or CPU), evaluate max(|ϕ_k|, τ_k); if the
-        criterion is violated, double `n` (up to `max_slices`) and repeat.
-
-        Parameters
-        ----------
-        sample, stage : object
-            As in the slice‑integral helpers. Stage transform is applied (Å).
-        kernel_radius : int, optional
-            Gaussian blur radius (pixels) forwarded to the per‑slice integrals.
-        target_step : float, optional
-            Maximum allowed per‑slice change (radians or unitless attenuation).
-        use_gpu : bool, optional
-            If True and CuPy is available, use the GPU path for both the initial
-            A(u,v) and the per‑slice integrals. Otherwise, CPU is used.
-        max_slices : int, optional
-            Hard cap on the number of slices to avoid runaway refinement.
-        n_init : int or None, optional
-            If provided, start refinement from this value instead of `n0`.
-
-        Returns
-        -------
-        n_final : int
-            Chosen number of slices (≥ 1).
-        edges_A : np.ndarray, shape (n_final+1,)
-            Depth edges (Å) spanning [s_min, s_max].
-        delta_list, beta_list : list
-            Per‑slice integrals (Å). On GPU these are lists of CuPy arrays; on CPU,
-            lists of NumPy arrays.
-        info : dict
-            Diagnostics with keys:
-                {"phi_max": float, "tau_max": float, "n0": int}
-
-        Notes
-        -----
-        • Thickness is measured along the unit beam direction after the stage transform.
-        • If thickness ≤ 0 Å, returns a single “empty” slice with zeros.
-        • The refinement uses equal‑depth bins; this is robust and monotone in `n`.
-        • The routine does not modify global state; the caller decides how to use
-        the returned (delta_list, beta_list).
+        Note:
+            - Thickness is measured along the unit beam direction after stage transform.
+            - If thickness <= 0, returns a single empty slice with zeros.
+            - Refinement uses equal-depth bins (robust and monotone in n).
+            - Does not modify global state; caller decides how to use returned data.
         """
         use_gpu = bool(use_gpu and (cp is not None))
 
@@ -4686,67 +4717,46 @@ class beam(logging):
                             use_gpu=True, kernel_radius=0,
                             padding_mode="edge", pad_constant=0.0,
                             n_slices=None, target_phase_step=0.1,
-                            pad_factor=2): 
+                            pad_factor=2):
         """
-        Projection‑only multislice transmission.
+        Compute projection-only multislice transmission.
 
-        Inside the sample, the beam field on the beam grid is updated by a pure
-        projection model:
+        Updates the beam field on the beam grid using a pure projection model:
+        E <- E * A_k(u,v) for k = 0..n_slices-1, where A_k = exp(-tau_k + i*phi_k).
+        No angular-spectrum propagation between slices. After exit surface, E_exit(u,v)
+        is bilinearly resampled to detector pixels, with an optional free-space hop
+        if the detector plane is offset from the exit plane.
 
-            E ← E · A_k(u,v)      for k = 0..n_slices−1,
+        Args:
+            sample: Chunked atoms with species; used by the slice-integral helpers.
+            detector: Object providing shape=(Nx, Ny) and pixel_coordinates (3, Nx*Ny)
+                in Angstrom.
+            stage: Rigid transform with rotation (3x3) and translation (3,) in Angstrom.
+            use_gpu (bool, optional): Use GPU for slice integrals and propagation
+                when CuPy is available. Defaults to True.
+            kernel_radius (int, optional): Gaussian blur radius (pixels) applied to
+                per-slice maps. Defaults to 0.
+            padding_mode (str, optional): Padding policy for exit-to-detector propagation.
+                One of "edge" or "constant". Defaults to "edge".
+            pad_constant (float, optional): Constant pad value when padding_mode="constant".
+                Defaults to 0.0.
+            n_slices (int or None, optional): Number of slices. If None, auto-selected
+                via _auto_slice_count_linear_regime with target_phase_step.
+            target_phase_step (float, optional): Per-slice linear-regime target
+                (radians / unitless) for auto-slicer. Defaults to 0.1.
+            pad_factor (float, optional): Minimum multiplicative padding for
+                angular-spectrum FFT sizes (>= 1). Defaults to 2.
 
-        where A_k(u,v) = exp(−τ_k + iϕ_k) and (ϕ_k, τ_k) are derived from the per‑slice
-        integrals computed in Å units. There is **no** angular‑spectrum propagation
-        between slices. After the exit surface is reached, E_exit(u,v) is bilinearly
-        resampled to the detector pixels. If the detector plane is not coincident with
-        the exit plane (along the beam direction), a single free‑space hop is applied
-        via the angular spectrum method.
+        Returns:
+            np.ndarray: Complex64 array of shape (Ny, Nx) with the exit field sampled
+                on the detector (after optional free-space hop).
 
-        Slice count
-        -----------
-        • If `n_slices` is None, the method calls `_auto_slice_count_linear_regime`
-        with the requested `target_phase_step` (default 0.1) so that every slice
-        update satisfies max(|ϕ_k|, τ_k) ≤ target_phase_step.
-        • If `n_slices` is provided, that exact number is used.
-
-        Parameters
-        ----------
-        sample, detector, stage : object
-            - `sample`: chunked atoms with species; used by the slice‑integral helpers.
-            - `detector`: provides `shape = (Nx, Ny)` and `pixel_coordinates` (3, Nx·Ny) in Å.
-            - `stage`: rigid transform (`rotation`, `translation`) applied in Å.
-        use_gpu : bool, optional
-            Use GPU for slice integrals and/or propagation when CuPy is available.
-        kernel_radius : int, optional
-            Gaussian blur radius (pixels) applied to per‑slice maps (forwarded downstream).
-        padding_mode : {"edge", "constant"}
-            Padding policy used by the exit‑to‑detector propagation step.
-        pad_constant : float, optional
-            Constant pad value when `padding_mode="constant"`.
-        n_slices : int or None, optional
-            Number of slices; if None, auto‑selected as described above.
-        target_phase_step : float, optional
-            Per‑slice linear‑regime target used by the auto‑slicer (radians / unitless).
-        pad_factor : float, optional
-            Minimum multiplicative padding used by the angular‑spectrum helper to
-            choose FFT sizes; ≥ 1 (default 2).
-
-        Returns
-        -------
-        np.ndarray (complex64), shape (Ny, Nx)
-            Complex exit field sampled on the detector (after optional free‑space hop).
-
-        Edge Cases & Behavior
-        ---------------------
-        • Zero or degenerate thickness: falls back to a single‑slice A(u,v).
-        • Resampling: detector pixels are projected to (u,v) via the beam basis;
-        bilinear weights are applied; pixels outside the beam grid receive 0.
-        • Detector offset: if the detector plane is not coincident with the exit
-        plane, a single propagation by the signed offset distance is performed.
-        Pixel sizes for that hop are taken from `detector.pixel_size` when
-        available; otherwise they are estimated from (u,v).
-        • Units: all geometry is in Å internally; the propagation step converts to
-        meters under the hood.
+        Note:
+            - Zero/degenerate thickness: falls back to single-slice A(u,v).
+            - Detector pixels projected to (u,v) via beam basis; out-of-bounds get 0.
+            - Detector offset: propagates by signed offset distance using
+              detector.pixel_size if available, else estimates from (u,v).
+            - All geometry in Angstrom internally; propagation converts to meters.
         """
         use_gpu = bool(use_gpu and (cp is not None))
 
