@@ -302,18 +302,30 @@ class optics(logging):
         - rolloff='tophat'  : amplitude = 1 inside half-angle, else 0
         - rolloff='darwin'  : amplitude = 1 / (1 + (delta / halfwidth)^2)
 
-        Notes
-        -----
-        - delta is the small-angle deviation (radians) in the paraxial limit:
-            delta = sqrt((theta_x - cx)^2 + (theta_y - cy)^2) for circular 2D
-        For 'elliptical' we use the normalized radius r^2 = (tpar/hx)^2 + (tperp/hy)^2
-        and apply the same laws with r in place of delta/hw.
-        - 'mode' can be '2d' (default) or '1d' (slit). In '1d', acceptance is along the
-        rolled pass axis only: delta = |tpar|.
-        - half_angle_x_mrad is interpreted as:
-            * top-hat: acceptance half-angle (radians)
-            * darwin : Darwin halfwidth (radians)
-        which matches the GPU analyser's accept_angle_rad and darwin_halfwidth_rad.
+        Args:
+            field (array-like): Complex field, shape (Ny, Nx).
+            dx (float): Pixel size along x in meters.
+            dy (float): Pixel size along y in meters.
+            filt (dict): Filter parameters including 'center_x_mrad', 'center_y_mrad',
+                'half_angle_x_mrad', 'half_angle_y_mrad', 'mode', 'shape', 'rolloff',
+                'roll_deg', 'transmission', 'phase_shift', and 'order'.
+            wavelength (float): Wavelength in meters.
+            use_gpu (bool): If True and CuPy is available, use GPU path.
+
+        Returns:
+            np.ndarray: Complex64 field with the angular filter applied (NumPy array).
+
+        Note:
+            - delta is the small-angle deviation (radians) in the paraxial limit:
+                delta = sqrt((theta_x - cx)^2 + (theta_y - cy)^2) for circular 2D.
+              For 'elliptical' we use the normalized radius r^2 = (tpar/hx)^2 + (tperp/hy)^2
+              and apply the same laws with r in place of delta/hw.
+            - 'mode' can be '2d' (default) or '1d' (slit). In '1d', acceptance is along
+              the rolled pass axis only: delta = |tpar|.
+            - half_angle_x_mrad is interpreted as:
+                * top-hat: acceptance half-angle (radians)
+                * darwin : Darwin halfwidth (radians)
+              which matches the GPU analyser's accept_angle_rad and darwin_halfwidth_rad.
         """
         if wavelength is None:
             raise ValueError("wavelength must be provided to _apply_angular_filter_kspace")
@@ -480,29 +492,23 @@ class optics(logging):
         """
         Apply all components in this optics stack to 'field' in-order.
 
-        Parameters
-        ----------
-        field : array-like (Ny, Nx), complex64
-            Input complex field (NumPy). If the free-space propagator returns a
-            CuPy array, this function will fetch it back to host automatically.
-        dx, dy : float
-            Pixel sizes along x and y in meters.
-        wavelength : float
-            Wavelength in meters. Required by some components (e.g., angular filter, lenses).
-        propagate_free_space : callable
-            Function with signature:
-                out = propagate_free_space(field, dx, dy, z)
-            It should apply free-space propagation over distance 'z' (meters)
-            and return a NumPy complex64 array (or a CuPy array, which will be
-            converted to NumPy here).
-        use_gpu : bool
-            Whether to request GPU-accelerated paths for optics-internal
-            operations when available.
+        Args:
+            field (array-like): Input complex field, shape (Ny, Nx), complex64 (NumPy).
+                If the free-space propagator returns a CuPy array, this function will
+                fetch it back to host automatically.
+            dx (float): Pixel size along x in meters.
+            dy (float): Pixel size along y in meters.
+            wavelength (float): Wavelength in meters. Required by some components
+                (e.g., angular filter, lenses).
+            propagate_free_space (callable): Function with signature
+                ``out = propagate_free_space(field, dx, dy, z)``. It should apply
+                free-space propagation over distance 'z' (meters) and return a NumPy
+                complex64 array (or a CuPy array, which will be converted to NumPy here).
+            use_gpu (bool): Whether to request GPU-accelerated paths for optics-internal
+                operations when available.
 
-        Returns
-        -------
-        np.ndarray (Ny, Nx), complex64
-            Field after applying all components.
+        Returns:
+            np.ndarray: Field after applying all components, shape (Ny, Nx), complex64.
         """
         if wavelength is None:
             raise ValueError("wavelength must be provided to optics.apply_stack")
@@ -549,19 +555,22 @@ class optics(logging):
 
     def read_optics_metadata(self):
         """
-        Stub for reading an optics JSON or other meta file from self.directory
+        Stub for reading an optics JSON or other meta file from self.directory.
         """
         pass
 
     def write_optics_metadata(self):
         """
-        Stub for writing an optics JSON or other meta file to self.directory
+        Stub for writing an optics JSON or other meta file to self.directory.
         """
         pass
 
     def add_free_space(self, length_mm):
         """
-        Add a free-space propagation segment of length in millimeters.
+        Add a free-space propagation segment to the optics stack.
+
+        Args:
+            length_mm (float): Propagation length in millimeters.
         """
         self._components.append({
             'kind'   : 'free space',
@@ -571,9 +580,17 @@ class optics(logging):
     def add_CRL_box(self, number, focal_length_mm, thickness_mm,
                     absorption_sigma=np.inf):
         """
-        A simplified compound refractive lens (CRL) "box" specification.
-        For example, 'number' CRLs in series, each of focal_length_mm in
-        thin-lens approximation, thickness_mm for absorption, etc.
+        Add a compound refractive lens (CRL) box to the optics stack.
+
+        A simplified CRL "box" specification using thin-lens approximation.
+
+        Args:
+            number (int): Number of identical lens elements in series.
+            focal_length_mm (float): Focal length of each lens element in millimeters.
+            thickness_mm (float): Thickness of each lens element in millimeters
+                (used for absorption calculation).
+            absorption_sigma (float): Absorption length in meters. Default is np.inf
+                (no absorption).
         """
         self._components.append({
             'kind'           : 'lens box',
@@ -629,29 +646,35 @@ class optics(logging):
                         mode='2d',
                         roll_deg=0.0):
         """
-        Analyzer-like k-space angular filter.
+        Add an analyzer-like k-space angular filter to the optics stack.
 
         Semantics aligned with beam.analyser_mode:
         - rolloff='tophat' : half_angle_mrad is the acceptance half-angle (mrad).
         - rolloff='darwin' : half_angle_mrad is the Darwin halfwidth (mrad).
         The mask is applied to the field's Fourier spectrum as an amplitude filter.
 
-        Parameters
-        ----------
-        center_x_mrad, center_y_mrad : float
-            Analyzer axis offset in milliradians relative to the optical axis.
-        mode : '2d' or '1d'
-            '2d' circular/elliptical acceptance; '1d' slit along the rolled pass axis.
-        shape : 'circular' or 'elliptical'
-            Only used for '2d'. 'circular' matches the isotropic analyser in beam.
-        roll_deg : float
-            Roll angle of the acceptance axes (degrees). 0 aligns pass axis with +x.
-        transmission : float
-            Peak intensity transmission (0..1). Amplitude factor sqrt(transmission) is applied.
-        phase_shift : float
-            Uniform phase (radians) applied after the mask.
-        order : int
-            Only used for 'butterworth' soft edges (not part of analyser), defaults to 4.
+        Args:
+            half_angle_mrad (float): Acceptance half-angle or Darwin halfwidth in
+                milliradians, depending on rolloff mode.
+            center_x_mrad (float): Analyzer axis offset along x in milliradians
+                relative to the optical axis. Default 0.0.
+            center_y_mrad (float): Analyzer axis offset along y in milliradians
+                relative to the optical axis. Default 0.0.
+            shape (str): 'circular' or 'elliptical'. Only used for '2d' mode.
+                'circular' matches the isotropic analyser in beam. Default 'circular'.
+            half_angle_y_mrad (float or None): Half-angle along y for elliptical shape.
+                If None, defaults to half_angle_mrad.
+            rolloff (str): 'tophat' or 'darwin'. Default 'tophat'.
+            order (int): Only used for 'butterworth' soft edges (not part of analyser).
+                Default 4.
+            transmission (float): Peak intensity transmission (0..1). Amplitude factor
+                sqrt(transmission) is applied. Default 1.0.
+            phase_shift (float): Uniform phase in radians applied after the mask.
+                Default 0.0.
+            mode (str): '2d' for circular/elliptical acceptance, '1d' for slit along
+                the rolled pass axis. Default '2d'.
+            roll_deg (float): Roll angle of the acceptance axes in degrees.
+                0 aligns pass axis with +x. Default 0.0.
         """
         if shape.lower() not in ('circular', 'elliptical'):
             shape = 'circular'
@@ -675,7 +698,11 @@ class optics(logging):
 
     def add_aperture(self, width_mm, shape='square'):
         """
-        Hard aperture (default: square of given width in mm).
+        Add a hard aperture to the optics stack.
+
+        Args:
+            width_mm (float): Aperture width (or diameter for circular) in millimeters.
+            shape (str): Aperture shape, either 'square' or 'circular'. Default 'square'.
         """
         self._components.append({
             'kind'  : 'aperture',
@@ -685,7 +712,11 @@ class optics(logging):
 
     def add_custom_component(self, component):
         """
-        Add any arbitrary custom component (dict) to the optics stack.
+        Add an arbitrary custom component to the optics stack.
+
+        Args:
+            component (dict): Component specification dictionary. Must include a 'kind'
+                key to identify the component type during apply_stack processing.
         """
         self._components.append(component)
 
@@ -702,36 +733,26 @@ class optics(logging):
         """
         Plot the optical stack in 3D with components lying along the x axis.
 
-        Parameters
-        ----------
-        unit : str
-            Display unit for the axes and labels. One of:
-            'm', 'cm', 'mm', 'um', 'nm'. Default 'm'.
-        cross_section_m : float
-            Square cross section size (y and z extents) in meters for all boxes.
-            Default 0.02 (2 cm).
-        thin_element_thickness_m : float
-            Fallback thickness in meters for elements without a defined axial length.
-            Default 1e-3 (1 mm).
-        bragg_thickness_m : float
-            Fallback thickness in meters for the bragg magnifier element.
-            Default 5e-3 (5 mm).
-        colors : dict or None
-            Optional map from component kind -> color hex, for example:
-            {'free space':'#cfd8dc', 'lens box':'#ffcc80', 'aperture':'#90caf9'}
-            If None, sensible defaults are used.
-        annotate : bool
-            If True, place text labels above each element.
-        show : bool
-            If True, call plt.show() at the end.
-        savepath : str or None
-            If provided, save the figure to this path.
-        ax : mpl_toolkits.mplot3d.Axes3D or None
-            If provided, draw into this axes; otherwise a new figure and axes are created.
+        Args:
+            unit (str): Display unit for the axes and labels. One of 'm', 'cm', 'mm',
+                'um', 'nm'. Default 'm'.
+            cross_section_m (float): Square cross section size (y and z extents) in
+                meters for all boxes. Default 0.02 (2 cm).
+            thin_element_thickness_m (float): Fallback thickness in meters for elements
+                without a defined axial length. Default 1e-3 (1 mm).
+            bragg_thickness_m (float): Fallback thickness in meters for the bragg
+                magnifier element. Default 5e-3 (5 mm).
+            colors (dict or None): Optional map from component kind to color hex,
+                for example: {'free space':'#cfd8dc', 'lens box':'#ffcc80',
+                'aperture':'#90caf9'}. If None, sensible defaults are used.
+            annotate (bool): If True, place text labels above each element. Default True.
+            show (bool): If True, call plt.show() at the end. Default True.
+            savepath (str or None): If provided, save the figure to this path.
+            ax (mpl_toolkits.mplot3d.Axes3D or None): If provided, draw into this axes;
+                otherwise a new figure and axes are created.
 
-        Returns
-        -------
-        (fig, ax) : matplotlib Figure and 3D Axes
+        Returns:
+            tuple: (fig, ax) matplotlib Figure and 3D Axes.
         """
         import math
         import matplotlib.pyplot as plt
@@ -946,6 +967,9 @@ class optics(logging):
     @property
     def components(self):
         """
-        Return the internal list of components.
+        Return the internal list of optical components.
+
+        Returns:
+            list: List of component dictionaries in the optics stack.
         """
         return self._components
