@@ -19,6 +19,14 @@ class experiment:
     # -----------------------------------------------------------------------------
     ## Initialization
     def __init__(self,directory=os.getcwd()):
+        """
+        Initialize an experiment instance with a specified working directory.
+
+        Args:
+            directory (str): Path to the working directory for the experiment.
+                Defaults to the current working directory. If the directory
+                does not exist, it will be created.
+        """
         self.directory = directory
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
@@ -26,8 +34,13 @@ class experiment:
     ## Data Handling Functions
     def write_experiment_metadata(self): #incomplete
         """
-        Serializes the analysis object's critical internal fields to disk 
-        as human-readable JSON so that the state can be restored later.
+        Serialize the experiment metadata to disk as human-readable JSON.
+
+        Writes the experiment object's critical internal fields to a JSON file
+        so that the state can be restored later.
+
+        Note:
+            This function is incomplete and not yet implemented.
         """
 
     # Static Function
@@ -54,11 +67,45 @@ class experiment:
         prop_kwargs=None,
     ):
         """
-        General nD scan (n <= 3) over stage motors and/or detector axes.
+        Perform a general n-dimensional scan over stage motors and/or detector axes.
 
-        Fix: in both absolute and relative modes, the per-step delta is computed as
-        (target - last_applied) in the same user units used to build axis_vals.
-        This keeps the real motor positions identical to the labels shown in plots.
+        Executes a scan with n <= 3 dimensions, moving specified motors through
+        their ranges while collecting intensity data at each step. In both absolute
+        and relative modes, the per-step delta is computed as (target - last_applied)
+        in the same user units used to build axis_vals, keeping the real motor
+        positions identical to the labels shown in plots.
+
+        Args:
+            sample (Sample): The sample object to interact with.
+            beam (Beam): The X-ray beam object.
+            detector (Detector): The detector object for collecting data.
+            stage (Stage): The stage object controlling sample position.
+            ranges (list): List of (start, stop) tuples for each scan axis.
+            stepsizes (list): Step size for each scan axis.
+            motors (list): Names of motors/axes to scan (e.g., ["theta", "two_theta"]).
+            degrees (bool): If True, interpret angles in degrees. Defaults to True.
+            scan_mode (str): Either "absolute" or "relative". Defaults to "absolute".
+            optics (Optics, optional): Optics object for wavefield propagation.
+            couplings (dict, optional): Motor coupling definitions mapping source
+                motor to list of (target, ratio) tuples.
+            per_step_outputs (tuple): Output types to plot at each step.
+                Defaults to ("Intensity",).
+            plot_in_angle_space (bool): If True, plot in angle space. Defaults to False.
+            show_plots (bool): If True, display plots interactively. Defaults to True.
+            save_dir (str, optional): Directory to save output images.
+            adi_kwargs (dict, optional): Additional kwargs for atomic_direct_interaction.
+            prop_kwargs (dict, optional): Additional kwargs for wavefield_propagation.
+
+        Returns:
+            dict: A dictionary containing:
+                - axes (list): List of axis value arrays.
+                - motor_names (list): Names of scanned motors.
+                - sum_intensity (ndarray): Summed intensity at each scan position.
+                - step_count (int): Total number of scan steps.
+
+        Raises:
+            ValueError: If number of axes is not 1, 2, or 3, or if ranges/stepsizes/motors
+                have mismatched lengths, or if step size is zero or wrong sign.
         """
         import matplotlib.pyplot as plt
 
@@ -327,41 +374,37 @@ class experiment:
         """
         Plot the experimental geometry in 3D.
 
+        Draws the experimental setup including beam, sample, detector, and optics
+        in a 3D visualization.
+
         Draw order:
-        1) Beam as a light pink cuboid with the same transverse dimensions as the beam.
-        2) Sample as a box defined by Sample dimensions (after stage rotation/translation).
-        3) Black line from origin to detector center.
-        4) Optics drawn along +x (if provided).
-        5) Rectangle outlining the bounding box of the detector pixels in 3D.
+            1. Beam as a light pink cuboid with the same transverse dimensions as the beam.
+            2. Sample as a box defined by Sample dimensions (after stage rotation/translation).
+            3. Black line from origin to detector center.
+            4. Optics drawn along +x (if provided).
+            5. Rectangle outlining the bounding box of the detector pixels in 3D.
 
-        Parameters
-        ----------
-        beam : Beam
-            Must provide _beam_size (angstrom) for transverse size.
-        sample : Sample
-            Must provide corners (8x3, angstrom).
-        detector : Detector
-            Must be positioned; uses center, direction, and pixel_coordinates.
-        stage : Stage or None
-            If provided, its rotation and translation are applied to the sample.
-        optics : Optics or None
-            If provided, drawn via optics.plot_stack_3d into the same axes.
-        unit : str
-            Display unit for all geometry. One of: "m","cm","mm","um","nm".
-            Defaults to "mm".
-        beam_length : float or None
-            Length of the beam cuboid along +x in angstrom. If None, uses
-            sample.dimensions[0] as a reasonable default.
-        show : bool
-            If True, calls plt.show().
-        elev, azim : float
-            Matplotlib view angles.
-        figsize : tuple
-            Figure size in inches.
+        Args:
+            beam (Beam): Beam object. Must provide _beam_size (angstrom) for
+                transverse size.
+            sample (Sample): Sample object. Must provide corners (8x3, angstrom).
+            detector (Detector): Detector object. Must be positioned; uses center,
+                direction, and pixel_coordinates.
+            stage (Stage, optional): Stage object. If provided, its rotation and
+                translation are applied to the sample.
+            optics (Optics, optional): Optics object. If provided, drawn via
+                optics.plot_stack_3d into the same axes.
+            unit (str): Display unit for all geometry. One of "m", "cm", "mm",
+                "um", "nm". Defaults to "mm".
+            beam_length (float, optional): Length of the beam cuboid along +x in
+                angstrom. If None, uses sample.dimensions[0] as a reasonable default.
+            show (bool): If True, calls plt.show(). Defaults to True.
+            elev (float): Matplotlib elevation view angle. Defaults to 20.
+            azim (float): Matplotlib azimuth view angle. Defaults to -60.
+            figsize (tuple): Figure size in inches. Defaults to (9, 7).
 
-        Returns
-        -------
-        (fig, ax)
+        Returns:
+            tuple: A tuple (fig, ax) containing the matplotlib figure and 3D axes.
         """
         import numpy as np
         import matplotlib.pyplot as plt
