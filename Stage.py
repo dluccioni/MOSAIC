@@ -15,7 +15,17 @@ from Logging import logging
 # Class
 # -----------------------------------------------------------------------------
 class stage(logging):
-    
+    """
+    Represents a multi-axis stage with rotational and translational motors.
+
+    This class models a goniometer or similar stage system, supporting motor
+    coupling, axis transformations, and metadata persistence. Users must call
+    `create_stage()` after instantiation to define the stage configuration.
+
+    Attributes:
+        directory (str): Directory for saving/loading stage metadata.
+    """
+
     # -------------------------------------------------------------------------
     # Logging configuration
     # -------------------------------------------------------------------------
@@ -456,9 +466,12 @@ class stage(logging):
     @property
     def motor_value(self):
         """
-        numpy.ndarray: The current motor values.
+        Returns the current motor values.
 
         If not initialized, prints a message asking the user to call `create_stage()`.
+
+        Returns:
+            numpy.ndarray: The current motor values array.
         """
         if self._motor_value is None:
             print("Stage motors not initialized. Please call create_stage(...) first.")
@@ -467,9 +480,12 @@ class stage(logging):
     @property
     def translation(self):
         """
-        numpy.ndarray: The current stage translation vector [x, y, z].
+        Returns the current stage translation vector.
 
         If not initialized, prints a message asking the user to call `create_stage()`.
+
+        Returns:
+            numpy.ndarray: The translation vector [x, y, z].
         """
         if self._translation is None:
             print("Stage translation not initialized. Please call create_stage(...) first.")
@@ -478,9 +494,12 @@ class stage(logging):
     @property
     def rotation(self):
         """
-        numpy.ndarray: The current stage rotation matrix (3x3).
+        Returns the current stage rotation matrix.
 
         If not initialized, prints a message asking the user to call `create_stage()`.
+
+        Returns:
+            numpy.ndarray: The 3x3 rotation matrix.
         """
         if self._rotation is None:
             print("Stage rotation not initialized. Please call create_stage(...) first.")
