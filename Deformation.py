@@ -41,7 +41,8 @@ class deformation(logging):
     # -------------------------------------------------------------------------
     # Initialization
     def __init__(self, directory=None):
-        """Initialize the deformation helper.
+        """
+        Initialize the deformation helper.
 
         Args:
             directory (str or None): Optional directory. If provided and it
@@ -69,7 +70,8 @@ class deformation(logging):
         drop_nan_rows=True,
         dtype=np.float32,
     ):
-        """Import a deformation gradient tensor field from a text file.
+        """
+        Import a deformation gradient tensor field from a text file.
 
         This loader reads tabular text data containing x, y, z coordinates and
         the 3x3 deformation gradient components F11..F33. It returns two arrays:
@@ -247,7 +249,8 @@ class deformation(logging):
 
     # Field transforms (CPU/GPU)
     def _select_backend(self, use_gpu):
-        """Select numpy or cupy module.
+        """
+        Select numpy or cupy module.
 
         Args:
             use_gpu (bool): If True and CuPy is available, return CuPy; else NumPy.
@@ -258,7 +261,8 @@ class deformation(logging):
         return cp if (use_gpu and (cp is not None)) else np
 
     def _infer_dtype(self, positions, F, dtype):
-        """Infer a floating dtype from inputs or fallback to float32.
+        """
+        Infer a floating dtype from inputs or fallback to float32.
 
         Args:
             positions (ndarray or None): Position array used to infer dtype.
@@ -286,7 +290,8 @@ class deformation(logging):
         use_gpu=True,
         dtype=None,
     ):
-        """Build a 3x3 rotation matrix.
+        """
+        Build a 3x3 rotation matrix.
 
         Either construct from axis-angle or validate and return a provided
         rotation matrix.
@@ -355,7 +360,8 @@ class deformation(logging):
 
     # positions transforms
     def scale_positions(self, positions, scale=1.0, use_gpu=True, dtype=None, copy=True):
-        """Scale positions isotropically.
+        """
+        Scale positions isotropically.
 
         Args:
             positions (ndarray): Array of shape (N, 3).
@@ -377,7 +383,8 @@ class deformation(logging):
         return P
 
     def rotate_positions(self, positions, R, origin=(0.0, 0.0, 0.0), use_gpu=True, dtype=None, copy=True):
-        """Rotate positions with row-vector convention: (p - origin) @ R + origin.
+        """
+        Rotate positions with row-vector convention: (p - origin) @ R + origin.
 
         Args:
             positions (ndarray): Array of shape (N, 3).
@@ -401,7 +408,8 @@ class deformation(logging):
         return xp.matmul(P - org, R) + org
 
     def translate_positions(self, positions, translate, use_gpu=True, dtype=None, copy=True):
-        """Translate positions by a vector.
+        """
+        Translate positions by a vector.
 
         Args:
             positions (ndarray): Array of shape (N, 3).
@@ -426,7 +434,8 @@ class deformation(logging):
 
     # F tensor transforms
     def scale_F_about_identity(self, F, alpha=None, use_gpu=True, dtype=None, copy=True):
-        """Scale deformation gradients about identity: F' = I + alpha * (F - I).
+        """
+        Scale deformation gradients about identity: F' = I + alpha * (F - I).
 
         Args:
             F (ndarray): Array of shape (N, 9) with row-major 3x3 entries.
@@ -453,7 +462,8 @@ class deformation(logging):
         return Fm.reshape(N, 9)
 
     def rotate_F_tensors(self, F, R, use_gpu=True, dtype=None, copy=True):
-        """Rotate second-order tensors with row-vector convention: F' = R.T @ F @ R.
+        """
+        Rotate second-order tensors with row-vector convention: F' = R.T @ F @ R.
 
         Args:
             F (ndarray): Array of shape (N, 9) with row-major 3x3 entries.
@@ -481,7 +491,8 @@ class deformation(logging):
 
     # clipping
     def _parse_clip_bounds(self, clip_bounds):
-        """Normalize clip bounds to (xmin, xmax, ymin, ymax, zmin, zmax).
+        """
+        Normalize clip bounds to (xmin, xmax, ymin, ymax, zmin, zmax).
 
         Args:
             clip_bounds (sequence or None): Either a flat 6-length list
@@ -515,7 +526,8 @@ class deformation(logging):
         dtype=None,
         copy=True,
     ):
-        """Clip or clamp a field to a bounding box.
+        """
+        Clip or clamp a field to a bounding box.
 
         Args:
             positions (ndarray): Array of shape (N, 3).
@@ -589,7 +601,8 @@ class deformation(logging):
         clip_bounds=None,
         return_mask=False,
         use_gpu=True):
-        """Transform a deformation field (placeholder API).
+        """
+        Transform a deformation field (placeholder API).
 
         The intended operation order is:
             1) Position scaling
@@ -616,7 +629,8 @@ class deformation(logging):
         copy=True,
         return_mask=False,
     ):
-        """Clip a deformation field to the sample axis-aligned bounding box.
+        """
+        Clip a deformation field to the sample axis-aligned bounding box.
 
         The bounding box is derived from sample.corners. A non-negative margin
         grows the box by the same amount in all directions.
@@ -698,7 +712,8 @@ class deformation(logging):
         return P_out, F_out
 
     def _ensure_field_cuda_kernels(self, dtype=np.float32, k=8):
-        """Compile and cache CUDA RawKernels for field kNN and application.
+        """
+        Compile and cache CUDA RawKernels for field kNN and application.
 
         Args:
             dtype (numpy dtype): Floating dtype (np.float32 or np.float64).
@@ -875,7 +890,8 @@ class deformation(logging):
         self._field_kernels[key] = kernels
 
     def _get_field_cuda_kernels(self, dtype, k):
-        """Retrieve compiled CUDA kernels for field operations.
+        """
+        Retrieve compiled CUDA kernels for field operations.
 
         Args:
             dtype (numpy dtype): Floating dtype.
@@ -890,7 +906,8 @@ class deformation(logging):
         return self._field_kernels[("field_kernels", np.dtype(dtype).name, int(k))]
 
     def _ensure_fe_nodal_cuda_kernels(self, dtype=np.float32, k=48):
-        """Compile and cache optimized CUDA kernels for FE nodal field operations.
+        """
+        Compile and cache optimized CUDA kernels for FE nodal field operations.
 
         Creates highly optimized kernels targeting:
         - Bitonic sort-based kNN
@@ -1341,7 +1358,8 @@ class deformation(logging):
         self._fe_nodal_kernels[key] = kernels
 
     def _get_fe_nodal_cuda_kernels(self, dtype, k):
-        """Retrieve compiled optimized CUDA kernels for FE nodal operations.
+        """
+        Retrieve compiled optimized CUDA kernels for FE nodal operations.
 
         Args:
             dtype (numpy dtype): Floating dtype.
@@ -1375,7 +1393,8 @@ class deformation(logging):
         cell_r_cut=None,
         cell_pad_cells=1,
     ):
-        """Apply a deformation field to sample points in chunks.
+        """
+        Apply a deformation field to sample points in chunks.
 
         This accelerated path uses custom CUDA kernels for:
         - kNN over field nodes,
@@ -1840,7 +1859,8 @@ class deformation(logging):
         figsize=(7, 7),
         use_gpu=True,
     ):
-        """Plot sample edges and field AABB edges in 3D.
+        """
+        Plot sample edges and field AABB edges in 3D.
 
         Draws two wireframes:
           - The sample box edges from sample.corners.
@@ -2023,7 +2043,8 @@ class deformation(logging):
     # Nodal Deformation Field ----------------------------------------------------
     # Kernel management
     def _ensure_fe_kernels(self, dtype=np.float32):
-        """Compile and cache CuPy RawKernels for FE tet mapping.
+        """
+        Compile and cache CuPy RawKernels for FE tet mapping.
 
         Args:
             dtype (numpy dtype): Floating dtype (np.float32 or np.float64).
@@ -2189,7 +2210,8 @@ class deformation(logging):
         self._fe_kernels_cache[key] = kernels
 
     def _get_fe_kernels(self, dtype):
-        """Retrieve compiled CUDA kernels for FE tet mapping.
+        """
+        Retrieve compiled CUDA kernels for FE tet mapping.
 
         Args:
             dtype (numpy dtype): Floating dtype.
@@ -2214,7 +2236,8 @@ class deformation(logging):
                             comments="%",
                             drop_nan_rows=True,
                             dtype=np.float32):
-        """Import FE nodal field (reference nodes plus displacement or current nodes).
+        """
+        Import FE nodal field (reference nodes plus displacement or current nodes).
 
         Supports two column patterns:
             A) x, y, z, u1, u2, u3  -> returns Xref, Xref+U
@@ -2374,7 +2397,8 @@ class deformation(logging):
                             one_based=True,
                             use_gpu=True,
                             dtype=np.int32):
-        """Import FE element connectivity for 4-node elements.
+        """
+        Import FE element connectivity for 4-node elements.
 
         Supported modes:
 
@@ -2586,7 +2610,8 @@ class deformation(logging):
 
     # FE transforms --------------------------------------------------------------
     def zero_fe_nodal_field(self, center_mode="bbox", return_shift=False):
-        """Translate the FE nodal field so that its center is at the origin.
+        """
+        Translate the FE nodal field so that its center is at the origin.
 
         The center is computed from the reference nodal coordinates (self._Xref)
         and the same translation is applied to the current coordinates
@@ -2669,7 +2694,8 @@ class deformation(logging):
                                  use_gpu=True,
                                  dtype=None,
                                  copy=True):
-        """Transform FE nodal reference/current positions consistently.
+        """
+        Transform FE nodal reference/current positions consistently.
 
         Steps:
           1) optional isotropic scale of both Xref and Xcur
@@ -2737,7 +2763,8 @@ class deformation(logging):
                             elem_nodes=None,
                             margin=0.0,
                             use_gpu=True):
-        """Clip FE mesh to elements intersecting the sample AABB (+margin).
+        """
+        Clip FE mesh to elements intersecting the sample AABB (+margin).
 
         The test is performed in REFERENCE space and keeps entire elements. An
         element is kept if:
@@ -2849,7 +2876,8 @@ class deformation(logging):
     
     # FE apply (atoms) -----------------------------------------------------------
     def _estimate_mls_batch_bytes(self, n_rows, k, dtype):
-        """Heuristic helper for sizing MLS mini-batches.
+        """
+        Heuristic helper for sizing MLS mini-batches.
 
         Not used outside this module. Returns a conservative per-row byte estimate
         to keep temporary arrays (B, A, b, neighbors, weights) under a few hundred MB.
@@ -2871,7 +2899,8 @@ class deformation(logging):
                                     reg=1e-6,
                                     use_gpu=True,
                                     dtype=None):
-        """Compute MLS-quadratic displacement per query from nodal data.
+        """
+        Compute MLS-quadratic displacement per query from nodal data.
 
         The fit is performed in query-centered coordinates. For each query i,
         define shifts s_ij = P_nodes[idx[i,j]] - Xq[i], and the 10-term basis
@@ -3010,7 +3039,8 @@ class deformation(logging):
         return U_pred.astype(T, copy=False)
 
     def apply_fe_nodal_field(self, sample, use_gpu=True):
-        """Apply FE nodal mapping to atom positions using an MLS quadratic fit.
+        """
+        Apply FE nodal mapping to atom positions using an MLS quadratic fit.
 
         Uses a moving-least-squares (MLS) quadratic fit of the nodal
         displacement field U = Xcurr - Xref. The MLS fit is performed in query-
@@ -3476,7 +3506,8 @@ class deformation(logging):
                                       proj_alpha=0.5,
                                       figsize=(7, 7),
                                       use_gpu=True):
-        """Plot sample edges and an AABB of FE nodal points in 3D.
+        """
+        Plot sample edges and an AABB of FE nodal points in 3D.
 
         Mirrors style of plot_field_and_sample_edges_3d.
 
@@ -3608,7 +3639,8 @@ class deformation(logging):
     # Properties
     @property
     def Xref(self):
-        """Reference nodal coordinates.
+        """
+        Reference nodal coordinates.
 
         Returns:
             ndarray or None: If not initialized, prints a message and returns None.
@@ -3619,7 +3651,8 @@ class deformation(logging):
 
     @property
     def Xcurr(self):
-        """Current nodal coordinates.
+        """
+        Current nodal coordinates.
 
         Returns:
             ndarray or None: If not initialized, prints a message and returns None.
@@ -3630,7 +3663,8 @@ class deformation(logging):
 
     @property
     def elem_nodes(self):
-        """Element connectivity, 0-based node indices.
+        """
+        Element connectivity, 0-based node indices.
 
         Returns:
             ndarray or None: If not initialized, prints a message and returns None.
