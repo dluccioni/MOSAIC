@@ -43,7 +43,8 @@ class sample(logging):
     # -----------------------------------------------------------------------------
     ## Initialization
     def __init__(self, directory=os.getcwd()):
-        """Initialize core state and ensure the working directory exists.
+        """
+        Initialize core state and ensure the working directory exists.
 
         Compiles the CFFI intersection routine, sets default attributes for the
         sample, and guarantees that the target directory is present on disk.
@@ -53,7 +54,7 @@ class sample(logging):
                 will be read from and written to. Defaults to the current
                 working directory.
 
-        Notes:
+        Note:
             Geometry and data are not created here. Use `create_sample`,
             `import_atomic_data`, or `generate_sample_single` to populate files.
         """
@@ -90,7 +91,8 @@ class sample(logging):
             os.makedirs(self.directory)
             
     def create_sample(self, dimensions, offset=[0, 0, 0], chunk_volume=12500000, sample_type="single"):
-        """Create an axis-aligned sample box and precompute helpers.
+        """
+        Create an axis-aligned sample box and precompute helpers.
 
         Sets dimensions, offset, an identity rotation, and a diagonal matrix
         representation. Also computes the 8 sample corners centered about
@@ -131,7 +133,8 @@ class sample(logging):
         self._sample_type = sample_type
             
     def read_sample_metadata(self):
-        """Load JSON metadata from disk and restore core state.
+        """
+        Load JSON metadata from disk and restore core state.
 
         Reads `sample_metadata.json` from `self.directory` (or from a provided
         override path in the writer) and restores `_dimensions`, `_offset`,
@@ -168,7 +171,8 @@ class sample(logging):
     # -------------------------------------
     # Generate sample
     def write_chunk_positions(self, data, chunk_num, override_directory=None):
-        """Write a positions array for a specific chunk to disk.
+        """
+        Write a positions array for a specific chunk to disk.
 
         Saves a (N, 3) positions array as `atomic_positions_<chunk_num>.npy`
         either under `self.directory` or `override_directory` if provided.
@@ -193,7 +197,8 @@ class sample(logging):
             np.save(os.path.join(self.directory, chunk_filename), data)
     
     def write_chunk_species(self, data, chunk_num, override_directory=None):
-        """Write a species array for a specific chunk to disk.
+        """
+        Write a species array for a specific chunk to disk.
 
         Saves a 1-D species array as `atomic_species_<chunk_num>.npy` either
         under `self.directory` or `override_directory` if provided.
@@ -218,7 +223,8 @@ class sample(logging):
             np.save(os.path.join(self.directory, chunk_filename), data)
             
     def write_sample_metadata(self, override_directory=None):
-        """Serialize critical fields to a JSON metadata file on disk.
+        """
+        Serialize critical fields to a JSON metadata file on disk.
 
         Writes `sample_metadata.json` containing `dimensions`, `offset`,
         `rotation`, `chunk_total`, and `sample_type`.
@@ -251,7 +257,8 @@ class sample(logging):
         print(f"Metadata written to {metadata_filename} in JSON format.")
     
     def load_chunk_positions(self, chunk_number, use_gpu=True):
-        """Load a chunk's positions from disk, optionally on GPU.
+        """
+        Load a chunk's positions from disk, optionally on GPU.
 
         If `use_gpu` is True and CuPy is available, returns a `cp.ndarray`.
         Otherwise, returns an `np.ndarray`. If `self.enable_temp` is True,
@@ -296,7 +303,8 @@ class sample(logging):
         return positions
 
     def load_chunk_species(self, chunk_number, use_gpu=True):
-        """Load a chunk's species array from disk, optionally on GPU.
+        """
+        Load a chunk's species array from disk, optionally on GPU.
 
         If `use_gpu` is True and CuPy is available, returns a `cp.ndarray`.
         Otherwise, returns an `np.ndarray`.
@@ -329,7 +337,8 @@ class sample(logging):
     # -------------------------------------
     # KNN search
     def write_chunk_nn_indices(self, index_list, chunk_num, override_directory=None):
-        """Write neighbor index lists for a chunk to a compact NPZ.
+        """
+        Write neighbor index lists for a chunk to a compact NPZ.
 
         Produces ``nearest_neighbors_indices_<chunk_num>.npz`` containing:
         - ``flat_idx``: concatenated neighbor indices for all atoms.
@@ -374,7 +383,8 @@ class sample(logging):
         
 
     def write_chunk_nn_phase(self, phase_list, chunk_num, override_directory=None):
-        """Write neighbor phases for a chunk to a compact NPZ.
+        """
+        Write neighbor phases for a chunk to a compact NPZ.
 
         Produces ``nearest_neighbors_phase_<chunk_num>.npz`` containing:
         - ``flat_phase``: concatenated float phases for all atoms' neighbors.
@@ -415,7 +425,8 @@ class sample(logging):
         np.savez(save_path, flat_phase=flat_phase, offsets=offsets)
 
     def write_chunk_nn_scatter(self, scatter_list, chunk_num, override_directory=None):
-        """Write neighbor wavevectors for a chunk to a compact NPZ.
+        """
+        Write neighbor wavevectors for a chunk to a compact NPZ.
 
         Each element of ``scatter_list`` has shape ``(N_i, 3)`` with columns
         ``[kx, ky, kz]``. This function writes:
@@ -461,13 +472,14 @@ class sample(logging):
         np.savez(save_path, flat_kx=flat_kx, flat_ky=flat_ky, flat_kz=flat_kz, offsets=offsets)
         
     def write_chunk_nn_species(self, species_list, chunk_num, override_directory=None):
-        """Write neighbor species for a chunk to a compact NPZ.
+        """
+        Write neighbor species for a chunk to a compact NPZ.
 
         Produces ``nearest_neighbors_species_<chunk_num>.npz`` with:
         - ``flat_species``: concatenated neighbor species values.
         - ``offsets``: start positions per atom (length n_atoms + 1).
 
-        Notes:
+        Note:
             ``flat_species`` dtype may be numeric or string depending on input.
             For maximum portability, prefer fixed-length dtypes over object arrays.
 
@@ -507,7 +519,8 @@ class sample(logging):
         np.savez(save_path, flat_species=flat_species, offsets=offsets)
         
     def load_chunk_nn_indices(self, chunk_num):
-        """Load neighbor indices for a chunk.
+        """
+        Load neighbor indices for a chunk.
 
         Reads ``nearest_neighbors_indices_<chunk_num>.npz`` and returns the
         flattened indices and offsets.
@@ -539,7 +552,8 @@ class sample(logging):
 
 
     def load_chunk_nn_phase(self, chunk_num):
-        """Load neighbor phases for a chunk.
+        """
+        Load neighbor phases for a chunk.
 
         Reads ``nearest_neighbors_phase_<chunk_num>.npz`` and returns the
         flattened phases and offsets.
@@ -570,7 +584,8 @@ class sample(logging):
         return flat_phase, offsets
 
     def load_chunk_nn_scatter(self, chunk_num):
-        """Load neighbor wavevectors for a chunk.
+        """
+        Load neighbor wavevectors for a chunk.
 
         Reads ``nearest_neighbors_scatter_<chunk_num>.npz`` and returns the
         flattened ``kx``, ``ky``, ``kz`` arrays and the offsets vector.
@@ -602,13 +617,14 @@ class sample(logging):
         return flat_kx, flat_ky, flat_kz, offsets
     
     def load_chunk_nn_species(self, chunk_num):
-        """Load neighbor species for a chunk.
+        """
+        Load neighbor species for a chunk.
 
         Reads ``nearest_neighbors_species_<chunk_num>.npz`` and returns the
         flattened species array and offsets.
 
         Example:
-            To reconstruct the ragged lists:
+            To reconstruct the ragged lists::
 
                 flat_spc, offsets = self.load_chunk_nn_species(chunk_num)
                 species_list = [flat_spc[offsets[i]:offsets[i+1]]
@@ -641,7 +657,8 @@ class sample(logging):
     # -------------------------------------
     # MD sample   
     def import_atomic_data(self, import_file, element_list, header_lines=9, ID_column=1, position_columns=[2,3,4], scale=1e-10, flush_size=100000000, override_directory=None):
-        """Import a large text file of atoms and write chunked .npy outputs.
+        """
+        Import a large text file of atoms and write chunked .npy outputs.
 
         Reads atomic positions and species from a text file, skipping a header,
         and streams them into fixed-size binary chunks for positions/species.
@@ -760,7 +777,8 @@ class sample(logging):
     # General
     @staticmethod
     def get_unit_corners():
-        """Return the 8 corners of the unit cube as an (8, 3) float32 array.
+        """
+        Return the 8 corners of the unit cube as an (8, 3) float32 array.
 
         The ordering matches bit-coded vertices used elsewhere:
         index i has bits (x,y,z) taken from (i&1, (i>>1)&1, (i>>2)&1).
@@ -783,7 +801,8 @@ class sample(logging):
     
     @staticmethod
     def get_rotation(axis, angle):
-        """Compute a 3x3 rotation matrix for a rotation about an axis.
+        """
+        Compute a 3x3 rotation matrix for a rotation about an axis.
 
         The input axis is normalized inside this function. The rotation follows
         the right-hand rule.
@@ -807,7 +826,8 @@ class sample(logging):
     
     @staticmethod
     def get_flat_grid(dimensions, use_gpu=False):
-        """Create a flat grid of integer coordinates as an (N, 3) array.
+        """
+        Create a flat grid of integer coordinates as an (N, 3) array.
 
         The grid spans [0..d0-1] x [0..d1-1] x [0..d2-1] in row-major order
         without materializing a full 3D tensor. Returned dtype is float32 to
@@ -851,7 +871,8 @@ class sample(logging):
         max_displacement=None,
         seed=40
     ):
-        """Configure Einstein-model thermal displacements and enable temperature.
+        """
+        Configure Einstein-model thermal displacements and enable temperature.
 
         Sets ``enable_temp=True`` and programs ``temp_params`` to use the
         Einstein model, where the random displacement variance is derived from
@@ -904,7 +925,8 @@ class sample(logging):
             self._position_unit_in_m = 1.0e-10
 
     def set_position_unit_in_m(self, unit_in_m):
-        """Set the conversion factor from the position unit to meters.
+        """
+        Set the conversion factor from the position unit to meters.
 
         This affects the Einstein-model conversion from mean-square displacement
         in meters^2 to the position units of your arrays.
@@ -928,7 +950,8 @@ class sample(logging):
         seed=40,
         chunk_number=None
     ):
-        """Apply random displacements to positions using a chosen distribution.
+        """
+        Apply random displacements to positions using a chosen distribution.
 
         Two modes are supported:
 
@@ -1069,7 +1092,8 @@ class sample(logging):
     # Sample generation
     @staticmethod    
     def compile_parallelepipeds_intersect_batch_cffi():
-        """Compile the CFFI SAT intersection batch function.
+        """
+        Compile the CFFI SAT intersection batch function.
 
         Builds and verifies a small C module implementing a 15-axis Separating
         Axis Theorem (SAT) test for parallelepipeds. The compiled module
@@ -1295,7 +1319,8 @@ class sample(logging):
     # KNN search
     @staticmethod
     def build_cell_list_count_kernel():
-        """Build and return the CUDA kernel that counts items per cell.
+        """
+        Build and return the CUDA kernel that counts items per cell.
 
         Compiles a CUDA C kernel that:
         1) Computes a cell index for each point given an axis-aligned bounding
@@ -1363,7 +1388,8 @@ class sample(logging):
 
     @staticmethod
     def build_cell_list_fill_kernel():
-        """Build and return the CUDA kernel that fills sorted cell lists.
+        """
+        Build and return the CUDA kernel that fills sorted cell lists.
 
         Compiles a CUDA C kernel that:
         1) Uses the per-point cell index to place each point into a compact,
@@ -1415,7 +1441,8 @@ class sample(logging):
     # -------------------------------------
     # General
     def zero_sample_position(self, use_gpu=True):
-        """Center all atom positions by subtracting the current offset.
+        """
+        Center all atom positions by subtracting the current offset.
 
         Reloads each chunk, subtracts ``self.offset`` from every position, and
         writes them back to disk. Finally sets ``self._offset`` to zeros.
@@ -1459,7 +1486,8 @@ class sample(logging):
         print("All atomic positions re-centered. Offset is now [0, 0, 0].")
         
     def zero_sample_rotation(self, use_gpu=True):
-        """Remove the current global rotation from all atom positions.
+        """
+        Remove the current global rotation from all atom positions.
 
         Reloads each chunk, right-multiplies all positions by ``self._rotation.T``
         (the inverse for an orthonormal rotation), writes them back, and then
@@ -1504,7 +1532,8 @@ class sample(logging):
         print("All atomic positions de-rotated. Sample rotation is now the identity matrix.")
         
     def zero_sample(self, use_gpu=True):
-        """Center and de-rotate the sample in-place.
+        """
+        Center and de-rotate the sample in-place.
 
         Calls ``zero_sample_position`` followed by ``zero_sample_rotation``.
 
@@ -1520,7 +1549,8 @@ class sample(logging):
         self.zero_sample_rotation(use_gpu=use_gpu)
         
     def rotate_sample_relative(self, axis, dangle, degrees=True, use_gpu=True):
-        """Apply an additional rotation to all atoms and update state.
+        """
+        Apply an additional rotation to all atoms and update state.
 
         Computes a rotation matrix for the given axis and angle, applies it to
         every chunk, writes the results, and left-multiplies the stored
@@ -1570,7 +1600,8 @@ class sample(logging):
               f"Updated sample rotation matrix:\n{self._rotation}")
 
     def translate_sample_relative(self, offset_vector, use_gpu=True):  # update this to use dx, dy, dz
-        """Translate the sample by adding an offset to all atom positions.
+        """
+        Translate the sample by adding an offset to all atom positions.
 
         Reloads each chunk, adds ``offset_vector`` to every position, writes the
         results, and updates ``self._offset`` accordingly.
@@ -1616,7 +1647,8 @@ class sample(logging):
     # -------------------------------------
     # Sample generation
     def _gpu_stream_chunk(self, material, chunk_position, chunk_dimensions, stream):
-        """Generate, filter, and offset a chunk on a given CUDA stream.
+        """
+        Generate, filter, and offset a chunk on a given CUDA stream.
 
         Builds atomic positions for a single geometric chunk entirely on GPU:
         1) Computes lattice positions in the sample frame.
@@ -1679,7 +1711,8 @@ class sample(logging):
         return pos_sel_cp, idx_sel_cp
     
     def get_chunk_positions(self, material):
-        """Compute candidate chunk origins and dimensions that intersect the sample.
+        """
+        Compute candidate chunk origins and dimensions that intersect the sample.
 
         Workflow:
           1) Transform the sample corners into the lattice frame and estimate the
@@ -1794,7 +1827,8 @@ class sample(logging):
         return chunk_positions_S.astype(np.float32, copy=False), chunk_dimensions.astype(np.float32, copy=False)
         
     def parallelepipeds_intersect_cffi(self, compiled_code, ffi_object, pts1, pts2, eps=1e-12):
-        """Run a batched SAT intersection test via the verified CFFI module.
+        """
+        Run a batched SAT intersection test via the verified CFFI module.
 
         Converts input arrays to contiguous float64 buffers, passes them to the
         C function, and returns a boolean mask of intersections.
@@ -1834,7 +1868,8 @@ class sample(logging):
         return results_int == 1
 
     def get_lattice_positions(self, material, chunk_position, chunk_dimensions, use_gpu=True):
-        """Compute lattice point positions in the sample frame for one chunk.
+        """
+        Compute lattice point positions in the sample frame for one chunk.
 
         Args:
             material: Object with ``lattice_matrix`` (3x3). Transposed internally.
@@ -1880,7 +1915,8 @@ class sample(logging):
         offset_gpu=None,
         dim_half_gpu=None
     ):
-        """Build atom positions and species for a single geometric chunk.
+        """
+        Build atom positions and species for a single geometric chunk.
 
         On GPU:
             - Expands lattice points by the unit-cell atom offsets,
@@ -2012,7 +2048,8 @@ class sample(logging):
         gpu_streams=4,
         writer_threads=3
     ):
-        """Generate and persist the sample to disk in fixed-size chunks.
+        """
+        Generate and persist the sample to disk in fixed-size chunks.
 
         The function:
           - Computes geometric chunks once using :meth:`get_chunk_positions`.
@@ -2232,7 +2269,8 @@ class sample(logging):
         return
 
     def input_voronoi_seed(self, seeds):
-        """Set user-provided Voronoi seed map.
+        """
+        Set user-provided Voronoi seed map.
 
         Args:
             seeds (array-like): shape (G, 3) array of seed positions in the same
@@ -2250,7 +2288,8 @@ class sample(logging):
         return self._grain_seeds
 
     def input_grain_orientation(self, orientation_matrices):
-        """Set user-provided grain orientation map.
+        """
+        Set user-provided grain orientation map.
 
         Args:
             orientation_matrices (array-like): shape (G, 3, 3). Each 3x3 is a
@@ -2269,7 +2308,8 @@ class sample(logging):
         return self._grain_orientations
 
     def generate_voronoi_seeds(self, n_grains, method="uniform", random_seed=None):
-        """Generate Voronoi seeds inside the sample box.
+        """
+        Generate Voronoi seeds inside the sample box.
 
         Two methods:
         - 'uniform': build a near-cubic grid, place one seed per cell center,
@@ -2341,7 +2381,9 @@ class sample(logging):
 
     @staticmethod
     def _random_rotation_matrix(rng):
-        """Shoemake-style random rotation matrix (uniform on SO(3))."""
+        """
+        Return a Shoemake-style random rotation matrix (uniform on SO(3)).
+        """
         u1, u2, u3 = rng.rand(3)
         q1 = np.sqrt(1.0 - u1) * np.sin(2.0 * np.pi * u2)
         q2 = np.sqrt(1.0 - u1) * np.cos(2.0 * np.pi * u2)
@@ -2358,7 +2400,9 @@ class sample(logging):
 
     @staticmethod
     def _align_rotation_from_to(a, b):
-        """Rotation aligning vector a to b (both 3, any length)."""
+        """
+        Return a rotation aligning vector a to b (both 3, any length).
+        """
         a = np.asarray(a, dtype=np.float64)
         b = np.asarray(b, dtype=np.float64)
         a = a / (np.linalg.norm(a) + 1e-20)
@@ -2389,7 +2433,9 @@ class sample(logging):
                                         texture_axis=(0.0, 0.0, 1.0),
                                         spread_deg=5.0,
                                         random_seed=None):
-        """Build per-grain orientation matrices."""
+        """
+        Build per-grain orientation matrices.
+        """
         rng = np.random.RandomState(None if random_seed is None else int(random_seed))
         R = np.zeros((int(n_grains), 3, 3), dtype=np.float32)
         if mode not in ("random", "textured"):
@@ -2432,7 +2478,9 @@ class sample(logging):
 
     @staticmethod
     def _rotate_material_like(material, R):
-        """Construct a lightweight material-like object with rotated lattice."""
+        """
+        Construct a lightweight material-like object with rotated lattice.
+        """
         # R is 3x3 in sample frame
         mat = type("MatLike", (), {})()
         # rotate lattice vectors (columns) -> R @ lattice_matrix
@@ -2446,7 +2494,9 @@ class sample(logging):
 
     @staticmethod
     def _voronoi_min_index_cpu(positions_np, seeds_np):
-        """Return argmin seed index for each position (CPU; streaming over seeds)."""
+        """
+        Return argmin seed index for each position (CPU; streaming over seeds).
+        """
         N = positions_np.shape[0]
         G = seeds_np.shape[0]
         min_d2 = np.full((N,), np.inf, dtype=np.float64)
@@ -2528,7 +2578,8 @@ class sample(logging):
         grain_workers=None,
         writer_threads=3
     ):
-        """Generate and persist a polycrystalline sample using Voronoi grains.
+        """
+        Generate and persist a polycrystalline sample using Voronoi grains.
 
         Each grain gets:
         - a Voronoi cell (from seeds provided or generated),
@@ -2810,7 +2861,8 @@ class sample(logging):
     # -------------------------------------
     # KNN search
     def build_cell_list_gpu(self, positions, r_cut):
-        """Build a GPU cell list for neighbor searches with a cubic cutoff.
+        """
+        Build a GPU cell list for neighbor searches with a cubic cutoff.
 
         Two-pass algorithm on GPU:
           1) Count pass assigns each point to a cell and atomically increments
@@ -2926,7 +2978,8 @@ class sample(logging):
     # -------------------------------------
     # Plotting
     def plot_sample(self, elev=0, azim=0):
-        """Plot all chunks of the sample as a 3D scatter.
+        """
+        Plot all chunks of the sample as a 3D scatter.
 
         Loads each chunk from disk on CPU, then plots the points using Matplotlib.
 
@@ -3233,7 +3286,8 @@ class sample(logging):
         figsize=(12, 8),
         cmap_name="tab20"
     ):
-        """Plot Voronoi grains (cells) as colored surfaces inside the sample box.
+        """
+        Plot Voronoi grains (cells) as colored surfaces inside the sample box.
 
         The volume is discretized to a regular grid; each voxel center is assigned
         to the nearest Voronoi seed; inter-voxel boundaries between different grain
