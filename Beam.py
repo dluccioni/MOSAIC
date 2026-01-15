@@ -59,6 +59,7 @@ class beam(logging):
         self._direction = None
         self._energy = None
         self._wavelength = None
+        self._pol_perp_rate = 0.5  # Default: unpolarized
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
         # Constants (SI units)
@@ -265,6 +266,10 @@ class beam(logging):
                 # Malformed input -> safe default if gaussian, else None
                 self._gauss_waist = (0.5 * Sy, 0.5 * Sz) if self._beam_profile == "gaussian" else None
 
+        # Polarization rate (default to 0.5 = unpolarized if not in metadata)
+        self._pol_perp_rate = float(beam_metadata.get("pol_perp_rate", 0.5))
+        self._pol_perp_rate = float(np.clip(self._pol_perp_rate, 0.0, 1.0))
+
         # Transverse basis and grid build
         e1, e2 = self.make_orthonormal_basis(self._direction)
         self._beam_e1 = e1.astype(np.float32)
@@ -307,6 +312,7 @@ class beam(logging):
         gauss_waist  = getattr(self, "_gauss_waist", None)
         if gauss_waist is not None:
             gauss_waist = [float(gauss_waist[0]), float(gauss_waist[1])]
+        pol_perp_rate = getattr(self, "_pol_perp_rate", 0.5)
 
         beam_metadata = {
             "metadata_version": 2,
@@ -317,7 +323,8 @@ class beam(logging):
             "beam_size"       : beam_size,       # [size_u_angstrom, size_v_angstrom]
             "beam_samples"    : beam_samples,    # [Ny, Nz]
             "beam_profile"    : beam_profile,    # "uniform" | "gaussian"
-            "gaussian_waist"  : gauss_waist      # [wy_angstrom, wz_angstrom] or null
+            "gaussian_waist"  : gauss_waist,     # [wy_angstrom, wz_angstrom] or null
+            "pol_perp_rate"   : float(pol_perp_rate)  # Polarization rate [0.0-1.0]
         }
 
         if override_directory is not None:
@@ -6230,8 +6237,22 @@ class beam(logging):
             None or np.ndarray: Writes to detector by default; returns the field if save_field is False.
         """
         # Convert detector pixel sizes from Angstrom to meters.
-        dy, dx = detector.pixel_size * 1e-10
+        pixel_size = np.asarray(detector.pixel_size, dtype=np.float64)
+        dy, dx = pixel_size * 1e-10
         E = detector.pixel_values  # complex64 (Ny, Nx)
+
+        # Check that pixel_values has been populated
+        if E is None:
+            raise ValueError(
+                "detector.pixel_values is None. Run atomic_direct_interaction() first "
+                "to populate the detector field before calling wavefield_propagation()."
+            )
+
+        # Check that beam wavelength is set
+        if self._wavelength is None:
+            raise ValueError(
+                "Beam wavelength is not set. Call beam.define_beam() first to set energy/wavelength."
+            )
 
         # Build free-space propagator as a closure so optics need not import beam.
         if use_gpu and cp is not None:
