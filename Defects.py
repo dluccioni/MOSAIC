@@ -802,7 +802,6 @@ class defects(logging):
         self._opendis_bounds = {"min": bmin, "max": bmax}
 
     def generate_nodal_field(self,
-                             crystal,
                              mu,
                              nu,
                              grid_shape=(64, 64, 64),
