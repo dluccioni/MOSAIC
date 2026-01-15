@@ -180,7 +180,68 @@ class detector(logging):
         if detector_metadata["distance"] is not None:
             self._distance = float(detector_metadata["distance"])
         self._geometry = detector_metadata["geometry"]
-        
+
+        # Regenerate pixel coordinates from loaded metadata
+        if self._shape is not None and self._pixel_size is not None and self._geometry is not None:
+            geometry = self._geometry.lower()
+            if geometry == 'rectangular':
+                # Create 1D axes centered on 0 for y and z
+                y_lin = np.linspace(-(self._shape[0]/2)*self._pixel_size[0],
+                                    +(self._shape[0]/2)*self._pixel_size[0],
+                                    self._shape[0], dtype=np.float32)
+                z_lin = np.linspace(-(self._shape[1]/2)*self._pixel_size[1],
+                                    +(self._shape[1]/2)*self._pixel_size[1],
+                                    self._shape[1], dtype=np.float32)
+                Y, Z = np.meshgrid(y_lin, z_lin)
+                X = np.full_like(Y, 0)
+                self._pixel_coordinates = np.vstack((X.ravel(), Y.ravel(), Z.ravel()))
+            elif geometry == 'ring':
+                # Compute inner radius
+                r_in = (self._shape[1] * self._pixel_size[1]) / (2 * np.pi)
+                i_lin = np.arange(self._shape[0], dtype=np.float32)
+                j_lin = np.arange(self._shape[1], dtype=np.float32)
+                r_lin = r_in + (i_lin + 0.5) * self._pixel_size[0]
+                phi_lin = 2.0 * np.pi * (j_lin + 0.5) / self._shape[1]
+                PHI, R = np.meshgrid(phi_lin, r_lin, indexing='xy')
+                Y = R * np.cos(PHI)
+                Z = R * np.sin(PHI)
+                X = np.zeros_like(Y)
+                self._pixel_coordinates = np.vstack((X.ravel(), Y.ravel(), Z.ravel()))
+
+            # Apply stored position (distance, two_theta, eta) to pixel coordinates
+            if self._distance is not None and self._distance > 0:
+                # Translate to distance
+                self._pixel_coordinates[0, :] += self._distance
+                self._center = np.array([self._distance, 0.0, 0.0], dtype=np.float32)
+
+                # Apply rotations if two_theta or eta are non-zero
+                if (self._two_theta is not None and self._two_theta != 0) or \
+                   (self._eta is not None and self._eta != 0):
+                    two_theta = self._two_theta if self._two_theta is not None else 0
+                    eta = self._eta if self._eta is not None else 0
+
+                    # Combined rotation: first eta (about x-axis), then two_theta (about y-axis)
+                    cos_t, sin_t = np.cos(two_theta), np.sin(two_theta)
+                    cos_e, sin_e = np.cos(eta), np.sin(eta)
+
+                    # Rotation matrices
+                    R_eta = np.array([
+                        [1, 0, 0],
+                        [0, cos_e, -sin_e],
+                        [0, sin_e, cos_e]
+                    ], dtype=np.float32)
+
+                    R_two_theta = np.array([
+                        [cos_t, 0, sin_t],
+                        [0, 1, 0],
+                        [-sin_t, 0, cos_t]
+                    ], dtype=np.float32)
+
+                    R_combined = R_two_theta @ R_eta
+                    self._pixel_coordinates = R_combined @ self._pixel_coordinates
+                    self._center = R_combined @ self._center
+                    self._direction = R_combined @ np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
     ## Data Handling Functions
     def write_detector_metadata(self, override_directory=None):
         """
@@ -197,16 +258,16 @@ class detector(logging):
         Returns:
           None
         """
-        # Convert NumPy arrays to Python lists so JSON can handle them
+        # Convert NumPy arrays/types to native Python types so JSON can handle them
         detector_metadata = {
-            "shape": list(self._shape) if self._shape is not None else None,
-            "pixel_size": list(self._pixel_size) if self._pixel_size is not None else None,
-            "center": self._center.tolist() if self._center is not None else None,
-            "direction": self._direction.tolist() if self._direction is not None else None,
+            "shape": [int(x) for x in self._shape] if self._shape is not None else None,
+            "pixel_size": [float(x) for x in self._pixel_size] if self._pixel_size is not None else None,
+            "center": [float(x) for x in self._center] if self._center is not None else None,
+            "direction": [float(x) for x in self._direction] if self._direction is not None else None,
             "two_theta": float(self._two_theta) if self._two_theta is not None else None,
             "eta": float(self._eta) if self._eta is not None else None,
             "distance": float(self._distance) if self._distance is not None else None,
-            "geometry": self._geometry
+            "geometry": str(self._geometry) if self._geometry is not None else None
         }
 
         if override_directory is not None:
