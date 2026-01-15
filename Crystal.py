@@ -6,6 +6,7 @@ import json
 import os
 from Logging import logging
 from pymatgen.core import Structure
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
 # -----------------------------------------------------------------------------
 # Class
@@ -42,6 +43,8 @@ class crystal(logging):
         self._species = None
         self._lattice_atom_fractional = None
         self._lattice_matrix_conventional = None
+        self._lattice_atom_fractional_conventional = None
+        self._species_conventional = None
         self._lattice_orientation = None
         self._cumulative_rotation = np.eye(3)
         self._default_filenames = np.array(["crystal_metadata.npy"]) #sample_metadata will be a struct
@@ -50,25 +53,36 @@ class crystal(logging):
         """
         Load crystal structure from the CIF file and initialize all lattice properties.
 
-        Reads the CIF file at self.filepath, converts to primitive cell for internal
-        storage, then extracts lattice vectors, atom positions, species, and also
-        computes the conventional cell representation.
+        Reads the CIF file at self.filepath, uses SpacegroupAnalyzer to get proper
+        primitive and conventional cell representations with correct atom positions.
         """
         self.structure = Structure.from_file(self.filepath)
-        self.to_primitive()
-        self._lattice_matrix = (self.structure.lattice.matrix) #.T
-        self._lattice_corners = self.get_unit_corners()@self.lattice_matrix
-        self._lattice_center = self.lattice_matrix/2
-        self._lattice_lengths = np.array(self.structure.lattice.abc)
-        self._lattice_volume = self.structure.lattice.volume
-        self._lattice_atom_fractional = self.structure.frac_coords
-        self._lattice_atom_cartesian = self.structure.cart_coords
-        self._species = np.array([site.specie.name for site in self.structure.sites])
-        self.to_conventional()
-        self._lattice_matrix_conventional = (self.structure.lattice.matrix) #.T
-        self._lattice_lengths_conventional = np.array(self.structure.lattice.abc)
-        self._lattice_volume_conventional = self.structure.lattice.volume
-        self._lattice_orientation = np.linalg.inv(self.lattice_matrix_conventional)/np.linalg.norm(np.linalg.inv(self.lattice_matrix_conventional), axis=0, keepdims=True)
+
+        # Use SpacegroupAnalyzer for proper symmetry-aware cell transformations
+        sga = SpacegroupAnalyzer(self.structure)
+
+        # Get primitive cell
+        prim_structure = sga.get_primitive_standard_structure()
+        self._lattice_matrix = prim_structure.lattice.matrix
+        self._lattice_corners = self.get_unit_corners() @ self._lattice_matrix
+        self._lattice_center = self._lattice_matrix / 2
+        self._lattice_lengths = np.array(prim_structure.lattice.abc)
+        self._lattice_volume = prim_structure.lattice.volume
+        self._lattice_atom_fractional = prim_structure.frac_coords
+        self._lattice_atom_cartesian = prim_structure.cart_coords
+        self._species = np.array([site.specie.name for site in prim_structure.sites])
+
+        # Get conventional cell
+        conv_structure = sga.get_conventional_standard_structure()
+        self._lattice_matrix_conventional = conv_structure.lattice.matrix
+        self._lattice_lengths_conventional = np.array(conv_structure.lattice.abc)
+        self._lattice_volume_conventional = conv_structure.lattice.volume
+        self._lattice_atom_fractional_conventional = conv_structure.frac_coords
+        self._species_conventional = np.array([site.specie.name for site in conv_structure.sites])
+        self._lattice_orientation = np.linalg.inv(self._lattice_matrix_conventional) / np.linalg.norm(
+            np.linalg.inv(self._lattice_matrix_conventional), axis=0, keepdims=True
+        )
+
         del self.structure
         
     def read_crystal_metadata(self, override_directory=None):
@@ -118,6 +132,10 @@ class crystal(logging):
             self._lattice_lengths_conventional = np.array(data["lattice_lengths_conventional"], dtype=np.float64)
         if data["lattice_volume_conventional"] is not None:
             self._lattice_volume_conventional = float(data["lattice_volume_conventional"])
+        if data.get("lattice_atom_fractional_conventional") is not None:
+            self._lattice_atom_fractional_conventional = np.array(data["lattice_atom_fractional_conventional"], dtype=np.float64)
+        if data.get("species_conventional") is not None:
+            self._species_conventional = np.array(data["species_conventional"], dtype=object)
         if data["lattice_orientation"] is not None:
             self._lattice_orientation = np.array(data["lattice_orientation"], dtype=np.float64)
         if data["cumulative_rotation"] is not None:
@@ -152,15 +170,19 @@ class crystal(logging):
             "lattice_atom_cartesian":    self._lattice_atom_cartesian.tolist() if self._lattice_atom_cartesian is not None else None,
             "species":                   self._species.tolist() if self._species is not None else None,
             "lattice_atom_fractional":   self._lattice_atom_fractional.tolist() if self._lattice_atom_fractional is not None else None,
-            "lattice_matrix_conventional": 
+            "lattice_matrix_conventional":
                 self._lattice_matrix_conventional.tolist() if self._lattice_matrix_conventional is not None else None,
-            "lattice_lengths_conventional": 
+            "lattice_lengths_conventional":
                 self._lattice_lengths_conventional.tolist() if self._lattice_lengths_conventional is not None else None,
-            "lattice_volume_conventional": 
+            "lattice_volume_conventional":
                 float(self._lattice_volume_conventional) if self._lattice_volume_conventional is not None else None,
-            "lattice_orientation": 
+            "lattice_atom_fractional_conventional":
+                self._lattice_atom_fractional_conventional.tolist() if self._lattice_atom_fractional_conventional is not None else None,
+            "species_conventional":
+                self._species_conventional.tolist() if self._species_conventional is not None else None,
+            "lattice_orientation":
                 self._lattice_orientation.tolist() if self._lattice_orientation is not None else None,
-            "cumulative_rotation": 
+            "cumulative_rotation":
                 self._cumulative_rotation.tolist() if self._cumulative_rotation is not None else None
         }
 
