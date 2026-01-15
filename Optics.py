@@ -3,6 +3,7 @@
 # -----------------------------------------------------------------------------
 import os
 import gc
+import json
 from Logging import logging
 import numpy as np
 try:
@@ -517,11 +518,15 @@ class optics(logging):
         dx = float(dx)
         dy = float(dy)
 
-        for elem in self.components:
+        print(f"[Optics] apply_stack: processing {len(self.components)} component(s)")
+
+        for i, elem in enumerate(self.components):
             kind = str(elem.get("kind", "")).lower()
+            pre_amp = np.abs(E).mean()
 
             if kind == "free space":
                 z = float(elem.get("length", 0.0)) * 1e-3
+                print(f"[Optics] Component {i+1}: free space, z={z:.6e} m ({elem.get('length', 0.0):.2f} mm)")
                 E = propagate_free_space(E, dx, dy, z)
                 # Ensure NumPy on return so downstream ops are consistent
                 if cp is not None and hasattr(cp, "ndarray") and isinstance(E, cp.ndarray):
@@ -529,21 +534,25 @@ class optics(logging):
                 E = np.asarray(E, dtype=np.complex64)
 
             elif kind == "lens box":
+                print(f"[Optics] Component {i+1}: lens box, N={elem.get('number')}, f={elem.get('focal_length')} mm")
                 E = self._apply_thin_lens_box(
                     E, dx, dy, elem, wavelength=wavelength, use_gpu=use_gpu
                 )
 
             elif kind == "bragg magnifier 2b":
+                print(f"[Optics] Component {i+1}: bragg magnifier, Mx={elem.get('magnification_x')}, My={elem.get('magnification_y')}")
                 E = self._apply_bragg_magnifier_2b(
                     E, dx, dy, elem, use_gpu=use_gpu
                 )
 
             elif kind == "angular filter":
+                print(f"[Optics] Component {i+1}: angular filter, half_angle={elem.get('half_angle_x_mrad')} mrad")
                 E = self._apply_angular_filter_kspace(
                     E, dx, dy, elem, wavelength=wavelength, use_gpu=use_gpu
                 )
 
             elif kind == "aperture":
+                print(f"[Optics] Component {i+1}: aperture, width={elem.get('width')} mm, shape={elem.get('type', elem.get('shape'))}")
                 E = self._apply_aperture(
                     E, dx, dy, elem, use_gpu=use_gpu
                 )
@@ -551,19 +560,110 @@ class optics(logging):
             else:
                 raise ValueError(f'Unknown optics element "{kind}"')
 
+            post_amp = np.abs(E).mean()
+            print(f"[Optics]   -> amplitude: {pre_amp:.6e} -> {post_amp:.6e}")
+
         return np.asarray(E, dtype=np.complex64)
 
     def read_optics_metadata(self):
         """
-        Stub for reading an optics JSON or other meta file from self.directory.
+        Read optics component stack from JSON metadata file in self.directory.
+
+        Loads the component list from 'optics_metadata.json' if it exists.
+        Each component is stored as a dictionary with 'kind' and component-specific
+        parameters.
+
+        Returns:
+            bool: True if metadata was loaded successfully, False otherwise.
         """
-        pass
+        if self.directory is None:
+            return False
+
+        metadata_path = os.path.join(self.directory, "optics_metadata.json")
+        if not os.path.exists(metadata_path):
+            return False
+
+        try:
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+
+            # Load components list
+            self._components = metadata.get("components", [])
+
+            # Validate and ensure proper types for each component
+            for comp in self._components:
+                kind = comp.get("kind", "").lower()
+                if kind == "free space":
+                    comp["length"] = float(comp.get("length", 0.0))
+                elif kind == "lens box":
+                    comp["number"] = int(comp.get("number", 1))
+                    comp["focal_length"] = float(comp.get("focal_length", 0.0))
+                    comp["thickness"] = float(comp.get("thickness", 0.0))
+                    comp["absorption_sigma"] = float(comp.get("absorption_sigma", np.inf))
+                elif kind == "bragg magnifier 2b":
+                    comp["magnification_x"] = float(comp.get("magnification_x", 1.0))
+                    comp["magnification_y"] = float(comp.get("magnification_y", 1.0))
+                    comp["reflectivity"] = float(comp.get("reflectivity", 1.0))
+                    comp["phase_shift"] = float(comp.get("phase_shift", 0.0))
+                elif kind == "aperture":
+                    comp["width"] = float(comp.get("width", 0.0))
+                    comp["type"] = str(comp.get("type", "square"))
+                elif kind == "angular filter":
+                    comp["half_angle_x_mrad"] = float(comp.get("half_angle_x_mrad", 0.0))
+                    comp["half_angle_y_mrad"] = float(comp.get("half_angle_y_mrad", 0.0))
+                    comp["shape"] = str(comp.get("shape", "circular"))
+                    comp["rolloff"] = str(comp.get("rolloff", "tophat"))
+
+            return True
+        except Exception as e:
+            print(f"[Optics] Failed to read metadata: {e}")
+            return False
 
     def write_optics_metadata(self):
         """
-        Stub for writing an optics JSON or other meta file to self.directory.
+        Write optics component stack to JSON metadata file in self.directory.
+
+        Saves the component list to 'optics_metadata.json'. Each component is
+        stored as a dictionary with 'kind' and component-specific parameters.
+
+        Returns:
+            bool: True if metadata was saved successfully, False otherwise.
         """
-        pass
+        if self.directory is None:
+            return False
+
+        metadata_path = os.path.join(self.directory, "optics_metadata.json")
+
+        try:
+            # Build metadata dict
+            metadata = {
+                "components": self._components,
+                "num_components": len(self._components),
+            }
+
+            # Write to JSON file with nice formatting
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2, default=self._json_serializer)
+
+            return True
+        except Exception as e:
+            print(f"[Optics] Failed to write metadata: {e}")
+            return False
+
+    @staticmethod
+    def _json_serializer(obj):
+        """Custom JSON serializer for numpy types."""
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        elif isinstance(obj, (np.floating,)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif obj == np.inf:
+            return "inf"
+        elif obj == -np.inf:
+            return "-inf"
+        raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
     def add_free_space(self, length_mm):
         """
