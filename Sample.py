@@ -924,6 +924,52 @@ class sample(logging):
         if not hasattr(self, '_position_unit_in_m'):
             self._position_unit_in_m = 1.0e-10
 
+    def set_temperature_debye(
+        self,
+        T_K,
+        mass_amu=None,
+        theta_D_K=None,
+        max_displacement=None,
+        seed=40
+    ):
+        """
+        Configure Debye-model thermal displacements and enable temperature.
+
+        Sets ``enable_temp=True`` and programs ``temp_params`` to use the
+        Debye model, where the random displacement variance is derived from
+        the Debye function integral for more accurate low-temperature behavior.
+
+        Args:
+            T_K (float): Target temperature in kelvin.
+            mass_amu (float | None): Atomic mass in amu. Defaults to 28.0 if not provided.
+            theta_D_K (float | None): Debye temperature (K). Defaults to 300.0 if not provided.
+            max_displacement (float | None): Optional per-axis clip in position units.
+            seed (int, optional): Random seed for reproducibility. Defaults to 40.
+
+        Returns:
+            None
+
+        Notes:
+            - Default position unit is angstrom; override with
+              ``set_position_unit_in_m`` if positions are in a different unit.
+            - The Debye model provides more accurate thermal displacement at low
+              temperatures (T << theta_D) compared to the Einstein model.
+            - At high temperatures, Debye and Einstein models converge.
+        """
+        # Enable temperature-driven displacements via the Debye model
+        self.enable_temp = True
+        self.temp_params = ['debye', float(T_K), max_displacement, seed]
+
+        # Save optional global parameters
+        if mass_amu is not None:
+            self._temp_mass_amu = float(mass_amu)
+        if theta_D_K is not None:
+            self._temp_theta_D_K = float(theta_D_K)
+
+        # Default position unit is angstrom (1e-10 m) unless user overrides later
+        if not hasattr(self, '_position_unit_in_m'):
+            self._position_unit_in_m = 1.0e-10
+
     def set_position_unit_in_m(self, unit_in_m):
         """
         Set the conversion factor from the position unit to meters.
@@ -953,7 +999,7 @@ class sample(logging):
         """
         Apply random displacements to positions using a chosen distribution.
 
-        Two modes are supported:
+        Three modes are supported:
 
         1) ``distribution='gaussian'``:
            - ``sigma`` is the standard deviation in position units.
@@ -965,11 +1011,18 @@ class sample(logging):
            - If per-species mass and theta_E were configured with
              ``set_temperature_einstein`` and ``chunk_number`` is provided, the
              correct per-atom parameters are used by reading species for that chunk.
+        3) ``distribution='debye'``:
+           - ``sigma`` is interpreted as temperature in kelvin.
+           - Uses the Debye model with the Debye function integral:
+             <u^2> = (9 hbar^2 / m k_B theta_D) * [D_3(theta_D/T) * (T/theta_D) + 1/4]
+           - More accurate than Einstein at low temperatures (T << theta_D).
+           - Configure with ``set_temperature_debye``.
 
         Args:
             positions (np.ndarray or cp.ndarray): Array of shape (N, 3).
-            distribution (str, optional): 'gaussian' or 'einstein'. Defaults to 'gaussian'.
-            sigma (float, optional): Stddev (gaussian) or temperature K (einstein).
+            distribution (str, optional): 'gaussian', 'einstein', or 'debye'.
+                Defaults to 'gaussian'.
+            sigma (float, optional): Stddev (gaussian) or temperature K (einstein/debye).
                 Defaults to 0.25.
             max_displacement (float | None, optional): Optional per-axis clip on
                 the displacement magnitude. Defaults to 1.
@@ -986,7 +1039,7 @@ class sample(logging):
 
         Notes:
             - Backend (NumPy vs CuPy) is inferred from ``positions`` type.
-            - If ``T_K <= 0`` in Einstein mode, only zero-point motion is applied.
+            - If ``T_K <= 0`` in Einstein/Debye mode, only zero-point motion is applied.
         """
         # Select backend based on input array type
         use_cp = (cp is not None) and isinstance(positions, cp.ndarray)
@@ -1076,6 +1129,81 @@ class sample(logging):
             # Draw per-atom Gaussian noise and cast to match input dtype
             rand = xp.random.standard_normal(size=positions.shape)
             displacements = rand * sigma_units.reshape(-1, 1)
+            displacements = displacements.astype(positions.dtype, copy=False)
+
+            # Optionally clip each coordinate
+            if (max_displacement is not None) and (max_displacement > 0.0):
+                xp.clip(displacements, -max_displacement, max_displacement, out=displacements)
+
+            return positions + displacements
+
+        # Mode 3: Debye-model temperature-driven displacements
+        if isinstance(distribution, str) and distribution.lower() == 'debye':
+            # Treat sigma as temperature in kelvin in this mode
+            T_K = float(sigma)
+
+            # Conversion from position units to meters (default assumes angstroms)
+            pos_unit_m = getattr(self, '_position_unit_in_m', 1e-10)
+
+            # Physical constants (SI)
+            k_B = 1.380649e-23
+            hbar = 1.054571817e-34
+            amu_to_kg = 1.66053906660e-27
+
+            N = int(positions.shape[0])
+
+            # Get global mass and Debye temperature (with safe fallbacks)
+            m_default = getattr(self, '_temp_mass_amu', 28.0)
+            theta_D = getattr(self, '_temp_theta_D_K', 300.0)
+
+            # Convert mass to kg
+            m_kg = m_default * amu_to_kg
+
+            # Debye model mean-square displacement formula:
+            # <u^2> = (9 hbar^2 / m k_B theta_D) * [D_3(x)/x + 1/4]
+            # where x = theta_D / T and D_3(x) = (3/x^3) * integral_0^x t^3/(e^t - 1) dt
+            #
+            # Simplified form:
+            # <u^2> = (9 hbar^2 / m k_B theta_D) * [phi(x) + 1/4]
+            # where phi(x) = D_3(x)/x = (3/x^4) * integral_0^x t^3/(e^t - 1) dt
+
+            # Compute the prefactor (units: m^2 / K)
+            prefactor = (9.0 * hbar * hbar) / (m_kg * k_B * theta_D)
+
+            # Compute the Debye integral contribution
+            if T_K <= 0.0:
+                # Zero-point motion only: phi(infinity) -> 0, so just 1/4 term
+                phi_term = 0.0
+            else:
+                x = theta_D / T_K
+                # Compute phi(x) = (3/x^4) * integral_0^x t^3/(e^t - 1) dt
+                # Use scipy.integrate.quad for numerical integration
+                from scipy.integrate import quad
+
+                def debye_integrand(t):
+                    if t < 1e-10:
+                        # Taylor expansion near t=0: t^3/(e^t - 1) ~ t^2
+                        return t * t
+                    return (t * t * t) / (np.exp(t) - 1.0)
+
+                if x > 50.0:
+                    # For very large x, use the known limit: integral -> pi^4/15
+                    # phi(x) = (3/x^4) * (pi^4/15) for x -> infinity
+                    integral_val = (np.pi ** 4) / 15.0
+                else:
+                    integral_val, _ = quad(debye_integrand, 0, x, limit=100)
+
+                phi_term = (3.0 / (x ** 4)) * integral_val
+
+            # Mean-square displacement in m^2
+            msd_m2 = prefactor * (phi_term + 0.25)
+
+            # Convert to position units (sigma per atom)
+            sigma_units = np.sqrt(msd_m2) / pos_unit_m
+
+            # Draw Gaussian noise and scale by sigma
+            rand = xp.random.standard_normal(size=positions.shape)
+            displacements = rand * sigma_units
             displacements = displacements.astype(positions.dtype, copy=False)
 
             # Optionally clip each coordinate
@@ -2562,7 +2690,42 @@ class sample(logging):
             best_idx[p0:p1] = cp.where(better, lbest_idx, best_idx[p0:p1])
 
         return best_idx
-    
+
+    @staticmethod
+    def _voronoi_assign_gpu_bounded(positions_cp, seeds_cp, memory_budget_bytes=None):
+        """
+        Memory-bounded GPU Voronoi assignment.
+
+        Automatically calculates a safe pos_tile based on available GPU memory
+        or the provided budget. This prevents OOM for large atom counts.
+
+        Args:
+            positions_cp: (N, 3) CuPy array of atom positions.
+            seeds_cp: (G, 3) CuPy array of Voronoi seed positions.
+            memory_budget_bytes: Optional maximum bytes to use for intermediate
+                arrays. If None, uses 50% of free GPU memory.
+
+        Returns:
+            cp.ndarray: (N,) int32 array of grain indices for each position.
+        """
+        N = int(positions_cp.shape[0])
+        G = int(seeds_cp.shape[0])
+
+        # Calculate safe tile size based on memory budget
+        if memory_budget_bytes is None:
+            try:
+                free_bytes, _ = cp.cuda.runtime.memGetInfo()
+                memory_budget_bytes = int(0.5 * free_bytes)  # Use 50% of free memory
+            except Exception:
+                memory_budget_bytes = 1024 * 1024 * 1024 * 10  # Default 10GB
+
+        # Memory per position tile: pos_tile × G × 4 bytes (float32 distance matrix)
+        # Plus overhead: pos_tile × 4 (indices) + pos_tile × 4 (distances) + pos_tile × 3 × 4 (positions)
+        bytes_per_pos = G * 4 + 8 + 12
+        pos_tile = max(65536, min(N, memory_budget_bytes // max(bytes_per_pos, 1)))
+
+        return sample._voronoi_min_index_gpu(positions_cp, seeds_cp, seed_tile=512, pos_tile=pos_tile)
+
     def generate_sample_poly(
         self,
         material,
@@ -2587,10 +2750,6 @@ class sample(logging):
         - its own lattice generation over the sample,
         - masking to the Voronoi region.
 
-        Generation is streamed to disk in fixed-size chunks exactly like
-        `generate_sample_single`. CPU path uses per-grain threads; GPU path uses
-        multi-stream pipelining and robustly falls back to CPU if needed.
-
         Args:
             material: object with lattice/unit-cell, see `generate_sample_single`.
             n_grains (int|None): if provided, defines or overrides number of grains.
@@ -2605,7 +2764,7 @@ class sample(logging):
                 cone around `texture_axis` (small angle approx).
             flush_size (int): atoms per on-disk chunk.
             use_gpu (bool): enable GPU path if CuPy + device available.
-            gpu_streams (int): CUDA streams per grain in GPU path.
+            gpu_streams (int): CUDA streams for GPU path (used for atom generation).
             grain_workers (int|None): CPU worker threads; default=min(G, os.cpu_count()).
             writer_threads (int): I/O worker threads.
 
@@ -2709,146 +2868,131 @@ class sample(logging):
             except Exception:
                 gpu_ok = False
 
-        # 5) Grain worker functions
-        def _process_grain_cpu(g_idx):
-            # Rotate material for this grain
-            mat_g = self._rotate_material_like(material, R[g_idx])
+        # 5) Single-pass generation: generate atoms once per chunk, compute Voronoi once,
+        # Get geometric chunks using the base (unrotated) material
+        chunk_positions, chunk_dims = self.get_chunk_positions(material)
+        num_geom_chunks = int(chunk_positions.shape[0])
 
-            # Build geometric chunking for this grain
-            chunk_positions, chunk_dims = self.get_chunk_positions(mat_g)
-
-            # Stream all chunks on CPU
-            for i in range(int(chunk_positions.shape[0])):
-                pos_np, spc_np = self.get_atomic_data(
-                    mat_g,
-                    chunk_positions[i, :],
-                    chunk_dims,
-                    use_gpu=False
-                )
-                if pos_np.shape[0] == 0:
-                    continue
-                # Voronoi membership on CPU
-                min_idx = self._voronoi_min_index_cpu(pos_np, seeds_np)
-                keep = (min_idx == int(g_idx))
-                if not np.any(keep):
-                    continue
-                _accumulate_to_buffers(pos_np[keep, :], spc_np[keep])
-
-        def _process_grain_gpu(g_idx):
-            # Rotate material for this grain
-            mat_g = self._rotate_material_like(material, R[g_idx])
-
-            # Geometric chunks (host math)
-            chunk_positions, chunk_dims = self.get_chunk_positions(mat_g)
-            num_geom = int(chunk_positions.shape[0])
-            if num_geom == 0:
-                return
-
+        if gpu_ok:
+            # GPU path: single-pass with memory-bounded Voronoi
             try:
-                n_streams = max(1, int(gpu_streams))
-                streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
-
-                # Invariants on device
-                lattice_atom_cartesian_cp = cp.asarray(mat_g.lattice_atom_cartesian, dtype=cp.float32)
+                # Pre-allocate invariants on GPU
+                seeds_cp = cp.asarray(seeds_np, dtype=cp.float32)
+                R_cp = cp.asarray(R, dtype=cp.float32)  # (G, 3, 3) rotation matrices
+                lattice_atom_cartesian_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
                 offset_gpu = cp.asarray(self.offset, dtype=cp.float32)
                 dim_half_gpu = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
-                seeds_cp = cp.asarray(seeds_np, dtype=cp.float32)
 
-                inflight = []
-                enqueue_idx = 0
+                for chunk_idx in range(num_geom_chunks):
+                    # Generate atoms ONCE per chunk using unrotated material
+                    pos_cp, mask_cp, site_count = self.get_atomic_data(
+                        material,
+                        chunk_positions[chunk_idx, :],
+                        chunk_dims,
+                        use_gpu=True,
+                        return_on_gpu=True,
+                        lattice_atom_cartesian_cp=lattice_atom_cartesian_cp,
+                        offset_gpu=offset_gpu,
+                        dim_half_gpu=dim_half_gpu
+                    )
 
-                def _enqueue(i, s):
-                    with s:
-                        pos_cp, mask_cp, site_count = self.get_atomic_data(
-                            mat_g,
-                            chunk_positions[i, :],
-                            chunk_dims,
-                            use_gpu=True,
-                            stream=s,
-                            return_on_gpu=True,
-                            lattice_atom_cartesian_cp=lattice_atom_cartesian_cp,
-                            offset_gpu=offset_gpu,
-                            dim_half_gpu=dim_half_gpu
-                        )
-                    ev = cp.cuda.Event()
-                    ev.record(s)
-                    inflight.append({
-                        "event": ev,
-                        "pos_cp": pos_cp,
-                        "mask_cp": mask_cp,
-                        "site_count": int(site_count)
-                    })
-
-                def _drain_one():
-                    task = inflight.pop(0)
-                    task["event"].synchronize()
-
-                    pos_cp = task["pos_cp"]
                     if pos_cp.size == 0:
-                        # no atoms in sample for this chunk
-                        return
+                        continue
 
-                    # Voronoi membership on GPU
-                    min_idx = self._voronoi_min_index_gpu(pos_cp, seeds_cp)
-                    keep_gpu = (min_idx == int(g_idx))
-                    if not bool(cp.any(keep_gpu)):
-                        return
+                    # Compute Voronoi membership ONCE for all atoms in this chunk
+                    # This is O(N_chunk * G) instead of O(G * N_chunk * G)
+                    grain_labels = self._voronoi_assign_gpu_bounded(pos_cp, seeds_cp)
 
-                    pos_keep = pos_cp[keep_gpu, :].get()
-
-                    # Species mapping on CPU:
-                    # 1) mask_cp -> inside-sample mask for flattened sites
-                    # 2) keep_gpu -> voronoi mask for the already-filtered positions
-                    mask_np = task["mask_cp"].get()
-                    spc_all = np.tile(mat_g.species, task["site_count"])
+                    # Species array for this chunk (on CPU for memory efficiency)
+                    mask_np = mask_cp.get()
+                    spc_all = np.tile(material.species, site_count)
                     spc_sample = spc_all[mask_np]
-                    keep_np = keep_gpu.get()
-                    spc_keep = spc_sample[keep_np]
 
-                    _accumulate_to_buffers(pos_keep, spc_keep)
+                    # Partition atoms by grain and apply rotations
+                    for g in range(G):
+                        mask_g = (grain_labels == g)
+                        if not bool(cp.any(mask_g)):
+                            continue
 
-                    # Cleanup to return memory
-                    del pos_keep, spc_keep, spc_sample, spc_all, mask_np, keep_np, pos_cp, keep_gpu, min_idx, task
+                        # Extract grain atoms and apply rotation ON GPU
+                        pos_g_unrotated = pos_cp[mask_g, :]  # (N_g, 3)
+                        pos_g_rotated = pos_g_unrotated @ R_cp[g].T  # Apply grain rotation
+                        pos_np = pos_g_rotated.get().astype(np.float32)
 
-                # Fill-drain
-                while (enqueue_idx < num_geom) or inflight:
-                    while (enqueue_idx < num_geom) and (len(inflight) < n_streams):
-                        s = streams[enqueue_idx % n_streams]
-                        _enqueue(enqueue_idx, s)
-                        enqueue_idx += 1
-                    if inflight:
-                        _drain_one()
+                        # Extract species for this grain
+                        mask_g_np = mask_g.get()
+                        spc_g = spc_sample[mask_g_np]
 
+                        _accumulate_to_buffers(pos_np, spc_g)
+
+                    # Memory cleanup after each chunk
+                    del pos_cp, mask_cp, grain_labels
+                    try:
+                        cp.get_default_memory_pool().free_all_blocks()
+                    except Exception:
+                        pass
+
+                # Final cleanup of GPU invariants
+                del seeds_cp, R_cp, lattice_atom_cartesian_cp, offset_gpu, dim_half_gpu
                 try:
                     cp.get_default_memory_pool().free_all_blocks()
                 except Exception:
                     pass
 
             except (cp.cuda.memory.OutOfMemoryError, cp.cuda.runtime.CUDARuntimeError, RuntimeError, ValueError):
-                # GPU error -> fallback to CPU for this grain
+                # GPU error -> fallback to CPU path
                 try:
                     cp.get_default_memory_pool().free_all_blocks()
                 except Exception:
                     pass
-                _process_grain_cpu(g_idx)
+                gpu_ok = False  # Fall through to CPU path
 
-        # 6) Dispatch grains
-        if gpu_ok:
-            # GPU path: process grains sequentially (each uses multi-stream pipeline)
-            for g_idx in range(G):
-                _process_grain_gpu(g_idx)
-        else:
-            # CPU path: per-grain threads
+        if not gpu_ok:
+            # CPU path: single-pass with chunk-level parallelism
+            def _process_chunk_cpu(chunk_idx):
+                # Generate atoms ONCE per chunk using unrotated material
+                pos_np, spc_np = self.get_atomic_data(
+                    material,
+                    chunk_positions[chunk_idx, :],
+                    chunk_dims,
+                    use_gpu=False
+                )
+
+                if pos_np.shape[0] == 0:
+                    return
+
+                # Compute Voronoi membership ONCE for all atoms in this chunk
+                grain_labels = self._voronoi_min_index_cpu(pos_np, seeds_np)
+
+                # Partition atoms by grain and apply rotations
+                for g in range(G):
+                    mask_g = (grain_labels == g)
+                    if not np.any(mask_g):
+                        continue
+
+                    # Extract grain atoms and apply rotation
+                    pos_g_unrotated = pos_np[mask_g, :]
+                    pos_g_rotated = (pos_g_unrotated @ R[g].T).astype(np.float32)
+                    spc_g = spc_np[mask_g]
+
+                    _accumulate_to_buffers(pos_g_rotated, spc_g)
+
+            # Process chunks (can be parallelized with threads if needed)
             if grain_workers is None or int(grain_workers) <= 0:
                 try:
-                    grain_workers = min(G, os.cpu_count() or 1)
+                    grain_workers = min(num_geom_chunks, os.cpu_count() or 1)
                 except Exception:
-                    grain_workers = min(G, 4)
-            with ThreadPoolExecutor(max_workers=int(grain_workers), thread_name_prefix="grain") as pool:
-                futs = [pool.submit(_process_grain_cpu, g) for g in range(G)]
-                wait(futs, return_when=ALL_COMPLETED)
+                    grain_workers = min(num_geom_chunks, 4)
 
-        # 7) Flush and finalize
+            if num_geom_chunks > 1 and grain_workers > 1:
+                with ThreadPoolExecutor(max_workers=int(grain_workers), thread_name_prefix="chunk") as pool:
+                    futs = [pool.submit(_process_chunk_cpu, i) for i in range(num_geom_chunks)]
+                    wait(futs, return_when=ALL_COMPLETED)
+            else:
+                for i in range(num_geom_chunks):
+                    _process_chunk_cpu(i)
+
+        # 6) Flush and finalize
         _flush_tail()
         wait(pending_writes, return_when=ALL_COMPLETED)
         writer_pool.shutdown(wait=True)
