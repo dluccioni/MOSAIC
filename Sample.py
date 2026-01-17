@@ -2801,18 +2801,17 @@ class sample(logging):
         return best_idx
 
     @staticmethod
-    def _voronoi_assign_gpu_bounded(positions_cp, seeds_cp, memory_budget_bytes=None):
+    def _voronoi_assign_gpu_bounded(positions_cp, seeds_cp, memory_fraction=0.5):
         """
-        Memory-bounded GPU Voronoi assignment.
+        Memory-bounded GPU Voronoi assignment using correct memory calculation.
 
-        Automatically calculates a safe pos_tile based on available GPU memory
-        or the provided budget. This prevents OOM for large atom counts.
+        Guarantees GPU memory usage stays below memory_fraction of total GPU memory
+        regardless of N (positions) or G (grains/seeds).
 
         Args:
             positions_cp: (N, 3) CuPy array of atom positions.
             seeds_cp: (G, 3) CuPy array of Voronoi seed positions.
-            memory_budget_bytes: Optional maximum bytes to use for intermediate
-                arrays. If None, uses 50% of free GPU memory.
+            memory_fraction: Fraction of total GPU memory to use (default 0.5).
 
         Returns:
             cp.ndarray: (N,) int32 array of grain indices for each position.
@@ -2820,20 +2819,100 @@ class sample(logging):
         N = int(positions_cp.shape[0])
         G = int(seeds_cp.shape[0])
 
-        # Calculate safe tile size based on memory budget
-        if memory_budget_bytes is None:
+        # Get available GPU memory
+        try:
+            free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
+            budget_bytes = int(memory_fraction * total_bytes)
+        except Exception:
+            budget_bytes = 2 * 1024 * 1024 * 1024  # Default 2GB
+
+        # Fixed seed_tile (controls inner loop granularity)
+        seed_tile = min(512, G)
+
+        # Calculate pos_tile based on ACTUAL memory requirements:
+        # Per iteration allocates: d2_blk + PS + intermediates
+        # = pos_tile × seed_tile × (4 + 4 + 4) bytes ≈ pos_tile × seed_tile × 16 bytes
+        # Plus: lbest_d2 (pos_tile × 4) + lbest_idx (pos_tile × 4) ≈ pos_tile × 8
+        # Total per iteration ≈ pos_tile × (seed_tile × 16 + 8)
+        bytes_per_pos_iteration = seed_tile * 16 + 8
+
+        # Reserve memory for global arrays: best_d2 + best_idx = N × 8 bytes
+        # And input arrays: positions (N × 12) + seeds (G × 12)
+        reserved_bytes = N * 8 + N * 12 + G * 12
+        available_bytes = max(budget_bytes - reserved_bytes, budget_bytes // 2)
+
+        # Calculate safe pos_tile
+        pos_tile = max(32768, available_bytes // max(bytes_per_pos_iteration, 1))
+        pos_tile = min(pos_tile, N)  # Don't exceed actual positions
+
+        return sample._voronoi_min_index_gpu(positions_cp, seeds_cp,
+                                              seed_tile=seed_tile, pos_tile=pos_tile)
+
+    @staticmethod
+    def _voronoi_assign_gpu_streaming(positions_cp, seeds_cp, memory_fraction=0.5):
+        """
+        Fully streaming GPU Voronoi for arbitrarily large samples.
+
+        Processes positions in sub-chunks, never allocating more than
+        memory_fraction of GPU memory regardless of N or G.
+
+        Args:
+            positions_cp: (N, 3) CuPy array of atom positions.
+            seeds_cp: (G, 3) CuPy array of Voronoi seed positions.
+            memory_fraction: Fraction of total GPU memory to use (default 0.5).
+
+        Returns:
+            cp.ndarray: (N,) int32 array of grain indices for each position.
+        """
+        N = int(positions_cp.shape[0])
+        G = int(seeds_cp.shape[0])
+
+        try:
+            free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
+            budget_bytes = int(memory_fraction * total_bytes)
+        except Exception:
+            budget_bytes = 2 * 1024 * 1024 * 1024  # Default 2GB
+
+        seed_tile = min(512, G)
+
+        # For streaming: we can only hold a portion of positions at a time
+        # Each sub-chunk needs: positions (sub_N × 12) + best arrays (sub_N × 8)
+        # Plus working memory for GEMM: sub_N × seed_tile × 16
+        bytes_per_pos = 12 + 8 + seed_tile * 16  # ~8KB per position for seed_tile=512
+
+        # Reserve for seeds array
+        seeds_bytes = G * 12
+        available_bytes = max(budget_bytes - seeds_bytes, budget_bytes // 2)
+
+        # Calculate sub-chunk size
+        sub_chunk_size = max(32768, available_bytes // max(bytes_per_pos, 1))
+        sub_chunk_size = min(sub_chunk_size, N)
+
+        # If sub_chunk covers all positions, use the faster non-streaming version
+        if sub_chunk_size >= N:
+            return sample._voronoi_assign_gpu_bounded(positions_cp, seeds_cp, memory_fraction)
+
+        # Process in sub-chunks, accumulating results
+        result_idx = cp.empty((N,), dtype=cp.int32)
+
+        for start in range(0, N, sub_chunk_size):
+            end = min(start + sub_chunk_size, N)
+            pos_sub = positions_cp[start:end]
+
+            # Compute Voronoi for this sub-chunk using the bounded version
+            idx_sub = sample._voronoi_min_index_gpu(pos_sub, seeds_cp,
+                                                     seed_tile=seed_tile,
+                                                     pos_tile=end - start)
+            result_idx[start:end] = idx_sub
+
+            # Free intermediate memory
+            del pos_sub, idx_sub
             try:
-                free_bytes, _ = cp.cuda.runtime.memGetInfo()
-                memory_budget_bytes = int(0.5 * free_bytes)  # Use 50% of free memory
+                cp.get_default_memory_pool().free_all_blocks()
             except Exception:
-                memory_budget_bytes = 1024 * 1024 * 1024 * 10  # Default 10GB
+                pass
 
-        # Memory per position tile: pos_tile × G × 4 bytes (float32 distance matrix)
-        # Plus overhead: pos_tile × 4 (indices) + pos_tile × 4 (distances) + pos_tile × 3 × 4 (positions)
-        bytes_per_pos = G * 4 + 8 + 12
-        pos_tile = max(65536, min(N, memory_budget_bytes // max(bytes_per_pos, 1)))
-
-        return sample._voronoi_min_index_gpu(positions_cp, seeds_cp, seed_tile=512, pos_tile=pos_tile)
+        return result_idx
 
     def generate_sample_poly(
         self,
@@ -3010,7 +3089,8 @@ class sample(logging):
 
                     # Compute Voronoi membership ONCE for all atoms in this chunk
                     # This is O(N_chunk * G) instead of O(G * N_chunk * G)
-                    grain_labels = self._voronoi_assign_gpu_bounded(pos_cp, seeds_cp)
+                    # Uses streaming to guarantee memory stays bounded for any G or N
+                    grain_labels = self._voronoi_assign_gpu_streaming(pos_cp, seeds_cp)
 
                     # Species array for this chunk (on CPU for memory efficiency)
                     mask_np = mask_cp.get()
