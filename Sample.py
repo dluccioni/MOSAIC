@@ -76,6 +76,12 @@ class sample(logging):
         self.enable_temp = False
         self.temp_params = ['gaussian', 0.25, 1, 40]
 
+        # Thermal expansion configuration (disabled by default)
+        self._thermal_expansion_enabled = False
+        self._thermal_expansion_alpha = None       # Isotropic: single float (1/K)
+        self._thermal_expansion_alpha_xyz = None   # Anisotropic: [αx, αy, αz] (1/K)
+        self._thermal_expansion_T_ref = 300.0      # Reference temperature (K)
+
         # Default file basenames for chunked outputs
         self._default_filenames = np.array([
             "atomic_positions.npy",
@@ -289,12 +295,25 @@ class sample(logging):
         else:
             positions = np.load(full_path)
 
-        # Optionally apply thermal displacements according to configured model
+        # Optionally apply thermal effects according to configured model
         if self.enable_temp is True:
-            # Note: 'sigma' now means 'temperature_K' when distribution='einstein'
+            # Determine temperature from temp_params (index 1 is sigma/T_K)
+            # For gaussian mode, use reference temperature for expansion calculation
+            distribution = self.temp_params[0]
+            if distribution.lower() in ('gaussian', 'normal'):
+                T_K = getattr(self, '_thermal_expansion_T_ref', 300.0)
+            else:
+                T_K = float(self.temp_params[1])
+
+            # Apply thermal expansion first (scales equilibrium positions)
+            if getattr(self, '_thermal_expansion_enabled', False):
+                positions = self.apply_thermal_expansion(positions, T_K)
+
+            # Apply thermal vibrations (random displacements around scaled positions)
+            # Note: 'sigma' now means 'temperature_K' when distribution='einstein' or 'debye'
             positions = self.apply_temperature(
                 positions,
-                distribution=self.temp_params[0],
+                distribution=distribution,
                 sigma=self.temp_params[1],
                 max_displacement=self.temp_params[2],
                 seed=self.temp_params[3],
@@ -969,6 +988,96 @@ class sample(logging):
         # Default position unit is angstrom (1e-10 m) unless user overrides later
         if not hasattr(self, '_position_unit_in_m'):
             self._position_unit_in_m = 1.0e-10
+
+    def set_thermal_expansion(
+        self,
+        alpha=None,
+        alpha_xyz=None,
+        T_ref=300.0
+    ):
+        """
+        Configure thermal expansion coefficient(s).
+
+        Thermal expansion scales positions by factor (1 + α * ΔT) where ΔT = T - T_ref.
+        Can use either isotropic (single α) or anisotropic (αx, αy, αz) expansion.
+
+        Args:
+            alpha (float | None): Isotropic linear expansion coefficient (1/K).
+                Typical values: ~1e-5 for metals, ~1e-6 for ceramics.
+            alpha_xyz (array-like | None): Anisotropic expansion [αx, αy, αz] (1/K).
+                If provided, overrides isotropic alpha.
+            T_ref (float): Reference temperature in Kelvin. Default 300 K (room temp).
+                Expansion is calculated as ΔT = T_current - T_ref.
+
+        Returns:
+            None
+
+        Notes:
+            - Thermal expansion is applied during chunk loading if enable_temp is True.
+            - Expansion is applied before thermal vibrations.
+            - For most materials, α is in the range 1e-6 to 1e-5 per Kelvin.
+        """
+        self._thermal_expansion_enabled = True
+        self._thermal_expansion_T_ref = float(T_ref)
+
+        if alpha_xyz is not None:
+            self._thermal_expansion_alpha_xyz = np.array(alpha_xyz, dtype=np.float64)
+            self._thermal_expansion_alpha = None
+        elif alpha is not None:
+            self._thermal_expansion_alpha = float(alpha)
+            self._thermal_expansion_alpha_xyz = None
+
+    def apply_thermal_expansion(self, positions, T_K):
+        """
+        Apply thermal expansion to positions.
+
+        Scales positions relative to sample center by (1 + α * ΔT) where ΔT = T_K - T_ref.
+        Supports both isotropic and anisotropic expansion.
+
+        The expansion formula is: p_new = center + (p_old - center) * scale
+        This ensures atoms expand uniformly from the sample center, not from the origin.
+
+        Args:
+            positions (np.ndarray or cp.ndarray): Array of shape (N, 3).
+            T_K (float): Current temperature in Kelvin.
+
+        Returns:
+            np.ndarray or cp.ndarray: Scaled positions of the same shape and backend.
+
+        Notes:
+            - If thermal expansion is not enabled, returns positions unchanged.
+            - Expansion is relative to self.offset (sample center), not origin.
+            - Isotropic: all coordinates scaled by same factor.
+            - Anisotropic: each axis (x, y, z) scaled by different factor.
+        """
+        if not getattr(self, '_thermal_expansion_enabled', False):
+            return positions
+
+        T_ref = getattr(self, '_thermal_expansion_T_ref', 300.0)
+        dT = T_K - T_ref
+
+        # Determine backend (NumPy vs CuPy)
+        use_cp = (cp is not None) and isinstance(positions, cp.ndarray)
+        xp = cp if use_cp else np
+
+        # Expand from the sample CENTER (self.offset), not the origin
+        # This ensures uniform expansion regardless of sample position
+        center = xp.asarray(self.offset, dtype=xp.float64)
+
+        alpha_xyz = getattr(self, '_thermal_expansion_alpha_xyz', None)
+        alpha = getattr(self, '_thermal_expansion_alpha', None)
+
+        if alpha_xyz is not None:
+            # Anisotropic: different scaling per axis
+            alpha_arr = xp.asarray(alpha_xyz, dtype=xp.float64)
+            scale = 1.0 + alpha_arr * dT  # Shape (3,)
+            return center + (positions - center) * scale
+        elif alpha is not None:
+            # Isotropic: uniform scaling
+            scale = 1.0 + alpha * dT
+            return center + (positions - center) * scale
+
+        return positions
 
     def set_position_unit_in_m(self, unit_in_m):
         """
