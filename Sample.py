@@ -11,6 +11,21 @@ try:
 except ImportError:
     cp = None
 from cffi import FFI
+import threading
+
+# -----------------------------------------------------------------------------
+# Multi-GPU Configuration (environment variables)
+# -----------------------------------------------------------------------------
+SAMPLE_STREAMS_PER_GPU = int(os.environ.get("SAMPLE_STREAMS_PER_GPU", "4"))
+SAMPLE_WRITER_THREADS = int(os.environ.get("SAMPLE_WRITER_THREADS", "3"))
+
+
+def _get_gpu_count():
+    """Return number of available CUDA GPUs, or 0 if none."""
+    try:
+        return cp.cuda.runtime.getDeviceCount() if cp is not None else 0
+    except Exception:
+        return 0
 
 # -----------------------------------------------------------------------------
 # Class
@@ -2283,7 +2298,8 @@ class sample(logging):
         flush_size=100000000,
         use_gpu=True,
         gpu_streams=4,
-        writer_threads=3
+        writer_threads=3,
+        n_gpus=None
     ):
         """
         Generate and persist the sample to disk in fixed-size chunks.
@@ -2295,6 +2311,7 @@ class sample(logging):
             thread pool to overlap I/O.
           - Runs a multi-stream GPU path if available; otherwise, or upon GPU
             failure, it falls back to a pure-CPU path without losing progress.
+          - Supports multi-GPU acceleration when n_gpus > 1.
 
         Args:
             material: Object with lattice and unit-cell definitions used by
@@ -2304,9 +2321,11 @@ class sample(logging):
             use_gpu (bool, optional): Enable the GPU generation path if CuPy and
                 a CUDA device are available. Defaults to True.
             gpu_streams (int, optional): Number of concurrent CUDA streams to
-                pipeline GPU work. Defaults to 4.
+                pipeline GPU work per GPU. Defaults to 4.
             writer_threads (int, optional): Number of I/O worker threads for
                 writing chunks to disk. Defaults to 3.
+            n_gpus (int, optional): Number of GPUs to use. Default (None) uses
+                all available GPUs. Set to 1 to force single-GPU mode.
 
         Returns:
             None
@@ -2384,18 +2403,146 @@ class sample(logging):
                 )
                 fill = 0
 
-        # 3) Decide if we can and should use GPU
+        # 3) Decide if we can and should use GPU, and how many
         gpu_ok = False
+        available_gpus = 0
         if use_gpu and (cp is not None):
             try:
-                devcount = int(cp.cuda.runtime.getDeviceCount())
-                gpu_ok = (devcount > 0)
+                available_gpus = int(cp.cuda.runtime.getDeviceCount())
+                gpu_ok = (available_gpus > 0)
             except Exception:
                 gpu_ok = False
 
+        # Determine number of GPUs to use
+        if n_gpus is None:
+            use_n_gpus = max(1, available_gpus)
+        else:
+            use_n_gpus = min(int(n_gpus), available_gpus) if available_gpus > 0 else 0
+
         # 4) GPU path (with safe fallback)
         drained_count = 0  # number of geom-chunks fully drained into CPU buffers
-        if gpu_ok:
+
+        # 4a) Multi-GPU path: distribute chunks across multiple GPUs
+        if gpu_ok and use_n_gpus > 1:
+            try:
+                n_streams = max(1, int(gpu_streams))
+                buf_lock = threading.Lock()
+
+                # Round-robin distribute chunks to GPUs
+                shards = [[] for _ in range(use_n_gpus)]
+                for i in range(num_geom):
+                    shards[i % use_n_gpus].append(i)
+
+                # Shared state for multi-GPU accumulation
+                gpu_errors = [None] * use_n_gpus
+
+                def gpu_worker(dev_id, my_chunks):
+                    """Process assigned chunks on a specific GPU."""
+                    nonlocal drained_count
+                    try:
+                        cp.cuda.Device(dev_id).use()
+
+                        # Per-GPU stream ring
+                        streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
+
+                        # Preload GPU invariants once per device
+                        lattice_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
+                        offset_cp = cp.asarray(self.offset, dtype=cp.float32)
+                        dim_half_cp = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
+
+                        inflight = []
+                        enq_idx = 0
+
+                        def _enqueue_local(chunk_i, s):
+                            with s:
+                                pos_cp, mask_cp, site_count = self.get_atomic_data(
+                                    material,
+                                    self.chunk_positions[chunk_i, :],
+                                    self._chunk_dimensions,
+                                    use_gpu=True,
+                                    stream=s,
+                                    return_on_gpu=True,
+                                    lattice_atom_cartesian_cp=lattice_cp,
+                                    offset_gpu=offset_cp,
+                                    dim_half_gpu=dim_half_cp
+                                )
+                            ev = cp.cuda.Event()
+                            ev.record(s)
+                            inflight.append({
+                                "event": ev,
+                                "pos_cp": pos_cp,
+                                "mask_cp": mask_cp,
+                                "site_count": site_count
+                            })
+
+                        def _drain_local():
+                            nonlocal drained_count
+                            task = inflight.pop(0)
+                            task["event"].synchronize()
+
+                            pos_np = task["pos_cp"].get()
+                            mask_np = task["mask_cp"].get()
+
+                            spc_all = np.tile(material.species, task["site_count"])
+                            spc_np = spc_all[mask_np]
+
+                            # Thread-safe accumulation
+                            with buf_lock:
+                                _accumulate_to_buffers(pos_np, spc_np)
+                                drained_count += 1
+
+                            del pos_np, mask_np, spc_all, spc_np, task
+
+                        # Fill-drain loop for this GPU's chunks
+                        while (enq_idx < len(my_chunks)) or inflight:
+                            while (enq_idx < len(my_chunks)) and (len(inflight) < n_streams):
+                                s = streams[enq_idx % n_streams]
+                                _enqueue_local(my_chunks[enq_idx], s)
+                                enq_idx += 1
+
+                            if inflight:
+                                _drain_local()
+
+                        # Cleanup this GPU's memory
+                        try:
+                            cp.get_default_memory_pool().free_all_blocks()
+                        except Exception:
+                            pass
+
+                    except Exception as e:
+                        gpu_errors[dev_id] = e
+
+                # Launch one thread per GPU
+                threads = []
+                for dev_id in range(use_n_gpus):
+                    if shards[dev_id]:
+                        t = threading.Thread(
+                            target=gpu_worker,
+                            args=(dev_id, shards[dev_id]),
+                            name=f"GPU-{dev_id}"
+                        )
+                        t.start()
+                        threads.append(t)
+
+                # Wait for all GPUs to complete
+                for t in threads:
+                    t.join()
+
+                # Check for errors (if any GPU failed, fall back to CPU for remaining)
+                if any(e is not None for e in gpu_errors):
+                    gpu_ok = False
+
+            except Exception:
+                try:
+                    for dev_id in range(use_n_gpus):
+                        cp.cuda.Device(dev_id).use()
+                        cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+                gpu_ok = False
+
+        # 4b) Single-GPU path (original implementation)
+        elif gpu_ok:
             try:
                 n_streams = max(1, int(gpu_streams))
                 streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
@@ -2927,7 +3074,8 @@ class sample(logging):
         use_gpu=True,
         gpu_streams=4,
         grain_workers=None,
-        writer_threads=3
+        writer_threads=3,
+        n_gpus=None
     ):
         """
         Generate and persist a polycrystalline sample using Voronoi grains.
@@ -2937,6 +3085,8 @@ class sample(logging):
         - an orientation (random or textured),
         - its own lattice generation over the sample,
         - masking to the Voronoi region.
+
+        Supports multi-GPU acceleration when n_gpus > 1.
 
         Args:
             material: object with lattice/unit-cell, see `generate_sample_single`.
@@ -2952,9 +3102,11 @@ class sample(logging):
                 cone around `texture_axis` (small angle approx).
             flush_size (int): atoms per on-disk chunk.
             use_gpu (bool): enable GPU path if CuPy + device available.
-            gpu_streams (int): CUDA streams for GPU path (used for atom generation).
+            gpu_streams (int): CUDA streams for GPU path per GPU.
             grain_workers (int|None): CPU worker threads; default=min(G, os.cpu_count()).
             writer_threads (int): I/O worker threads.
+            n_gpus (int, optional): Number of GPUs to use. Default (None) uses
+                all available GPUs. Set to 1 to force single-GPU mode.
 
         Returns:
             None (writes chunked arrays and metadata to disk).
@@ -3048,20 +3200,137 @@ class sample(logging):
                     )
                     fill = 0
 
-        # 4) Decide if GPU is available
+        # 4) Decide if GPU is available, and how many
         gpu_ok = False
+        available_gpus = 0
         if use_gpu and (cp is not None):
             try:
-                gpu_ok = (int(cp.cuda.runtime.getDeviceCount()) > 0)
+                available_gpus = int(cp.cuda.runtime.getDeviceCount())
+                gpu_ok = (available_gpus > 0)
             except Exception:
                 gpu_ok = False
+
+        # Determine number of GPUs to use
+        if n_gpus is None:
+            use_n_gpus = max(1, available_gpus)
+        else:
+            use_n_gpus = min(int(n_gpus), available_gpus) if available_gpus > 0 else 0
 
         # 5) Single-pass generation: generate atoms once per chunk, compute Voronoi once,
         # Get geometric chunks using the base (unrotated) material
         chunk_positions, chunk_dims = self.get_chunk_positions(material)
         num_geom_chunks = int(chunk_positions.shape[0])
 
-        if gpu_ok:
+        # 5a) Multi-GPU path: distribute chunks across multiple GPUs
+        if gpu_ok and use_n_gpus > 1:
+            try:
+                # Round-robin distribute chunks to GPUs
+                shards = [[] for _ in range(use_n_gpus)]
+                for i in range(num_geom_chunks):
+                    shards[i % use_n_gpus].append(i)
+
+                # Shared state for multi-GPU accumulation
+                gpu_errors = [None] * use_n_gpus
+
+                def gpu_worker_poly(dev_id, my_chunks):
+                    """Process assigned chunks on a specific GPU."""
+                    try:
+                        cp.cuda.Device(dev_id).use()
+
+                        # Pre-allocate invariants on this GPU
+                        seeds_cp = cp.asarray(seeds_np, dtype=cp.float32)
+                        R_cp = cp.asarray(R, dtype=cp.float32)
+                        lattice_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
+                        offset_cp = cp.asarray(self.offset, dtype=cp.float32)
+                        dim_half_cp = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
+
+                        for chunk_idx in my_chunks:
+                            pos_cp, mask_cp, site_count = self.get_atomic_data(
+                                material,
+                                chunk_positions[chunk_idx, :],
+                                chunk_dims,
+                                use_gpu=True,
+                                return_on_gpu=True,
+                                lattice_atom_cartesian_cp=lattice_cp,
+                                offset_gpu=offset_cp,
+                                dim_half_gpu=dim_half_cp
+                            )
+
+                            if pos_cp.size == 0:
+                                continue
+
+                            # Voronoi assignment (streaming for memory safety)
+                            grain_labels = self._voronoi_assign_gpu_streaming(pos_cp, seeds_cp)
+
+                            # Species array on CPU
+                            mask_np = mask_cp.get()
+                            spc_all = np.tile(material.species, site_count)
+                            spc_sample = spc_all[mask_np]
+
+                            # Partition by grain and apply rotations
+                            for g in range(G):
+                                mask_g = (grain_labels == g)
+                                if not bool(cp.any(mask_g)):
+                                    continue
+
+                                pos_g_unrotated = pos_cp[mask_g, :]
+                                pos_g_rotated = pos_g_unrotated @ R_cp[g].T
+                                pos_np = pos_g_rotated.get().astype(np.float32)
+
+                                mask_g_np = mask_g.get()
+                                spc_g = spc_sample[mask_g_np]
+
+                                # Thread-safe accumulation (lock is inside _accumulate_to_buffers)
+                                _accumulate_to_buffers(pos_np, spc_g)
+
+                            # Cleanup after each chunk
+                            del pos_cp, mask_cp, grain_labels
+                            try:
+                                cp.get_default_memory_pool().free_all_blocks()
+                            except Exception:
+                                pass
+
+                        # Cleanup this GPU's invariants
+                        del seeds_cp, R_cp, lattice_cp, offset_cp, dim_half_cp
+                        try:
+                            cp.get_default_memory_pool().free_all_blocks()
+                        except Exception:
+                            pass
+
+                    except Exception as e:
+                        gpu_errors[dev_id] = e
+
+                # Launch one thread per GPU
+                threads = []
+                for dev_id in range(use_n_gpus):
+                    if shards[dev_id]:
+                        t = threading.Thread(
+                            target=gpu_worker_poly,
+                            args=(dev_id, shards[dev_id]),
+                            name=f"GPU-{dev_id}"
+                        )
+                        t.start()
+                        threads.append(t)
+
+                # Wait for all GPUs to complete
+                for t in threads:
+                    t.join()
+
+                # Check for errors
+                if any(e is not None for e in gpu_errors):
+                    gpu_ok = False
+
+            except Exception:
+                try:
+                    for dev_id in range(use_n_gpus):
+                        cp.cuda.Device(dev_id).use()
+                        cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+                gpu_ok = False
+
+        # 5b) Single-GPU path (original implementation)
+        elif gpu_ok:
             # GPU path: single-pass with memory-bounded Voronoi
             try:
                 # Pre-allocate invariants on GPU
