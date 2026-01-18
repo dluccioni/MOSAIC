@@ -504,5 +504,36 @@ class stage(logging):
         if self._rotation is None:
             print("Stage rotation not initialized. Please call create_stage(...) first.")
         return self._rotation
+
+    @property
+    def motors(self):
+        """
+        Returns a dictionary mapping motor names to their info.
+
+        Returns:
+            dict: {motor_name: {'type': 'R'|'T', 'value': float, 'index': int}}
+        """
+        if self._motor_name is None:
+            return {}
+        result = {}
+        for i, name in enumerate(self._motor_name):
+            result[str(name)] = {
+                'type': self._motor_type[i] if self._motor_type is not None else 'R',
+                'value': self._motor_value[i] if self._motor_value is not None else 0.0,
+                'index': i
+            }
+        return result
+
+    @property
+    def motor_names(self):
+        """
+        Returns list of motor names as strings.
+
+        Returns:
+            list: List of motor name strings.
+        """
+        if self._motor_name is None:
+            return []
+        return [str(name) for name in self._motor_name]
     
 
