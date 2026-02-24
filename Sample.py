@@ -97,6 +97,23 @@ class sample(logging):
         self._thermal_expansion_alpha_xyz = None   # Anisotropic: [αx, αy, αz] (1/K)
         self._thermal_expansion_T_ref = 300.0      # Reference temperature (K)
 
+        # Streaming mode configuration (disabled by default)
+        # When enabled, chunks are generated on-demand during simulation
+        self._streaming_mode = False
+        self._streaming_material = None  # Store material reference for on-demand generation
+        self._streaming_flush_size = None  # flush_size for virtual chunking
+        self._streaming_geom_atom_counts = None  # atom counts per geometric chunk
+        self._streaming_file_chunk_ranges = None  # mapping from file chunks to geometric chunks
+        self._streaming_use_gpu = False  # GPU preference from generate_sample_* call
+
+        # Streaming GPU cache (None when not initialized)
+        # These are uploaded to GPU once and reused across chunk generation calls
+        self._streaming_gpu_seeds_cp = None       # (G, 3) CuPy array of grain seeds
+        self._streaming_gpu_rotations_cp = None   # (G, 3, 3) CuPy array of rotation matrices
+        self._streaming_gpu_lattice_cp = None     # Pre-uploaded lattice for get_atomic_data
+        self._streaming_gpu_offset_cp = None      # Pre-uploaded offset
+        self._streaming_gpu_dim_half_cp = None    # Pre-uploaded dimensions/2
+
         # Default file basenames for chunked outputs
         self._default_filenames = np.array([
             "atomic_positions.npy",
@@ -111,7 +128,7 @@ class sample(logging):
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
             
-    def create_sample(self, dimensions, offset=[0, 0, 0], chunk_volume=12500000, sample_type="single"):
+    def create_sample(self, dimensions, offset=[0, 0, 0], chunk_volume=12500000, sample_type="single", streaming=False):
         """
         Create an axis-aligned sample box and precompute helpers.
 
@@ -131,10 +148,18 @@ class sample(logging):
                 12_500_000.
             sample_type (str, optional): "single" (default) or "poly". Controls
                 whether subsequent generation is single crystal or polycrystal.
+            streaming (bool, optional): If True, enables streaming mode where
+                chunks are generated on-demand during simulation rather than
+                persisted to disk. This allows samples larger than disk capacity.
+                Defaults to False.
 
         Returns:
             None
         """
+        # Clear any existing GPU cache from previous streaming session
+        if hasattr(self, '_streaming_gpu_seeds_cp') and self._streaming_gpu_seeds_cp is not None:
+            self._clear_streaming_gpu_cache()
+
         # Cache numeric forms in single precision for consistency
         self._dimensions = np.array(dimensions, dtype=np.float32)
         self._offset = np.array(offset, dtype=np.float32)
@@ -152,6 +177,11 @@ class sample(logging):
 
         # Sample type and poly state
         self._sample_type = sample_type
+
+        # Streaming mode configuration
+        self._streaming_mode = bool(streaming)
+        if streaming:
+            self._streaming_material = None  # Will be set during generate_*
             
     def read_sample_metadata(self):
         """
@@ -285,6 +315,9 @@ class sample(logging):
         Otherwise, returns an `np.ndarray`. If `self.enable_temp` is True,
         temperature-based displacements are applied via `apply_temperature`.
 
+        In streaming mode, positions are generated on-demand instead of being
+        loaded from disk.
+
         Args:
             chunk_number (int): 1-based chunk index to load.
             use_gpu (bool, optional): If True and CuPy is available, load using
@@ -298,7 +331,12 @@ class sample(logging):
                 underlying loader).
             ValueError: If temperature application is enabled and an unknown
                 distribution was configured.
+            RuntimeError: In streaming mode, if material reference is not set.
         """
+        # STREAMING MODE: generate on-demand instead of loading from disk
+        if getattr(self, "_streaming_mode", False):
+            return self._generate_chunk_on_demand(chunk_number, use_gpu, return_positions=True)
+
         # Compose the on-disk filename for this chunk
         base, ext = os.path.splitext(self._default_filenames[0])
         positions_filename = f"{base}_{chunk_number}{ext}"
@@ -343,6 +381,9 @@ class sample(logging):
         If `use_gpu` is True and CuPy is available, returns a `cp.ndarray`.
         Otherwise, returns an `np.ndarray`.
 
+        In streaming mode, species are generated on-demand instead of being
+        loaded from disk.
+
         Args:
             chunk_number (int): 1-based chunk index to load.
             use_gpu (bool, optional): If True and CuPy is available, load using
@@ -355,7 +396,12 @@ class sample(logging):
         Raises:
             FileNotFoundError: If the chunk file does not exist (raised by the
                 underlying loader).
+            RuntimeError: In streaming mode, if material reference is not set.
         """
+        # STREAMING MODE: generate on-demand instead of loading from disk
+        if getattr(self, "_streaming_mode", False):
+            return self._generate_chunk_on_demand(chunk_number, use_gpu, return_positions=False)
+
         # Compose the on-disk filename for this chunk
         base, ext = os.path.splitext(self._default_filenames[1])
         species_filename = f"{base}_{chunk_number}{ext}"
@@ -366,8 +412,456 @@ class sample(logging):
             return cp.load(full_path)
         else:
             return np.load(full_path)
+
     # -------------------------------------
-    
+    # Streaming mode helpers
+    # -------------------------------------
+    def _get_chunk_atom_count(self, material, chunk_position, chunk_dimensions):
+        """
+        Count atoms in a geometric chunk without storing positions.
+
+        Uses the same logic as get_atomic_data but only returns the count,
+        which is faster for computing chunk mappings.
+
+        Args:
+            material: Crystal material object.
+            chunk_position: (3,) array of chunk origin.
+            chunk_dimensions: (3,) array of chunk size in lattice units.
+
+        Returns:
+            int: Number of atoms in this geometric chunk.
+        """
+        # Get lattice positions
+        lattice_positions_np = self.get_lattice_positions(
+            material, chunk_position, chunk_dimensions, use_gpu=False
+        )
+        n_lattice = lattice_positions_np.shape[0]
+        if n_lattice == 0:
+            return 0
+
+        n_atoms_per_cell = len(material.species)
+        lattice_atom_cartesian_np = material.lattice_atom_cartesian.astype(np.float32)
+
+        # Expand to atom sites
+        atomic_positions_S = (
+            lattice_positions_np[:, np.newaxis, :].astype(np.float32) +
+            lattice_atom_cartesian_np[np.newaxis, :, :]
+        ).reshape(-1, 3)
+
+        # In-box mask
+        mask = (
+            (atomic_positions_S[:, 0] >= 0) & (atomic_positions_S[:, 0] <= self.dimensions[0]) &
+            (atomic_positions_S[:, 1] >= 0) & (atomic_positions_S[:, 1] <= self.dimensions[1]) &
+            (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= self.dimensions[2])
+        )
+
+        return int(np.sum(mask))
+
+    def _compute_streaming_chunk_mapping(self, material, flush_size):
+        """
+        Pre-compute mapping from file chunks to geometric chunks.
+
+        This allows streaming mode to produce the same number of chunks
+        as non-streaming mode (which accumulates atoms up to flush_size).
+
+        Args:
+            material: Crystal material object.
+            flush_size (int): Number of atoms per file chunk.
+        """
+        num_geom = self._chunk_positions.shape[0]
+        flush_size = int(flush_size)
+
+        # Count atoms in each geometric chunk
+        geom_counts = []
+        for i in range(num_geom):
+            count = self._get_chunk_atom_count(
+                material, self._chunk_positions[i], self._chunk_dimensions
+            )
+            geom_counts.append(count)
+
+        self._streaming_geom_atom_counts = np.array(geom_counts, dtype=np.int64)
+        self._streaming_flush_size = flush_size
+
+        # Build file chunk ranges
+        # Each range is (start_geom_idx, end_geom_idx, start_offset, end_offset)
+        # where offsets are within the respective geometric chunks
+        ranges = []
+        current_file_chunk_start_geom = 0
+        current_file_chunk_start_offset = 0
+        accumulated = 0
+
+        for i, count in enumerate(geom_counts):
+            accumulated += count
+
+            while accumulated >= flush_size:
+                # This file chunk ends somewhere in geometric chunk i
+                overflow = accumulated - flush_size
+                end_offset = count - overflow
+
+                ranges.append((
+                    current_file_chunk_start_geom,
+                    i,
+                    current_file_chunk_start_offset,
+                    end_offset
+                ))
+
+                # Start next file chunk from where we left off in geometric chunk i
+                current_file_chunk_start_geom = i
+                current_file_chunk_start_offset = end_offset
+                accumulated = overflow
+
+        # Handle tail (remaining atoms that don't fill a full flush_size)
+        if accumulated > 0:
+            last_geom_idx = num_geom - 1
+            ranges.append((
+                current_file_chunk_start_geom,
+                last_geom_idx,
+                current_file_chunk_start_offset,
+                geom_counts[last_geom_idx] if last_geom_idx >= 0 else 0
+            ))
+
+        self._streaming_file_chunk_ranges = ranges
+        self._chunk_total = len(ranges)
+
+        self._log("normal", f"[sample] Streaming mode: {num_geom} geometric chunks mapped to {len(ranges)} file chunks")
+
+    def _generate_geometric_chunk(self, geom_idx, use_gpu=True):
+        """
+        Generate atoms for a single geometric chunk.
+
+        Dispatches to single-crystal or polycrystal generation as appropriate.
+        Uses GPU acceleration when available for better performance.
+
+        Args:
+            geom_idx (int): 0-based geometric chunk index.
+            use_gpu (bool): Whether to use GPU acceleration. Defaults to True.
+
+        Returns:
+            tuple: (positions, species) NumPy arrays for this geometric chunk.
+        """
+        material = self._streaming_material
+        chunk_pos = self._chunk_positions[geom_idx]
+        chunk_dims = self._chunk_dimensions
+
+        if self._sample_type == "poly":
+            return self._generate_poly_geometric_chunk(geom_idx, use_gpu=use_gpu)
+        else:
+            # Single crystal: pass use_gpu to get_atomic_data
+            # Note: get_atomic_data returns numpy arrays when use_gpu=True but return_on_gpu=False (default)
+            return self.get_atomic_data(material, chunk_pos, chunk_dims, use_gpu=use_gpu)
+
+    def _generate_poly_geometric_chunk(self, geom_idx, use_gpu=True):
+        """
+        Generate polycrystal atoms for a single geometric chunk.
+
+        Applies Voronoi grain assignment and per-grain rotations.
+        Uses GPU acceleration when available for better performance.
+
+        Args:
+            geom_idx (int): 0-based geometric chunk index.
+            use_gpu (bool): Whether to use GPU acceleration. Defaults to True.
+
+        Returns:
+            tuple: (positions, species) NumPy arrays for this geometric chunk.
+        """
+        material = self._streaming_material
+        chunk_pos = self._chunk_positions[geom_idx]
+        chunk_dims = self._chunk_dimensions
+
+        # Determine if GPU path is available
+        gpu_available = (use_gpu and cp is not None)
+        gpu_count = 0
+        if gpu_available:
+            try:
+                gpu_count = int(cp.cuda.runtime.getDeviceCount())
+                gpu_available = (gpu_count > 0)
+            except Exception as e:
+                self._log("debug", f"[sample] GPU detection failed: {type(e).__name__}: {e}")
+                gpu_available = False
+
+        # Try GPU path first
+        if gpu_available:
+            try:
+                return self._generate_poly_geometric_chunk_gpu(material, chunk_pos, chunk_dims)
+            except (cp.cuda.memory.OutOfMemoryError, cp.cuda.runtime.CUDARuntimeError) as e:
+                # GPU memory or runtime error -> fall through to CPU path
+                self._log("normal", f"[sample] GPU streaming chunk generation failed (OOM/runtime), falling back to CPU: {e}")
+                try:
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+            except Exception as e:
+                # Unexpected error - log it and re-raise to help debugging
+                self._log("normal", f"[sample] GPU streaming chunk generation failed with unexpected error: {type(e).__name__}: {e}")
+                raise
+
+        # CPU fallback path
+        return self._generate_poly_geometric_chunk_cpu(material, chunk_pos, chunk_dims)
+
+    def _generate_poly_geometric_chunk_gpu(self, material, chunk_pos, chunk_dims):
+        """
+        GPU-accelerated polycrystal chunk generation.
+
+        Internal helper for _generate_poly_geometric_chunk.
+
+        Args:
+            material: Material object with lattice data.
+            chunk_pos: Chunk position array.
+            chunk_dims: Chunk dimensions array.
+
+        Returns:
+            tuple: (positions, species) NumPy arrays.
+
+        Raises:
+            CuPy exceptions on GPU errors (caught by caller).
+        """
+        # Initialize GPU cache if needed
+        if self._streaming_gpu_seeds_cp is None:
+            if not self._init_streaming_gpu_cache():
+                raise RuntimeError("Failed to initialize GPU cache")
+
+        seeds_cp = self._streaming_gpu_seeds_cp
+        R_cp = self._streaming_gpu_rotations_cp
+
+        # Generate atoms on GPU
+        pos_cp, mask_cp, site_count = self.get_atomic_data(
+            material,
+            chunk_pos,
+            chunk_dims,
+            use_gpu=True,
+            return_on_gpu=True,
+            lattice_atom_cartesian_cp=self._streaming_gpu_lattice_cp,
+            offset_gpu=self._streaming_gpu_offset_cp,
+            dim_half_gpu=self._streaming_gpu_dim_half_cp
+        )
+
+        if pos_cp.size == 0:
+            return np.zeros((0, 3), dtype=np.float32), np.array([], dtype=object)
+
+        # GPU Voronoi assignment (memory-safe streaming)
+        grain_labels = self._voronoi_assign_gpu_streaming(pos_cp, seeds_cp)
+
+        # Species array (on CPU for memory efficiency, matching non-streaming path)
+        mask_np = mask_cp.get()
+        spc_all = np.tile(material.species, site_count)
+        spc_sample = spc_all[mask_np]
+
+        # Batched per-grain rotation using einsum
+        # R_per_atom[i] = R_cp[grain_labels[i]] for each atom i
+        R_per_atom = R_cp[grain_labels]  # (N, 3, 3)
+        pos_rotated = cp.einsum('nij,nj->ni', R_per_atom, pos_cp)
+
+        # Transfer results to CPU
+        pos_np = pos_rotated.get().astype(np.float32)
+
+        # Cleanup per-chunk GPU memory (keep invariant cache)
+        del pos_cp, mask_cp, grain_labels, R_per_atom, pos_rotated
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+
+        return pos_np, spc_sample
+
+    def _generate_poly_geometric_chunk_cpu(self, material, chunk_pos, chunk_dims):
+        """
+        CPU fallback for polycrystal chunk generation.
+
+        Internal helper for _generate_poly_geometric_chunk.
+
+        Args:
+            material: Material object with lattice data.
+            chunk_pos: Chunk position array.
+            chunk_dims: Chunk dimensions array.
+
+        Returns:
+            tuple: (positions, species) NumPy arrays.
+        """
+        seeds_np = np.asarray(self._grain_seeds, dtype=np.float32)
+        R = np.asarray(self._grain_orientations, dtype=np.float32)
+        G = int(seeds_np.shape[0])
+
+        # Generate base atoms (CPU path)
+        pos_np, spc_np = self.get_atomic_data(material, chunk_pos, chunk_dims, use_gpu=False)
+
+        if pos_np.shape[0] == 0:
+            return np.zeros((0, 3), dtype=np.float32), np.array([], dtype=spc_np.dtype if spc_np.size > 0 else object)
+
+        # Voronoi assignment (CPU method)
+        grain_labels = self._voronoi_min_index_cpu(pos_np, seeds_np)
+
+        # Apply per-grain rotations
+        pos_parts = []
+        spc_parts = []
+        for g in range(G):
+            mask_g = (grain_labels == g)
+            if not np.any(mask_g):
+                continue
+            pos_g = (pos_np[mask_g, :] @ R[g].T).astype(np.float32)
+            pos_parts.append(pos_g)
+            spc_parts.append(spc_np[mask_g])
+
+        if pos_parts:
+            return np.concatenate(pos_parts, axis=0), np.concatenate(spc_parts, axis=0)
+        return np.zeros((0, 3), dtype=np.float32), np.array([], dtype=spc_np.dtype if spc_np.size > 0 else object)
+
+    def _init_streaming_gpu_cache(self):
+        """
+        Initialize GPU cache for streaming mode invariants.
+
+        Uploads seeds, rotation matrices, and get_atomic_data invariants
+        to GPU once for reuse across all chunk generations.
+
+        Returns:
+            bool: True if GPU cache initialized successfully, False otherwise.
+        """
+        if cp is None:
+            return False
+
+        try:
+            # Check GPU availability
+            if int(cp.cuda.runtime.getDeviceCount()) < 1:
+                return False
+
+            material = self._streaming_material
+            if material is None:
+                return False
+
+            # Upload invariants to GPU
+            if self._grain_seeds is not None:
+                self._streaming_gpu_seeds_cp = cp.asarray(self._grain_seeds, dtype=cp.float32)
+            if self._grain_orientations is not None:
+                self._streaming_gpu_rotations_cp = cp.asarray(self._grain_orientations, dtype=cp.float32)
+            self._streaming_gpu_lattice_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
+            self._streaming_gpu_offset_cp = cp.asarray(self.offset, dtype=cp.float32)
+            self._streaming_gpu_dim_half_cp = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
+
+            return True
+
+        except Exception:
+            self._clear_streaming_gpu_cache()
+            return False
+
+    def _clear_streaming_gpu_cache(self):
+        """
+        Clear GPU cache for streaming mode invariants.
+
+        Frees GPU memory used by cached seeds, rotations, and other invariants.
+        Safe to call even if cache was never initialized.
+        """
+        self._streaming_gpu_seeds_cp = None
+        self._streaming_gpu_rotations_cp = None
+        self._streaming_gpu_lattice_cp = None
+        self._streaming_gpu_offset_cp = None
+        self._streaming_gpu_dim_half_cp = None
+
+        if cp is not None:
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+
+    def _generate_chunk_on_demand(self, chunk_number, use_gpu=True, return_positions=True):
+        """
+        Generate a file chunk on-demand for streaming mode.
+
+        Uses the pre-computed mapping from file chunks to geometric chunks to
+        generate atoms that match what non-streaming mode would produce.
+
+        Args:
+            chunk_number (int): 1-based file chunk index.
+            use_gpu (bool): Whether to use GPU and/or return GPU arrays.
+            return_positions (bool): If True, return positions; if False, return species.
+
+        Returns:
+            Positions array (N, 3) or species array (N,) depending on return_positions.
+
+        Raises:
+            RuntimeError: If streaming mode is active but material reference is not set.
+            ValueError: If chunk_number is out of range.
+        """
+        if self._streaming_material is None:
+            raise RuntimeError("Streaming mode requires material; call generate_sample_single/poly first")
+
+        if self._streaming_file_chunk_ranges is None:
+            raise RuntimeError("Streaming chunk mapping not computed; call generate_sample_single/poly first")
+
+        file_chunk_idx = chunk_number - 1
+        if file_chunk_idx < 0 or file_chunk_idx >= len(self._streaming_file_chunk_ranges):
+            raise ValueError(f"chunk_number {chunk_number} out of range [1, {len(self._streaming_file_chunk_ranges)}]")
+
+        # Get the mapping for this file chunk
+        start_geom, end_geom, start_offset, end_offset = self._streaming_file_chunk_ranges[file_chunk_idx]
+
+        # In streaming mode, use the GPU setting from sample generation, not from caller
+        effective_use_gpu = getattr(self, '_streaming_use_gpu', use_gpu)
+
+        # Generate atoms from all contributing geometric chunks
+        all_pos = []
+        all_spc = []
+
+        for geom_idx in range(start_geom, end_geom + 1):
+            pos, spc = self._generate_geometric_chunk(geom_idx, use_gpu=effective_use_gpu)
+
+            if pos.shape[0] == 0:
+                continue
+
+            # Apply slicing for boundary geometric chunks
+            if geom_idx == start_geom and geom_idx == end_geom:
+                # This file chunk is entirely within one geometric chunk
+                pos = pos[start_offset:end_offset]
+                spc = spc[start_offset:end_offset]
+            elif geom_idx == start_geom:
+                # First geometric chunk: take from start_offset to end
+                pos = pos[start_offset:]
+                spc = spc[start_offset:]
+            elif geom_idx == end_geom:
+                # Last geometric chunk: take from beginning to end_offset
+                pos = pos[:end_offset]
+                spc = spc[:end_offset]
+            # Middle geometric chunks: take all atoms (no slicing needed)
+
+            if pos.shape[0] > 0:
+                all_pos.append(pos)
+                all_spc.append(spc)
+
+        # Concatenate results
+        if all_pos:
+            positions = np.concatenate(all_pos, axis=0)
+            species = np.concatenate(all_spc, axis=0)
+        else:
+            positions = np.zeros((0, 3), dtype=np.float32)
+            species = np.array([], dtype=object)
+
+        # Apply temperature effects if enabled (same logic as load_chunk_positions)
+        if return_positions and self.enable_temp and positions.shape[0] > 0:
+            distribution = self.temp_params[0]
+            if distribution.lower() in ('gaussian', 'normal'):
+                T_K = getattr(self, '_thermal_expansion_T_ref', 300.0)
+            else:
+                T_K = float(self.temp_params[1])
+
+            if getattr(self, '_thermal_expansion_enabled', False):
+                positions = self.apply_thermal_expansion(positions, T_K)
+
+            positions = self.apply_temperature(
+                positions,
+                distribution=distribution,
+                sigma=self.temp_params[1],
+                max_displacement=self.temp_params[2],
+                seed=self.temp_params[3],
+                chunk_number=chunk_number
+            )
+
+        result = positions if return_positions else species
+
+        # Convert to GPU if requested
+        if use_gpu and (cp is not None):
+            return cp.asarray(result)
+        return result
+
+    # -------------------------------------
+
     # -------------------------------------
     # KNN search
     def write_chunk_nn_indices(self, index_list, chunk_num, override_directory=None):
@@ -769,7 +1263,10 @@ class sample(logging):
                     split_line = line.strip().split()
 
                     # Map 1-based species ID to label via provided element_list
-                    species_arr.append(element_list[int(split_line[ID_column]) - 1])
+                    if ID_column == 0:
+                        species_arr.append(element_list[0])
+                    else:
+                        species_arr.append(element_list[int(split_line[ID_column]) - 1])
 
                     # Convert coordinates; default keeps angstrom units unchanged
                     data_arr[i, 0] = float(split_line[position_columns[0]]) * float(scale / 1e-10)
@@ -2344,6 +2841,12 @@ class sample(logging):
             self._chunk_total = 0
             return
 
+        if self._streaming_mode:
+            self._streaming_use_gpu = use_gpu  # Remember GPU preference for streaming
+            self._streaming_material = material
+            self._compute_streaming_chunk_mapping(material, flush_size)
+            return
+
         flush_size = int(flush_size)
 
         from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
@@ -3138,6 +3641,17 @@ class sample(logging):
             R = np.asarray(self._grain_orientations, dtype=np.float32)
             if R.shape[0] != G:
                 raise ValueError("orientation map size does not match number of seeds")
+
+        # 2b) Compute chunk geometry (needed for both streaming and disk modes)
+        self._chunk_positions, self._chunk_dimensions = self.get_chunk_positions(material)
+        num_geom = int(self.chunk_positions.shape[0])
+
+        # STREAMING MODE: store material reference, compute mapping, and exit without writing files
+        if self._streaming_mode:
+            self._streaming_use_gpu = use_gpu  # Remember GPU preference for streaming
+            self._streaming_material = material
+            self._compute_streaming_chunk_mapping(material, flush_size)
+            return
 
         # 3) Writer and global accumulation buffers (same pattern as generate_sample_single)
         from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
@@ -4406,3 +4920,13 @@ class sample(logging):
         if not hasattr(self, "_sample_type"):
             self._sample_type = "single"
         return self._sample_type
+
+    @property
+    def streaming_mode(self):
+        """
+        Return True if streaming mode is enabled.
+
+        In streaming mode, chunks are generated on-demand during simulation
+        rather than being loaded from disk files.
+        """
+        return getattr(self, "_streaming_mode", False)
