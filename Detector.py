@@ -32,6 +32,7 @@ class detector(logging):
         "plot_detector_position",
         "get_detector_axis",
         "coordinate_conversion",
+        "add_noise",
     )
     
     # -----------------------------------------------------------------------------
@@ -786,6 +787,90 @@ class detector(logging):
         self._pixel_amplitude = np.abs(self.pixel_values)
         self._pixel_intensity = self.pixel_amplitude**2
 
+    def add_noise(self, noise_type, photon_flux=None, sigma=None, seed=None):
+        """
+        Add noise to the detector wavefield.
+
+        Args:
+            noise_type (str): Type of noise to apply:
+                'poisson'  — Shot noise from photon counting statistics.
+                    Noise is signal-dependent (stronger in low-count regions).
+                'gaussian' — Readout/electronic noise. Additive complex
+                    Gaussian noise with standard deviation relative to the
+                    mean field amplitude.
+                'uniform'  — Additive complex uniform noise, relative to
+                    the mean field amplitude.
+            photon_flux (float): For 'poisson' — expected photon count at
+                peak intensity. Higher values = less noise (higher dose).
+            sigma (float): For 'gaussian' and 'uniform' — noise level as a
+                fraction of the mean amplitude (e.g. 0.1 = 10% noise).
+            seed (int or None): Random seed for reproducibility.
+        """
+        if self._pixel_values is None:
+            raise ValueError("No pixel values to add noise to. "
+                             "Run a simulation first.")
+
+        rng = np.random.default_rng(seed)
+        E = np.array(self._pixel_values, dtype=np.complex64, copy=True)
+        noise_type = str(noise_type).lower()
+
+        if noise_type == 'poisson':
+            if photon_flux is None:
+                raise ValueError("photon_flux is required for Poisson noise")
+            photon_flux = float(photon_flux)
+
+            intensity = np.abs(E) ** 2
+            I_max = intensity.max()
+            if I_max <= 0.0:
+                print("[Detector] Warning: zero intensity, no Poisson noise applied")
+                return
+
+            # Scale to expected photon counts and sample
+            expected_counts = intensity * (photon_flux / I_max)
+            noisy_counts = rng.poisson(expected_counts).astype(np.float32)
+
+            # Reconstruct amplitude preserving phase
+            noisy_amplitude = np.sqrt(noisy_counts * (I_max / photon_flux))
+            phase = np.angle(E)
+            E = noisy_amplitude * (np.cos(phase) + 1j * np.sin(phase))
+            E = E.astype(np.complex64)
+
+            print(f"[Detector] Applied Poisson noise, photon_flux={photon_flux:.0f}")
+
+        elif noise_type == 'gaussian':
+            if sigma is None:
+                raise ValueError("sigma is required for Gaussian noise")
+            sigma = float(sigma)
+
+            A_mean = np.abs(E).mean()
+            noise_scale = sigma * A_mean / np.sqrt(2.0)
+            noise = noise_scale * (rng.standard_normal(E.shape).astype(np.float32)
+                                   + 1j * rng.standard_normal(E.shape).astype(np.float32))
+            E = E + noise
+            E = E.astype(np.complex64)
+
+            print(f"[Detector] Applied Gaussian noise, sigma={sigma:.4f}")
+
+        elif noise_type == 'uniform':
+            if sigma is None:
+                raise ValueError("sigma is required for uniform noise")
+            sigma = float(sigma)
+
+            A_mean = np.abs(E).mean()
+            noise_scale = sigma * A_mean
+            noise = noise_scale * (rng.uniform(-1, 1, E.shape).astype(np.float32)
+                                   + 1j * rng.uniform(-1, 1, E.shape).astype(np.float32))
+            E = E + noise
+            E = E.astype(np.complex64)
+
+            print(f"[Detector] Applied uniform noise, sigma={sigma:.4f}")
+
+        else:
+            raise ValueError(f"Unknown noise type '{noise_type}'. "
+                             f"Use 'poisson', 'gaussian', or 'uniform'.")
+
+        self.input_pixel_values(E)
+
     def coordinate_conversion(self,data,input_system="cartesian",output_system="angular",units="deg"):
         """
         Convert between Cartesian and angular coordinate systems.
@@ -1047,9 +1132,8 @@ class detector(logging):
             else:
                 ax1.set_title(title)
         else:
-            # Plane mode - use existing imshow implementation
             # Compute extent from half-size in each dimension
-            detector_extent = self._shape*self._pixel_size/2
+            detector_extent = np.array(self._shape) * np.array(self._pixel_size) / 2
             im = ax1.imshow(
                 plot_val,
                 extent=[-detector_extent[0], detector_extent[0], -detector_extent[1], detector_extent[1]],
