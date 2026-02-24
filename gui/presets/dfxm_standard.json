@@ -1,0 +1,67 @@
+{
+  "name": "DFXM Standard",
+  "category": "DFXM",
+  "description": "Standard Dark-Field X-ray Microscopy configuration for studying crystal defects and strain fields. Uses high-energy synchrotron radiation with objective lens magnification.",
+  "date": "2025-01-01T00:00:00",
+  "version": "1.0",
+  "parameters": {
+    "crystal": {
+      "lattice_parameters": {
+        "a": 4.05,
+        "b": 4.05,
+        "c": 4.05,
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0
+      },
+      "space_group": "Fm-3m",
+      "notes": "Aluminum FCC structure"
+    },
+    "sample": {
+      "dimensions": {
+        "Lx": 50000,
+        "Ly": 50000,
+        "Lz": 10000
+      },
+      "type": "single"
+    },
+    "beam": {
+      "energy": 17000,
+      "shape": "rectangular",
+      "Ny": 256,
+      "Nz": 256,
+      "Ly": 50000,
+      "Lz": 50000,
+      "profile": "uniform",
+      "polarization_rate": 0.99
+    },
+    "detector": {
+      "Ny": 2048,
+      "Nz": 2048,
+      "pixel_size": 0.75,
+      "distance": 5000000,
+      "two_theta": 0.0,
+      "eta": 0.0
+    },
+    "stage": {
+      "motors": {
+        "omega": 0.0,
+        "chi": 0.0,
+        "phi": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    "optics": {
+      "components": [
+        {
+          "type": "CRL",
+          "focal_length": 200000,
+          "aperture": 100,
+          "distance_from_sample": 300000
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "name": "Laue Diffraction",
+  "category": "Laue",
+  "description": "White-beam Laue diffraction configuration for crystal orientation determination. Uses polychromatic beam to capture multiple reflections simultaneously.",
+  "date": "2025-01-01T00:00:00",
+  "version": "1.0",
+  "parameters": {
+    "crystal": {
+      "lattice_parameters": {
+        "a": 5.43,
+        "b": 5.43,
+        "c": 5.43,
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0
+      },
+      "space_group": "Fd-3m",
+      "notes": "Silicon diamond cubic structure"
+    },
+    "sample": {
+      "dimensions": {
+        "Lx": 100000,
+        "Ly": 100000,
+        "Lz": 5000
+      },
+      "type": "single"
+    },
+    "beam": {
+      "energy": 20000,
+      "shape": "circular",
+      "Ny": 128,
+      "Nz": 128,
+      "Ly": 1000,
+      "Lz": 1000,
+      "profile": "gaussian",
+      "waist_y": 500,
+      "waist_z": 500,
+      "polarization_rate": 0.0
+    },
+    "detector": {
+      "Ny": 1024,
+      "Nz": 1024,
+      "pixel_size": 50.0,
+      "distance": 100000,
+      "two_theta": 90.0,
+      "eta": 0.0
+    },
+    "stage": {
+      "motors": {
+        "omega": 0.0,
+        "chi": 45.0,
+        "phi": 0.0,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    "optics": {
+      "components": []
+    }
+  }
+}

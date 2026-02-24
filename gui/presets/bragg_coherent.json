@@ -1,0 +1,78 @@
+{
+  "name": "Bragg Coherent Diffraction",
+  "category": "BCDI",
+  "description": "Bragg Coherent Diffraction Imaging configuration for 3D strain mapping of nanocrystals. Uses coherent synchrotron beam with high-resolution detector.",
+  "date": "2025-01-01T00:00:00",
+  "version": "1.0",
+  "parameters": {
+    "crystal": {
+      "lattice_parameters": {
+        "a": 4.078,
+        "b": 4.078,
+        "c": 4.078,
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0
+      },
+      "space_group": "Fm-3m",
+      "notes": "Gold FCC nanoparticle"
+    },
+    "sample": {
+      "dimensions": {
+        "Lx": 3000,
+        "Ly": 3000,
+        "Lz": 3000
+      },
+      "type": "single",
+      "notes": "300nm gold nanocrystal"
+    },
+    "beam": {
+      "energy": 9000,
+      "shape": "rectangular",
+      "Ny": 512,
+      "Nz": 512,
+      "Ly": 5000,
+      "Lz": 5000,
+      "profile": "gaussian",
+      "waist_y": 2500,
+      "waist_z": 2500,
+      "polarization_rate": 0.99,
+      "coherent": true
+    },
+    "detector": {
+      "Ny": 256,
+      "Nz": 256,
+      "pixel_size": 55.0,
+      "distance": 1500000,
+      "two_theta": 33.5,
+      "eta": 0.0,
+      "notes": "Maxipix detector at (111) Bragg peak"
+    },
+    "stage": {
+      "motors": {
+        "omega": 16.75,
+        "chi": 0.0,
+        "phi": 0.0,
+        "theta": 16.75,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    "optics": {
+      "components": [
+        {
+          "type": "FreeSpace",
+          "distance": 500000
+        }
+      ]
+    },
+    "scan": {
+      "type": "rocking_curve",
+      "motor": "theta",
+      "range": [-0.5, 0.5],
+      "steps": 101,
+      "notes": "Typical BCDI rocking curve scan"
+    }
+  }
+}

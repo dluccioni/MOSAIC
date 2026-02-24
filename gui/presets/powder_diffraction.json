@@ -1,0 +1,61 @@
+{
+  "name": "Powder Diffraction",
+  "category": "Powder",
+  "description": "Powder X-ray diffraction configuration for polycrystalline samples. Uses monochromatic beam with 2D area detector to capture Debye-Scherrer rings.",
+  "date": "2025-01-01T00:00:00",
+  "version": "1.0",
+  "parameters": {
+    "crystal": {
+      "lattice_parameters": {
+        "a": 4.05,
+        "b": 4.05,
+        "c": 4.05,
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0
+      },
+      "space_group": "Fm-3m",
+      "notes": "Generic FCC metal"
+    },
+    "sample": {
+      "dimensions": {
+        "Lx": 10000,
+        "Ly": 10000,
+        "Lz": 10000
+      },
+      "type": "polycrystalline",
+      "grain_size": 1000
+    },
+    "beam": {
+      "energy": 8047,
+      "shape": "circular",
+      "Ny": 64,
+      "Nz": 64,
+      "Ly": 500,
+      "Lz": 500,
+      "profile": "uniform",
+      "polarization_rate": 0.0,
+      "notes": "Cu K-alpha radiation"
+    },
+    "detector": {
+      "Ny": 2048,
+      "Nz": 2048,
+      "pixel_size": 172.0,
+      "distance": 200000,
+      "two_theta": 0.0,
+      "eta": 0.0,
+      "geometry": "flat"
+    },
+    "stage": {
+      "motors": {
+        "omega": 0.0,
+        "chi": 0.0,
+        "phi": 0.0,
+        "spinner": 0.0
+      }
+    },
+    "optics": {
+      "components": []
+    }
+  }
+}
