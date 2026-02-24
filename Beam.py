@@ -10,8 +10,10 @@ import threading
 from Logging import logging
 try:
     import cupy as cp
+    import cupyx
 except ImportError:
     cp = None
+    cupyx = None
 from cffi import FFI
 import databases.scattering
 import importlib.resources as pkg_resources
@@ -2513,8 +2515,9 @@ class beam(logging):
         srx = min(srx, 0.999999)
         sry = min(sry, 0.999999)
 
-        tanx = srx / np.sqrt(max(1e-18, 1.0 - srx * srx))
-        tany = sry / np.sqrt(max(1e-18, 1.0 - sry * sry))
+        # Cap tangent to prevent runaway padding when pixel_size < lambda/2
+        tanx = min(srx / np.sqrt(max(1e-18, 1.0 - srx * srx)), 2.0)
+        tany = min(sry / np.sqrt(max(1e-18, 1.0 - sry * sry)), 2.0)
 
         pad_x_m = safety * zabs * tanx
         pad_y_m = safety * zabs * tany
@@ -2528,6 +2531,11 @@ class beam(logging):
         # Enforce a minimum multiplicative padding if requested
         Nx2 = max(Nx2, int(np.ceil(Nx * min_pad_factor)))
         Ny2 = max(Ny2, int(np.ceil(Ny * min_pad_factor)))
+
+        # Cap padded dimensions to prevent GPU OOM from pow2 rounding
+        max_padded_dim = 8192
+        Nx2 = min(Nx2, max_padded_dim)
+        Ny2 = min(Ny2, max_padded_dim)
 
         if enforce_pow2:
             Nx2 = beam._next_pow_two(Nx2)
@@ -4106,11 +4114,6 @@ class beam(logging):
         """
         Compute per-slice forward integrals on the beam grid using GPU (Angstrom units).
 
-        Semantics match the CPU version:
-            - delta_int[k] = C * sum (f0(0) + f1) * W_TSC
-            - beta_int[k]  = C * sum (f2) * W_TSC
-        where phi_k = -k_A * delta_int[k], tau_k = k_A * beta_int[k] (with tau_k >= 0).
-
         Args:
             sample: Chunked sample object (same as CPU version).
             stage: Rigid transform object with rotation and translation (Angstrom).
@@ -4127,11 +4130,10 @@ class beam(logging):
             - Falls back to CPU if CuPy is unavailable or no GPU is detected.
             - Atom-wise forward factors assembled on host, then transferred once.
             - Depth binning uses cp.searchsorted on edges (Angstrom).
-            - TSC deposition vectorized; per-slice adds via _safe_bincount_gpu.
+            - TSC deposition vectorized via cupyx.scatter_add.
             - Optional per-slice Gaussian blur uses cuFFT; tau_k clamped >= 0.
         """
         if (cp is None) or (cp.cuda.runtime.getDeviceCount() < 1):
-            # Fallback to CPU and return NumPy arrays
             return self._compute_beam_slice_integrals_cpu(sample, stage, slice_edges_A, kernel_radius)
 
         nS = int(len(slice_edges_A) - 1)
@@ -4143,6 +4145,7 @@ class beam(logging):
         C = (r_e_A * (lam_A * lam_A)) / (2.0 * np.pi * A_pix_A2)
 
         NyB, NzB = int(self._beam_Ny), int(self._beam_Nz)
+        bins = NyB * NzB
         Rg = cp.asarray(stage.rotation, dtype=cp.float32)
         Tg = cp.asarray(stage.translation, dtype=cp.float32)
 
@@ -4150,13 +4153,11 @@ class beam(logging):
         e2g = cp.asarray(self._beam_e2, dtype=cp.float32)
         khatg = cp.asarray((self._direction / np.linalg.norm(self._direction)).astype(np.float32))
 
-        # DB on host, then broadcast to atoms on device as needed
         f1f2_dict = self.parse_f1f2_db_all("f1f2_CromerLiberman.dat")
         f0_params = self.parse_f0_db_all('f0_WaasKirf.dat')
         f0_zero   = self._build_f0_zero_dict(f0_params)
 
-        sum_real = [cp.zeros((NyB, NzB), dtype=cp.float32) for _ in range(nS)]
-        sum_imag = [cp.zeros((NyB, NzB), dtype=cp.float32) for _ in range(nS)]
+        edges_g = cp.asarray(slice_edges_A, dtype=cp.float32)
 
         def _tsc_w(d):
             w = cp.zeros_like(d, dtype=cp.float32)
@@ -4167,16 +4168,44 @@ class beam(logging):
             w[m1] = 0.5 * t * t
             return w
 
-        edges_g = cp.asarray(slice_edges_A, dtype=cp.float32)
+        # decide window size for accumulator
+        # Each window holds W slices; 2 flat arrays of W*bins float32
+        accum_bytes_full = int(nS) * bins * 4 * 2
+        try:
+            free_b, _ = cp.cuda.runtime.memGetInfo()
+            budget = int(0.5 * free_b)  # reserve 50 % for atom data + temporaries
+        except Exception:
+            budget = 2 * 1024**3  # 2 GB fallback
+        if accum_bytes_full <= budget:
+            window_size = nS  # fits in one shot
+        else:
+            window_size = max(1, budget // (bins * 4 * 2))
 
+        # Host-side accumulator for all slices
+        sum_real_host = np.zeros((nS, NyB, NzB), dtype=np.float32)
+        sum_imag_host = np.zeros((nS, NyB, NzB), dtype=np.float32)
+
+        # adaptive atom batch cap
+        def _atom_batch_cap():
+            try:
+                free_b, _ = cp.cuda.runtime.memGetInfo()
+                # Per-atom footprint: pos(12) + fr,fi(8) + projections ~80 bytes + TSC ~120 bytes
+                bytes_per_atom = 220
+                cap = int(0.4 * free_b / max(bytes_per_atom, 1))
+                return max(32768, cap)
+            except Exception:
+                return 2_000_000
+
+        # Pre-compute per-chunk host-side scattering factors
+        # to avoid redundant DB lookups when processing windows
+        chunk_data_cache = []
         for cid in range(1, int(sample.chunk_total or 0) + 1):
             spc = sample.load_chunk_species(cid, use_gpu=False)
             pos = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float32)
             nA = pos.shape[0]
             if nA == 0:
+                chunk_data_cache.append(None)
                 continue
-
-            # Build f0(0)+f1 and f2 per atom on host
             fr_h = np.zeros(nA, np.float32)
             fi_h = np.zeros(nA, np.float32)
             for el in np.unique(spc):
@@ -4188,73 +4217,98 @@ class beam(logging):
                     cplx = self.get_f1f2_from_params(self._energy, tbl)
                     fr_h[m] += float(cplx.real)
                     fi_h[m]  = float(cplx.imag)
+            chunk_data_cache.append((pos, fr_h, fi_h))
 
-            fr = cp.asarray(fr_h, dtype=cp.float32)
-            fi = cp.asarray(fi_h, dtype=cp.float32)
-            posg = cp.asarray(pos, dtype=cp.float32)
-            posg = posg @ Rg
-            posg += Tg
+        # Process slices in windows
+        for w_start in range(0, nS, window_size):
+            w_end = min(w_start + window_size, nS)
+            w_len = w_end - w_start
+            w_bins = w_len * bins
 
-            au = posg[:, 0]*e1g[0] + posg[:, 1]*e1g[1] + posg[:, 2]*e1g[2]
-            av = posg[:, 0]*e2g[0] + posg[:, 1]*e2g[1] + posg[:, 2]*e2g[2]
-            iu = au/float(self._beam_du) + float(self._beam_uc)
-            iv = av/float(self._beam_dv) + float(self._beam_vc)
+            sum_real_flat = cp.zeros(w_bins, dtype=cp.float32)
+            sum_imag_flat = cp.zeros(w_bins, dtype=cp.float32)
 
-            s_vals = posg[:, 0]*khatg[0] + posg[:, 1]*khatg[1] + posg[:, 2]*khatg[2]
-            ki = cp.clip(cp.searchsorted(edges_g, s_vals, side="right") - 1, 0, nS - 1)
+            for chunk_entry in chunk_data_cache:
+                if chunk_entry is None:
+                    continue
+                pos, fr_h, fi_h = chunk_entry
+                nA = pos.shape[0]
 
-            inb = (iu >= 0.0) & (iu <= (NyB - 1)) & (iv >= 0.0) & (iv <= (NzB - 1))
-            if not bool(inb.any()):
-                cp.get_default_memory_pool().free_all_blocks()
-                continue
+                batch_cap = _atom_batch_cap()
 
-            iu = iu[inb]; iv = iv[inb]
-            fr = fr[inb]; fi = fi[inb]; ki = ki[inb]
+                for b_start in range(0, nA, batch_cap):
+                    b_end = min(b_start + batch_cap, nA)
+                    pos_b = pos[b_start:b_end]
+                    fr_b_h = fr_h[b_start:b_end]
+                    fi_b_h = fi_h[b_start:b_end]
 
-            ic = cp.floor(iu + 0.5).astype(cp.int64)
-            jc = cp.floor(iv + 0.5).astype(cp.int64)
+                    fr = cp.asarray(fr_b_h, dtype=cp.float32)
+                    fi = cp.asarray(fi_b_h, dtype=cp.float32)
+                    posg = cp.asarray(pos_b, dtype=cp.float32)
+                    posg = posg @ Rg
+                    posg += Tg
 
-            du_m1 = cp.abs(iu - (ic - 1)); du_0 = cp.abs(iu - ic); du_p1 = cp.abs(iu - (ic + 1))
-            dv_m1 = cp.abs(iv - (jc - 1)); dv_0 = cp.abs(iv - jc); dv_p1 = cp.abs(iv - (jc + 1))
+                    au = posg[:, 0]*e1g[0] + posg[:, 1]*e1g[1] + posg[:, 2]*e1g[2]
+                    av = posg[:, 0]*e2g[0] + posg[:, 1]*e2g[1] + posg[:, 2]*e2g[2]
+                    iu = au/float(self._beam_du) + float(self._beam_uc)
+                    iv = av/float(self._beam_dv) + float(self._beam_vc)
 
-            wu_m1, wu_0, wu_p1 = _tsc_w(du_m1), _tsc_w(du_0), _tsc_w(du_p1)
-            wv_m1, wv_0, wv_p1 = _tsc_w(dv_m1), _tsc_w(dv_0), _tsc_w(dv_p1)
+                    s_vals = posg[:, 0]*khatg[0] + posg[:, 1]*khatg[1] + posg[:, 2]*khatg[2]
+                    ki = cp.clip(cp.searchsorted(edges_g, s_vals, side="right") - 1, 0, nS - 1)
 
-            bins = NyB * NzB
-
-            for dx, wx in [(-1, wu_m1), (0, wu_0), (1, wu_p1)]:
-                ii = ic + dx
-                for dy, wy in [(-1, wv_m1), (0, wv_0), (1, wv_p1)]:
-                    jj = jc + dy
-                    fac = wx * wy
-                    mask = (ii >= 0) & (ii < NyB) & (jj >= 0) & (jj < NzB) & (fac > 0.0)
-                    if not bool(mask.any()):
+                    # Filter to atoms within beam grid AND current slice window
+                    inb = ((iu >= 0.0) & (iu <= (NyB - 1)) &
+                           (iv >= 0.0) & (iv <= (NzB - 1)) &
+                           (ki >= w_start) & (ki < w_end))
+                    if not bool(inb.any()):
+                        del posg, fr, fi, au, av, iu, iv, s_vals, ki, inb
+                        cp.get_default_memory_pool().free_all_blocks()
                         continue
 
-                    rows = ii[mask]; cols = jj[mask]
-                    pidx = (rows * NzB + cols).astype(cp.int64)
-                    wsel = fac[mask]
-                    frs  = fr[mask]
-                    fis  = fi[mask]
-                    kis  = ki[mask]
+                    iu = iu[inb]; iv = iv[inb]
+                    fr = fr[inb]; fi = fi[inb]
+                    ki = (ki[inb] - w_start).astype(cp.int64)  # local slice index
 
-                    us = cp.unique(kis)
-                    for s in us.tolist():
-                        ms = (kis == s)
-                        if not bool(ms.any()):
-                            continue
-                        addR = self._safe_bincount_gpu(pidx[ms], (frs[ms] * wsel[ms]).astype(cp.float32), bins, dtype=cp.float32)
-                        addI = self._safe_bincount_gpu(pidx[ms], (fis[ms] * wsel[ms]).astype(cp.float32), bins, dtype=cp.float32)
-                        sum_real[s] += addR.reshape(NyB, NzB)
-                        sum_imag[s] += addI.reshape(NyB, NzB)
+                    ic = cp.floor(iu + 0.5).astype(cp.int64)
+                    jc = cp.floor(iv + 0.5).astype(cp.int64)
 
+                    du_m1 = cp.abs(iu - (ic - 1)); du_0 = cp.abs(iu - ic); du_p1 = cp.abs(iu - (ic + 1))
+                    dv_m1 = cp.abs(iv - (jc - 1)); dv_0 = cp.abs(iv - jc); dv_p1 = cp.abs(iv - (jc + 1))
+
+                    wu_m1, wu_0, wu_p1 = _tsc_w(du_m1), _tsc_w(du_0), _tsc_w(du_p1)
+                    wv_m1, wv_0, wv_p1 = _tsc_w(dv_m1), _tsc_w(dv_0), _tsc_w(dv_p1)
+
+                    # fused scatter_add over (slice, pixel)
+                    for dx, wx in [(-1, wu_m1), (0, wu_0), (1, wu_p1)]:
+                        ii = ic + dx
+                        for dy, wy in [(-1, wv_m1), (0, wv_0), (1, wv_p1)]:
+                            jj = jc + dy
+                            fac = wx * wy
+                            mask = (ii >= 0) & (ii < NyB) & (jj >= 0) & (jj < NzB) & (fac > 0.0)
+                            if not bool(mask.any()):
+                                continue
+                            pidx = (ii[mask] * NzB + jj[mask]).astype(cp.int64)
+                            flat_idx = (ki[mask] * bins + pidx)
+                            wsel = fac[mask]
+                            cupyx.scatter_add(sum_real_flat, flat_idx, (fr[mask] * wsel).astype(cp.float32))
+                            cupyx.scatter_add(sum_imag_flat, flat_idx, (fi[mask] * wsel).astype(cp.float32))
+
+                    del posg, au, av, iu, iv, s_vals, inb, ic, jc
+                    del du_m1, du_0, du_p1, dv_m1, dv_0, dv_p1
+                    del wu_m1, wu_0, wu_p1, wv_m1, wv_0, wv_p1
+                    cp.get_default_memory_pool().free_all_blocks()
+
+            # Copy window results to host
+            sum_real_host[w_start:w_end] = sum_real_flat.reshape(w_len, NyB, NzB).get()
+            sum_imag_host[w_start:w_end] = sum_imag_flat.reshape(w_len, NyB, NzB).get()
+            del sum_real_flat, sum_imag_flat
             cp.get_default_memory_pool().free_all_blocks()
 
-        # Convert sums to per-slice integrals on GPU
-        delta_int = [cp.asarray(C, dtype=cp.float32) * sr for sr in sum_real]
-        beta_int  = [cp.asarray(C, dtype=cp.float32) * si for si in sum_imag]
+        # Convert sums to per-slice integrals (keep on host as numpy)
+        delta_int = [np.float32(C) * sum_real_host[s] for s in range(nS)]
+        beta_int  = [np.float32(C) * sum_imag_host[s] for s in range(nS)]
 
-        # Optional blur per slice
+        # Optional blur per slice (transiently on GPU, one at a time)
         if int(kernel_radius) > 0 and len(delta_int) > 0:
             rad = int(kernel_radius); sig = max(1e-6, rad / 2.0)
             yg = cp.arange(-rad, rad + 1, dtype=cp.float32)[:, None]
@@ -4263,10 +4317,15 @@ class beam(logging):
             kg /= cp.sum(kg)
             Fk = cp.fft.fft2(kg, delta_int[0].shape)
             for i in range(len(delta_int)):
-                d = cp.fft.ifft2(cp.fft.fft2(delta_int[i]) * Fk).real.astype(cp.float32)
-                b = cp.fft.ifft2(cp.fft.fft2(beta_int[i])  * Fk).real.astype(cp.float32)
-                beta_int[i]  = cp.maximum(cp.float32(0.0), b)
-                delta_int[i] = d
+                d_g = cp.asarray(delta_int[i])
+                b_g = cp.asarray(beta_int[i])
+                d_g = cp.fft.ifft2(cp.fft.fft2(d_g) * Fk).real.astype(cp.float32)
+                b_g = cp.fft.ifft2(cp.fft.fft2(b_g) * Fk).real.astype(cp.float32)
+                b_g = cp.maximum(cp.float32(0.0), b_g)
+                delta_int[i] = d_g.get()
+                beta_int[i]  = b_g.get()
+            del d_g, b_g
+            cp.get_default_memory_pool().free_all_blocks()
 
         return delta_int, beta_int
     
@@ -4279,6 +4338,7 @@ class beam(logging):
         use_gpu=True,
         max_slices=2048,
         n_init=None,
+        absorption_multiplier=1.0,
     ):
         """
         Choose the number of projection slices so each slice stays in the linear regime.
@@ -4299,6 +4359,9 @@ class beam(logging):
                 refinement. Defaults to 2048.
             n_init (int or None, optional): If provided, start refinement from this
                 value instead of the computed lower bound n0.
+            absorption_multiplier (float, optional): Multiplicative factor for
+                absorption coefficient. Applied when checking tau bounds.
+                Defaults to 1.0.
 
         Returns:
             tuple: (n_final, edges_A, delta_list, beta_list, info) where:
@@ -4339,37 +4402,77 @@ class beam(logging):
             phi_tot_max = float(np.max(np.abs(np.angle(Ab))))
             tau_tot_max = float(np.max(np.maximum(-np.log(np.abs(Ab) + np.float32(1e-20)), 0.0)))
 
-        n0 = int(max(1, np.ceil(max(phi_tot_max, tau_tot_max) / ts)))
-        n = int(max(1, n_init if (n_init is not None) else n0))
-        n = min(n, int(max_slices))
+        abs_m = float(absorption_multiplier)
+        n0 = int(max(1, np.ceil(max(phi_tot_max, abs_m * tau_tot_max) / ts)))
+        n_start = int(max(1, n_init if (n_init is not None) else n0))
+        n_start = min(n_start, int(max_slices))
 
-        # Iteratively refine based on true per-slice maxima
-        while True:
-            edges_A = np.linspace(s_min_A, s_max_A, n + 1, dtype=np.float32)
+        # Round up to the next power of 2 so all coarser trial values divide evenly
+        n_fine = n_start
+        p = 1
+        while p < n_fine:
+            p *= 2
+        n_fine = min(p, int(max_slices))
 
-            if use_gpu:
-                delta_list, beta_list = self._compute_beam_slice_integrals_gpu(sample, stage, edges_A, kernel_radius)
-                phi_max = 0.0
-                tau_max = 0.0
-                for d, b in zip(delta_list, beta_list):
-                    # phi_k = -kA * delta_int; tau_k = kA * beta_int
-                    pm = float(cp.max(cp.abs((-kA) * d)).get())
-                    tm = float(cp.max(cp.maximum(kA * b, cp.float32(0.0))).get())
-                    if pm > phi_max: phi_max = pm
-                    if tm > tau_max: tau_max = tm
+        # Compute slice integrals ONCE at the finest resolution
+        edges_fine = np.linspace(s_min_A, s_max_A, n_fine + 1, dtype=np.float32)
+        if use_gpu:
+            delta_fine, beta_fine = self._compute_beam_slice_integrals_gpu(
+                sample, stage, edges_fine, kernel_radius)
+        else:
+            delta_fine, beta_fine = self._compute_beam_slice_integrals_cpu(
+                sample, stage, edges_fine, kernel_radius)
+
+        # Helper: check max per-slice phase/attenuation for a given n
+        # by merging groups of (n_fine // n) consecutive fine slices.
+        # Slice integrals are numpy arrays (host-side) so use numpy ops.
+        def _check_n(n_trial):
+            if n_trial == n_fine:
+                d_list, b_list = delta_fine, beta_fine
             else:
-                delta_list, beta_list = self._compute_beam_slice_integrals_cpu(sample, stage, edges_A, kernel_radius)
-                phi_max = 0.0
-                tau_max = 0.0
-                for d, b in zip(delta_list, beta_list):
-                    pm = float(np.max(np.abs((-kA) * d)))
-                    tm = float(np.max(np.maximum(kA * b, 0.0)))
-                    if pm > phi_max: phi_max = pm
-                    if tm > tau_max: tau_max = tm
+                group = n_fine // n_trial
+                d_list, b_list = [], []
+                for i in range(n_trial):
+                    s = i * group
+                    d_merged = delta_fine[s].copy()
+                    b_merged = beta_fine[s].copy()
+                    for j in range(1, group):
+                        d_merged += delta_fine[s + j]
+                        b_merged += beta_fine[s + j]
+                    d_list.append(d_merged)
+                    b_list.append(b_merged)
 
-            if max(phi_max, tau_max) <= ts or n >= int(max_slices):
+            phi_max = 0.0
+            tau_max = 0.0
+            for d, b in zip(d_list, b_list):
+                pm = float(np.max(np.abs((-kA) * d)))
+                tm = float(np.max(np.maximum(kA * abs_m * b, 0.0)))
+                if pm > phi_max: phi_max = pm
+                if tm > tau_max: tau_max = tm
+
+            return phi_max, tau_max, d_list, b_list
+
+        # Search from coarsest (n_start) upward by doubling until target is met
+        n = n_start
+        while True:
+            # Only trial values that evenly divide n_fine
+            n_trial = min(n, n_fine)
+            while n_fine % n_trial != 0 and n_trial < n_fine:
+                n_trial += 1
+            n_trial = min(n_trial, n_fine)
+
+            phi_max, tau_max, d_list, b_list = _check_n(n_trial)
+
+            if max(phi_max, tau_max) <= ts or n_trial >= int(max_slices):
+                edges_out = np.linspace(s_min_A, s_max_A, n_trial + 1, dtype=np.float32)
                 info = {"phi_max": float(phi_max), "tau_max": float(tau_max), "n0": int(n0)}
-                return int(max(1, n)), edges_A, delta_list, beta_list, info
+                return int(max(1, n_trial)), edges_out, d_list, b_list, info
+
+            if n_trial >= n_fine:
+                # Already at finest resolution computed; return it
+                edges_out = np.linspace(s_min_A, s_max_A, n_fine + 1, dtype=np.float32)
+                info = {"phi_max": float(phi_max), "tau_max": float(tau_max), "n0": int(n0)}
+                return int(max(1, n_fine)), edges_out, delta_fine, beta_fine, info
 
             n = min(n * 2, int(max_slices))
 
@@ -4724,7 +4827,7 @@ class beam(logging):
                             use_gpu=True, kernel_radius=0,
                             padding_mode="edge", pad_constant=0.0,
                             n_slices=None, target_phase_step=0.1,
-                            pad_factor=2):
+                            pad_factor=2, absorption_multiplier=1.0):
         """
         Compute projection-only multislice transmission.
 
@@ -4753,6 +4856,10 @@ class beam(logging):
                 (radians / unitless) for auto-slicer. Defaults to 0.1.
             pad_factor (float, optional): Minimum multiplicative padding for
                 angular-spectrum FFT sizes (>= 1). Defaults to 2.
+            absorption_multiplier (float, optional): Multiplicative factor applied to
+                the absorption coefficient (beta / imaginary part of refractive index).
+                1.0 = physical absorption, 0.0 = no absorption, >1.0 = enhanced.
+                Defaults to 1.0.
 
         Returns:
             np.ndarray: Complex64 array of shape (Ny, Nx) with the exit field sampled
@@ -4785,6 +4892,8 @@ class beam(logging):
         beta_list = None
         edges_A = None
 
+        abs_m = float(absorption_multiplier)
+
         if thickness_A <= 0.0:
             n_final = 1
         else:
@@ -4796,7 +4905,8 @@ class beam(logging):
                     target_step=float(target_phase_step),
                     use_gpu=use_gpu,
                     max_slices=2048,
-                    n_init=None
+                    n_init=None,
+                    absorption_multiplier=abs_m
                 )
             else:
                 n_final = int(max(1, n_slices))
@@ -4804,16 +4914,12 @@ class beam(logging):
         print(f"{n_final} steps used")
         
         # -------- Build exit wave on the beam grid (projection-only multislice) --------
-        if thickness_A <= 0.0 or n_final <= 1:
-            # Single-slice projection (or zero thickness)
+        if thickness_A <= 0.0:
+            # Zero thickness — no interaction, pass beam through unchanged
             if use_gpu:
-                A_beam = self._compute_beam_column_A_map_gpu(sample, stage, kernel_radius)
-                E_exit = (cp.asarray(self._beam_E0_map.astype(np.complex64)) *
-                        cp.asarray(A_beam).astype(cp.complex64)).astype(cp.complex64)
+                E_exit = cp.asarray(self._beam_E0_map.astype(np.complex64))
             else:
-                A_beam = self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius)
-                E_exit = (self._beam_E0_map.astype(np.complex64) *
-                        np.asarray(A_beam, dtype=np.complex64)).astype(np.complex64)
+                E_exit = self._beam_E0_map.astype(np.complex64)
         else:
             # Product of per-slice transmissions only (no intra-slice propagation)
             if edges_A is None:
@@ -4826,11 +4932,19 @@ class beam(logging):
                     )
                 E = cp.asarray(self._beam_E0_map.astype(np.complex64))
                 for k in range(n_final):
-                    phi_k = (-kA * delta_list[k]).astype(cp.float32)
-                    tau_k = ( kA * beta_list[k]).astype(cp.float32)
+                    # Transfer one slice at a time to GPU (host numpy -> device)
+                    dk = cp.asarray(delta_list[k])
+                    bk = cp.asarray(beta_list[k])
+                    phi_k = (-kA * dk).astype(cp.float32)
+                    tau_k = (kA * abs_m * bk).astype(cp.float32)
                     tau_k = cp.maximum(tau_k, cp.float32(0.0))
-                    A_k = cp.exp((-tau_k).astype(cp.float32) + 1j * phi_k).astype(cp.complex64)
+                    arg_k = cp.empty_like(phi_k, dtype=cp.complex64)
+                    arg_k.real = -tau_k
+                    arg_k.imag = phi_k
+                    A_k = cp.exp(arg_k)
                     E = (E * A_k).astype(cp.complex64)
+                    del dk, bk, phi_k, tau_k, arg_k, A_k
+                    cp.get_default_memory_pool().free_all_blocks()
                 E_exit = E
             else:
                 if delta_list is None or beta_list is None:
@@ -4840,9 +4954,12 @@ class beam(logging):
                 E = self._beam_E0_map.astype(np.complex64)
                 for k in range(n_final):
                     phi_k = (-kA * delta_list[k]).astype(np.float32)
-                    tau_k = ( kA * beta_list[k]).astype(np.float32)
+                    tau_k = (kA * abs_m * beta_list[k]).astype(np.float32)
                     tau_k = np.maximum(tau_k, np.float32(0.0))
-                    A_k = np.exp((-tau_k).astype(np.float32) + 1j * phi_k).astype(np.complex64)
+                    arg_k = np.empty_like(phi_k, dtype=np.complex64)
+                    arg_k.real = -tau_k
+                    arg_k.imag = phi_k
+                    A_k = np.exp(arg_k)
                     E = (E * A_k).astype(np.complex64)
                 E_exit = E
 
@@ -6007,7 +6124,7 @@ class beam(logging):
             - All GPU toggles honor CuPy availability; when CuPy is not present,
             CPU implementations are used regardless of requested GPU usage.
         """
-        Nx, Ny = detector.shape
+        Ny, Nx = detector.shape
         final_field = np.zeros((Ny, Nx), dtype=np.complex64)
 
         # -------- Compute and combine terms --------
