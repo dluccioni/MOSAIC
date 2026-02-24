@@ -1231,60 +1231,90 @@ class sample(logging):
               and ``_rotation`` are updated.
             - This function streams lines to bound memory usage on very large files.
         """
+        from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
+
         chunk_num = 0  # running chunk counter
 
         # Track bounding box while streaming the file
         x_min = y_min = z_min = float('inf')
         x_max = y_max = z_max = float('-inf')
 
-        # Open and iterate in batches of up to flush_size lines
-        with open(import_file, "r") as f:
-            # Skip header lines at the top of the file
-            for _ in range(header_lines):
-                next(f)
+        # Thread pool for async disk writes (mirrors generate_sample_single pattern)
+        def _write_chunk(idx, pos_arr, spc_arr):
+            self.write_chunk_positions(pos_arr, idx, override_directory=override_directory)
+            self.write_chunk_species(spc_arr, idx, override_directory=override_directory)
+            return idx
 
-            while True:
-                lines = []
-                # Collect up to flush_size lines for this batch
-                for _ in range(flush_size):
-                    line = f.readline()
-                    if not line:
+        writer_pool = ThreadPoolExecutor(
+            max_workers=max(1, SAMPLE_WRITER_THREADS),
+            thread_name_prefix="import_writer"
+        )
+        pending_writes = []
+
+        # Determine which columns to read and their order in the output array
+        scale_factor = float(scale / 1e-10)
+        read_species = (ID_column != 0)
+        if read_species:
+            cols_to_read = list(position_columns) + [ID_column]
+            element_arr = np.array(element_list)
+        else:
+            cols_to_read = list(position_columns)
+
+        try:
+            # Open and iterate in batches of up to flush_size rows
+            with open(import_file, "r") as f:
+                # Skip header lines at the top of the file
+                for _ in range(header_lines):
+                    next(f)
+
+                while True:
+                    # Read up to flush_size rows with C-optimized parsing
+                    try:
+                        raw_data = np.loadtxt(
+                            f,
+                            max_rows=flush_size,
+                            usecols=cols_to_read,
+                            dtype=np.float64,
+                            ndmin=2
+                        )
+                    except (StopIteration, ValueError):
                         break
-                    lines.append(line)
 
-                # End when we have no more lines
-                if not lines:
-                    break
+                    if raw_data.size == 0:
+                        break
 
-                # Parse positions/species from the batch
-                data_arr = np.zeros((len(lines), 3), dtype=np.float32)
-                species_arr = []
-                for i, line in enumerate(lines):
-                    split_line = line.strip().split()
+                    n_atoms = raw_data.shape[0]
 
-                    # Map 1-based species ID to label via provided element_list
-                    if ID_column == 0:
-                        species_arr.append(element_list[0])
+                    # Extract and scale positions (first 3 columns correspond to position_columns)
+                    data_arr = (raw_data[:, :3] * scale_factor).astype(np.float32)
+
+                    # Vectorized bounding box update
+                    chunk_min = data_arr.min(axis=0)
+                    chunk_max = data_arr.max(axis=0)
+                    x_min = min(x_min, chunk_min[0])
+                    y_min = min(y_min, chunk_min[1])
+                    z_min = min(z_min, chunk_min[2])
+                    x_max = max(x_max, chunk_max[0])
+                    y_max = max(y_max, chunk_max[1])
+                    z_max = max(z_max, chunk_max[2])
+
+                    # Map species IDs to element labels
+                    if read_species:
+                        species_ids = raw_data[:, 3].astype(np.int32)
+                        species_arr = element_arr[species_ids - 1]
                     else:
-                        species_arr.append(element_list[int(split_line[ID_column]) - 1])
+                        species_arr = np.full(n_atoms, element_list[0])
 
-                    # Convert coordinates; default keeps angstrom units unchanged
-                    data_arr[i, 0] = float(split_line[position_columns[0]]) * float(scale / 1e-10)
-                    data_arr[i, 1] = float(split_line[position_columns[1]]) * float(scale / 1e-10)
-                    data_arr[i, 2] = float(split_line[position_columns[2]]) * float(scale / 1e-10)
+                    # Submit async write (copy to isolate from next iteration)
+                    chunk_num += 1
+                    pending_writes.append(
+                        writer_pool.submit(_write_chunk, chunk_num, data_arr.copy(), species_arr.copy())
+                    )
 
-                    # Update bounding box online to avoid a second pass
-                    if data_arr[i, 0] < x_min: x_min = data_arr[i, 0]
-                    if data_arr[i, 0] > x_max: x_max = data_arr[i, 0]
-                    if data_arr[i, 1] < y_min: y_min = data_arr[i, 1]
-                    if data_arr[i, 1] > y_max: y_max = data_arr[i, 1]
-                    if data_arr[i, 2] < z_min: z_min = data_arr[i, 2]
-                    if data_arr[i, 2] > z_max: z_max = data_arr[i, 2]
-
-                # Bump the chunk index and persist this batch
-                chunk_num += 1
-                self.write_chunk_positions(data_arr, chunk_num, override_directory=override_directory)
-                self.write_chunk_species(species_arr, chunk_num, override_directory=override_directory)
+            # Wait for all writes to complete before setting metadata
+            wait(pending_writes, return_when=ALL_COMPLETED)
+        finally:
+            writer_pool.shutdown(wait=True)
 
         # Record how many chunks were written to disk
         self._chunk_total = chunk_num
