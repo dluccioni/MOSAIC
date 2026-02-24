@@ -24,6 +24,7 @@ class optics(logging):
         "add_CRL_box",
         "add_bragg_magnifier_2b",
         "add_aperture",
+        "add_fresnel_zone_plate",
         "add_custom_component",
         "plot_stack_3d",
         "read_optics_metadata",
@@ -418,6 +419,95 @@ class optics(logging):
         out = Eo.get() if on_gpu else np.asarray(Eo)
         return out.astype(np.complex64)
 
+    def _apply_fresnel_zone_plate(self, field, dx, dy, zp_data,
+                                  wavelength=None, use_gpu=True):
+        """
+        Apply a Fresnel zone plate as a real-space binary transmission mask.
+
+        Zone boundaries are at r_n = sqrt(n * lambda * f), where n is the zone
+        index. For an amplitude FZP, even zones transmit and odd zones are
+        opaque. For a phase FZP, even zones transmit with phase 0 and odd zones
+        with phase pi. All diffraction orders are naturally produced.
+
+        Args:
+            field (array-like): Complex field, shape (Ny, Nx).
+            dx (float): Pixel size along x in meters.
+            dy (float): Pixel size along y in meters.
+            zp_data (dict): Zone plate parameters from add_fresnel_zone_plate.
+            wavelength (float or None): Wavelength in meters.
+            use_gpu (bool): If True and CuPy is available, use GPU path.
+
+        Returns:
+            np.ndarray: Complex64 field after FZP transmission.
+        """
+        if wavelength is None:
+            raise ValueError("wavelength must be provided to _apply_fresnel_zone_plate")
+
+        dr_N_m  = float(zp_data['outermost_zone_width_nm']) * 1e-9
+        D_m     = float(zp_data['diameter_um']) * 1e-6
+        order   = int(zp_data.get('order', 1))
+        eff     = float(zp_data.get('efficiency', 1.0))
+        cs      = float(zp_data.get('central_stop_fraction', 0.0))
+        zp_type = str(zp_data.get('zone_plate_type', 'amplitude')).lower()
+
+        # Focal length and radius
+        f   = D_m * dr_N_m / (order * float(wavelength))
+        R   = D_m / 2.0
+        amp = float(np.sqrt(max(eff, 0.0)))
+
+        Ny, Nx = int(field.shape[0]), int(field.shape[1])
+        on_gpu = bool(use_gpu and (cp is not None))
+        xp = cp if on_gpu else np
+
+        # Real-space coordinate grids (meters, centered)
+        cx = (Nx - 1) / 2.0
+        cy = (Ny - 1) / 2.0
+        x = (xp.arange(Nx, dtype=xp.float32) - cx) * float(dx)
+        y = (xp.arange(Ny, dtype=xp.float32) - cy) * float(dy)
+        R2 = x[None, :] ** 2 + y[:, None] ** 2
+
+        # Zone index: n(r) = r^2 / (lambda * f)
+        n_zone = R2 / (float(wavelength) * f)
+        zone_parity = xp.floor(n_zone).astype(xp.int32) % 2  # 0=even, 1=odd
+
+        # Circular aperture
+        inside = R2 <= (R * R)
+
+        # Central stop
+        if cs > 0.0:
+            R_stop = R * cs
+            inside = inside & (R2 >= (R_stop * R_stop))
+
+        # Build transmission
+        T = xp.zeros((Ny, Nx), dtype=xp.complex64)
+        if zp_type == 'ideal':
+            # Ideal thin-lens phase within circular aperture (1st order only)
+            k_val = 2.0 * xp.pi / float(wavelength)
+            phase = -0.5 * (k_val / f) * R2
+            T[inside] = amp * (xp.cos(phase[inside]) + 1j * xp.sin(phase[inside]))
+        elif zp_type == 'phase':
+            # Phase FZP: even zones +amp, odd zones -amp (pi phase shift)
+            T[inside & (zone_parity == 0)] = amp
+            T[inside & (zone_parity == 1)] = -amp
+        else:
+            # Amplitude FZP: even zones transmit, odd zones blocked
+            T[inside & (zone_parity == 0)] = amp
+
+        # Edge apodization (Tukey/cosine taper)
+        taper = float(zp_data.get('edge_taper', 0.0))
+        if taper > 0.0:
+            r = xp.sqrt(R2)
+            r_inner = R * (1.0 - taper)
+            taper_zone = (r > r_inner) & (r <= R)
+            window = 0.5 * (1.0 + xp.cos(xp.pi * (r[taper_zone] - r_inner) / (R * taper)))
+            T[taper_zone] *= window.astype(xp.float32)
+
+        # Apply transmission
+        E = xp.asarray(field, dtype=xp.complex64)
+        E = E * T
+
+        return (E.get() if on_gpu else np.asarray(E)).astype(np.complex64)
+
     def _apply_aperture(self, field, dx, dy, aperture_data, use_gpu=True):
         """
         Apply a real-space aperture (square or circular) centered on the field.
@@ -544,6 +634,13 @@ class optics(logging):
                 E = self._apply_bragg_magnifier_2b(
                     E, dx, dy, elem, use_gpu=use_gpu
                 )
+                Mx = abs(float(elem.get('magnification_x', 1.0)))
+                My = abs(float(elem.get('magnification_y', 1.0)))
+                if Mx > 0:
+                    dx = dx / Mx
+                if My > 0:
+                    dy = dy / My
+                print(f"[Optics]   -> pixel size updated: dx={dx:.4e} m, dy={dy:.4e} m")
 
             elif kind == "angular filter":
                 print(f"[Optics] Component {i+1}: angular filter, half_angle={elem.get('half_angle_x_mrad')} mrad")
@@ -555,6 +652,25 @@ class optics(logging):
                 print(f"[Optics] Component {i+1}: aperture, width={elem.get('width')} mm, shape={elem.get('type', elem.get('shape'))}")
                 E = self._apply_aperture(
                     E, dx, dy, elem, use_gpu=use_gpu
+                )
+
+            elif kind == "zone plate":
+                dr_nm = float(elem.get('outermost_zone_width_nm'))
+                dr_m  = dr_nm * 1e-9
+                D_um  = float(elem.get('diameter_um'))
+                D_m   = D_um * 1e-6
+                m_ord = int(elem.get('order', 1))
+                NA_zp = min(m_ord * float(wavelength) / (2.0 * dr_m), 1.0)
+                res_nm = 1.22 * dr_nm
+                f_m = D_m * dr_m / (m_ord * float(wavelength))
+                f_mm = f_m * 1e3
+                N_zones = int(D_m / (2.0 * dr_m))
+                zp_type = elem.get('zone_plate_type', 'amplitude')
+                print(f"[Optics] Component {i+1}: zone plate ({zp_type}), dr_N={dr_nm} nm, "
+                      f"D={D_um} um, NA={NA_zp:.4f}, res={res_nm:.2f} nm, "
+                      f"f={f_mm:.4e} mm, N_zones={N_zones}")
+                E = self._apply_fresnel_zone_plate(
+                    E, dx, dy, elem, wavelength=wavelength, use_gpu=use_gpu
                 )
 
             else:
@@ -808,6 +924,50 @@ class optics(logging):
             'kind'  : 'aperture',
             'type'  : shape.lower(),
             'width' : float(width_mm)
+        })
+
+    def add_fresnel_zone_plate(self, outermost_zone_width_nm, diameter_um,
+                               efficiency=1.0, order=1,
+                               central_stop_fraction=0.0,
+                               zone_plate_type='amplitude',
+                               edge_taper=0.0):
+        """
+        Add a Fresnel zone plate to the optics stack.
+
+        The FZP is modeled as a real-space binary transmission mask. Zone
+        boundaries are defined by r_n = sqrt(n * lambda * f), where
+        f = D * dr_N / (m * lambda). Even zones transmit and odd zones are
+        either opaque (amplitude FZP) or pi-shifted (phase FZP).
+
+        Args:
+            outermost_zone_width_nm (float): Width of the outermost zone in
+                nanometers. Determines resolution (1.22 * dr_N) and NA
+                (lambda / (2 * dr_N)) for the 1st order.
+            diameter_um (float): Zone plate diameter in micrometers.
+                Determines focal length f = D * dr_N / (m * lambda) and
+                the number of zones N = D / (2 * dr_N).
+            efficiency (float): Diffraction efficiency into the imaging order
+                (0-1). Amplitude is scaled by sqrt(efficiency). Default 1.0.
+            order (int): Diffraction order used for imaging. Default 1.
+            central_stop_fraction (float): Fraction of the zone plate radius
+                blocked by a central stop (0-1). Default 0.0.
+            zone_plate_type (str): 'ideal' (thin-lens phase, 1st order only),
+                'amplitude' (binary open/blocked zones, all orders), or
+                'phase' (binary 0/pi phase shift, all orders). Default 'amplitude'.
+            edge_taper (float): Fraction of the radius over which transmission
+                tapers smoothly to zero (0-1). Uses a cosine taper (Tukey window).
+                0.0 = hard edge (strong Airy rings), 0.5 = taper over outer half.
+                Default 0.0.
+        """
+        self._components.append({
+            'kind'                   : 'zone plate',
+            'outermost_zone_width_nm': float(outermost_zone_width_nm),
+            'diameter_um'            : float(diameter_um),
+            'efficiency'             : float(efficiency),
+            'order'                  : int(order),
+            'central_stop_fraction'  : float(central_stop_fraction),
+            'zone_plate_type'        : str(zone_plate_type).lower(),
+            'edge_taper'             : float(edge_taper),
         })
 
     def add_custom_component(self, component):
