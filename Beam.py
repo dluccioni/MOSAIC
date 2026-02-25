@@ -622,6 +622,7 @@ class beam(logging):
             float k_val,                  // 2*pi/lambda [rad/m]
             int   apply_pol,              // 0/1
             float pol_perp_rate,          // rho_perp in [0,1]
+            int   apply_spherical_decay,  // 0/1
             float *out_r, float *out_i    // (Nx*Ny)
         )
         {
@@ -771,7 +772,7 @@ class beam(logging):
 
                     // (A) Relative spherical-decay factor: R0 / r_det
                     float scale_rel = 1.0f;
-                    if (r_det > 0.0f) {
+                    if (apply_spherical_decay && r_det > 0.0f) {
                         float R0_local;
                         if (have_r0) {
                             R0_local = R0_arr[p];
@@ -828,6 +829,7 @@ class beam(logging):
                 float k_val,
                 int   apply_pol,
                 float pol_perp_rate,
+                int   apply_spherical_decay,
                 float *out_r, float *out_i
             );
         """)
@@ -3239,8 +3241,8 @@ class beam(logging):
             coords_x_ptr, coords_y_ptr, coords_z_ptr,
             k_val,
             int(1 if apply_polarization else 0),
-            int(1 if apply_spherical_decay else 0),
             float(self._pol_perp_rate),
+            int(1 if apply_spherical_decay else 0),
             out_r_ptr, out_i_ptr
         )
 
@@ -6124,7 +6126,7 @@ class beam(logging):
             - All GPU toggles honor CuPy availability; when CuPy is not present,
             CPU implementations are used regardless of requested GPU usage.
         """
-        Ny, Nx = detector.shape
+        Nx, Ny = detector.shape
         final_field = np.zeros((Ny, Nx), dtype=np.complex64)
 
         # -------- Compute and combine terms --------
