@@ -1276,70 +1276,79 @@ class beam(logging):
 
             int ix = blockIdx.x * blockDim.x + threadIdx.x;
             int iy = blockIdx.y * blockDim.y + threadIdx.y;
-            if (ix >= Nx || iy >= Ny) return;
-            const int pidx = iy * Nx + ix;
+            const bool valid_pixel = (ix < Nx && iy < Ny);
+            const int pidx = valid_pixel ? (iy * Nx + ix) : 0;
 
-            float tx = x_coords[pidx];
-            float ty = y_coords[pidx];
-            float tz = z_coords[pidx];
+            // Per-pixel state (initialised only for valid threads)
+            float tx = 0.f, ty = 0.f, tz = 0.f;
+            float R0 = 0.f, invR0 = 0.f;
+            float ux = 0.f, uy = 0.f, uz = 0.f;
+            float k_global = 0.f;
+            float sb = 0.f, cb = 1.f;
+            float Q_cut = 0.f;
+            float cx = 0.f, cy = 0.f, cz = 0.f;
+            float cos_accept = 0.f;
+            float2 sum_rel = make_float2(0.0f, 0.0f);
 
-            // Pixel sightline and unit vector from origin
-            float R0 = sqrtf(tx*tx + ty*ty + tz*tz);
-            float invR0 = 0.0f, ux = 0.0f, uy = 0.0f, uz = 0.0f;
-            if (R0 > 0.0f) {
-                invR0 = 1.0f / R0;
-                ux = tx * invR0;
-                uy = ty * invR0;
-                uz = tz * invR0;
+            if (valid_pixel) {
+                tx = x_coords[pidx];
+                ty = y_coords[pidx];
+                tz = z_coords[pidx];
+
+                // Pixel sightline and unit vector from origin
+                R0 = sqrtf(tx*tx + ty*ty + tz*tz);
+                if (R0 > 0.0f) {
+                    invR0 = 1.0f / R0;
+                    ux = tx * invR0;
+                    uy = ty * invR0;
+                    uz = tz * invR0;
+                }
+
+                k_global = fabsf(kx_atom[0]);
+
+                // Base phasor exp(i*k*R0)
+                sincos_k_times_reduced(k_global, R0, sb, cb);
+
+                // Q_cut from local pixel size
+                {
+                    int n_right = (ix + 1 < Nx) ? (pidx + 1) : ((ix > 0) ? (pidx - 1) : pidx);
+                    int n_up    = (iy + 1 < Ny) ? (pidx + Nx) : ((iy > 0) ? (pidx - Nx) : pidx);
+
+                    // neighbor +x/-x
+                    float rx = x_coords[n_right];
+                    float ry = y_coords[n_right];
+                    float rz = z_coords[n_right];
+                    float Rr = sqrtf(rx*rx + ry*ry + rz*rz);
+                    float urx = 0.0f, ury = 0.0f, urz = 0.0f;
+                    if (Rr > 0.0f) { float invRr = 1.0f / Rr; urx = rx*invRr; ury = ry*invRr; urz = rz*invRr; }
+                    float cos_dx = ux*urx + uy*ury + uz*urz;
+                    cos_dx = fminf(1.0f, fmaxf(-1.0f, cos_dx));
+                    float Qx = k_global * __fsqrt_rn(fmaxf(0.0f, 2.0f * (1.0f - cos_dx)));
+
+                    // neighbor +y/-y
+                    float ux2 = x_coords[n_up];
+                    float uy2 = y_coords[n_up];
+                    float uz2 = z_coords[n_up];
+                    float Ru = sqrtf(ux2*ux2 + uy2*uy2 + uz2*uz2);
+                    float vux = 0.0f, vuy = 0.0f, vuz = 0.0f;
+                    if (Ru > 0.0f) { float invRu = 1.0f / Ru; vux = ux2*invRu; vuy = uy2*invRu; vuz = uz2*invRu; }
+                    float cos_dy = ux*vux + uy*vuy + uz*vuz;
+                    cos_dy = fminf(1.0f, fmaxf(-1.0f, cos_dy));
+                    float Qy = k_global * __fsqrt_rn(fmaxf(0.0f, 2.0f * (1.0f - cos_dy)));
+
+                    // diagonal half-width in Q (approximate pixel "radius" in Q-space)
+                    float Qhx = 0.5f * Qx;
+                    float Qhy = 0.5f * Qy;
+                    Q_cut = __fsqrt_rn(Qhx*Qhx + Qhy*Qhy);
+                }
+
+                // Normalized analyser centre axis
+                float cen_norm = sqrtf(centre_x*centre_x + centre_y*centre_y + centre_z*centre_z);
+                if (cen_norm > 0.0f) { float invC = 1.0f / cen_norm; cx = centre_x*invC; cy = centre_y*invC; cz = centre_z*invC; }
+                cos_accept = cosf(accept_angle_rad);
             }
 
-            if (nAtoms <= 0) return;
-            float k_global = fabsf(kx_atom[0]);
-
-            // Base phasor exp(i*k*R0)
-            float sb, cb;
-            sincos_k_times_reduced(k_global, R0, sb, cb);
-
-            // Q_cut from local pixel size
-            float Q_cut = 0.0f;
-            {
-                int n_right = (ix + 1 < Nx) ? (pidx + 1) : ((ix > 0) ? (pidx - 1) : pidx);
-                int n_up    = (iy + 1 < Ny) ? (pidx + Nx) : ((iy > 0) ? (pidx - Nx) : pidx);
-
-                // neighbor +x/-x
-                float rx = x_coords[n_right];
-                float ry = y_coords[n_right];
-                float rz = z_coords[n_right];
-                float Rr = sqrtf(rx*rx + ry*ry + rz*rz);
-                float urx = 0.0f, ury = 0.0f, urz = 0.0f;
-                if (Rr > 0.0f) { float invRr = 1.0f / Rr; urx = rx*invRr; ury = ry*invRr; urz = rz*invRr; }
-                float cos_dx = ux*urx + uy*ury + uz*urz;
-                cos_dx = fminf(1.0f, fmaxf(-1.0f, cos_dx));
-                float Qx = k_global * __fsqrt_rn(fmaxf(0.0f, 2.0f * (1.0f - cos_dx)));
-
-                // neighbor +y/-y
-                float ux2 = x_coords[n_up];
-                float uy2 = y_coords[n_up];
-                float uz2 = z_coords[n_up];
-                float Ru = sqrtf(ux2*ux2 + uy2*uy2 + uz2*uz2);
-                float vux = 0.0f, vuy = 0.0f, vuz = 0.0f;
-                if (Ru > 0.0f) { float invRu = 1.0f / Ru; vux = ux2*invRu; vuy = uy2*invRu; vuz = uz2*invRu; }
-                float cos_dy = ux*vux + uy*vuy + uz*vuz;
-                cos_dy = fminf(1.0f, fmaxf(-1.0f, cos_dy));
-                float Qy = k_global * __fsqrt_rn(fmaxf(0.0f, 2.0f * (1.0f - cos_dy)));
-
-                // diagonal half-width in Q (approximate pixel "radius" in Q-space)
-                float Qhx = 0.5f * Qx;
-                float Qhy = 0.5f * Qy;
-                Q_cut = __fsqrt_rn(Qhx*Qhx + Qhy*Qhy);
-            }
-
-            // Normalized analyser centre axis
-            float cen_norm = sqrtf(centre_x*centre_x + centre_y*centre_y + centre_z*centre_z);
-            float cx = 0.0f, cy = 0.0f, cz = 0.0f;
-            if (cen_norm > 0.0f) { float invC = 1.0f / cen_norm; cx = centre_x*invC; cy = centre_y*invC; cz = centre_z*invC; }
-            float cos_accept = cosf(accept_angle_rad);
-
+            // Shared memory and thread indexing — ALL threads must participate
             __shared__ float  s_px[CHUNK_SIZE];
             __shared__ float  s_py[CHUNK_SIZE];
             __shared__ float  s_pz[CHUNK_SIZE];
@@ -1350,8 +1359,6 @@ class beam(logging):
 
             const int threads_in_block = blockDim.x * blockDim.y;
             const int t_id = threadIdx.y * blockDim.x + threadIdx.x;
-
-            float2 sum_rel = make_float2(0.0f, 0.0f);
 
             for (int base = 0; base < nAtoms; base += CHUNK_SIZE) {
                 for (int t = t_id; t < CHUNK_SIZE; t += threads_in_block) {
@@ -1368,118 +1375,123 @@ class beam(logging):
                 }
                 __syncthreads();
 
-                #pragma unroll 4
-                for (int j = 0; j < CHUNK_SIZE; ++j) {
-                    int a = base + j;
-                    if (a >= nAtoms) break;
+                // Only valid pixels process atoms
+                if (valid_pixel) {
+                    #pragma unroll 4
+                    for (int j = 0; j < CHUNK_SIZE; ++j) {
+                        int a = base + j;
+                        if (a >= nAtoms) break;
 
-                    float ax = s_px[j];
-                    float ay = s_py[j];
-                    float az = s_pz[j];
+                        float ax = s_px[j];
+                        float ay = s_py[j];
+                        float az = s_pz[j];
 
-                    float dx = tx - ax;
-                    float dy = ty - ay;
-                    float dz = tz - az;
-                    float r_det = sqrtf(dx*dx + dy*dy + dz*dz);
-                    if (!(r_det > 0.0f)) continue;
+                        float dx = tx - ax;
+                        float dy = ty - ay;
+                        float dz = tz - az;
+                        float r_det = sqrtf(dx*dx + dy*dy + dz*dz);
+                        if (!(r_det > 0.0f)) continue;
 
-                    // +x incidence approximation
-                    float dotv = dx / r_det;
+                        // +x incidence approximation
+                        float dotv = dx / r_det;
 
-                    float tmp = 2.0f * (1.0f - dotv);
-                    if (tmp < 0.0f) tmp = 0.0f;
-                    float Q_val = k_global * __fsqrt_rn(tmp);
+                        float tmp = 2.0f * (1.0f - dotv);
+                        if (tmp < 0.0f) tmp = 0.0f;
+                        float Q_val = k_global * __fsqrt_rn(tmp);
 
-                    const float* param_ptr = &s_params[j*11];
-                    float f0v = get_f0_from_params(Q_val, param_ptr);
+                        const float* param_ptr = &s_params[j*11];
+                        float f0v = get_f0_from_params(Q_val, param_ptr);
 
-                    // Build scattering factor and optionally remove full forward amplitude
-                    float2 s_tot;
-                    s_tot.x = f0v + s_anm[j].x;
-                    s_tot.y = s_anm[j].y;
+                        // Build scattering factor and optionally remove full forward amplitude
+                        float2 s_tot;
+                        s_tot.x = f0v + s_anm[j].x;
+                        s_tot.y = s_anm[j].y;
 
-                    if (remove_forward && (Q_val < Q_cut)) {
-                        s_tot.x -= (s_f0z[j] + s_anm[j].x);
-                        s_tot.y -= (s_anm[j].y);
-                    }
-
-                    float2 amp = s_amp[j];
-                    float real_part = amp.x * s_tot.x - amp.y * s_tot.y;
-                    float imag_part = amp.x * s_tot.y + amp.y * s_tot.x;
-
-                    float delta_r;
-                    #if GLOBAL_USE_SERIES
-                        if (R0 > 0.0f) {
-                            float sproj = fmaf(uz, az, fmaf(uy, ay, ux*ax));
-                            float a2    = fmaf(az, az, fmaf(ay, ay, ax*ax));
-                            float tval  = -2.0f * sproj * invR0 + a2 * (invR0 * invR0);
-                            delta_r = R0 * sqrt1pm1_series(tval);
-                        } else {
-                            delta_r = r_det;
+                        if (remove_forward && (Q_val < Q_cut)) {
+                            s_tot.x -= (s_f0z[j] + s_anm[j].x);
+                            s_tot.y -= (s_anm[j].y);
                         }
-                    #else
-                        delta_r = r_det - R0;
-                    #endif
 
-                    float s_rel, c_rel;
-                    sincos_k_times_reduced(k_global, ax + delta_r, s_rel, c_rel);
+                        float2 amp = s_amp[j];
+                        float real_part = amp.x * s_tot.x - amp.y * s_tot.y;
+                        float imag_part = amp.x * s_tot.y + amp.y * s_tot.x;
 
-                    float2 val;
-                    val.x = real_part * c_rel - imag_part * s_rel;
-                    val.y = real_part * s_rel + imag_part * c_rel;
-
-                    if (apply_polarization) {
-                        float P = pol_perp_rate + (1.0f - pol_perp_rate) * (dotv * dotv);
-                        P = fminf(1.0f, fmaxf(0.0f, P));
-                        float sc = __fsqrt_rn(P);
-                        val.x *= sc; val.y *= sc;
-                    }
-
-                    // Optional analyser
-                    if (apply_analyser) {
-                        // unit direction from atom -> pixel
-                        float inv_rd = 1.0f / r_det;
-                        float rux = dx * inv_rd;
-                        float ruy = dy * inv_rd;
-                        float ruz = dz * inv_rd;
-                        float cosang = rux*cx + ruy*cy + ruz*cz;
-                        cosang = fminf(1.0f, fmaxf(-1.0f, cosang));
-
-                        float scaleA = 1.0f;
-                        if (analyser_kind == 1) {
-                            // top-hat acceptance
-                            if (cosang < cos_accept) scaleA = 0.0f;
-                        } else if (analyser_kind == 2) {
-                            float delta = acosf(cosang);
-                            float hw = darwin_halfwidth_rad;
-                            if (hw > 0.0f) {
-                                float r = delta / hw;
-                                scaleA = 1.0f / (1.0f + r*r);
+                        float delta_r;
+                        #if GLOBAL_USE_SERIES
+                            if (R0 > 0.0f) {
+                                float sproj = fmaf(uz, az, fmaf(uy, ay, ux*ax));
+                                float a2    = fmaf(az, az, fmaf(ay, ay, ax*ax));
+                                float tval  = -2.0f * sproj * invR0 + a2 * (invR0 * invR0);
+                                delta_r = R0 * sqrt1pm1_series(tval);
                             } else {
-                                scaleA = 1.0f;
+                                delta_r = r_det;
                             }
+                        #else
+                            delta_r = r_det - R0;
+                        #endif
+
+                        float s_rel, c_rel;
+                        sincos_k_times_reduced(k_global, ax + delta_r, s_rel, c_rel);
+
+                        float2 val;
+                        val.x = real_part * c_rel - imag_part * s_rel;
+                        val.y = real_part * s_rel + imag_part * c_rel;
+
+                        if (apply_polarization) {
+                            float P = pol_perp_rate + (1.0f - pol_perp_rate) * (dotv * dotv);
+                            P = fminf(1.0f, fmaxf(0.0f, P));
+                            float sc = __fsqrt_rn(P);
+                            val.x *= sc; val.y *= sc;
                         }
-                        val.x *= scaleA; val.y *= scaleA;
-                    }
 
-                    // Optional relative spherical decay
-                    float amp_rel = 1.0f;
-                    if (apply_spherical_decay) {
-                        amp_rel = (R0 > 0.0f) ? (R0 / r_det) : 1.0f;
-                    }
+                        // Optional analyser
+                        if (apply_analyser) {
+                            // unit direction from atom -> pixel
+                            float inv_rd = 1.0f / r_det;
+                            float rux = dx * inv_rd;
+                            float ruy = dy * inv_rd;
+                            float ruz = dz * inv_rd;
+                            float cosang = rux*cx + ruy*cy + ruz*cz;
+                            cosang = fminf(1.0f, fmaxf(-1.0f, cosang));
 
-                    sum_rel.x += val.x * rE_F * amp_rel;
-                    sum_rel.y += val.y * rE_F * amp_rel;
+                            float scaleA = 1.0f;
+                            if (analyser_kind == 1) {
+                                // top-hat acceptance
+                                if (cosang < cos_accept) scaleA = 0.0f;
+                            } else if (analyser_kind == 2) {
+                                float delta = acosf(cosang);
+                                float hw = darwin_halfwidth_rad;
+                                if (hw > 0.0f) {
+                                    float r = delta / hw;
+                                    scaleA = 1.0f / (1.0f + r*r);
+                                } else {
+                                    scaleA = 1.0f;
+                                }
+                            }
+                            val.x *= scaleA; val.y *= scaleA;
+                        }
+
+                        // Optional relative spherical decay
+                        float amp_rel = 1.0f;
+                        if (apply_spherical_decay) {
+                            amp_rel = (R0 > 0.0f) ? (R0 / r_det) : 1.0f;
+                        }
+
+                        sum_rel.x += val.x * rE_F * amp_rel;
+                        sum_rel.y += val.y * rE_F * amp_rel;
+                    }
                 }
                 __syncthreads();
             }
 
-            float2 sum_rot;
-            sum_rot.x = sum_rel.x * cb - sum_rel.y * sb;
-            sum_rot.y = sum_rel.x * sb + sum_rel.y * cb;
+            if (valid_pixel) {
+                float2 sum_rot;
+                sum_rot.x = sum_rel.x * cb - sum_rel.y * sb;
+                sum_rot.y = sum_rel.x * sb + sum_rel.y * cb;
 
-            detector_field[pidx].x += sum_rot.x;
-            detector_field[pidx].y += sum_rot.y;
+                detector_field[pidx].x += sum_rot.x;
+                detector_field[pidx].y += sum_rot.y;
+            }
         } // kernel
 
         } // extern "C"

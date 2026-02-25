@@ -1264,8 +1264,20 @@ class detector(logging):
                 plot_val_2d = plot_val_2d.T
 
             # Compute extent from angular coordinates
-            eta_min, eta_max = eta_pixels.min(), eta_pixels.max()
-            two_theta_min, two_theta_max = two_theta_pixels.min(), two_theta_pixels.max()
+            if geometry == 'ring' and hasattr(self, '_angular_range') and self._angular_range is not None:
+                # Use stored angular parameters for correct extent
+                two_theta_min, two_theta_max = self._angular_range
+                if not degrees:
+                    two_theta_min = np.deg2rad(two_theta_min)
+                    two_theta_max = np.deg2rad(two_theta_max)
+                # Eta covers full 360° ring
+                if degrees:
+                    eta_min, eta_max = 0.0, 360.0
+                else:
+                    eta_min, eta_max = 0.0, 2.0 * np.pi
+            else:
+                eta_min, eta_max = eta_pixels.min(), eta_pixels.max()
+                two_theta_min, two_theta_max = two_theta_pixels.min(), two_theta_pixels.max()
 
             im = ax.imshow(
                 plot_val_2d,  # Transpose: shape is (Ny, Nz), imshow expects (rows, cols)
