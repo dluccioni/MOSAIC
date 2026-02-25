@@ -257,7 +257,7 @@ class detector(logging):
                 two_theta_lin = two_theta_inner + (np.arange(N_two_theta, dtype=np.float32) + 0.5) * d_two_theta_rad
                 eta_lin = 2.0 * np.pi * (np.arange(N_eta, dtype=np.float32) + 0.5) / N_eta
 
-                ETA, TWO_THETA = np.meshgrid(eta_lin, two_theta_lin, indexing='xy')
+                TWO_THETA, ETA = np.meshgrid(two_theta_lin, eta_lin, indexing='xy')
 
                 if self._construction_mode == 'plane':
                     # Build at unit distance (r = tan(2theta))
@@ -283,7 +283,7 @@ class detector(logging):
                 j_lin = np.arange(self.shape[1], dtype=np.float32)
                 r_lin = r_in + (i_lin + 0.5) * self.pixel_size[0]
                 phi_lin = 2.0 * np.pi * (j_lin + 0.5) / self.shape[1]
-                PHI, R = np.meshgrid(phi_lin, r_lin, indexing='xy')
+                R, PHI = np.meshgrid(r_lin, phi_lin, indexing='xy')
                 Y = R * np.cos(PHI)
                 Z = R * np.sin(PHI)
                 X = np.zeros_like(Y)
@@ -346,7 +346,7 @@ class detector(logging):
                 eta_lin = 2.0 * np.pi * (np.arange(self.shape[1], dtype=np.float32) + 0.5) / self.shape[1]
 
                 # Create meshgrid
-                ETA, TWO_THETA = np.meshgrid(eta_lin, two_theta_lin, indexing='xy')
+                TWO_THETA, ETA = np.meshgrid(two_theta_lin, eta_lin, indexing='xy')
 
                 # Convert to Cartesian on unit sphere
                 # Standard spherical coordinates: (theta=two_theta from +x axis, phi=eta azimuthal)
@@ -1257,8 +1257,11 @@ class detector(logging):
 
         if is_regular_angular_grid:
             # Direct imshow - pixels form a regular grid in angular space
-            # Reshape to 2D array matching detector shape
-            plot_val_2d = plot_val.reshape(self._shape)
+            # Reshape using natural kernel layout: (slow=shape[1], fast=shape[0])
+            plot_val_2d = plot_val.reshape(self._shape[1], self._shape[0])
+            # Ring geometry: rows=eta, cols=2theta → transpose so rows=2theta for imshow
+            if geometry == 'ring':
+                plot_val_2d = plot_val_2d.T
 
             # Compute extent from angular coordinates
             eta_min, eta_max = eta_pixels.min(), eta_pixels.max()
