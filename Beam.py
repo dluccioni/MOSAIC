@@ -5990,6 +5990,11 @@ class beam(logging):
         # constants
         k_val_m = np.float32(2.0 * np.pi / float(self._wavelength))  # rad/m
 
+        # Beam-map setup for initial amplitude sampling (matches kinematic path)
+        s_min, s_max = self._compute_global_depth_bounds(sample, stage)
+        if getattr(self, "_ein_kernel", None) is None:
+            self._ein_kernel = self.build_ein_sampler_kernel()
+
         def gpu_worker(gpu_id, chunk_list, out_idx):
             cp.cuda.Device(gpu_id).use()
 
@@ -6000,6 +6005,14 @@ class beam(logging):
             lut_f0p = cp.asarray(code_to_f0_params)
             lut_f0z = cp.asarray(code_to_f0_zero)
             lut_anm = cp.asarray(code_to_anom)
+
+            # Beam field maps for initial amplitude sampling (matches kinematic path)
+            E0_g  = cp.asarray(self._beam_E0_map.astype(np.complex64))
+            tau_g = cp.zeros(E0_g.shape, dtype=cp.float32)
+            phi_g = cp.zeros_like(tau_g)
+            e1g   = cp.asarray(self._beam_e1.astype(np.float32))
+            e2g   = cp.asarray(self._beam_e2.astype(np.float32))
+            khatg = cp.asarray((self._direction / np.linalg.norm(self._direction)).astype(np.float32))
 
             dfield_gpu = cp.zeros((Ny * Nz,), dtype=cp.complex64)
 
@@ -6042,7 +6055,13 @@ class beam(logging):
                 pz_at = (pos[:, 2] / 1e10).astype(cp.float32)
 
                 # bounce 0: scatter to detector using per-path Q (k_in = +x)
-                amp0 = cp.ones((nA,), dtype=cp.complex64)
+                # Sample beam field map for initial amplitudes (matches kinematic path)
+                amp0 = self._ein_for_positions_gpu_fast(
+                    pos_g=pos,
+                    tau_g=tau_g, phi_g=phi_g, E0_g=E0_g,
+                    e1g=e1g, e2g=e2g, khat_g=khatg,
+                    s_min=np.float32(s_min), s_max=np.float32(s_max)
+                )
                 kx0  = cp.full((nA,), self._kx_scalar, dtype=cp.float32)
                 ky0  = cp.full((nA,), self._ky_scalar, dtype=cp.float32)
                 kz0  = cp.full((nA,), self._kz_scalar, dtype=cp.float32)
@@ -6317,7 +6336,7 @@ class beam(logging):
 
             # write partial image
             partial_results[out_idx] = dfield_gpu.reshape((Nz, Ny)).get()
-            del xg, yg, zg, dfield_gpu
+            del xg, yg, zg, dfield_gpu, E0_g, tau_g, phi_g, e1g, e2g, khatg
             cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
 
