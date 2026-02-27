@@ -98,11 +98,9 @@ class detector(logging):
             - ring + spatial: (N_two_theta, N_eta) bin counts
             - ring + angular: (two_theta_inner, two_theta_outer) in degrees
           pixel_size (tuple[float, float]): Depends on geometry, construction_mode, and input_mode:
-            - rectangular + plane + spatial: (dy, dz) in Angstroms — dy = width spacing, dz = height spacing
-            - rectangular + shell + spatial: (d_theta_y, d_theta_z) in degrees — d_theta_y = width, d_theta_z = height
+            - rectangular + spatial (plane or shell): (dy, dz) in Angstroms — dy = width spacing, dz = height spacing
             - rectangular + angular: (d_theta_y, d_theta_z) in degrees — d_theta_y = width, d_theta_z = height
-            - ring + plane + spatial: (d_two_theta, d_eta) in Angstroms
-            - ring + shell + spatial: (d_two_theta, d_eta) in degrees
+            - ring + spatial (plane or shell): (d_two_theta, d_eta) in Angstroms
             - ring + angular: (d_two_theta, d_eta) in degrees
           geometry (str): "rectangular" (default) or "ring".
           construction_mode (str): "plane" (default) or "shell".
@@ -188,14 +186,26 @@ class detector(logging):
                                          endpoint=False, dtype=np.float32)
                 theta_z_lin += (theta_z_max_rad - theta_z_min_rad) / (2 * Nz)
 
-                # Build at unit distance using gnomonic projection
+                # Build pixel coordinates from angular positions.
+                # Each pixel at (theta_y, theta_z) corresponds to the direction
+                # (1, tan(theta_y), tan(theta_z)) from the origin.
                 THETA_Y, THETA_Z = np.meshgrid(theta_y_lin, theta_z_lin)
-                rho = np.sqrt(THETA_Y**2 + THETA_Z**2)
-                c = np.arctan(rho)
-                mask = rho > 1e-10
-                X = np.cos(c)
-                Y = np.where(mask, np.sin(c) * (THETA_Y / rho), 0.0).astype(np.float32)
-                Z = np.where(mask, np.sin(c) * (THETA_Z / rho), 0.0).astype(np.float32)
+
+                if self._construction_mode == 'plane':
+                    # Flat plane at X=0 (unit distance convention, matching spatial mode).
+                    # tan(angle) gives the physical offset on a flat plane at unit distance.
+                    X = np.zeros_like(THETA_Y, dtype=np.float32)
+                    Y = np.tan(THETA_Y).astype(np.float32)
+                    Z = np.tan(THETA_Z).astype(np.float32)
+                else:  # shell
+                    # Unit sphere: normalise direction (1, tan(theta_y), tan(theta_z)).
+                    TAN_Y = np.tan(THETA_Y)
+                    TAN_Z = np.tan(THETA_Z)
+                    norm = np.sqrt(1.0 + TAN_Y**2 + TAN_Z**2)
+                    X = (1.0 / norm).astype(np.float32)
+                    Y = (TAN_Y / norm).astype(np.float32)
+                    Z = (TAN_Z / norm).astype(np.float32)
+
                 self._pixel_coordinates = np.vstack((X.ravel(), Y.ravel(), Z.ravel()))
 
             else:  # spatial mode (existing behavior)
@@ -291,71 +301,10 @@ class detector(logging):
         else:
             raise ValueError(f"Unknown geometry '{geometry}'. Choose 'rectangular' or 'ring'.")
 
-        # Apply shell projection if construction_mode is 'shell' ----------------
-        # Note: For angular mode, shell projection is already applied during geometry creation
-        if self._construction_mode == 'shell' and self._input_mode == 'spatial':
-            # Get the current plane coordinates
-            X_plane, Y_plane, Z_plane = self._pixel_coordinates
-
-            if geometry.lower() == 'rectangular':
-                # For rectangular geometry on shell, interpret pixel_size as angular spacing (degrees)
-                # Convert to radians
-                theta_y = np.deg2rad(self.pixel_size[0])
-                theta_z = np.deg2rad(self.pixel_size[1])
-
-                # Create angular grid centered on 0 (in radians)
-                theta_y_lin = np.linspace(-(self.shape[0]/2) * theta_y,
-                                          +(self.shape[0]/2) * theta_y,
-                                          self.shape[0], dtype=np.float32)
-                theta_z_lin = np.linspace(-(self.shape[1]/2) * theta_z,
-                                          +(self.shape[1]/2) * theta_z,
-                                          self.shape[1], dtype=np.float32)
-
-                # Create meshgrid of angular coordinates
-                THETA_Y, THETA_Z = np.meshgrid(theta_y_lin, theta_z_lin)
-
-                # Use gnomonic (tangent plane) projection to map to unit sphere
-                # This creates a rectangular patch on the sphere centered at (1,0,0)
-                rho = np.sqrt(THETA_Y**2 + THETA_Z**2)
-                c = np.arctan(rho)
-
-                # Handle the center point (rho=0) to avoid division by zero
-                mask = rho > 1e-10
-                X_shell = np.cos(c)
-                Y_shell = np.zeros_like(THETA_Y)
-                Z_shell = np.zeros_like(THETA_Z)
-
-                # For non-zero rho, compute spherical projection
-                Y_shell = np.where(mask, np.sin(c) * (THETA_Y / rho), 0.0)
-                Z_shell = np.where(mask, np.sin(c) * (THETA_Z / rho), 0.0)
-
-                # Update pixel coordinates with shell projection
-                self._pixel_coordinates = np.vstack((X_shell.ravel(), Y_shell.ravel(), Z_shell.ravel()))
-
-            elif geometry.lower() == 'ring':
-                # For ring geometry on shell, interpret pixel_size as angular spacing (degrees)
-                # Convert to radians
-                d_two_theta_rad = np.deg2rad(self.pixel_size[0])
-                d_eta_rad = np.deg2rad(self.pixel_size[1])
-
-                # Create angular arrays
-                # two_theta: starts from d_two_theta_rad/2 (0.5-bin offset)
-                two_theta_lin = (np.arange(self.shape[0], dtype=np.float32) + 0.5) * d_two_theta_rad
-
-                # eta: full rotation around the shell, with 0.5-bin offset
-                eta_lin = 2.0 * np.pi * (np.arange(self.shape[1], dtype=np.float32) + 0.5) / self.shape[1]
-
-                # Create meshgrid
-                TWO_THETA, ETA = np.meshgrid(two_theta_lin, eta_lin, indexing='xy')
-
-                # Convert to Cartesian on unit sphere
-                # Standard spherical coordinates: (theta=two_theta from +x axis, phi=eta azimuthal)
-                X_shell = np.cos(TWO_THETA)
-                Y_shell = np.sin(TWO_THETA) * np.sin(ETA)
-                Z_shell = np.sin(TWO_THETA) * np.cos(ETA)
-
-                # Update pixel coordinates with shell projection
-                self._pixel_coordinates = np.vstack((X_shell.ravel(), Y_shell.ravel(), Z_shell.ravel()))
+        # Note: For angular mode, shell projection is already applied during
+        # geometry creation above. For spatial + shell mode, the flat-plane
+        # coordinates are kept here and projected onto a sphere during
+        # positioning (position_detector_absolute), when the distance is known.
 
     def read_detector_metadata(self, override_directory=None):
         """
@@ -712,9 +661,10 @@ class detector(logging):
         self._distance = float(distance)
 
         # Scale to distance if needed:
-        # - Shell mode: always scale (built at unit radius)
-        # - Angular mode + plane: scale (built at unit distance)
-        if self._construction_mode == 'shell':
+        # - Shell + angular: built on unit sphere, scale to distance
+        # - Angular + plane: built at unit distance, scale to distance
+        # - Shell + spatial: flat-plane coords in Angstroms, projection handled below
+        if self._construction_mode == 'shell' and self._input_mode == 'angular':
             self._pixel_coordinates *= self._distance
         elif self._input_mode == 'angular' and self._construction_mode == 'plane':
             # Angular mode plane detectors are built at unit distance, scale by actual distance
@@ -734,12 +684,19 @@ class detector(logging):
             np.sin(self._two_theta) * np.cos(self._eta)
         ], dtype=np.float32)
 
-        # Apply rotation based on construction mode
-        if self._construction_mode == 'plane':
+        # Apply rotation and positioning based on construction mode
+        if self._construction_mode == 'shell' and self._input_mode == 'spatial':
+            # Spatial shell: position as flat plane first, then project onto sphere.
+            # This "wraps" the flat detector onto a spherical shell of radius = distance,
+            # preserving each pixel's angular direction from the origin.
+            self._pixel_coordinates = R @ self._pixel_coordinates + self._center[:, None]
+            norms = np.linalg.norm(self._pixel_coordinates, axis=0, keepdims=True)
+            self._pixel_coordinates = self._pixel_coordinates / norms * self._distance
+        elif self._construction_mode == 'plane':
             # Plane mode: rotate then translate to center
             self._pixel_coordinates = R @ self._pixel_coordinates + self._center[:, None]
-        else:  # shell mode
-            # Shell mode: only rotate (already at distance from origin)
+        else:  # shell + angular
+            # Shell mode (angular): only rotate (already at distance from origin)
             self._pixel_coordinates = R @ self._pixel_coordinates
         self.display_detector_values(degrees=True)
         
@@ -1250,12 +1207,14 @@ class detector(logging):
         construction_mode = getattr(self, '_construction_mode', 'plane')
         input_mode = getattr(self, '_input_mode', 'spatial')
 
-        # Detectors that form a regular grid in angular space:
+        # Detectors that form a regular grid in (2θ, η) angular space:
         # - Ring + Shell: pixels at regular (2θ, η) intervals
-        # - Angular input mode: creates regular angular grids by definition
+        # - Ring + Angular: also regular in (2θ, η)
+        # Note: Rectangular + angular is regular in (θ_y, θ_z) but NOT in (η, 2θ),
+        # so it must use the interpolation path.
         is_regular_angular_grid = (
             (geometry == 'ring' and construction_mode == 'shell') or
-            input_mode == 'angular'
+            (input_mode == 'angular' and geometry == 'ring')
         )
 
         if is_regular_angular_grid:
