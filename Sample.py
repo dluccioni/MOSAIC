@@ -1045,7 +1045,41 @@ class sample(logging):
 
         # Persist to disk
         np.savez(save_path, flat_species=flat_species, offsets=offsets)
-        
+
+    def write_chunk_nn_dist(self, dist_list, chunk_num, override_directory=None):
+        """
+        Write neighbor distances for a chunk to a compact NPZ.
+
+        Produces ``nearest_neighbors_dist_<chunk_num>.npz`` containing:
+        - ``flat_dist``: concatenated float distances (Angstrom) for all atoms' neighbors.
+        - ``offsets``: start positions for each atom's neighbor list.
+
+        Args:
+            dist_list (list[np.ndarray]): Ragged list where ``dist_list[i]`` is
+                a 1-D float array (float32) of distances in Angstrom for atom ``i``.
+            chunk_num (int): 1-based chunk number used in the output filename.
+            override_directory (str | None): If provided, write to this directory
+                instead of ``self.directory``.
+        """
+        base_name = "nearest_neighbors_dist"
+        filename = f"{base_name}_{chunk_num}.npz"
+        if override_directory is not None:
+            save_path = os.path.join(override_directory, filename)
+        else:
+            save_path = os.path.join(self.directory, filename)
+
+        n_atoms = len(dist_list)
+        lengths = [arr.size for arr in dist_list]
+        offsets = np.zeros(n_atoms + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(lengths)
+
+        if n_atoms > 0:
+            flat_dist = np.concatenate(dist_list)
+        else:
+            flat_dist = np.zeros(0, dtype=np.float32)
+
+        np.savez(save_path, flat_dist=flat_dist, offsets=offsets)
+
     def load_chunk_nn_indices(self, chunk_num):
         """
         Load neighbor indices for a chunk.
@@ -1180,10 +1214,40 @@ class sample(logging):
             offsets = data['offsets']
 
         return flat_species, offsets
+
+    def load_chunk_nn_dist(self, chunk_num):
+        """
+        Load neighbor distances for a chunk.
+
+        Reads ``nearest_neighbors_dist_<chunk_num>.npz`` and returns the
+        flattened distances (Angstrom) and offsets.
+
+        Args:
+            chunk_num (int): 1-based chunk number to load.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: ``(flat_dist, offsets)`` where
+            ``flat_dist`` is a 1-D float32 array of distances in Angstrom and
+            ``offsets`` is a 1-D int64 array of length n_atoms + 1.
+
+        Raises:
+            FileNotFoundError: If the NPZ file is missing.
+        """
+        base_name = "nearest_neighbors_dist"
+        filename = f"{base_name}_{chunk_num}.npz"
+        full_path = os.path.join(self.directory, filename)
+        if not os.path.isfile(full_path):
+            raise FileNotFoundError(f"NN dist file not found: {full_path}")
+
+        with np.load(full_path) as data:
+            flat_dist = data['flat_dist']
+            offsets = data['offsets']
+
+        return flat_dist, offsets
     # -------------------------------------
 
     # -------------------------------------
-    # MD sample   
+    # MD sample
     def import_atomic_data(self, import_file, element_list, header_lines=9, ID_column=1, position_columns=[2,3,4], scale=1e-10, flush_size=100000000, override_directory=None):
         """
         Import a large text file of atoms and write chunked .npy outputs.
