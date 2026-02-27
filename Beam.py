@@ -5248,26 +5248,28 @@ class beam(logging):
             max_neighbors_per_atom (int): Maximum stored neighbors per atom.
 
         Returns:
-            list: Length-N list. Each entry is a tuple
-                (phase_array, kvec_3_array, neighbor_idx_array, dist_array) where
-                phase_array has dtype float32 and shape (M,),
-                kvec_3_array has dtype float32 and shape (M, 3),
-                neighbor_idx_array has dtype int32 and shape (M,),
-                dist_array has dtype float32 and shape (M,) in angstrom.
+            dict: Flat-array representation with keys:
+                "flat_phase": 1-D float32 array of all neighbor phases.
+                "flat_kx", "flat_ky", "flat_kz": 1-D float32 arrays of
+                    neighbor wave-vector components (1/angstrom).
+                "flat_idx": 1-D int32 array of neighbor indices.
+                "flat_dist": 1-D float32 array of neighbor distances (angstrom).
+                "offsets": int64 array of length N+1 where atom i's neighbors
+                    span offsets[i]:offsets[i+1].
 
         Notes:
             Wavelength and wavenumber are used in angstrom units for consistency.
         """
         N = positions.shape[0]
         if N == 0:
-            # Return empty structures for empty input
-            return [
-                (np.array([], dtype=np.float32),
-                np.zeros((0,3), dtype=np.float32),
-                np.array([], dtype=np.int32),
-                np.array([], dtype=np.float32))
-                for _ in range(N)
-            ]
+            empty_f = np.zeros(0, dtype=np.float32)
+            return {
+                "flat_phase": empty_f.copy(), "flat_kx": empty_f.copy(),
+                "flat_ky": empty_f.copy(), "flat_kz": empty_f.copy(),
+                "flat_dist": empty_f.copy(),
+                "flat_idx": np.zeros(0, dtype=np.int32),
+                "offsets": np.zeros(1, dtype=np.int64)
+            }
 
         # 1) Build a cell list for neighbor search
         (sorted_positions,
@@ -5323,40 +5325,50 @@ class beam(logging):
             )
         )
 
-        # 4) Convert to CPU ragged list-of-arrays
-        phase_arr  = phase_gpu.reshape(N, max_neighbors_per_atom).get()
-        kx_arr     = kx_gpu.reshape(N, max_neighbors_per_atom).get()
-        ky_arr     = ky_gpu.reshape(N, max_neighbors_per_atom).get()
-        kz_arr     = kz_gpu.reshape(N, max_neighbors_per_atom).get()
-        dist_arr   = dist_gpu.reshape(N, max_neighbors_per_atom).get()
-        idx_arr    = idx_gpu.reshape(N, max_neighbors_per_atom).get()
-        counts_arr = counts_gpu.get()
-        sorted_idx_arr = sorted_indices.get()
+        # 4) Compact dense GPU arrays → flat CPU arrays in original atom order
+        counts_cpu = counts_gpu.get()
+        sorted_idx_cpu = sorted_indices.get()
+        capped = np.minimum(counts_cpu, max_neighbors_per_atom)
 
-        output = [None]*N
-        for sorted_i in range(N):
-            orig_i = sorted_idx_arr[sorted_i]
-            used = min(counts_arr[sorted_i], max_neighbors_per_atom)
-            if used <= 0:
-                output[orig_i] = (
-                    np.array([], dtype=np.float32),
-                    np.zeros((0,3), dtype=np.float32),
-                    np.array([], dtype=np.int32),
-                    np.array([], dtype=np.float32)
-                )
-                continue
+        # Map sorted→original order for counts
+        orig_counts = np.empty(N, dtype=np.int32)
+        orig_counts[sorted_idx_cpu] = capped
 
-            ph_sub   = phase_arr[sorted_i, :used]
-            kx_sub   = kx_arr[sorted_i, :used]
-            ky_sub   = ky_arr[sorted_i, :used]
-            kz_sub   = kz_arr[sorted_i, :used]
-            dist_sub = dist_arr[sorted_i, :used]
-            idx_sub  = idx_arr[sorted_i, :used]
+        # Build offsets in original atom order
+        offsets = np.zeros(N + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(orig_counts)
 
-            kvec_sub = np.vstack([kx_sub, ky_sub, kz_sub]).T
-            output[orig_i] = (ph_sub, kvec_sub, idx_sub, dist_sub)
+        # Valid-entry boolean mask (computed once, reused for all arrays)
+        range_idx = np.arange(max_neighbors_per_atom, dtype=np.int32)[None, :]  # (1, max_nn)
+        valid_mask = range_idx < orig_counts[:, None]  # (N, max_nn)
 
-        return output
+        def _compact_one(dense_gpu, dtype=np.float32):
+            """Transfer dense (N*max_nn,) GPU → flat CPU in original atom order."""
+            dense_2d = dense_gpu.reshape(N, max_neighbors_per_atom).get()
+            orig_2d = np.empty_like(dense_2d)
+            orig_2d[sorted_idx_cpu] = dense_2d
+            del dense_2d
+            return orig_2d[valid_mask].astype(dtype)
+
+        flat_phase = _compact_one(phase_gpu, np.float32)
+        flat_kx    = _compact_one(kx_gpu,    np.float32)
+        flat_ky    = _compact_one(ky_gpu,    np.float32)
+        flat_kz    = _compact_one(kz_gpu,    np.float32)
+        flat_dist  = _compact_one(dist_gpu,  np.float32)
+        flat_idx   = _compact_one(idx_gpu,   np.int32)
+
+        del phase_gpu, kx_gpu, ky_gpu, kz_gpu, dist_gpu, idx_gpu
+        del counts_gpu, sorted_indices, valid_mask
+        cp.get_default_memory_pool().free_all_blocks()
+        gc.collect()
+
+        return {
+            "flat_phase": flat_phase,
+            "flat_kx": flat_kx, "flat_ky": flat_ky, "flat_kz": flat_kz,
+            "flat_dist": flat_dist,
+            "flat_idx": flat_idx,
+            "offsets": offsets
+        }
 
     def compute_inter_chunk_neighbors_gpu(
         self,
@@ -5510,16 +5522,16 @@ class beam(logging):
             max_neighbors_per_atom (int): Maximum neighbors stored per atom.
 
         Returns:
-            tuple: (boundary_dict, all_data_memory)
-                boundary_dict: dict mapping chunk_id to:
-                    "positions": cupy.ndarray (Nb, 3) in angstrom,
-                    "indices": cupy.ndarray (Nb,) int32, original atom indices,
-                    "species": numpy.ndarray (Nb,) int32 species codes.
-                all_data_memory: dict mapping chunk_id to a list of length n_atoms
-                    with entries (phase_arr, kvec_3, idx_arr, spc_codes).
+            dict: boundary_dict mapping chunk_id to:
+                "positions": cupy.ndarray (Nb, 3) in angstrom,
+                "indices": cupy.ndarray (Nb,) int32, original atom indices,
+                "species": numpy.ndarray (Nb,) int32 species codes.
 
         Notes:
             Requires CuPy. Species code maps are stored on `self` for reuse.
+            Neighbor data is written directly to disk per chunk and NOT kept
+            in memory, eliminating the ``all_data_memory`` dict that previously
+            caused page-file swapping on large samples.
         """
         # Lazy species codec
         if not hasattr(self, "_species_code_map"):
@@ -5538,20 +5550,22 @@ class beam(logging):
             return str(x)
 
         def _encode_species(arr):
-            # Map species strings to contiguous int32 codes
-            out = np.empty(arr.shape, dtype=np.int32)
-            for i, v in enumerate(arr):
+            # Vectorized species encoding: O(n_unique × N) numpy ops
+            unique_vals = np.unique(arr)
+            # Register any new species (tiny loop over ~1-4 unique values)
+            for v in unique_vals:
                 sym = _sym_of(v)
-                code = self._species_code_map.get(sym)
-                if code is None:
-                    code = len(self._species_decode)
-                    self._species_code_map[sym] = code
+                if sym not in self._species_code_map:
+                    self._species_code_map[sym] = len(self._species_decode)
                     self._species_decode.append(sym)
-                out[i] = code
+            # Vectorized mapping
+            out = np.empty(len(arr), dtype=np.int32)
+            for v in unique_vals:
+                sym = _sym_of(v)
+                out[arr == v] = self._species_code_map[sym]
             return out
 
-        boundary_dict   = {}
-        all_data_memory = {}
+        boundary_dict = {}
 
         for cid in range(1, sample.chunk_total+1):
             chunk_positions = sample.load_chunk_positions(cid, use_gpu=True)
@@ -5570,18 +5584,41 @@ class beam(logging):
                     "indices":   cp.zeros((0,),  dtype=cp.int32),
                     "species":   np.array([], dtype=np.int32)
                 }
-                all_data_memory[cid] = []
                 continue
 
-            # Encode species -> int32 codes
+            # Encode species -> int32 codes (vectorized)
             chunk_codes = _encode_species(chunk_species)
+            del chunk_species
 
-            results_intra = self.compute_intra_chunk_neighbors_gpu(
+            # Intra-chunk neighbor search → flat arrays (no ragged Python list)
+            result = self.compute_intra_chunk_neighbors_gpu(
                 sample, chunk_positions, r_cut=r_cut,
                 max_neighbors_per_atom=max_neighbors_per_atom
             )
 
-            # Boundary set (angstrom)
+            # Compute neighbor species codes vectorized from flat index array
+            flat_spc = chunk_codes[result["flat_idx"]].astype(np.int32)
+
+            # Write flat arrays directly to disk via np.savez
+            d = sample.directory
+            offsets = result["offsets"]
+            np.savez(os.path.join(d, f"nearest_neighbors_phase_{cid}.npz"),
+                     flat_phase=result["flat_phase"], offsets=offsets)
+            np.savez(os.path.join(d, f"nearest_neighbors_scatter_{cid}.npz"),
+                     flat_kx=result["flat_kx"], flat_ky=result["flat_ky"],
+                     flat_kz=result["flat_kz"], offsets=offsets)
+            np.savez(os.path.join(d, f"nearest_neighbors_indices_{cid}.npz"),
+                     flat_idx=result["flat_idx"], offsets=offsets)
+            np.savez(os.path.join(d, f"nearest_neighbors_species_{cid}.npz"),
+                     flat_species=flat_spc, offsets=offsets)
+            np.savez(os.path.join(d, f"nearest_neighbors_dist_{cid}.npz"),
+                     flat_dist=result["flat_dist"], offsets=offsets)
+
+            # Free result arrays immediately — NOT kept in memory
+            del result, flat_spc
+            gc.collect()
+
+            # Boundary set (angstrom) — stays on GPU for Pass B
             min_val = cp.min(chunk_positions, axis=0)
             max_val = cp.max(chunk_positions, axis=0)
             margin  = r_cut
@@ -5593,62 +5630,40 @@ class beam(logging):
             boundary_mask_cpu  = boundary_mask.get()
             boundary_species   = chunk_codes[boundary_mask_cpu]  # codes
 
-            phase_list    = []
-            kvector_list  = []
-            idx_list      = []
-            species_list  = []
-            dist_list     = []
-            results_intra_with_spc = [None] * n_atoms
-
-            for i_atom, (ph, kvec_3, n_idx, n_dist) in enumerate(results_intra):
-                n_spc_codes = chunk_codes[n_idx]  # codes for neighbors
-
-                phase_list.append(ph.astype(np.float32))
-                kvector_list.append(kvec_3.astype(np.float32))
-                idx_list.append(n_idx.astype(np.int32))
-                species_list.append(n_spc_codes.astype(np.int32))
-                dist_list.append(n_dist.astype(np.float32))
-
-                results_intra_with_spc[i_atom] = (ph, kvec_3, n_idx, n_spc_codes, n_dist)
-
-            # Persist per-atom arrays for Pass A
-            sample.write_chunk_nn_phase(phase_list, cid)
-            sample.write_chunk_nn_scatter(kvector_list, cid)
-            sample.write_chunk_nn_indices(idx_list, cid)
-            sample.write_chunk_nn_species(species_list, cid)
-            sample.write_chunk_nn_dist(dist_list, cid)
-
-            all_data_memory[cid] = results_intra_with_spc
             boundary_dict[cid] = {
                 "positions": boundary_positions,
                 "indices":   boundary_indices,
                 "species":   boundary_species
             }
 
-            del chunk_positions
+            del chunk_positions, chunk_codes
             cp.get_default_memory_pool().free_all_blocks()
+            gc.collect()
 
-        return boundary_dict, all_data_memory
+        return boundary_dict
 
-    def compute_nearest_neighbor_distances_passB(self, sample, boundary_dict, all_data_memory,
+    def compute_nearest_neighbor_distances_passB(self, sample, boundary_dict,
                                                 r_cut, max_neighbors_per_atom):
         """
-        Pass B: add cross-chunk neighbors to per-atom lists using boundary sets.
+        Pass B: add cross-chunk neighbors via boundary sets (disk-based merge).
 
-        Each pair of chunks that may interact within `r_cut` is tested using a
-        fast bounding-box check. If interaction is possible, a GPU cross-chunk
-        neighbor search is performed and merged into the per-atom neighbor data.
+        Phase 1: For each interacting chunk pair, compute cross-chunk neighbors
+        and accumulate lightweight addition records (only boundary atoms contribute).
+
+        Phase 2: For each chunk that received additions, load its flat arrays
+        from disk, merge the additions, and re-save.
 
         Args:
             sample: Sample object.
             boundary_dict (dict): Output of Pass A; per-chunk boundary sets.
-            all_data_memory (dict): Output of Pass A; per-atom neighbor data to update.
             r_cut (float): Cutoff radius in angstrom.
             max_neighbors_per_atom (int): Maximum neighbors per atom used in kernels.
 
         Returns:
-            dict: Updated `all_data_memory` with cross-chunk neighbors merged in.
+            None
         """
+        from collections import defaultdict
+
         # Build bounding boxes for quick rejection
         chunk_bounds = {}
         for cid in range(1, sample.chunk_total+1):
@@ -5660,23 +5675,25 @@ class beam(logging):
             max_bb = cp.max(posB, axis=0)
             chunk_bounds[cid] = (min_bb, max_bb)
 
+        # Phase 1: Accumulate cross-chunk additions (lightweight)
+        # cross_additions[cid] = list of (atom_idx, ph, kx, ky, kz, spc, dist)
+        cross_additions = defaultdict(list)
+
         for i in range(1, sample.chunk_total+1):
-            i_bd   = boundary_dict[i]
-            i_data = all_data_memory[i]
-            pos_i  = i_bd["positions"]
-            idx_i  = i_bd["indices"]
-            spc_i  = i_bd["species"]  # codes
+            i_bd  = boundary_dict[i]
+            pos_i = i_bd["positions"]
+            idx_i = i_bd["indices"]
+            spc_i = i_bd["species"]  # codes
             if pos_i.size == 0:
                 continue
             N_i = pos_i.shape[0]
             min_i, max_i = chunk_bounds[i]
 
             for j in range(i+1, sample.chunk_total+1):
-                j_bd   = boundary_dict[j]
-                j_data = all_data_memory[j]
-                pos_j  = j_bd["positions"]
-                idx_j  = j_bd["indices"]
-                spc_j  = j_bd["species"]  # codes
+                j_bd  = boundary_dict[j]
+                pos_j = j_bd["positions"]
+                idx_j = j_bd["indices"]
+                spc_j = j_bd["species"]  # codes
                 if pos_j.size == 0:
                     continue
                 N_j = pos_j.shape[0]
@@ -5685,7 +5702,7 @@ class beam(logging):
                 if (min_i is None) or (min_j is None):
                     continue
 
-                # Quick reject using expanded AABB test; wrap in bool(...) for CuPy
+                # Quick reject using expanded AABB test
                 bool_sep_ij = bool(((max_i + r_cut) < (min_j - r_cut)).any())
                 bool_sep_ji = bool(((max_j + r_cut) < (min_i - r_cut)).any())
                 if bool_sep_ij or bool_sep_ji:
@@ -5699,50 +5716,141 @@ class beam(logging):
                 idx_i_cpu = idx_i.get()
                 idx_j_cpu = idx_j.get()
 
-                # Attach neighbors into i_data (codes preserved)
+                # Record additions for chunk i boundary atoms
                 for local_i in range(N_i):
                     (ph_new, kvec_new, idx_new, dist_new) = cross_list[local_i]
                     if ph_new.size > 0:
-                        global_i = idx_i_cpu[local_i]
-                        (ph_old, kvec_old, idx_old, spc_old, dist_old) = i_data[global_i]
+                        global_i = int(idx_i_cpu[local_i])
                         spc_new = np.array([spc_j[n - N_i] if n >= N_i else spc_i[n]
                                             for n in idx_new], dtype=np.int32)
-                        i_data[global_i] = (
-                            np.concatenate([ph_old, ph_new]),
-                            np.vstack([kvec_old, kvec_new]),
-                            np.concatenate([idx_old, idx_new]),
-                            np.concatenate([spc_old, spc_new]),
-                            np.concatenate([dist_old, dist_new])
-                        )
+                        cross_additions[i].append((
+                            global_i,
+                            ph_new.astype(np.float32),
+                            kvec_new[:, 0].astype(np.float32),
+                            kvec_new[:, 1].astype(np.float32),
+                            kvec_new[:, 2].astype(np.float32),
+                            spc_new,
+                            dist_new.astype(np.float32)
+                        ))
 
-                # Attach neighbors into j_data (codes preserved)
+                # Record additions for chunk j boundary atoms
                 for local_j in range(N_j):
                     (ph_new, kvec_new, idx_new, dist_new) = cross_list[N_i + local_j]
                     if ph_new.size > 0:
-                        global_j = idx_j_cpu[local_j]
-                        (ph_old, kvec_old, idx_old, spc_old, dist_old) = j_data[global_j]
+                        global_j = int(idx_j_cpu[local_j])
                         spc_new = np.array([spc_i[n] if n < N_i else spc_j[n - N_i]
                                             for n in idx_new], dtype=np.int32)
-                        j_data[global_j] = (
-                            np.concatenate([ph_old, ph_new]),
-                            np.vstack([kvec_old, kvec_new]),
-                            np.concatenate([idx_old, idx_new]),
-                            np.concatenate([spc_old, spc_new]),
-                            np.concatenate([dist_old, dist_new])
-                        )
+                        cross_additions[j].append((
+                            global_j,
+                            ph_new.astype(np.float32),
+                            kvec_new[:, 0].astype(np.float32),
+                            kvec_new[:, 1].astype(np.float32),
+                            kvec_new[:, 2].astype(np.float32),
+                            spc_new,
+                            dist_new.astype(np.float32)
+                        ))
 
                 del cross_list
                 cp.get_default_memory_pool().free_all_blocks()
 
-        return all_data_memory
+        # Phase 2: Merge additions into disk data (one chunk at a time)
+        for cid, adds in cross_additions.items():
+            if not adds:
+                continue
+
+            # Load existing flat data from disk
+            flat_phase, offsets = sample.load_chunk_nn_phase(cid)
+            flat_kx, flat_ky, flat_kz, _ = sample.load_chunk_nn_scatter(cid)
+            flat_idx, _ = sample.load_chunk_nn_indices(cid)
+            flat_spc, _ = sample.load_chunk_nn_species(cid)
+            flat_dist, _ = sample.load_chunk_nn_dist(cid)
+            n_atoms = len(offsets) - 1
+            old_counts = (offsets[1:] - offsets[:-1]).astype(np.int64)
+
+            # Group additions by atom and compute extra counts
+            per_atom = defaultdict(list)
+            for (atom_idx, ph, kx, ky, kz, spc, dist) in adds:
+                per_atom[atom_idx].append((ph, kx, ky, kz, spc, dist))
+
+            extra_counts = np.zeros(n_atoms, dtype=np.int64)
+            for atom_idx, add_list in per_atom.items():
+                for (ph, _, _, _, _, _) in add_list:
+                    extra_counts[atom_idx] += len(ph)
+
+            # Build new offsets
+            new_offsets = np.zeros(n_atoms + 1, dtype=np.int64)
+            new_offsets[1:] = np.cumsum(old_counts + extra_counts)
+            total_new = int(new_offsets[-1])
+
+            # Vectorized copy of old data to shifted positions in new arrays
+            if len(flat_phase) > 0:
+                atom_ids = np.repeat(np.arange(n_atoms, dtype=np.int64), old_counts.astype(int))
+                shifts = new_offsets[:-1] - offsets[:-1]
+                new_positions = np.arange(len(flat_phase), dtype=np.int64) + shifts[atom_ids]
+            else:
+                new_positions = np.array([], dtype=np.int64)
+
+            new_phase = np.empty(total_new, dtype=np.float32)
+            new_kx    = np.empty(total_new, dtype=np.float32)
+            new_ky    = np.empty(total_new, dtype=np.float32)
+            new_kz    = np.empty(total_new, dtype=np.float32)
+            new_idx   = np.empty(total_new, dtype=flat_idx.dtype)
+            new_spc   = np.empty(total_new, dtype=flat_spc.dtype)
+            new_dist  = np.empty(total_new, dtype=np.float32)
+
+            if len(flat_phase) > 0:
+                new_phase[new_positions] = flat_phase
+                new_kx[new_positions]    = flat_kx
+                new_ky[new_positions]    = flat_ky
+                new_kz[new_positions]    = flat_kz
+                new_idx[new_positions]   = flat_idx
+                new_spc[new_positions]   = flat_spc
+                new_dist[new_positions]  = flat_dist
+
+            del flat_phase, flat_kx, flat_ky, flat_kz, flat_idx, flat_spc, flat_dist
+
+            # Insert additions (small loop — only boundary atoms with new neighbors)
+            for atom_idx, add_list in per_atom.items():
+                cursor = int(new_offsets[atom_idx] + old_counts[atom_idx])
+                for (ph, kx, ky, kz, spc, dist) in add_list:
+                    n = len(ph)
+                    new_phase[cursor:cursor + n] = ph
+                    new_kx[cursor:cursor + n]    = kx
+                    new_ky[cursor:cursor + n]    = ky
+                    new_kz[cursor:cursor + n]    = kz
+                    new_idx[cursor:cursor + n]   = np.arange(n, dtype=new_idx.dtype)  # placeholder indices
+                    new_spc[cursor:cursor + n]   = spc
+                    new_dist[cursor:cursor + n]  = dist
+                    cursor += n
+
+            # Re-save merged data to disk
+            d = sample.directory
+            np.savez(os.path.join(d, f"nearest_neighbors_phase_{cid}.npz"),
+                     flat_phase=new_phase, offsets=new_offsets)
+            np.savez(os.path.join(d, f"nearest_neighbors_scatter_{cid}.npz"),
+                     flat_kx=new_kx, flat_ky=new_ky, flat_kz=new_kz, offsets=new_offsets)
+            np.savez(os.path.join(d, f"nearest_neighbors_indices_{cid}.npz"),
+                     flat_idx=new_idx, offsets=new_offsets)
+            np.savez(os.path.join(d, f"nearest_neighbors_species_{cid}.npz"),
+                     flat_species=new_spc, offsets=new_offsets)
+            np.savez(os.path.join(d, f"nearest_neighbors_dist_{cid}.npz"),
+                     flat_dist=new_dist, offsets=new_offsets)
+
+            del new_phase, new_kx, new_ky, new_kz, new_idx, new_spc, new_dist
+            gc.collect()
+
+        del cross_additions
+        gc.collect()
 
     def compute_nearest_neighbor_distances(self, sample, r_cut=5.0, use_gpu=True, max_neighbors_per_atom=32):
         """
-        Compute nearest neighbors for all atoms using GPU (Passes A, B, C).
+        Compute nearest neighbors for all atoms using GPU (Passes A + B).
 
-        Pass A: Intra-chunk neighbors and boundary sets.
-        Pass B: Inter-chunk neighbors merged via boundary sets.
-        Pass C: Persist final arrays (phase, kvec, idx, species code) to sample.
+        Pass A: Intra-chunk neighbors → flat arrays written directly to disk.
+        Pass B: Inter-chunk neighbors → load/merge/re-save per affected chunk.
+
+        No large in-memory accumulation: each chunk's data is freed after writing
+        to disk, keeping peak host memory bounded to one chunk at a time.
 
         Args:
             sample: Sample object with chunk accessors and writers.
@@ -5758,37 +5866,20 @@ class beam(logging):
         if sample.chunk_total is None:
             raise ValueError("No chunks found; import or generate sample first.")
 
-        # Pass A
-        boundary_dict, all_data_memory = self.compute_nearest_neighbor_distances_passA(
+        # Pass A: intra-chunk neighbors → disk (returns only boundary_dict)
+        boundary_dict = self.compute_nearest_neighbor_distances_passA(
             sample, r_cut, max_neighbors_per_atom
         )
 
-        # Pass B
-        all_data_memory = self.compute_nearest_neighbor_distances_passB(
-            sample, boundary_dict, all_data_memory, r_cut, max_neighbors_per_atom
-        )
+        # Pass B: inter-chunk neighbors → load/merge/re-save
+        if sample.chunk_total > 1:
+            self.compute_nearest_neighbor_distances_passB(
+                sample, boundary_dict, r_cut, max_neighbors_per_atom
+            )
 
-        # Pass C: re-save final arrays (phase, kvec, idx, species, dist)
-        for cid in range(1, sample.chunk_total+1):
-            final_list = all_data_memory[cid]  # list of (ph_arr, kvec_3, idx_arr, spc_arr, dist_arr)
-            phase_list    = []
-            kvector_list  = []
-            idx_list      = []
-            species_list  = []
-            dist_list     = []
-
-            for (ph_arr, kvec_3, idx_arr, spc_arr, dist_arr) in final_list:
-                phase_list.append(ph_arr.astype(np.float32))
-                kvector_list.append(kvec_3.astype(np.float32))
-                idx_list.append(idx_arr.astype(np.int32))
-                species_list.append(spc_arr)  # keep user dtype or cast if needed
-                dist_list.append(dist_arr.astype(np.float32))
-
-            sample.write_chunk_nn_phase(phase_list, cid)
-            sample.write_chunk_nn_scatter(kvector_list, cid)  # re-use "scatter" slot for k vectors
-            sample.write_chunk_nn_indices(idx_list, cid)
-            sample.write_chunk_nn_species(species_list, cid)
-            sample.write_chunk_nn_dist(dist_list, cid)
+        del boundary_dict
+        cp.get_default_memory_pool().free_all_blocks()
+        gc.collect()
 
         print(f"[beam] Completed nearest-neighbor calculation with cutoff={r_cut} "
             f"for {sample.chunk_total} chunks (GPU).")
@@ -5838,21 +5929,25 @@ class beam(logging):
             self._species_decode   = []
 
         def _ensure_codes_from(arr):
-            out = np.empty(arr.shape, dtype=np.int32)
-            for i, v in enumerate(arr):
+            # Vectorized species encoding
+            def _sym_of_val(v):
                 if isinstance(v, (str, np.str_)):
-                    sym = str(v)
-                elif hasattr(sample, "get_symbol_from_id"):
-                    try: sym = str(sample.get_symbol_from_id(int(v)))
-                    except Exception: sym = str(v)
-                else:
-                    sym = str(v)
-                code = self._species_code_map.get(sym)
-                if code is None:
-                    code = len(self._species_decode)
-                    self._species_code_map[sym] = code
+                    return str(v)
+                if hasattr(sample, "get_symbol_from_id"):
+                    try: return str(sample.get_symbol_from_id(int(v)))
+                    except Exception: return str(v)
+                return str(v)
+
+            unique_vals = np.unique(arr)
+            for v in unique_vals:
+                sym = _sym_of_val(v)
+                if sym not in self._species_code_map:
+                    self._species_code_map[sym] = len(self._species_decode)
                     self._species_decode.append(sym)
-                out[i] = code
+            out = np.empty(len(arr), dtype=np.int32)
+            for v in unique_vals:
+                sym = _sym_of_val(v)
+                out[arr == v] = self._species_code_map[sym]
             return out
 
         n_codes = len(self._species_decode)
