@@ -93,14 +93,14 @@ class detector(logging):
 
         Args:
           shape: Depends on geometry and input_mode:
-            - rectangular + spatial: (Ny, Nz) pixel counts
+            - rectangular + spatial: (Ny, Nz) pixel counts — Ny = width (Y, horizontal), Nz = height (Z, vertical)
             - rectangular + angular: (theta_y_min, theta_y_max, theta_z_min, theta_z_max) in degrees
             - ring + spatial: (N_two_theta, N_eta) bin counts
             - ring + angular: (two_theta_inner, two_theta_outer) in degrees
           pixel_size (tuple[float, float]): Depends on geometry, construction_mode, and input_mode:
-            - rectangular + plane + spatial: (dy, dz) in Angstroms
-            - rectangular + shell + spatial: (d_theta_y, d_theta_z) in degrees
-            - rectangular + angular: (d_theta_y, d_theta_z) in degrees
+            - rectangular + plane + spatial: (dy, dz) in Angstroms — dy = width spacing, dz = height spacing
+            - rectangular + shell + spatial: (d_theta_y, d_theta_z) in degrees — d_theta_y = width, d_theta_z = height
+            - rectangular + angular: (d_theta_y, d_theta_z) in degrees — d_theta_y = width, d_theta_z = height
             - ring + plane + spatial: (d_two_theta, d_eta) in Angstroms
             - ring + shell + spatial: (d_two_theta, d_eta) in degrees
             - ring + angular: (d_two_theta, d_eta) in degrees
@@ -1134,6 +1134,9 @@ class detector(logging):
         else:
             # Compute extent from half-size in each dimension
             detector_extent = np.array(self._shape) * np.array(self._pixel_size) / 2
+            # Ensure correct 2D orientation: (Nz, Ny) = (shape[1], shape[0])
+            if plot_val.ndim == 1:
+                plot_val = plot_val.reshape(self._shape[1], self._shape[0])
             im = ax1.imshow(
                 plot_val,
                 extent=[-detector_extent[0], detector_extent[0], -detector_extent[1], detector_extent[1]],
@@ -1319,7 +1322,7 @@ class detector(logging):
 
                 # Plot interpolated grid
                 im = ax.imshow(
-                    grid_values,
+                    grid_values.T,  # Transpose: mgrid axis 0 = eta, axis 1 = two_theta → match extent
                     extent=[eta_min, eta_max, two_theta_min, two_theta_max],
                     origin='lower',
                     cmap=cmap,
@@ -1411,14 +1414,14 @@ class detector(logging):
     
     @property
     def shape(self):
-        """tuple[int, int]: Detector shape in pixels as (Ny, Nz)."""
+        """tuple[int, int]: Detector shape in pixels as (Ny, Nz) — Ny = width (Y, horizontal), Nz = height (Z, vertical)."""
         if self._shape is None:
             print("self._shape has not been initialized yet")
         return self._shape
     
     @property
     def pixel_size(self):
-        """np.ndarray: Pixel size along (y, z)."""
+        """np.ndarray: Pixel size as (dy, dz) in Angstroms — dy = width spacing (Y, horizontal), dz = height spacing (Z, vertical)."""
         if self._pixel_size is None:
             print("self._pixel_size has not been initialized yet")
         return self._pixel_size

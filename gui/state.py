@@ -405,8 +405,8 @@ class SimulationState:
         Create a new detector.
 
         Args:
-            shape: Detector shape (Ny, Nz) in pixels
-            pixel_size: Pixel size (dy, dz) in mm
+            shape: Detector shape (Ny, Nz) in pixels — Ny = width, Nz = height
+            pixel_size: Pixel size (dy, dz) — dy = width spacing, dz = height spacing
             **kwargs: Additional arguments for detector constructor
 
         Returns:

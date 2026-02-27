@@ -810,7 +810,7 @@ class DetectorView(QWidget):
             data_2d, extent, xlabel, ylabel = self._prepare_angular_display(detector, data)
         else:
             # Spatial mode: reshape to 2D grid in physical coordinates
-            data_2d = data.reshape(detector.shape) if len(data.shape) == 1 else data
+            data_2d = data.reshape(detector.shape[1], detector.shape[0]) if len(data.shape) == 1 else data
 
             # Set extent in Angstroms (physical coordinates)
             pixel_size = getattr(detector, 'pixel_size', None)
@@ -854,7 +854,7 @@ class DetectorView(QWidget):
         coords = getattr(detector, 'pixel_coordinates', None)
         if coords is None:
             # Fallback to spatial if no coordinates
-            return data.reshape(detector.shape), None, "Y (Å)", "Z (Å)"
+            return data.reshape(detector.shape[1], detector.shape[0]), None, "Y (Å)", "Z (Å)"
 
         x, y, z = coords[0], coords[1], coords[2]
 
@@ -884,9 +884,19 @@ class DetectorView(QWidget):
 
         if is_regular_angular_grid:
             # Direct reshape - pixels form a regular angular grid
-            data_2d = data.reshape(detector.shape)
-            eta_min, eta_max = eta.min(), eta.max()
-            two_theta_min, two_theta_max = two_theta.min(), two_theta.max()
+            data_2d = data.reshape(detector.shape[1], detector.shape[0])
+            geometry = getattr(detector, '_geometry', 'rectangular')
+            if geometry == 'ring' and hasattr(detector, '_angular_range') and detector._angular_range is not None:
+                two_theta_min, two_theta_max = detector._angular_range
+                if self.angular_degrees.isChecked():
+                    eta_min, eta_max = 0.0, 360.0
+                else:
+                    two_theta_min = np.deg2rad(two_theta_min)
+                    two_theta_max = np.deg2rad(two_theta_max)
+                    eta_min, eta_max = 0.0, 2.0 * np.pi
+            else:
+                eta_min, eta_max = eta.min(), eta.max()
+                two_theta_min, two_theta_max = two_theta.min(), two_theta.max()
             extent = [eta_min, eta_max, two_theta_min, two_theta_max]
         else:
             # Need interpolation for non-regular grids

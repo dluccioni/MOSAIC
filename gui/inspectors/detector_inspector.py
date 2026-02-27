@@ -417,7 +417,7 @@ class DetectorInspector(InspectorPanel):
             if hasattr(detector_obj, 'directory'):
                 self.directory_edit.setText(detector_obj.directory)
 
-            # Shape (Ny, Nz)
+            # Shape (Ny, Nz) — Ny = width (horizontal), Nz = height (vertical)
             if hasattr(detector_obj, 'shape') and detector_obj.shape is not None:
                 self.pixels_y.blockSignals(True)
                 self.pixels_z.blockSignals(True)
