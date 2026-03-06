@@ -106,6 +106,13 @@ class sample(logging):
         self._streaming_file_chunk_ranges = None  # mapping from file chunks to geometric chunks
         self._streaming_use_gpu = False  # GPU preference from generate_sample_* call
 
+        # Alloy mode configuration (disabled by default)
+        # When enabled, atom species are randomly assigned from a user-provided list
+        self._alloy_species = None          # list of element symbols, e.g. ["Fe", "Co"]
+        self._alloy_concentrations = None   # list of probabilities, e.g. [0.5, 0.5]
+        self._alloy_rng = None              # np.random.Generator for reproducibility
+        self._alloy_lock = None             # threading.Lock for multi-GPU safety
+
         # Streaming GPU cache (None when not initialized)
         # These are uploaded to GPU once and reused across chunk generation calls
         self._streaming_gpu_seeds_cp = None       # (G, 3) CuPy array of grain seeds
@@ -217,7 +224,85 @@ class sample(logging):
             self._chunk_total = int(sample_metadata["chunk_total"])
         if sample_metadata["sample_type"] is not None:
             self._sample_type = sample_metadata["sample_type"]
-        
+        if sample_metadata.get("alloy_species") is not None:
+            self._alloy_species = sample_metadata["alloy_species"]
+        if sample_metadata.get("alloy_concentrations") is not None:
+            self._alloy_concentrations = sample_metadata["alloy_concentrations"]
+
+    ## Alloy helpers
+    # -------------------------------------
+    def _setup_alloy(self, alloy_species, alloy_concentrations, alloy_seed):
+        """
+        Validate and store alloy parameters for the current generation run.
+
+        Args:
+            alloy_species (list[str] | None): Element symbols for random
+                assignment. None disables alloy mode.
+            alloy_concentrations (list[float] | None): Per-species probabilities.
+                Must sum to 1. None uses equal probabilities.
+            alloy_seed (int | None): RNG seed for reproducibility.
+        """
+        if alloy_species is not None:
+            alloy_species = list(alloy_species)
+            if alloy_concentrations is None:
+                n = len(alloy_species)
+                alloy_concentrations = [1.0 / n] * n
+            else:
+                alloy_concentrations = list(alloy_concentrations)
+                if len(alloy_concentrations) != len(alloy_species):
+                    raise ValueError(
+                        f"alloy_concentrations length ({len(alloy_concentrations)}) "
+                        f"must match alloy_species length ({len(alloy_species)})"
+                    )
+                if abs(sum(alloy_concentrations) - 1.0) > 1e-6:
+                    raise ValueError(
+                        f"alloy_concentrations must sum to 1.0, got {sum(alloy_concentrations):.6f}"
+                    )
+            self._alloy_species = alloy_species
+            self._alloy_concentrations = alloy_concentrations
+            self._alloy_rng = np.random.default_rng(alloy_seed)
+            self._alloy_lock = threading.Lock()
+        else:
+            self._alloy_species = None
+            self._alloy_concentrations = None
+            self._alloy_rng = None
+            self._alloy_lock = None
+
+    def _teardown_alloy(self):
+        """Clear alloy state after generation is complete."""
+        self._alloy_rng = None
+        self._alloy_lock = None
+
+    def _build_species(self, base_species, n_tiles, mask=None):
+        """
+        Build a species array, optionally randomizing for alloy mode.
+
+        Tiles ``base_species`` by ``n_tiles``, applies ``mask`` if given,
+        then (if alloy mode is active) replaces every element with a random
+        draw from ``_alloy_species`` weighted by ``_alloy_concentrations``.
+
+        Args:
+            base_species (array-like): Per-unit-cell species labels.
+            n_tiles (int): Number of unit-cell repeats.
+            mask (np.ndarray | None): Boolean mask to select valid atoms.
+
+        Returns:
+            np.ndarray: 1-D array of species strings.
+        """
+        spc = np.tile(base_species, n_tiles)
+        if mask is not None:
+            spc = spc[mask]
+        if self._alloy_rng is not None:
+            with self._alloy_lock:
+                spc = np.array(
+                    self._alloy_rng.choice(
+                        self._alloy_species,
+                        size=len(spc),
+                        p=self._alloy_concentrations,
+                    )
+                )
+        return spc
+
     ## Data Handling Functions
     # -------------------------------------
     # Generate sample
@@ -294,6 +379,8 @@ class sample(logging):
             "rotation": self._rotation.tolist() if self._rotation is not None else None,
             "chunk_total": int(self._chunk_total) if self._chunk_total is not None else None,
             "sample_type": self._sample_type if self._sample_type is not None else None,
+            "alloy_species": self._alloy_species if self._alloy_species is not None else None,
+            "alloy_concentrations": self._alloy_concentrations if self._alloy_concentrations is not None else None,
         }
 
         # Choose the output directory and filename
@@ -643,8 +730,7 @@ class sample(logging):
 
         # Species array (on CPU for memory efficiency, matching non-streaming path)
         mask_np = mask_cp.get()
-        spc_all = np.tile(material.species, site_count)
-        spc_sample = spc_all[mask_np]
+        spc_sample = self._build_species(material.species, site_count, mask_np)
 
         # Batched per-grain rotation using einsum
         # R_per_atom[i] = R_cp[grain_labels[i]] for each atom i
@@ -2845,8 +2931,7 @@ class sample(logging):
                 mask_np = mask.get()
                 positions_np = atomic_positions_S.get()
 
-                atomic_species = np.tile(material.species, int(lattice_positions_cp.shape[0]))
-                atomic_species = atomic_species[mask_np]
+                atomic_species = self._build_species(material.species, int(lattice_positions_cp.shape[0]), mask_np)
 
                 # Free temporary device allocations
                 cp.get_default_memory_pool().free_all_blocks()
@@ -2864,8 +2949,6 @@ class sample(logging):
             lattice_atom_cartesian_np[np.newaxis, :, :]
         ).reshape(-1, 3)
 
-        atomic_species = np.tile(material.species, lattice_positions_np.shape[0])
-
         # In-box mask on CPU
         mask = (
             (atomic_positions_S[:, 0] >= 0) & (atomic_positions_S[:, 0] <= self.dimensions[0]) &
@@ -2875,7 +2958,7 @@ class sample(logging):
 
         # Apply mask and center/offset shift
         atomic_positions_S = atomic_positions_S[mask, :].astype(np.float32)
-        atomic_species = atomic_species[mask]
+        atomic_species = self._build_species(material.species, lattice_positions_np.shape[0], mask)
 
         offset_np = self.offset.astype(np.float32)
         dim_half_np = (self.dimensions * 0.5).astype(np.float32)
@@ -2890,7 +2973,10 @@ class sample(logging):
         use_gpu=True,
         gpu_streams=4,
         writer_threads=3,
-        n_gpus=None
+        n_gpus=None,
+        alloy_species=None,
+        alloy_concentrations=None,
+        alloy_seed=None
     ):
         """
         Generate and persist the sample to disk in fixed-size chunks.
@@ -2917,6 +3003,16 @@ class sample(logging):
                 writing chunks to disk. Defaults to 3.
             n_gpus (int, optional): Number of GPUs to use. Default (None) uses
                 all available GPUs. Set to 1 to force single-GPU mode.
+            alloy_species (list[str] | None, optional): Element symbols for
+                random alloy assignment (e.g. ``["Fe", "Co"]``). Each atom site
+                is randomly assigned one of these species instead of the CIF
+                species. None (default) uses the CIF species.
+            alloy_concentrations (list[float] | None, optional): Per-species
+                probabilities (must sum to 1.0). Must match the length of
+                ``alloy_species``. None defaults to equal probabilities.
+            alloy_seed (int | None, optional): Seed for the random number
+                generator used for alloy species assignment. None (default)
+                gives non-deterministic results.
 
         Returns:
             None
@@ -2926,7 +3022,10 @@ class sample(logging):
             written. Progress already written is preserved if the GPU path
             encounters an error and falls back to CPU.
         """
-        # 0) Build geometric chunks once
+        # Set up alloy mode if requested
+        self._setup_alloy(alloy_species, alloy_concentrations, alloy_seed)
+
+        # Build geometric chunks once
         self._chunk_positions, self._chunk_dimensions = self.get_chunk_positions(material)
         num_geom = int(self.chunk_positions.shape[0])
 
@@ -2945,7 +3044,7 @@ class sample(logging):
 
         from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
 
-        # 1) Thread pool for disk writes
+        # Thread pool for disk writes
         def _write_chunk(idx, pos_arr, spc_arr):
             self.write_chunk_positions(pos_arr, idx)
             self.write_chunk_species(spc_arr, idx)
@@ -2957,7 +3056,7 @@ class sample(logging):
         )
         pending_writes = []
 
-        # 2) CPU-side streaming buffers shared by both GPU and CPU paths
+        # CPU-side streaming buffers shared by both GPU and CPU paths
         buf_pos = None
         buf_spc = None
         fill = 0
@@ -3016,10 +3115,10 @@ class sample(logging):
         else:
             use_n_gpus = min(int(n_gpus), available_gpus) if available_gpus > 0 else 0
 
-        # 4) GPU path (with safe fallback)
+        # GPU path
         drained_count = 0  # number of geom-chunks fully drained into CPU buffers
 
-        # 4a) Multi-GPU path: distribute chunks across multiple GPUs
+        # Multi-GPU path: distribute chunks across multiple GPUs
         if gpu_ok and use_n_gpus > 1:
             try:
                 n_streams = max(1, int(gpu_streams))
@@ -3080,15 +3179,14 @@ class sample(logging):
                             pos_np = task["pos_cp"].get()
                             mask_np = task["mask_cp"].get()
 
-                            spc_all = np.tile(material.species, task["site_count"])
-                            spc_np = spc_all[mask_np]
+                            spc_np = self._build_species(material.species, task["site_count"], mask_np)
 
                             # Thread-safe accumulation
                             with buf_lock:
                                 _accumulate_to_buffers(pos_np, spc_np)
                                 drained_count += 1
 
-                            del pos_np, mask_np, spc_all, spc_np, task
+                            del pos_np, mask_np, spc_np, task
 
                         # Fill-drain loop for this GPU's chunks
                         while (enq_idx < len(my_chunks)) or inflight:
@@ -3138,7 +3236,7 @@ class sample(logging):
                     pass
                 gpu_ok = False
 
-        # 4b) Single-GPU path (original implementation)
+        # Single-GPU path
         elif gpu_ok:
             try:
                 n_streams = max(1, int(gpu_streams))
@@ -3184,14 +3282,13 @@ class sample(logging):
                     mask_np = task["mask_cp"].get()
 
                     # Build species vector on host
-                    spc_all = np.tile(material.species, task["site_count"])
-                    spc_np = spc_all[mask_np]
+                    spc_np = self._build_species(material.species, task["site_count"], mask_np)
 
                     _accumulate_to_buffers(pos_np, spc_np)
                     drained_count += 1
 
                     # Cleanup local references
-                    del pos_np, mask_np, spc_all, spc_np, task
+                    del pos_np, mask_np, spc_np, task
 
                 # Fill-drain loop
                 while (enqueue_idx < num_geom) or inflight:
@@ -3227,7 +3324,7 @@ class sample(logging):
                     pass
                 gpu_ok = False
 
-        # 5) CPU path (or GPU fallback remainder)
+        # CPU path (or GPU fallback remainder)
         if not gpu_ok:
             start_i = drained_count  # redo from first not-drained chunk
             for i in range(start_i, num_geom):
@@ -3240,13 +3337,14 @@ class sample(logging):
                 _accumulate_to_buffers(pos_np, spc_np)
                 del pos_np, spc_np
 
-        # 6) Flush trailing partial buffer and finish
+        # Flush trailing partial buffer and finish
         _flush_tail()
         wait(pending_writes, return_when=ALL_COMPLETED)
         writer_pool.shutdown(wait=True)
 
-        # 7) Update metadata
+        # Update metadata
         self._chunk_total = int(file_chunk_index)
+        self._teardown_alloy()
         return
 
     def input_voronoi_seed(self, seeds):
@@ -3672,7 +3770,10 @@ class sample(logging):
         gpu_streams=4,
         grain_workers=None,
         writer_threads=3,
-        n_gpus=None
+        n_gpus=None,
+        alloy_species=None,
+        alloy_concentrations=None,
+        alloy_seed=None
     ):
         """
         Generate and persist a polycrystalline sample using Voronoi grains.
@@ -3704,14 +3805,26 @@ class sample(logging):
             writer_threads (int): I/O worker threads.
             n_gpus (int, optional): Number of GPUs to use. Default (None) uses
                 all available GPUs. Set to 1 to force single-GPU mode.
+            alloy_species (list[str] | None, optional): Element symbols for
+                random alloy assignment (e.g. ``["Fe", "Co"]``). Each atom site
+                is randomly assigned one of these species instead of the CIF
+                species. None (default) uses the CIF species.
+            alloy_concentrations (list[float] | None, optional): Per-species
+                probabilities (must sum to 1.0). Must match the length of
+                ``alloy_species``. None defaults to equal probabilities.
+            alloy_seed (int | None, optional): Seed for the random number
+                generator used for alloy species assignment. None (default)
+                gives non-deterministic results.
 
         Returns:
             None (writes chunked arrays and metadata to disk).
         """
+        # Set up alloy mode if requested
+        self._setup_alloy(alloy_species, alloy_concentrations, alloy_seed)
 
         self._sample_type = "poly"
 
-        # 1) Seeds
+        # Seeds
         if self._grain_seeds is None:
             G = int(8 if (n_grains is None) else n_grains)
             self.generate_voronoi_seeds(G, method=voronoi_method, random_seed=randomness_seed)
@@ -3721,7 +3834,7 @@ class sample(logging):
                 raise ValueError("n_grains does not match existing seed map")
         seeds_np = np.asarray(self._grain_seeds, dtype=np.float32)
 
-        # 2) Orientations
+        # Orientations
         if self._grain_orientations is None:
             R = self._orientation_matrices_from_mode(
                 G,
@@ -3736,7 +3849,7 @@ class sample(logging):
             if R.shape[0] != G:
                 raise ValueError("orientation map size does not match number of seeds")
 
-        # 2b) Compute chunk geometry (needed for both streaming and disk modes)
+        # Compute chunk geometry (needed for both streaming and disk modes)
         self._chunk_positions, self._chunk_dimensions = self.get_chunk_positions(material)
         num_geom = int(self.chunk_positions.shape[0])
 
@@ -3747,7 +3860,7 @@ class sample(logging):
             self._compute_streaming_chunk_mapping(material, flush_size)
             return
 
-        # 3) Writer and global accumulation buffers (same pattern as generate_sample_single)
+        # Writer and global accumulation buffers (same pattern as generate_sample_single)
         from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
         import threading
 
@@ -3824,12 +3937,12 @@ class sample(logging):
         else:
             use_n_gpus = min(int(n_gpus), available_gpus) if available_gpus > 0 else 0
 
-        # 5) Single-pass generation: generate atoms once per chunk, compute Voronoi once,
+        # Single-pass generation: generate atoms once per chunk, compute Voronoi once,
         # Get geometric chunks using the base (unrotated) material
         chunk_positions, chunk_dims = self.get_chunk_positions(material)
         num_geom_chunks = int(chunk_positions.shape[0])
 
-        # 5a) Multi-GPU path: distribute chunks across multiple GPUs
+        # Multi-GPU path: distribute chunks across multiple GPUs
         if gpu_ok and use_n_gpus > 1:
             try:
                 # Round-robin distribute chunks to GPUs
@@ -3872,8 +3985,7 @@ class sample(logging):
 
                             # Species array on CPU
                             mask_np = mask_cp.get()
-                            spc_all = np.tile(material.species, site_count)
-                            spc_sample = spc_all[mask_np]
+                            spc_sample = self._build_species(material.species, site_count, mask_np)
 
                             # Partition by grain and apply rotations
                             for g in range(G):
@@ -3937,7 +4049,7 @@ class sample(logging):
                     pass
                 gpu_ok = False
 
-        # 5b) Single-GPU path (original implementation)
+        # Single-GPU path (original implementation)
         elif gpu_ok:
             # GPU path: single-pass with memory-bounded Voronoi
             try:
@@ -3971,8 +4083,7 @@ class sample(logging):
 
                     # Species array for this chunk (on CPU for memory efficiency)
                     mask_np = mask_cp.get()
-                    spc_all = np.tile(material.species, site_count)
-                    spc_sample = spc_all[mask_np]
+                    spc_sample = self._build_species(material.species, site_count, mask_np)
 
                     # Partition atoms by grain and apply rotations
                     for g in range(G):
@@ -4058,16 +4169,17 @@ class sample(logging):
                 for i in range(num_geom_chunks):
                     _process_chunk_cpu(i)
 
-        # 6) Flush and finalize
+        # Flush and finalize
         _flush_tail()
         wait(pending_writes, return_when=ALL_COMPLETED)
         writer_pool.shutdown(wait=True)
 
         # update metadata
         self._chunk_total = int(file_chunk_index)
+        self._teardown_alloy()
         return
     # -------------------------------------
-    
+
     # -------------------------------------
     # KNN search
     def build_cell_list_gpu(self, positions, r_cut):
