@@ -33,6 +33,7 @@ class detector(logging):
         "get_detector_axis",
         "coordinate_conversion",
         "add_noise",
+        "apply_psf",
     )
     
     # -----------------------------------------------------------------------------
@@ -827,6 +828,239 @@ class detector(logging):
                              f"Use 'poisson', 'gaussian', or 'uniform'.")
 
         self.input_pixel_values(E)
+
+    @staticmethod
+    def _build_psf_kernel(sigma_ax0, sigma_ax1, profile='gaussian',
+                          rotation=0.0, eta_pv=0.5, truncate=4.0):
+        """
+        Build a normalized 2D point spread function kernel on a pixel grid.
+
+        Args:
+            sigma_ax0 (float): Width along 2D axis 0 in pixels.
+                Gaussian: standard deviation. Lorentzian: half-width at
+                half-maximum.
+            sigma_ax1 (float): Width along 2D axis 1 in pixels.
+            profile (str): 'gaussian', 'lorentzian', or 'pseudo-voigt'.
+            rotation (float): Counter-clockwise rotation of the ellipse
+                principal axes in degrees. Default 0.
+            eta_pv (float): Pseudo-Voigt mixing fraction (0 = pure Gaussian,
+                1 = pure Lorentzian). Only used for 'pseudo-voigt'. Default 0.5.
+            truncate (float): Kernel half-width in multiples of the larger
+                sigma. Default 4.0.
+
+        Returns:
+            np.ndarray: Normalized 2D kernel (float64).
+        """
+        max_sigma = max(sigma_ax0, sigma_ax1)
+        if max_sigma <= 0:
+            raise ValueError("PSF width must be positive")
+        hw = int(np.ceil(truncate * max_sigma))
+        if hw < 1:
+            hw = 1
+        size = 2 * hw + 1
+
+        ax = np.arange(size, dtype=np.float64) - hw
+        grid_ax0, grid_ax1 = np.meshgrid(ax, ax, indexing='ij')
+
+        rot_rad = np.deg2rad(rotation)
+        cos_r, sin_r = np.cos(rot_rad), np.sin(rot_rad)
+        u = cos_r * grid_ax0 + sin_r * grid_ax1
+        v = -sin_r * grid_ax0 + cos_r * grid_ax1
+
+        u_norm = u / sigma_ax0
+        v_norm = v / sigma_ax1
+
+        profile = profile.lower()
+        if profile == 'gaussian':
+            r2 = u_norm**2 + v_norm**2
+            kernel = np.exp(-0.5 * r2)
+        elif profile == 'lorentzian':
+            r2 = u_norm**2 + v_norm**2
+            kernel = 1.0 / (1.0 + r2)
+        elif profile == 'pseudo-voigt':
+            r2 = u_norm**2 + v_norm**2
+            gauss = np.exp(-0.5 * r2)
+            lorentz = 1.0 / (1.0 + r2)
+            eta_pv = float(np.clip(eta_pv, 0.0, 1.0))
+            kernel = (1.0 - eta_pv) * gauss + eta_pv * lorentz
+        else:
+            raise ValueError(
+                f"Unknown profile '{profile}'. "
+                f"Use 'gaussian', 'lorentzian', or 'pseudo-voigt'."
+            )
+
+        kernel_sum = kernel.sum()
+        if kernel_sum > 0:
+            kernel /= kernel_sum
+
+        return kernel
+
+    def apply_psf(self, width, profile='gaussian', rotation=0.0,
+                  units='pixels', field='intensity', eta_pv=0.5,
+                  boundary='auto', truncate=4.0):
+        """
+        Apply a point spread function (resolution function) to the detector.
+
+        Convolves the detector intensity (or amplitude) with a 2D kernel to
+        simulate instrument broadening. For ring detectors the eta axis is
+        treated as periodic.
+
+        Args:
+            width (float or tuple[float, float]): PSF width parameter.
+                Scalar for a circular PSF, 2-tuple for elliptical.
+                Tuple order matches shape/pixel_size convention:
+                  rectangular: (width_y, width_z)
+                  ring:        (width_two_theta, width_eta)
+                Interpretation depends on *profile*:
+                  'gaussian'    — standard deviation (sigma)
+                  'lorentzian'  — half-width at half-maximum (gamma)
+                  'pseudo-voigt'— shared width parameter
+            profile (str): Kernel shape. 'gaussian' (default), 'lorentzian',
+                or 'pseudo-voigt'.
+            rotation (float): Rotation of the elliptical PSF axes relative to
+                the detector pixel axes, in degrees. Default 0.
+            units (str): Units for *width*. 'pixels' (default), 'physical'
+                (Angstroms, spatial-mode only), or 'angular' (degrees,
+                angular-mode only).
+            field (str): Which quantity to convolve. 'intensity' (default,
+                physically correct for incoherent detector PSF) or 'amplitude'
+                (coherent PSF).
+            eta_pv (float): Pseudo-Voigt mixing (0 = pure Gaussian,
+                1 = pure Lorentzian). Only used when profile='pseudo-voigt'.
+                Default 0.5.
+            boundary (str): Boundary mode for scipy.ndimage.convolve.
+                'auto' (default) picks 'wrap' on the periodic eta axis of ring
+                detectors and 'constant' elsewhere. Other options: 'constant',
+                'reflect', 'nearest', 'wrap'.
+            truncate (float): Kernel extent in multiples of the width
+                parameter. Default 4.0.
+
+        Raises:
+            ValueError: If pixel values are not set, or parameters are invalid.
+            NotImplementedError: For shell + spatial detectors (non-regular grid).
+        """
+        from scipy.ndimage import convolve
+
+        # --- Validation -------------------------------------------------------
+        if self._pixel_values is None:
+            raise ValueError(
+                "No pixel values to apply PSF to. Run a simulation first."
+            )
+        if (hasattr(self, '_construction_mode')
+                and self._construction_mode == 'shell'
+                and (not hasattr(self, '_input_mode')
+                     or self._input_mode != 'angular')):
+            raise NotImplementedError(
+                "PSF convolution is not supported for shell+spatial detectors "
+                "because the pixel grid is non-regular after spherical "
+                "projection. Use shell+angular mode instead."
+            )
+
+        # --- Parse width ------------------------------------------------------
+        if isinstance(width, (int, float, np.integer, np.floating)):
+            sigma_0 = float(width)
+            sigma_1 = float(width)
+        elif hasattr(width, '__len__') and len(width) == 2:
+            sigma_0 = float(width[0])
+            sigma_1 = float(width[1])
+        else:
+            raise ValueError(
+                "width must be a scalar (circular) or 2-tuple (elliptical)."
+            )
+
+        # --- Unit conversion --------------------------------------------------
+        # sigma_0 corresponds to shape[0] direction, sigma_1 to shape[1].
+        # The 2D array is (shape[1], shape[0]), so:
+        #   2D axis 0 ← shape[1] ← sigma_1
+        #   2D axis 1 ← shape[0] ← sigma_0
+        units = str(units).lower()
+        if units == 'pixels':
+            pass
+        elif units == 'physical':
+            if hasattr(self, '_input_mode') and self._input_mode == 'angular':
+                raise ValueError(
+                    "units='physical' is not meaningful for an angular-mode "
+                    "detector. Use 'angular' or 'pixels'."
+                )
+            # pixel_size = (dy, dz) for rectangular; (d_two_theta, d_eta) for ring
+            sigma_0 = sigma_0 / float(self._pixel_size[0])
+            sigma_1 = sigma_1 / float(self._pixel_size[1])
+        elif units == 'angular':
+            if not hasattr(self, '_input_mode') or self._input_mode != 'angular':
+                raise ValueError(
+                    "units='angular' requires an angular-mode detector. "
+                    "Use 'physical' or 'pixels'."
+                )
+            sigma_0 = sigma_0 / float(self._pixel_size[0])
+            sigma_1 = sigma_1 / float(self._pixel_size[1])
+        else:
+            raise ValueError(
+                f"Unknown units '{units}'. Use 'pixels', 'physical', or "
+                f"'angular'."
+            )
+
+        if sigma_0 <= 0 or sigma_1 <= 0:
+            raise ValueError("PSF width must be positive after unit conversion.")
+
+        # Map to 2D array axes: ax0 ← sigma_1, ax1 ← sigma_0
+        sigma_ax0 = sigma_1
+        sigma_ax1 = sigma_0
+
+        # --- Build kernel -----------------------------------------------------
+        kernel = self._build_psf_kernel(
+            sigma_ax0, sigma_ax1,
+            profile=profile,
+            rotation=rotation,
+            eta_pv=eta_pv,
+            truncate=truncate,
+        )
+
+        # --- Reshape to 2D and extract field ----------------------------------
+        shape_2d = (self._shape[1], self._shape[0])
+        field = str(field).lower()
+
+        if field == 'intensity':
+            data_2d = (np.abs(self._pixel_values) ** 2).reshape(shape_2d).astype(np.float64)
+        elif field == 'amplitude':
+            data_2d = np.abs(self._pixel_values).reshape(shape_2d).astype(np.float64)
+        else:
+            raise ValueError(
+                f"Unknown field '{field}'. Use 'intensity' or 'amplitude'."
+            )
+
+        # --- Boundary mode ----------------------------------------------------
+        boundary = str(boundary).lower()
+        is_ring = hasattr(self, '_geometry') and self._geometry == 'ring'
+
+        if boundary == 'auto':
+            if is_ring:
+                # axis 0 = eta (periodic), axis 1 = two_theta (non-periodic)
+                conv_mode = ['wrap', 'constant']
+            else:
+                conv_mode = 'constant'
+        else:
+            conv_mode = boundary
+
+        # --- Convolve ---------------------------------------------------------
+        convolved = convolve(data_2d, kernel, mode=conv_mode)
+        convolved = np.maximum(convolved, 0.0)
+
+        # --- Reconstruct E-field preserving phase -----------------------------
+        phase = np.angle(self._pixel_values).reshape(shape_2d)
+
+        if field == 'intensity':
+            new_amplitude = np.sqrt(convolved).astype(np.float32)
+        else:
+            new_amplitude = convolved.astype(np.float32)
+
+        E_new = new_amplitude * (np.cos(phase) + 1j * np.sin(phase))
+        E_new = E_new.astype(np.complex64).ravel()
+
+        self.input_pixel_values(E_new)
+
+        print(f"[Detector] Applied {profile} PSF, "
+              f"width=({sigma_ax0:.2f}, {sigma_ax1:.2f}) pixels, "
+              f"field={field}, boundary={conv_mode}")
 
     def coordinate_conversion(self,data,input_system="cartesian",output_system="angular",units="deg"):
         """
