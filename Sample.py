@@ -135,7 +135,7 @@ class sample(logging):
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
             
-    def create_sample(self, dimensions, offset=[0, 0, 0], chunk_volume=12500000, sample_type="single", streaming=False):
+    def create_sample(self, dimensions, offset=[0, 0, 0], chunk_volume=12500000, sample_type="single", streaming=False, sample_shape="box"):
         """
         Create an axis-aligned sample box and precompute helpers.
 
@@ -159,6 +159,11 @@ class sample(logging):
                 chunks are generated on-demand during simulation rather than
                 persisted to disk. This allows samples larger than disk capacity.
                 Defaults to False.
+            sample_shape (str, optional): "box" (default) or "ellipsoid".
+                For "ellipsoid", atoms outside the axis-aligned ellipsoid
+                inscribed in the bounding box are discarded. The semi-axes
+                are dimensions/2 along x, y, z. Equal dimensions yield a
+                sphere.
 
         Returns:
             None
@@ -182,8 +187,9 @@ class sample(logging):
         # Slightly rewritten for small overhead reduction (no functional change)
         self._corners = (self.get_unit_corners() @ self.matrix) - (self.dimensions * 0.5) + self.offset
 
-        # Sample type and poly state
+        # Sample type, shape, and poly state
         self._sample_type = sample_type
+        self._sample_shape = sample_shape
 
         # Streaming mode configuration
         self._streaming_mode = bool(streaming)
@@ -228,6 +234,8 @@ class sample(logging):
             self._alloy_species = sample_metadata["alloy_species"]
         if sample_metadata.get("alloy_concentrations") is not None:
             self._alloy_concentrations = sample_metadata["alloy_concentrations"]
+        if sample_metadata.get("sample_shape") is not None:
+            self._sample_shape = sample_metadata["sample_shape"]
 
     ## Alloy helpers
     # -------------------------------------
@@ -381,6 +389,7 @@ class sample(logging):
             "sample_type": self._sample_type if self._sample_type is not None else None,
             "alloy_species": self._alloy_species if self._alloy_species is not None else None,
             "alloy_concentrations": self._alloy_concentrations if self._alloy_concentrations is not None else None,
+            "sample_shape": getattr(self, '_sample_shape', 'box'),
         }
 
         # Choose the output directory and filename
@@ -2918,6 +2927,14 @@ class sample(logging):
                     (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= dims_gpu[2])
                 )
 
+                # Ellipsoid mask: discard atoms outside inscribed ellipsoid
+                if getattr(self, '_sample_shape', 'box') == 'ellipsoid':
+                    semi = dims_gpu * 0.5
+                    norm_sq = ((atomic_positions_S[:, 0] - semi[0]) / semi[0])**2 + \
+                              ((atomic_positions_S[:, 1] - semi[1]) / semi[1])**2 + \
+                              ((atomic_positions_S[:, 2] - semi[2]) / semi[2])**2
+                    mask = mask & (norm_sq <= 1.0)
+
                 # Filter and apply center/offset
                 atomic_positions_S = atomic_positions_S[mask, :]
                 atomic_positions_S += (offset_gpu - dim_half_gpu)
@@ -2955,6 +2972,14 @@ class sample(logging):
             (atomic_positions_S[:, 1] >= 0) & (atomic_positions_S[:, 1] <= self.dimensions[1]) &
             (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= self.dimensions[2])
         )
+
+        # Ellipsoid mask: discard atoms outside inscribed ellipsoid
+        if getattr(self, '_sample_shape', 'box') == 'ellipsoid':
+            semi = self.dimensions * 0.5
+            norm_sq = ((atomic_positions_S[:, 0] - semi[0]) / semi[0])**2 + \
+                      ((atomic_positions_S[:, 1] - semi[1]) / semi[1])**2 + \
+                      ((atomic_positions_S[:, 2] - semi[2]) / semi[2])**2
+            mask = mask & (norm_sq <= 1.0)
 
         # Apply mask and center/offset shift
         atomic_positions_S = atomic_positions_S[mask, :].astype(np.float32)
