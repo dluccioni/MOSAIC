@@ -6,10 +6,293 @@ try:
     import cupy as cp
 except ImportError:
     cp = None
+try:
+    from scipy.special import k0 as _scipy_k0, k1 as _scipy_k1
+except ImportError:
+    _scipy_k0 = None
+    _scipy_k1 = None
+try:
+    from cupyx.scipy.special import k0 as _cupy_k0, k1 as _cupy_k1
+except ImportError:
+    _cupy_k0 = None
+    _cupy_k1 = None
 import json
 import re
 import os
 from Logging import logging
+
+
+# -----------------------------------------------------------------------------
+# Helpers for the Bertin (2018) spectral dislocation framework
+# -----------------------------------------------------------------------------
+def _cai_kernel_fourier(K, a, xp=np):
+    """
+    3D Fourier transform of the Cai et al. (2006) non-singular spreading kernel
+    omega(r, a) = (15 / (8 pi a^3)) * ((r/a)^2 + 1)^(-7/2).
+
+    Closed form (Bertin 2018, derived in the paper appendix from
+    Gradshteyn-Ryzhik 3.771):
+
+        omega_hat(k, a) = ((a k)^2 / 2) * K_2(a k)
+
+    where K_2 is the modified Bessel function of the second kind, order 2.
+    K_2 is reconstructed from K_0 and K_1 via the standard recurrence
+    K_2(x) = K_0(x) + (2/x) K_1(x). For very small arguments x = ak < 1e-3
+    the routine switches to the series 1 - x^2/4 + O(x^4 log x), which avoids
+    the catastrophic 2/x^2 - 2/x^2 cancellation in the Bessel form.
+
+    Args:
+        K:  array of |k| values (sqrt(kx^2 + ky^2 + kz^2)) on the spectral grid.
+        a:  scalar spreading radius (a_grid).
+        xp: numpy or cupy module. Determines which Bessel implementation
+            (scipy.special or cupyx.scipy.special) is used.
+
+    Returns:
+        Phi: array of shape `K.shape` with values in [0, 1] giving the
+        Fourier-domain spreading kernel. Phi at K=0 is set to 1.
+    """
+    if xp is np:
+        if _scipy_k0 is None or _scipy_k1 is None:
+            raise ImportError(
+                "scipy.special.k0/k1 are required for the Cai kernel; "
+                "install scipy."
+            )
+        k0_fn = _scipy_k0
+        k1_fn = _scipy_k1
+    else:
+        if _cupy_k0 is None or _cupy_k1 is None:
+            raise ImportError(
+                "cupyx.scipy.special.k0/k1 are required for the Cai kernel "
+                "on the GPU; please use CuPy 12.0 or newer."
+            )
+        k0_fn = _cupy_k0
+        k1_fn = _cupy_k1
+
+    x = a * K
+    Phi = xp.empty_like(x)
+
+    # Threshold below which we use the small-argument series.
+    # Series:  ((ax)^2/2) K_2(ax) = 1 - (ax)^2/4 + O((ax)^4 log(ax))
+    eps_series = 1.0e-3
+
+    small_mask = x < eps_series
+    big_mask = ~small_mask
+
+    # Series branch: (1 - x^2/4)  -- accurate to ~6e-8 at x = 1e-3
+    Phi_small = 1.0 - 0.25 * (x * x)
+
+    # Bessel branch: ((ax)^2/2) * (K_0(ax) + (2/(ax)) K_1(ax))
+    #              = ((ax)^2/2) K_0(ax) + ax K_1(ax)
+    x_big = xp.where(big_mask, x, xp.ones_like(x))  # avoid log(0) inside k0
+    Phi_big = 0.5 * (x_big * x_big) * k0_fn(x_big) + x_big * k1_fn(x_big)
+
+    Phi = xp.where(small_mask, Phi_small, Phi_big)
+
+    # K = 0 (DC bin) is the indeterminate form 0 * inf; the limit is 1.
+    Phi = xp.where(K > 0, Phi, xp.ones_like(Phi))
+    return Phi
+
+
+def _isotropic_stiffness_tensor(mu, nu):
+    """
+    Build the (3,3,3,3) elastic stiffness tensor for isotropic Hooke's law
+    from shear modulus mu and Poisson ratio nu.
+
+        C_ijkl = lambda * delta_ij delta_kl + mu * (delta_ik delta_jl + delta_il delta_jk)
+
+    where lambda = 2 mu nu / (1 - 2 nu).
+    """
+    mu_ = float(mu)
+    nu_ = float(nu)
+    if not (0.0 < nu_ < 0.5):
+        raise ValueError("nu must be in (0, 0.5)")
+    lam = 2.0 * mu_ * nu_ / (1.0 - 2.0 * nu_)
+    I3 = np.eye(3, dtype=np.float64)
+    C = (
+        lam * np.einsum("ij,kl->ijkl", I3, I3)
+        + mu_ * np.einsum("ik,jl->ijkl", I3, I3)
+        + mu_ * np.einsum("il,jk->ijkl", I3, I3)
+    )
+    return C.astype(np.float64)
+
+
+def _voigt_to_tensor(C_voigt):
+    """
+    Expand a (6,6) Voigt stiffness matrix to a full (3,3,3,3) tensor using
+    the standard mapping (1<->11, 2<->22, 3<->33, 4<->23, 5<->13, 6<->12).
+    """
+    Cv = np.asarray(C_voigt, dtype=np.float64)
+    if Cv.shape != (6, 6):
+        raise ValueError("Voigt stiffness must be (6, 6)")
+    # Voigt index <-> tensor index pairs
+    voigt_pairs = [(0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1)]
+    C = np.zeros((3, 3, 3, 3), dtype=np.float64)
+    for I in range(6):
+        i, j = voigt_pairs[I]
+        for J in range(6):
+            k, l = voigt_pairs[J]
+            v = Cv[I, J]
+            C[i, j, k, l] = v
+            C[j, i, k, l] = v
+            C[i, j, l, k] = v
+            C[j, i, l, k] = v
+    return C
+
+
+def _cubic_stiffness_tensor(c11, c12, c44):
+    """
+    Build the (3,3,3,3) stiffness tensor for a cubic crystal from the three
+    independent moduli (c11, c12, c44) using the Voigt expansion.
+    """
+    Cv = np.zeros((6, 6), dtype=np.float64)
+    Cv[0, 0] = Cv[1, 1] = Cv[2, 2] = float(c11)
+    Cv[0, 1] = Cv[0, 2] = Cv[1, 0] = Cv[1, 2] = Cv[2, 0] = Cv[2, 1] = float(c12)
+    Cv[3, 3] = Cv[4, 4] = Cv[5, 5] = float(c44)
+    return _voigt_to_tensor(Cv)
+
+
+def _resolve_stiffness(stiffness, mu, nu):
+    """
+    Normalise the user-supplied `stiffness` argument of generate_nodal_field
+    into a (3,3,3,3) numpy array C_ijkl.
+
+    Accepted forms:
+      - None                                 -> isotropic from (mu, nu)
+      - dict {"isotropic": (mu, nu)}         -> isotropic
+      - dict {"cubic": (c11, c12, c44)}      -> cubic via Voigt expansion
+      - (6, 6) array                         -> Voigt expansion
+      - (3, 3, 3, 3) array                   -> validated and returned
+    """
+    if stiffness is None:
+        return _isotropic_stiffness_tensor(mu, nu)
+    if isinstance(stiffness, dict):
+        if "isotropic" in stiffness:
+            mu_iso, nu_iso = stiffness["isotropic"]
+            return _isotropic_stiffness_tensor(mu_iso, nu_iso)
+        if "cubic" in stiffness:
+            c11, c12, c44 = stiffness["cubic"]
+            return _cubic_stiffness_tensor(c11, c12, c44)
+        raise ValueError(
+            "stiffness dict must have key 'isotropic' or 'cubic'"
+        )
+    arr = np.asarray(stiffness, dtype=np.float64)
+    if arr.shape == (6, 6):
+        return _voigt_to_tensor(arr)
+    if arr.shape == (3, 3, 3, 3):
+        # Validate symmetries
+        if not np.allclose(arr, arr.transpose(1, 0, 2, 3), atol=1e-6):
+            raise ValueError("stiffness violates minor symmetry C_ijkl = C_jikl")
+        if not np.allclose(arr, arr.transpose(0, 1, 3, 2), atol=1e-6):
+            raise ValueError("stiffness violates minor symmetry C_ijkl = C_ijlk")
+        if not np.allclose(arr, arr.transpose(2, 3, 0, 1), atol=1e-6):
+            raise ValueError("stiffness violates major symmetry C_ijkl = C_klij")
+        return arr.copy()
+    raise ValueError(
+        "stiffness must be None, a dict, a (6,6) Voigt matrix, "
+        "or a (3,3,3,3) tensor"
+    )
+
+
+def _cic_line_segment_integral(d_tilde, t_hat, H, sa, sb):
+    """
+    Closed-form line integral of the trilinear cloud-in-cell (CIC) kernel over
+    a sub-interval [sa, sb] of a straight dislocation segment, following Bertin
+    (2018) Appendix A.
+
+    Computes
+        I = integral_{sa..sb}  prod_i max(0, 1 - |d_tilde_i - s * t_hat_i| / H_i)  ds
+    where d_tilde = x_voxel - x_segment_start (vector from segment start to the
+    voxel centre), t_hat is the unit segment tangent, H is the (per-axis) voxel
+    spacing (=CIC support half-width), and [sa, sb] is the sub-interval where
+    the segment lies inside the voxel's [-H, +H] CIC weighting box (caller is
+    responsible for that clipping).
+
+    Each axis-i factor (1 - |d_i - s t_i|/H_i) is piecewise linear in s with a
+    sign-flip at s_i* = d_i / t_i. We split [sa, sb] at the (up to three) flips
+    so that on each sub-interval the absolute values can be removed by attaching
+    a sign sigma_i in {+1, -1}. The integrand is then a cubic polynomial in s
+    that we expand in coefficients (c0..c3) of the basis (1, s, s^2, s^3) and
+    integrate analytically.
+
+    Returns 0.0 when [sa, sb] is empty.
+    """
+    if not (sb > sa):
+        return 0.0
+
+    # Find sign-flip points along this sub-interval
+    flips = []
+    for i in range(3):
+        ti = t_hat[i]
+        if abs(ti) > 1.0e-30:
+            sf = d_tilde[i] / ti
+            if sa < sf < sb:
+                flips.append(sf)
+    flips.sort()
+    breaks = [sa] + flips + [sb]
+
+    total = 0.0
+    for ki in range(len(breaks) - 1):
+        s0 = breaks[ki]
+        s1 = breaks[ki + 1]
+        if not (s1 > s0):
+            continue
+        s_mid = 0.5 * (s0 + s1)
+
+        # Per-axis (alpha_i + beta_i s) form of the (1 - sigma_i (d_i - s t_i)/H_i) factor
+        alpha = [0.0, 0.0, 0.0]
+        beta  = [0.0, 0.0, 0.0]
+        for i in range(3):
+            sgn = 1.0 if (d_tilde[i] - s_mid * t_hat[i]) >= 0.0 else -1.0
+            alpha[i] = 1.0 - sgn * d_tilde[i] / H[i]
+            beta[i]  =       sgn * t_hat[i]  / H[i]
+
+        # Polynomial coefficients of  prod_i (alpha_i + beta_i s)  =  c0 + c1 s + c2 s^2 + c3 s^3
+        a0, a1, a2 = alpha
+        b0, b1, b2 = beta
+        c0 = a0 * a1 * a2
+        c1 = a0 * a1 * b2 + a0 * b1 * a2 + b0 * a1 * a2
+        c2 = a0 * b1 * b2 + b0 * a1 * b2 + b0 * b1 * a2
+        c3 = b0 * b1 * b2
+
+        ds  = s1 - s0
+        ds2 = s1 * s1 - s0 * s0
+        ds3 = s1 * s1 * s1 - s0 * s0 * s0
+        ds4 = s1 * s1 * s1 * s1 - s0 * s0 * s0 * s0
+
+        total += c0 * ds + 0.5 * c1 * ds2 + (c2 / 3.0) * ds3 + 0.25 * c3 * ds4
+
+    return total
+
+
+def _cic_segment_voxel_clip(d_tilde, t_hat, H, L):
+    """
+    Slab-clip a straight dislocation segment of length L (parameter s in [0, L])
+    against a single CIC voxel's [-H, +H] weighting box (centred at the voxel,
+    expressed in the segment-local frame via d_tilde = x_voxel - x_segment_start).
+
+    Returns (sa, sb) such that the segment is inside the voxel's CIC support
+    for s in [sa, sb], or (None, None) if the slab is empty.
+    """
+    sa = 0.0
+    sb = L
+    for i in range(3):
+        ti = t_hat[i]
+        if abs(ti) > 1.0e-30:
+            inv_ti = 1.0 / ti
+            s_lo = (d_tilde[i] - H[i]) * inv_ti
+            s_hi = (d_tilde[i] + H[i]) * inv_ti
+            if s_lo > s_hi:
+                s_lo, s_hi = s_hi, s_lo
+            if s_lo > sa:
+                sa = s_lo
+            if s_hi < sb:
+                sb = s_hi
+        else:
+            if not (-H[i] <= d_tilde[i] <= H[i]):
+                return (None, None)
+        if sa >= sb:
+            return (None, None)
+    return (sa, sb)
 
 # -----------------------------------------------------------------------------
 # Class
@@ -809,6 +1092,7 @@ class defects(logging):
                              padding=0.0,
                              core_radius=5.0,
                              r_cut=None,
+                             stiffness=None,
                              scale=1.0,
                              write_directory=None,
                              nodes_filename="opendis_nodes_fe.txt",
@@ -823,54 +1107,103 @@ class defects(logging):
         """
         Compute a nodal displacement field from the dislocation network.
 
-        Computes a nodal displacement field U on a regular cell-centered grid
-        from the imported OpenDiS dislocation network.
+        Implements the spectral / analytic hybrid framework of Bertin (2018,
+        *Int. J. Plasticity* **122**, 268-284) specialised to the displacement
+        output that the X-ray Simulator needs to drive its atomic positions.
+        The Nye tensor is deposited on a periodic grid by the closed-form
+        cloud-in-cell line integral of Bertin Appendix A, smoothed in Fourier
+        space by the Cai et al. (2006) non-singular kernel
+        omega(r, a) = (15 / (8 pi a^3)) * ((r/a)^2 + 1)^(-7/2) whose 3D Fourier
+        transform admits the closed form omega_hat(k, a) = ((a k)^2 / 2) K_2(a k),
+        and converted to displacement by inverting the anisotropic
+        Christoffel matrix A_im(k) = C_ijml k_j k_l per Fourier mode. A
+        short-range correction (LR+SR mode) sums the difference of the Cai 2006
+        non-singular displacement gradient evaluated at the physical core
+        radius and the spectral spreading radius over neighbour segments
+        within `r_cut`, then integrates the result back to a displacement
+        correction in Fourier space.
 
         Args:
             crystal: Crystal object (deprecated, may be removed in future).
-            mu: Shear modulus of the material.
-            nu: Poisson's ratio (must be in range (0, 0.5)).
-            grid_shape: Shape of the output grid as (nx, ny, nz).
-                Defaults to (64, 64, 64).
-            bounds: Explicit bounds as ((xmin, xmax), (ymin, ymax), (zmin, zmax)).
-                If None, uses the dislocation network bounds plus padding.
-            padding: Padding to add around the network bounds. Defaults to 0.0.
-            core_radius: Physical dislocation core radius (a_phys).
-                Defaults to 5.0.
-            r_cut: Short-range neighbor radius for LR+SR mode. If None,
-                automatically computed from grid spacing. Defaults to None.
+            mu: Shear modulus, used by the **isotropic short-range correction**
+                (Cai 2006 closed form) regardless of whether `stiffness` is
+                supplied for the long-range solver. Required.
+            nu: Poisson's ratio in (0, 0.5), used by the short-range correction
+                and to build the default isotropic stiffness for the
+                long-range solver if `stiffness=None`.
+            grid_shape: (nx, ny, nz) shape of the spectral grid. 64-256 per
+                axis is typical.
+            bounds: Explicit ((xmin, xmax), (ymin, ymax), (zmin, zmax)). If
+                None, uses the imported network bounds plus `padding`.
+            padding: Padding around the network bounds when `bounds` is None.
+            core_radius: Physical dislocation core radius a_0 used in the
+                short-range Cai 2006 correction. Defaults to 5.0 angstrom.
+            r_cut: Short-range neighbour cutoff for LR+SR mode. If None,
+                set to 4 * a_grid where a_grid = 2 * min(dx, dy, dz) is the
+                spectral spreading radius. This corresponds to the ~5%
+                splitting-error rule of thumb of Bertin (2018) Fig. 10 for
+                a_phys ~ b. Pass a custom value to tighten/loosen.
+            stiffness: Elastic stiffness used by the **anisotropic** spectral
+                long-range solver. Accepts:
+
+                * None: build the isotropic Hooke's law from `(mu, nu)`
+                  (default; preserves backwards compatibility).
+                * dict ``{"isotropic": (mu, nu)}``: same as None but lets the
+                  caller decouple SR/LR moduli.
+                * dict ``{"cubic": (c11, c12, c44)}``: cubic crystal expanded
+                  via the Voigt mapping.
+                * (6, 6) ndarray: arbitrary anisotropic stiffness in Voigt
+                  notation.
+                * (3, 3, 3, 3) ndarray: full 4th-order tensor with the
+                  standard symmetries.
+
+                Note: the short-range Cai 2006 routine is intrinsically
+                isotropic, so even when an anisotropic `stiffness` is
+                supplied, the SR correction uses (mu, nu). Strict-anisotropic
+                short-range corrections via the spherical-harmonic expansion
+                of Aubry & Arsenlis (2013) or the closed-form non-singular
+                theory of Po et al. (2018) are out of scope here.
             scale: Scale factor for the displacement field. Defaults to 1.0.
             write_directory: Directory for output files. If None, uses
-                self.directory. Defaults to None.
-            nodes_filename: Filename for node output. Defaults to "opendis_nodes_fe.txt".
-            conn_filename: Filename for connectivity output. Defaults to "opendis_tet4.txt".
-            use_gpu: If True and CuPy is available, use GPU acceleration.
-                Defaults to True.
-            one_based_connectivity: If True, connectivity indices start at 1.
-                Defaults to True.
-            file_format: Output format ("txt", "npy", or "npz"). Defaults to "npy".
-            float_fmt: Float format string for text output. Defaults to "%.9e".
-            chunk_rows: Number of rows per write chunk. Defaults to 2000000.
-            dtype: NumPy dtype for output arrays. Defaults to np.float32.
-            mode: Computation mode. Options are:
-                - "LR": Spectral long-range only using periodic FFTs and
-                    Navier inversion.
-                - "SR": Continuum-mechanics only using non-singular displacement
-                    gradient line-integral formulation (ExaDiS-style).
-                - "LR+SR": Hybrid mode with spectral LR plus analytic near-core
-                    correction (default).
+                self.directory.
+            nodes_filename: Output filename for the nodal positions.
+            conn_filename: Output filename for the Tet4 connectivity.
+            use_gpu: If True and CuPy is available, run the spectral solve
+                and SR accumulation on the GPU.
+            one_based_connectivity: If True, Tet4 indices start at 1
+                (FE-style); else 0-based.
+            file_format: "txt", "npy", or "npz".
+            float_fmt: Float format string for text output.
+            chunk_rows: Number of rows per text-write chunk.
+            dtype: NumPy dtype for output arrays.
+            mode: Computation mode:
+                - "LR":   spectral long-range only.
+                - "SR":   continuum non-singular line-integral only
+                          (ExaDiS-style; sums over all segments).
+                - "LR+SR": hybrid spectral long-range plus analytic
+                          near-core delta correction (default; faithful to
+                          Bertin 2018 splitting Eq. 14 / 31).
 
         Returns:
-            dict: Contains:
-                - Xref: Reference node positions as (N, 3) array.
-                - U: Displacement field as (N, 3) array.
-                - conn: Tet4 connectivity array.
-                - nodes_path: Path to written nodes file.
-                - conn_path: Path to written connectivity file.
+            dict: ``Xref`` (N, 3) reference positions, ``U`` (N, 3)
+            displacement field, ``conn`` Tet4 connectivity, plus output
+            file paths.
 
         Raises:
-            RuntimeError: If dislocation network has not been imported.
-            ValueError: If mode is invalid or nu is out of range.
+            RuntimeError: If the dislocation network has not been imported.
+            ValueError: If `mode` is invalid, `nu` is out of range, or
+                `stiffness` violates the major/minor symmetries.
+
+        Notes:
+            For large segment counts (Ns > ~10**4) combined with the new
+            r_cut = 4 * a_grid default, the brute-force segment-midpoint
+            culling in the short-range loop becomes the bottleneck. A
+            uniform-grid spatial hash is a planned optimisation; for now,
+            consider lowering r_cut at the cost of a larger splitting error.
+
+        References:
+            Bertin, N. *Int. J. Plasticity* **122**, 268-284 (2019).
+            Cai, W. et al. *J. Mech. Phys. Solids* **54**, 561-587 (2006).
         """
         # --------------------------
         # Preconditions and inputs
@@ -886,6 +1219,12 @@ class defects(logging):
         mu_ = float(mu)
         lam = 2.0 * mu_ * nu / max(1.0 - 2.0*nu, 1e-12)
         a_phys = float(core_radius)
+
+        # Resolve the user-supplied stiffness into a (3,3,3,3) tensor used by
+        # the spectral long-range solver. The short-range correction always
+        # uses the isotropic Cai 2006 closed forms with (mu, nu); see the
+        # docstring for the rationale.
+        C_stiff = _resolve_stiffness(stiffness, mu_, nu)
 
         out_dir = write_directory if write_directory is not None else (self.directory if self.directory else ".")
         os.makedirs(out_dir, exist_ok=True)
@@ -914,10 +1253,12 @@ class defects(logging):
         # a_grid for LR spreading; SR-only does not use it
         a_grid = 2.0 * min(dx, dy, dz)
 
-        # default SR neighbor radius for LR+SR; for SR-only we include all segments
+        # default SR neighbor radius for LR+SR; for SR-only we include all segments.
+        # Bertin (2018) Fig. 10 / Eq. 53: r_c = sqrt((a_grid^2 - a_phys^2) / eps_max),
+        # which gives r_c ~= 4 a_grid for a_phys ~= b and eps_max ~= 5%. Tied to
+        # a_grid (not the mean grid spacing) so the splitting error stays bounded.
         if r_cut is None:
-            mean_h = (dx + dy + dz) / 3.0
-            r_cut = 2.0 * mean_h
+            r_cut = 4.0 * a_grid
         R_c = float(r_cut)
 
         # Cell-centered nodes (reference positions)
@@ -982,117 +1323,97 @@ class defects(logging):
                 gpu_ok = False
 
         # --------------------------
-        # Helper: spectral LR solver (unchanged)
+        # Helper: spectral LR solver
+        #
+        # Implements the Bertin (2018) spectral framework for the displacement
+        # field of a dislocation network on a periodic grid:
+        #   1. FFT(alpha) -> alpha_hat                                (Nye tensor in Fourier space)
+        #   2. alpha_hat_ns = omega_hat(k, a_grid) * alpha_hat        (Cai 2006 spreading)
+        #   3. chi_hat_ij = i eps_jkl k_l alpha_hat_ns_ik / |k|^2     (Stokes-Helmholtz incompatible distortion, Bertin Eq. 29)
+        #   4. eps_hat = sym(chi_hat)
+        #   5. sigma_hat_ij = C_ijkl eps_hat_kl                       (anisotropic Hooke's law)
+        #   6. RHS_i = i k_j sigma_hat_ij                             (force density driving Navier)
+        #   7. A_im(k) = C_ijml k_j k_l                               (acoustic / Christoffel matrix)
+        #   8. Uhat_i = A^{-1}_ij(k) RHS_j   (per-k 3x3 inverse)
+        #   9. u_long(r) = IFFT(Uhat)
+        # The k=0 mode is set to zero (rigid-body translation gauge).
         # --------------------------
-        def _fft_lr(alpha_arr, use_gpu_fft=True, ns_kernel="exp"):
-            if use_gpu_fft:
-                aa = alpha_arr
-                kx = 2.0*np.pi*cp.fft.fftfreq(nx, d=dx)
-                ky = 2.0*np.pi*cp.fft.fftfreq(ny, d=dy)
-                kz = 2.0*np.pi*cp.fft.fftfreq(nz, d=dz)
-                KX, KY, KZ = cp.meshgrid(kx, ky, kz, indexing="ij")
-                K2 = KX*KX + KY*KY + KZ*KZ
-                K = cp.sqrt(K2)
-                K2[0,0,0] = 1.0
+        def _fft_lr(alpha_arr, use_gpu_fft=True):
+            xp = cp if use_gpu_fft else np
+            C_xp = xp.asarray(C_stiff, dtype=xp.float32)
 
-                Phi = cp.exp(-a_grid * K) if ns_kernel != "helmholtz" else 1.0 / (1.0 + (a_grid*a_grid)*K2)
-                Ak = cp.fft.fftn(aa, axes=(0,1,2))
-                Ak_ns = Phi[...,None,None] * Ak
+            kx = 2.0*np.pi*xp.fft.fftfreq(nx, d=dx)
+            ky = 2.0*np.pi*xp.fft.fftfreq(ny, d=dy)
+            kz = 2.0*np.pi*xp.fft.fftfreq(nz, d=dz)
+            KX, KY, KZ = xp.meshgrid(kx, ky, kz, indexing="ij")
+            K2 = KX*KX + KY*KY + KZ*KZ
+            K = xp.sqrt(K2)
+            K2_safe = K2.copy()
+            K2_safe[0,0,0] = 1.0
 
-                beta_p = cp.zeros_like(Ak_ns, dtype=cp.complex64)
-                for i in range(3):
-                    arow = Ak_ns[..., i, :]
-                    cx = cp.stack([
-                        KY*arow[...,2] - KZ*arow[...,1],
-                        KZ*arow[...,0] - KX*arow[...,2],
-                        KX*arow[...,1] - KY*arow[...,0],
-                    ], axis=-1)
-                    beta_p[..., i, :] = 1j * cx / K2[...,None]
-                beta_p[0,0,0,...] = 0.0
+            # Cai 2006 non-singular spreading kernel in Fourier space.
+            # See _cai_kernel_fourier docstring for the closed form
+            # omega_hat(k, a) = ((a k)^2 / 2) K_2(a k).
+            Phi = _cai_kernel_fourier(K, a_grid, xp=xp).astype(xp.float32)
 
-                ep = 0.5*(beta_p + cp.transpose(beta_p, (0,1,2,4,3)))
-                tr_ep = ep[...,0,0] + ep[...,1,1] + ep[...,2,2]
-                kvec = cp.stack([KX, KY, KZ], axis=-1)
+            Ak = xp.fft.fftn(alpha_arr, axes=(0,1,2))
+            Ak_ns = Phi[...,None,None] * Ak
 
-                RHS = cp.zeros((nx,ny,nz,3), dtype=cp.complex64)
-                for i in range(3):
-                    term1 = lam * kvec[...,i] * tr_ep
-                    term2 = 2.0*mu_ * (kvec[...,0]*ep[...,i,0] + kvec[...,1]*ep[...,i,1] + kvec[...,2]*ep[...,i,2])
-                    RHS[..., i] = 1j * (term1 + term2)
+            # chi_hat from Bertin Eq. 29:  chi_hat_ij = i eps_jkl k_l alpha_hat_ns_ik / |k|^2
+            beta_p = xp.zeros_like(Ak_ns, dtype=xp.complex64)
+            for i in range(3):
+                arow = Ak_ns[..., i, :]
+                cx = xp.stack([
+                    KY*arow[...,2] - KZ*arow[...,1],
+                    KZ*arow[...,0] - KX*arow[...,2],
+                    KX*arow[...,1] - KY*arow[...,0],
+                ], axis=-1)
+                beta_p[..., i, :] = 1j * cx / K2_safe[...,None]
+            beta_p[0,0,0,...] = 0.0
 
-                denom = mu_ * K2
-                cfac = (lam + mu_) / (lam + 2.0*mu_ + 1e-30)
-                kk_over_k2 = cp.stack([kvec[...,0]/K2, kvec[...,1]/K2, kvec[...,2]/K2], axis=-1)
+            ep = 0.5*(beta_p + xp.transpose(beta_p, (0,1,2,4,3)))
+            kvec = xp.stack([KX, KY, KZ], axis=-1)
 
-                Uhat = cp.zeros_like(RHS)
-                for c in range(3):
-                    base = RHS[..., c] / denom
-                    corr = cfac * ( kk_over_k2[...,0]*RHS[...,0] + kk_over_k2[...,1]*RHS[...,1] + kk_over_k2[...,2]*RHS[...,2] )
-                    Uhat[..., c] = base - corr
-                Uhat[0,0,0,:] = 0.0
+            # sigma_hat_ij = C_ijkl eps_hat_kl  (full anisotropic Hooke's law)
+            sigma = xp.einsum('ijkl,xyzkl->xyzij', C_xp, ep)
 
-                u_long = cp.real(cp.fft.ifftn(Uhat, axes=(0,1,2))).astype(cp.float32)
-                return u_long
-            else:
-                aa = alpha_arr
-                kx = 2.0*np.pi*np.fft.fftfreq(nx, d=dx)
-                ky = 2.0*np.pi*np.fft.fftfreq(ny, d=dy)
-                kz = 2.0*np.pi*np.fft.fftfreq(nz, d=dz)
-                KX, KY, KZ = np.meshgrid(kx, ky, kz, indexing="ij")
-                K2 = KX*KX + KY*KY + KZ*KZ
-                K = np.sqrt(K2)
-                K2[0,0,0] = 1.0
+            # Force density RHS_i = i k_j sigma_hat_ij
+            RHS = 1j * xp.einsum('xyzj,xyzij->xyzi', kvec.astype(xp.complex64), sigma)
 
-                Phi = np.exp(-a_grid * K)
-                Ak = np.fft.fftn(aa, axes=(0,1,2))
-                Ak_ns = Phi[...,None,None] * Ak
+            # Christoffel matrix A_im(k) = C_ijml k_j k_l, shape (nx,ny,nz,3,3)
+            A_christ = xp.einsum('ijml,xyzj,xyzl->xyzim', C_xp, kvec, kvec)
 
-                beta_p = np.zeros_like(Ak_ns, dtype=np.complex64)
-                for i in range(3):
-                    arow = Ak_ns[..., i, :]
-                    cx = np.stack([
-                        KY*arow[...,2] - KZ*arow[...,1],
-                        KZ*arow[...,0] - KX*arow[...,2],
-                        KX*arow[...,1] - KY*arow[...,0],
-                    ], axis=-1)
-                    beta_p[..., i, :] = 1j * cx / K2[...,None]
-                beta_p[0,0,0,...] = 0.0
+            # Avoid singular k=0 inversion; we explicitly zero Uhat[0,0,0] below.
+            A_safe = A_christ.copy()
+            A_safe[0,0,0] = xp.eye(3, dtype=A_safe.dtype)
 
-                ep = 0.5*(beta_p + np.transpose(beta_p, (0,1,2,4,3)))
-                tr_ep = ep[...,0,0] + ep[...,1,1] + ep[...,2,2]
-                kvec = np.stack([KX, KY, KZ], axis=-1)
+            # Per-k 3x3 solve.  cupy.linalg.solve and numpy.linalg.solve both
+            # treat leading dimensions as a batch.
+            Uhat = xp.linalg.solve(A_safe.astype(xp.complex64), RHS[..., None]).squeeze(-1)
+            Uhat[0,0,0,:] = 0.0
 
-                RHS = np.zeros((nx,ny,nz,3), dtype=np.complex64)
-                for i in range(3):
-                    term1 = lam * kvec[...,i] * tr_ep
-                    term2 = 2.0*mu_ * (kvec[...,0]*ep[...,i,0] + kvec[...,1]*ep[...,i,1] + kvec[...,2]*ep[...,i,2])
-                    RHS[..., i] = 1j * (term1 + term2)
-
-                denom = mu_ * K2
-                cfac = (lam + mu_) / (lam + 2.0*mu_ + 1e-30)
-                kk_over_k2 = np.stack([kvec[...,0]/K2, kvec[...,1]/K2, kvec[...,2]/K2], axis=-1)
-                Uhat = np.zeros_like(RHS)
-                for c in range(3):
-                    base = RHS[..., c] / denom
-                    corr = cfac * ( kk_over_k2[...,0]*RHS[...,0] + kk_over_k2[...,1]*RHS[...,1] + kk_over_k2[...,2]*RHS[...,2] )
-                    Uhat[..., c] = base - corr
-                Uhat[0,0,0,:] = 0.0
-
-                u_long = np.real(np.fft.ifftn(Uhat, axes=(0,1,2))).astype(np.float32)
-                return u_long
+            u_long = xp.real(xp.fft.ifftn(Uhat, axes=(0,1,2))).astype(xp.float32)
+            return u_long
 
         # --------------------------
         # LR branch (alpha deposition + spectral solve), used when mode has LR
         # --------------------------
         lr_needed = (mode in ("LR", "LR+SR"))
         if lr_needed:
-            # Deposit Nye tensor alpha to grid (CIC), GPU if available
+            # Deposit Nye tensor alpha on the grid using the trilinear cloud-in-cell
+            # weighting function with the closed-form line integral of Bertin (2018)
+            # Appendix A. For each segment, slab-clip against each candidate voxel's
+            # [-H, +H] CIC support box, split the resulting parameter interval at the
+            # sign-flip points s_i* = (x_voxel_i - x_a_i) / t_hat_i, and accumulate
+            # the per-sub-interval cubic-polynomial integral analytically. This is
+            # exact for straight segments and replaces the previous oversampled
+            # numerical subdivision scheme.
             if gpu_ok:
                 alpha = cp.zeros((nx, ny, nz, 3, 3), dtype=cp.float32)
 
                 cic_kernel_src = r'''
                 extern "C" __global__
-                void deposit_alpha_cic(
+                void deposit_alpha_cic_analytical(
                     const int Ns,
                     const float *s0x, const float *s0y, const float *s0z,
                     const float *s1x, const float *s1y, const float *s1z,
@@ -1100,7 +1421,6 @@ class defects(logging):
                     const int nx, const int ny, const int nz,
                     const float xmin, const float ymin, const float zmin,
                     const float dx, const float dy, const float dz,
-                    const float oversamp,
                     float *alpha)   // flattened [nx,ny,nz,3,3]
                 {
                     int sid = blockDim.x * blockIdx.x + threadIdx.x;
@@ -1115,56 +1435,153 @@ class defects(logging):
                     float L = 1.0f / Linv;
                     tx *= Linv; ty *= Linv; tz *= Linv;
 
-                    float btx[3][3];
-                    btx[0][0] = bx[sid]*tx; btx[0][1] = bx[sid]*ty; btx[0][2] = bx[sid]*tz;
-                    btx[1][0] = by[sid]*tx; btx[1][1] = by[sid]*ty; btx[1][2] = by[sid]*tz;
-                    btx[2][0] = bz[sid]*tx; btx[2][1] = bz[sid]*ty; btx[2][2] = bz[sid]*tz;
+                    float bxv = bx[sid], byv = by[sid], bzv = bz[sid];
+                    float btx00 = bxv*tx, btx01 = bxv*ty, btx02 = bxv*tz;
+                    float btx10 = byv*tx, btx11 = byv*ty, btx12 = byv*tz;
+                    float btx20 = bzv*tx, btx21 = bzv*ty, btx22 = bzv*tz;
 
-                    float hmin = fminf(dx, fminf(dy, dz));
-                    int nsub = (int)fmaxf(1.0f, oversamp * L / hmin) + 1;
-                    float ds = L / (float)nsub;
+                    const float Hx = dx, Hy = dy, Hz = dz;
+                    const float vol_inv = 1.0f / (dx * dy * dz);
+                    const float TINY = 1.0e-30f;
 
-                    for (int m = 0; m <= nsub; ++m) {
-                        float s = (float)m * ds;
-                        float xs = x0 + s*tx;
-                        float ys = y0 + s*ty;
-                        float zs = z0 + s*tz;
+                    // AABB of touched voxel indices: a voxel with center c sees
+                    // a point x iff |c - x| < H, i.e. x - H < c < x + H, so
+                    // (x - xmin)/dx - 1.5 < i < (x - xmin)/dx + 0.5.
+                    float xa = fminf(x0, x1), xb = fmaxf(x0, x1);
+                    float ya = fminf(y0, y1), yb = fmaxf(y0, y1);
+                    float za = fminf(z0, z1), zb = fmaxf(z0, z1);
+                    int n_xmin = (int)ceilf((xa - xmin)/dx - 1.5f);
+                    int n_xmax = (int)floorf((xb - xmin)/dx + 0.5f);
+                    int n_ymin = (int)ceilf((ya - ymin)/dy - 1.5f);
+                    int n_ymax = (int)floorf((yb - ymin)/dy + 0.5f);
+                    int n_zmin = (int)ceilf((za - zmin)/dz - 1.5f);
+                    int n_zmax = (int)floorf((zb - zmin)/dz + 0.5f);
 
-                        float qx = (xs - xmin) / dx - 0.5f;
-                        float qy = (ys - ymin) / dy - 0.5f;
-                        float qz = (zs - zmin) / dz - 0.5f;
+                    for (int ii = n_xmin; ii <= n_xmax; ++ii) {
+                        float xc = xmin + ((float)ii + 0.5f) * dx;
+                        float dtx = xc - x0;
+                        for (int jj = n_ymin; jj <= n_ymax; ++jj) {
+                            float yc = ymin + ((float)jj + 0.5f) * dy;
+                            float dty = yc - y0;
+                            for (int kk = n_zmin; kk <= n_zmax; ++kk) {
+                                float zc = zmin + ((float)kk + 0.5f) * dz;
+                                float dtz = zc - z0;
 
-                        int i0 = (int)floorf(qx);
-                        int j0 = (int)floorf(qy);
-                        int k0 = (int)floorf(qz);
+                                // Slab-clip the segment against the voxel's [-H, +H] box
+                                float sa = 0.0f, sb = L;
+                                bool ok = true;
 
-                        float fx = qx - (float)i0;
-                        float fy = qy - (float)j0;
-                        float fz = qz - (float)k0;
+                                if (fabsf(tx) > TINY) {
+                                    float inv = 1.0f / tx;
+                                    float lo = (dtx - Hx) * inv;
+                                    float hi = (dtx + Hx) * inv;
+                                    if (lo > hi) { float t = lo; lo = hi; hi = t; }
+                                    if (lo > sa) sa = lo;
+                                    if (hi < sb) sb = hi;
+                                } else if (fabsf(dtx) >= Hx) {
+                                    ok = false;
+                                }
+                                if (ok && fabsf(ty) > TINY) {
+                                    float inv = 1.0f / ty;
+                                    float lo = (dty - Hy) * inv;
+                                    float hi = (dty + Hy) * inv;
+                                    if (lo > hi) { float t = lo; lo = hi; hi = t; }
+                                    if (lo > sa) sa = lo;
+                                    if (hi < sb) sb = hi;
+                                } else if (ok && fabsf(dty) >= Hy) {
+                                    ok = false;
+                                }
+                                if (ok && fabsf(tz) > TINY) {
+                                    float inv = 1.0f / tz;
+                                    float lo = (dtz - Hz) * inv;
+                                    float hi = (dtz + Hz) * inv;
+                                    if (lo > hi) { float t = lo; lo = hi; hi = t; }
+                                    if (lo > sa) sa = lo;
+                                    if (hi < sb) sb = hi;
+                                } else if (ok && fabsf(dtz) >= Hz) {
+                                    ok = false;
+                                }
 
-                        float wx[2] = {1.0f - fx, fx};
-                        float wy[2] = {1.0f - fy, fy};
-                        float wz[2] = {1.0f - fz, fz};
+                                if (!ok || !(sb > sa)) continue;
 
-                        float wscale = ds / (dx*dy*dz);
-
-                        for (int kk = 0; kk < 2; ++kk) {
-                            int k = (k0 + kk) % nz; if (k < 0) k += nz;
-                            float wk = wz[kk];
-                            for (int jj = 0; jj < 2; ++jj) {
-                                int j = (j0 + jj) % ny; if (j < 0) j += ny;
-                                float wj = wy[jj];
-                                for (int ii = 0; ii < 2; ++ii) {
-                                    int i = (i0 + ii) % nx; if (i < 0) i += nx;
-                                    float wi = wx[ii];
-                                    float w = wscale * wi * wj * wk;
-
-                                    size_t base = (((size_t)i*ny + (size_t)j)*nz + (size_t)k)*9;
-                                    for (int p = 0; p < 3; ++p) {
-                                        for (int q = 0; q < 3; ++q) {
-                                            atomicAdd(&alpha[base + p*3 + q], w * btx[p][q]);
-                                        }
+                                // Sign-flip parameters s_i* = d_tilde_i / t_i, sorted
+                                float flips[3];
+                                int n_flips = 0;
+                                if (fabsf(tx) > TINY) {
+                                    float sf = dtx / tx;
+                                    if (sa < sf && sf < sb) {
+                                        flips[n_flips++] = sf;
                                     }
+                                }
+                                if (fabsf(ty) > TINY) {
+                                    float sf = dty / ty;
+                                    if (sa < sf && sf < sb) {
+                                        int p = n_flips;
+                                        while (p > 0 && flips[p-1] > sf) { flips[p] = flips[p-1]; --p; }
+                                        flips[p] = sf;
+                                        ++n_flips;
+                                    }
+                                }
+                                if (fabsf(tz) > TINY) {
+                                    float sf = dtz / tz;
+                                    if (sa < sf && sf < sb) {
+                                        int p = n_flips;
+                                        while (p > 0 && flips[p-1] > sf) { flips[p] = flips[p-1]; --p; }
+                                        flips[p] = sf;
+                                        ++n_flips;
+                                    }
+                                }
+
+                                // Walk through sub-intervals; on each, the integrand
+                                // is the cubic polynomial prod_i (alpha_i + beta_i s).
+                                float total = 0.0f;
+                                float prev = sa;
+                                for (int q = 0; q <= n_flips; ++q) {
+                                    float curr = (q < n_flips) ? flips[q] : sb;
+                                    if (!(curr > prev)) continue;
+                                    float s_mid = 0.5f * (prev + curr);
+
+                                    float sgx = ((dtx - s_mid * tx) >= 0.0f) ? 1.0f : -1.0f;
+                                    float sgy = ((dty - s_mid * ty) >= 0.0f) ? 1.0f : -1.0f;
+                                    float sgz = ((dtz - s_mid * tz) >= 0.0f) ? 1.0f : -1.0f;
+
+                                    float ax = 1.0f - sgx * dtx / Hx;
+                                    float ay = 1.0f - sgy * dty / Hy;
+                                    float az = 1.0f - sgz * dtz / Hz;
+                                    float bxc = sgx * tx / Hx;
+                                    float byc = sgy * ty / Hy;
+                                    float bzc = sgz * tz / Hz;
+
+                                    float c0 = ax * ay * az;
+                                    float c1 = ax*ay*bzc + ax*byc*az + bxc*ay*az;
+                                    float c2 = ax*byc*bzc + bxc*ay*bzc + bxc*byc*az;
+                                    float c3 = bxc * byc * bzc;
+
+                                    float ds  = curr - prev;
+                                    float ds2 = curr*curr - prev*prev;
+                                    float ds3 = curr*curr*curr - prev*prev*prev;
+                                    float ds4 = curr*curr*curr*curr - prev*prev*prev*prev;
+
+                                    total += c0 * ds + 0.5f * c1 * ds2
+                                           + (c2 / 3.0f) * ds3 + 0.25f * c3 * ds4;
+                                    prev = curr;
+                                }
+
+                                if (total != 0.0f) {
+                                    int iw = ((ii % nx) + nx) % nx;
+                                    int jw = ((jj % ny) + ny) % ny;
+                                    int kw = ((kk % nz) + nz) % nz;
+                                    float w = total * vol_inv;
+                                    size_t base = (((size_t)iw*ny + (size_t)jw)*nz + (size_t)kw)*9;
+                                    atomicAdd(&alpha[base + 0], w * btx00);
+                                    atomicAdd(&alpha[base + 1], w * btx01);
+                                    atomicAdd(&alpha[base + 2], w * btx02);
+                                    atomicAdd(&alpha[base + 3], w * btx10);
+                                    atomicAdd(&alpha[base + 4], w * btx11);
+                                    atomicAdd(&alpha[base + 5], w * btx12);
+                                    atomicAdd(&alpha[base + 6], w * btx20);
+                                    atomicAdd(&alpha[base + 7], w * btx21);
+                                    atomicAdd(&alpha[base + 8], w * btx22);
                                 }
                             }
                         }
@@ -1172,7 +1589,7 @@ class defects(logging):
                 }'''.strip("\n")
                 mod_alpha = cp.RawModule(code=cic_kernel_src, backend='nvcc',
                                         options=('--gpu-architecture=native','-O3','--use_fast_math'))
-                deposit_alpha = mod_alpha.get_function('deposit_alpha_cic')
+                deposit_alpha = mod_alpha.get_function('deposit_alpha_cic_analytical')
 
                 s0x = cp.asarray(S0[:,0], dtype=cp.float32); s0y = cp.asarray(S0[:,1], dtype=cp.float32); s0z = cp.asarray(S0[:,2], dtype=cp.float32)
                 s1x = cp.asarray(S1[:,0], dtype=cp.float32); s1y = cp.asarray(S1[:,1], dtype=cp.float32); s1z = cp.asarray(S1[:,2], dtype=cp.float32)
@@ -1186,44 +1603,55 @@ class defects(logging):
                             np.int32(nx), np.int32(ny), np.int32(nz),
                             np.float32(xmin), np.float32(ymin), np.float32(zmin),
                             np.float32(dx), np.float32(dy), np.float32(dz),
-                            np.float32(1.0),
                             alpha))
             else:
                 alpha = np.zeros((nx, ny, nz, 3, 3), dtype=np.float32)
-                hmin = min(dx, dy, dz)
+                vol_inv = 1.0 / (dx * dy * dz)
+                H_arr = (dx, dy, dz)
                 for s in range(Ns):
-                    p0 = S0[s]; p1 = S1[s]
-                    t = p1 - p0
-                    L2 = float(np.dot(t, t))
+                    p0 = S0[s]
+                    t_vec = S1[s] - p0
+                    L2 = float(np.dot(t_vec, t_vec))
                     if L2 < 1e-20:
                         continue
-                    Linv = 1.0/np.sqrt(L2); L = 1.0/Linv; t = t*Linv
-                    btx = np.outer(Bv[s].astype(np.float32), t.astype(np.float32))
-                    nsub = int(max(1.0, L / hmin)) + 1
-                    ds = L / float(nsub)
-                    for m in range(nsub+1):
-                        sparam = m * ds
-                        xs_, ys_, zs_ = (p0 + sparam * t)
-                        qx = (xs_ - xmin)/dx - 0.5
-                        qy = (ys_ - ymin)/dy - 0.5
-                        qz = (zs_ - zmin)/dz - 0.5
-                        i0 = int(np.floor(qx)); j0 = int(np.floor(qy)); k0 = int(np.floor(qz))
-                        fx = qx - i0; fy = qy - j0; fz = qz - k0
-                        wx = np.array([1.0-fx, fx], dtype=np.float32)
-                        wy = np.array([1.0-fy, fy], dtype=np.float32)
-                        wz = np.array([1.0-fz, fz], dtype=np.float32)
-                        wscale = ds / (dx*dy*dz)
-                        for kk in range(2):
-                            k = (k0+kk) % nz; wk = wz[kk]
-                            for jj in range(2):
-                                j = (j0+jj) % ny; wj = wy[jj]
-                                for ii in range(2):
-                                    i = (i0+ii) % nx; wi = wx[ii]
-                                    w = wscale * wi * wj * wk
-                                    alpha[i,j,k,...] += w * btx
+                    L = float(np.sqrt(L2))
+                    t_hat = (t_vec / L).astype(np.float64)
+                    btx = np.outer(Bv[s].astype(np.float64), t_hat)
+
+                    # AABB of touched voxel indices (per axis: i in (xrel - 1.5, xrel + 0.5))
+                    xa, xb = float(min(p0[0], p0[0] + L*t_hat[0])), float(max(p0[0], p0[0] + L*t_hat[0]))
+                    ya, yb = float(min(p0[1], p0[1] + L*t_hat[1])), float(max(p0[1], p0[1] + L*t_hat[1]))
+                    za, zb = float(min(p0[2], p0[2] + L*t_hat[2])), float(max(p0[2], p0[2] + L*t_hat[2]))
+                    n_xmin = int(np.ceil((xa - xmin)/dx - 1.5))
+                    n_xmax = int(np.floor((xb - xmin)/dx + 0.5))
+                    n_ymin = int(np.ceil((ya - ymin)/dy - 1.5))
+                    n_ymax = int(np.floor((yb - ymin)/dy + 0.5))
+                    n_zmin = int(np.ceil((za - zmin)/dz - 1.5))
+                    n_zmax = int(np.floor((zb - zmin)/dz + 0.5))
+
+                    for ii in range(n_xmin, n_xmax + 1):
+                        xc = xmin + (ii + 0.5) * dx
+                        for jj in range(n_ymin, n_ymax + 1):
+                            yc = ymin + (jj + 0.5) * dy
+                            for kk in range(n_zmin, n_zmax + 1):
+                                zc = zmin + (kk + 0.5) * dz
+                                d_tilde = (xc - p0[0], yc - p0[1], zc - p0[2])
+
+                                sa, sb = _cic_segment_voxel_clip(d_tilde, t_hat, H_arr, L)
+                                if sa is None:
+                                    continue
+
+                                I_voxel = _cic_line_segment_integral(d_tilde, t_hat, H_arr, sa, sb)
+                                if I_voxel == 0.0:
+                                    continue
+
+                                iw = ii % nx
+                                jw = jj % ny
+                                kw = kk % nz
+                                alpha[iw, jw, kw, ...] += (I_voxel * vol_inv) * btx
 
             # Spectral LR solve
-            u_long = _fft_lr(alpha, use_gpu_fft=gpu_ok, ns_kernel="exp")
+            u_long = _fft_lr(alpha, use_gpu_fft=gpu_ok)
 
         # --------------------------
         # SR branch
