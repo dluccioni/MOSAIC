@@ -4531,109 +4531,160 @@ class beam(logging):
                   f"({cached_bytes/1024**3:.2f} GB), "
                   f"{n_uncached} streamed from disk per slice window.")
 
-        def _get_chunk_data(cid):
-            if cid in chunk_cache:
-                return chunk_cache[cid]
+        from concurrent.futures import ThreadPoolExecutor
+        prefetch_window = 2
+        prefetch_pool = ThreadPoolExecutor(max_workers=prefetch_window)
+        stream_h2d = cp.cuda.Stream(non_blocking=True)
+
+        def _prefetch_chunk(cid):
+            """
+            Worker-thread task: returns (cid, gpu_data_or_None).
+
+            For cached chunks this just transfers the already-host data H2D.
+            For streamed (uncached) chunks it loads from disk, computes
+            forward factors, pins the host arrays, and copies them to GPU
+            on the dedicated H2D stream. The worker thread synchronizes on
+            that stream before returning so callers receive ready-to-use
+            GPU arrays.
+            """
             if cid in empty_chunks:
-                return None
-            spc_l = sample.load_chunk_species(cid, use_gpu=False)
-            pos_l = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float32, copy=False)
-            if pos_l.shape[0] == 0:
-                empty_chunks.add(cid)
-                return None
-            fr_l, fi_l = _species_factors(spc_l)
-            return (pos_l, fr_l, fi_l)
+                return cid, None
+            if cid in chunk_cache:
+                pos_h, fr_h, fi_h = chunk_cache[cid]
+                pin_required = False
+            else:
+                spc_l = sample.load_chunk_species(cid, use_gpu=False)
+                pos_l = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float32, copy=False)
+                if pos_l.shape[0] == 0:
+                    empty_chunks.add(cid)
+                    return cid, None
+                fr_l, fi_l = _species_factors(spc_l)
+                # Pin streamed chunks so the H2D copy on stream_h2d is truly
+                # asynchronous with the main thread's compute kernels.
+                try:
+                    pos_h = self.allocate_pinned_array(pos_l, dtype=np.float32)
+                    fr_h  = self.allocate_pinned_array(fr_l,  dtype=np.float32)
+                    fi_h  = self.allocate_pinned_array(fi_l,  dtype=np.float32)
+                except Exception:
+                    # Pinning can fail if pinned memory is exhausted; fall
+                    # back to pageable arrays. H2D will still happen, just
+                    # synchronously inside cp.asarray.
+                    pos_h, fr_h, fi_h = pos_l, fr_l, fi_l
+                pin_required = True
+            with stream_h2d:
+                pos_g = cp.asarray(pos_h)
+                fr_g  = cp.asarray(fr_h)
+                fi_g  = cp.asarray(fi_h)
+            # Synchronize on the worker thread, NOT main, so the main thread
+            # can keep running compute kernels on its stream while we wait
+            # for this chunk's transfers to land on the device.
+            stream_h2d.synchronize()
+            # Drop pinned host buffers now that data is on GPU; for cached
+            # chunks the canonical reference lives in chunk_cache.
+            if pin_required:
+                del pos_h, fr_h, fi_h
+            return cid, (pos_g, fr_g, fi_g)
 
-        # Process slices in windows
-        for w_start in range(0, nS, window_size):
-            w_end = min(w_start + window_size, nS)
-            w_len = w_end - w_start
-            w_bins = w_len * bins
+        try:
+            # Process slices in windows
+            for w_start in range(0, nS, window_size):
+                w_end = min(w_start + window_size, nS)
+                w_len = w_end - w_start
+                w_bins = w_len * bins
 
-            sum_real_flat = cp.zeros(w_bins, dtype=cp.float32)
-            sum_imag_flat = cp.zeros(w_bins, dtype=cp.float32)
+                sum_real_flat = cp.zeros(w_bins, dtype=cp.float32)
+                sum_imag_flat = cp.zeros(w_bins, dtype=cp.float32)
 
-            for cid in range(1, total_chunks + 1):
-                chunk_entry = _get_chunk_data(cid)
-                if chunk_entry is None:
-                    continue
-                pos, fr_h, fi_h = chunk_entry
-                nA = pos.shape[0]
+                # Prime the pipeline with prefetch_window chunks ahead.
+                inflight = {}
+                for cid_init in range(1, min(prefetch_window, total_chunks) + 1):
+                    inflight[cid_init] = prefetch_pool.submit(_prefetch_chunk, cid_init)
+                next_cid = prefetch_window + 1
 
-                batch_cap = _atom_batch_cap()
+                for cid in range(1, total_chunks + 1):
+                    # Block until this chunk is on the GPU.
+                    fut = inflight.pop(cid, None)
+                    if fut is None:
+                        # Late submission (in case prefetch_window > total)
+                        fut = prefetch_pool.submit(_prefetch_chunk, cid)
+                    _, gpu_data = fut.result()
 
-                for b_start in range(0, nA, batch_cap):
-                    b_end = min(b_start + batch_cap, nA)
-                    pos_b = pos[b_start:b_end]
-                    fr_b_h = fr_h[b_start:b_end]
-                    fi_b_h = fi_h[b_start:b_end]
+                    # Submit the next prefetch immediately so the pool is
+                    # always working on chunks ahead of compute.
+                    if next_cid <= total_chunks:
+                        inflight[next_cid] = prefetch_pool.submit(_prefetch_chunk, next_cid)
+                        next_cid += 1
 
-                    fr = cp.asarray(fr_b_h, dtype=cp.float32)
-                    fi = cp.asarray(fi_b_h, dtype=cp.float32)
-                    posg = cp.asarray(pos_b, dtype=cp.float32)
-                    posg = posg @ Rg
-                    posg += Tg
-
-                    au = posg[:, 0]*e1g[0] + posg[:, 1]*e1g[1] + posg[:, 2]*e1g[2]
-                    av = posg[:, 0]*e2g[0] + posg[:, 1]*e2g[1] + posg[:, 2]*e2g[2]
-                    iu = au/float(self._beam_du) + float(self._beam_uc)
-                    iv = av/float(self._beam_dv) + float(self._beam_vc)
-
-                    s_vals = posg[:, 0]*khatg[0] + posg[:, 1]*khatg[1] + posg[:, 2]*khatg[2]
-                    ki = cp.clip(cp.searchsorted(edges_g, s_vals, side="right") - 1, 0, nS - 1)
-
-                    # Filter to atoms within beam grid AND current slice window
-                    inb = ((iu >= 0.0) & (iu <= (NyB - 1)) &
-                           (iv >= 0.0) & (iv <= (NzB - 1)) &
-                           (ki >= w_start) & (ki < w_end))
-                    if not bool(inb.any()):
-                        del posg, fr, fi, au, av, iu, iv, s_vals, ki, inb
-                        cp.get_default_memory_pool().free_all_blocks()
+                    if gpu_data is None:
                         continue
+                    pos_g, fr_g, fi_g = gpu_data
+                    nA = int(pos_g.shape[0])
 
-                    iu = iu[inb]; iv = iv[inb]
-                    fr = fr[inb]; fi = fi[inb]
-                    ki = (ki[inb] - w_start).astype(cp.int64)  # local slice index
+                    batch_cap = _atom_batch_cap()
 
-                    ic = cp.floor(iu + 0.5).astype(cp.int64)
-                    jc = cp.floor(iv + 0.5).astype(cp.int64)
+                    for b_start in range(0, nA, batch_cap):
+                        b_end = min(b_start + batch_cap, nA)
 
-                    du_m1 = cp.abs(iu - (ic - 1)); du_0 = cp.abs(iu - ic); du_p1 = cp.abs(iu - (ic + 1))
-                    dv_m1 = cp.abs(iv - (jc - 1)); dv_0 = cp.abs(iv - jc); dv_p1 = cp.abs(iv - (jc + 1))
+                        # GPU views (no copy) into the prefetched arrays.
+                        pos_b = pos_g[b_start:b_end]
+                        fr = fr_g[b_start:b_end]
+                        fi = fi_g[b_start:b_end]
 
-                    wu_m1, wu_0, wu_p1 = _tsc_w(du_m1), _tsc_w(du_0), _tsc_w(du_p1)
-                    wv_m1, wv_0, wv_p1 = _tsc_w(dv_m1), _tsc_w(dv_0), _tsc_w(dv_p1)
+                        posg = pos_b @ Rg
+                        posg = posg + Tg
 
-                    # fused scatter_add over (slice, pixel)
-                    for dx, wx in [(-1, wu_m1), (0, wu_0), (1, wu_p1)]:
-                        ii = ic + dx
-                        for dy, wy in [(-1, wv_m1), (0, wv_0), (1, wv_p1)]:
-                            jj = jc + dy
-                            fac = wx * wy
-                            mask = (ii >= 0) & (ii < NyB) & (jj >= 0) & (jj < NzB) & (fac > 0.0)
-                            if not bool(mask.any()):
-                                continue
-                            pidx = (ii[mask] * NzB + jj[mask]).astype(cp.int64)
-                            flat_idx = (ki[mask] * bins + pidx)
-                            wsel = fac[mask]
-                            cupyx.scatter_add(sum_real_flat, flat_idx, (fr[mask] * wsel).astype(cp.float32))
-                            cupyx.scatter_add(sum_imag_flat, flat_idx, (fi[mask] * wsel).astype(cp.float32))
+                        au = posg[:, 0]*e1g[0] + posg[:, 1]*e1g[1] + posg[:, 2]*e1g[2]
+                        av = posg[:, 0]*e2g[0] + posg[:, 1]*e2g[1] + posg[:, 2]*e2g[2]
+                        iu = au/float(self._beam_du) + float(self._beam_uc)
+                        iv = av/float(self._beam_dv) + float(self._beam_vc)
 
-                    del posg, au, av, iu, iv, s_vals, inb, ic, jc
-                    del du_m1, du_0, du_p1, dv_m1, dv_0, dv_p1
-                    del wu_m1, wu_0, wu_p1, wv_m1, wv_0, wv_p1
-                    cp.get_default_memory_pool().free_all_blocks()
+                        s_vals = posg[:, 0]*khatg[0] + posg[:, 1]*khatg[1] + posg[:, 2]*khatg[2]
+                        ki = cp.clip(cp.searchsorted(edges_g, s_vals, side="right") - 1, 0, nS - 1)
 
-                # Release uncached chunk arrays before the next iteration
-                # so streaming chunks don't accumulate on the host.
-                if cid not in chunk_cache:
-                    del pos, fr_h, fi_h, chunk_entry
+                        # Filter to atoms within beam grid AND current slice
+                        # window. Empty-mask scatter_adds are cheap GPU
+                        # no-ops, so we deliberately avoid bool(inb.any())
+                        # here -- that would force a host sync per batch.
+                        inb = ((iu >= 0.0) & (iu <= (NyB - 1)) &
+                               (iv >= 0.0) & (iv <= (NzB - 1)) &
+                               (ki >= w_start) & (ki < w_end))
 
-            # Copy window results to host
-            sum_real_host[w_start:w_end] = sum_real_flat.reshape(w_len, NyB, NzB).get()
-            sum_imag_host[w_start:w_end] = sum_imag_flat.reshape(w_len, NyB, NzB).get()
-            del sum_real_flat, sum_imag_flat
-            cp.get_default_memory_pool().free_all_blocks()
+                        iu = iu[inb]; iv = iv[inb]
+                        fr_b = fr[inb]; fi_b = fi[inb]
+                        ki_b = (ki[inb] - w_start).astype(cp.int64)
+
+                        ic = cp.floor(iu + 0.5).astype(cp.int64)
+                        jc = cp.floor(iv + 0.5).astype(cp.int64)
+
+                        du_m1 = cp.abs(iu - (ic - 1)); du_0 = cp.abs(iu - ic); du_p1 = cp.abs(iu - (ic + 1))
+                        dv_m1 = cp.abs(iv - (jc - 1)); dv_0 = cp.abs(iv - jc); dv_p1 = cp.abs(iv - (jc + 1))
+
+                        wu_m1, wu_0, wu_p1 = _tsc_w(du_m1), _tsc_w(du_0), _tsc_w(du_p1)
+                        wv_m1, wv_0, wv_p1 = _tsc_w(dv_m1), _tsc_w(dv_0), _tsc_w(dv_p1)
+
+                        # fused scatter_add over (slice, pixel)
+                        for dx, wx in [(-1, wu_m1), (0, wu_0), (1, wu_p1)]:
+                            ii = ic + dx
+                            for dy, wy in [(-1, wv_m1), (0, wv_0), (1, wv_p1)]:
+                                jj = jc + dy
+                                fac = wx * wy
+                                mask = (ii >= 0) & (ii < NyB) & (jj >= 0) & (jj < NzB) & (fac > 0.0)
+                                if not bool(mask.any()):
+                                    continue
+                                pidx = (ii[mask] * NzB + jj[mask]).astype(cp.int64)
+                                flat_idx = (ki_b[mask] * bins + pidx)
+                                wsel = fac[mask]
+                                cupyx.scatter_add(sum_real_flat, flat_idx, (fr_b[mask] * wsel).astype(cp.float32))
+                                cupyx.scatter_add(sum_imag_flat, flat_idx, (fi_b[mask] * wsel).astype(cp.float32))
+
+                    del pos_g, fr_g, fi_g, gpu_data
+
+                # Copy window results to host
+                sum_real_host[w_start:w_end] = sum_real_flat.reshape(w_len, NyB, NzB).get()
+                sum_imag_host[w_start:w_end] = sum_imag_flat.reshape(w_len, NyB, NzB).get()
+                del sum_real_flat, sum_imag_flat
+        finally:
+            prefetch_pool.shutdown(wait=True)
 
         # Convert sums to per-slice integrals (keep on host as numpy)
         delta_int = [np.float32(C) * sum_real_host[s] for s in range(nS)]
@@ -5261,21 +5312,23 @@ class beam(logging):
                     delta_list, beta_list = self._compute_beam_slice_integrals_gpu(
                         sample, stage, edges_A, kernel_radius
                     )
+                # Stack the per-slice delta / beta lists once and copy to
+                # GPU in a single H2D transfer. The previous slice-by-slice
+                # path issued 2 * n_final separate H2D copies plus a forced
+                # `free_all_blocks` per slice, both of which serialize the
+                # default stream.
+                delta_g = cp.asarray(np.stack(delta_list, axis=0))   # (nS, NyB, NzB)
+                beta_g  = cp.asarray(np.stack(beta_list,  axis=0))
                 E = cp.asarray(self._beam_E0_map.astype(np.complex64))
                 for k in range(n_final):
-                    # Transfer one slice at a time to GPU (host numpy -> device)
-                    dk = cp.asarray(delta_list[k])
-                    bk = cp.asarray(beta_list[k])
-                    phi_k = (-kA * dk).astype(cp.float32)
-                    tau_k = (kA * abs_m * bk).astype(cp.float32)
-                    tau_k = cp.maximum(tau_k, cp.float32(0.0))
+                    phi_k = (-kA * delta_g[k]).astype(cp.float32)
+                    tau_k = cp.maximum((kA * abs_m * beta_g[k]).astype(cp.float32),
+                                       cp.float32(0.0))
                     arg_k = cp.empty_like(phi_k, dtype=cp.complex64)
                     arg_k.real = -tau_k
                     arg_k.imag = phi_k
-                    A_k = cp.exp(arg_k)
-                    E = (E * A_k).astype(cp.complex64)
-                    del dk, bk, phi_k, tau_k, arg_k, A_k
-                    cp.get_default_memory_pool().free_all_blocks()
+                    E = (E * cp.exp(arg_k)).astype(cp.complex64)
+                del delta_g, beta_g
                 E_exit = E
             else:
                 if delta_list is None or beta_list is None:
