@@ -51,7 +51,9 @@ class optics(logging):
         Apply a thin-lens phase and optional uniform absorption.
 
         Multiplies the field by exp(-i * k/(2f) * r^2). If `absorption_sigma` is
-        provided, a uniform attenuation factor is applied.
+        provided, a uniform attenuation factor is applied. If `mu_per_m` and
+        `radius_of_curvature_m` are provided, a parabolic (r^2-dependent) CRL
+        absorption factor is applied in addition.
 
         Args:
             field (array-like): Complex field, shape (Ny, Nx).
@@ -62,6 +64,10 @@ class optics(logging):
                 - 'thickness' (float, mm)
                 - 'number' (int): number of identical lens elements
                 - 'absorption_sigma' (float, meters) optional
+                - 'mu_per_m' (float, 1/m) optional: intensity linear attenuation
+                  coefficient of the lens material
+                - 'radius_of_curvature_m' (float, meters) optional: per-surface
+                  parabolic apex radius R
             wavelength (float or None): Wavelength in meters. If None, tries
                 self._wavelength.
             use_gpu (bool): If True and CuPy is available, use a GPU path.
@@ -81,6 +87,23 @@ class optics(logging):
         t  = float(lens_data['thickness']) * 1e-3
         nsigma = float(lens_data.get('absorption_sigma', np.inf))
         N_lenses = int(lens_data['number'])
+
+        # Parabolic (r^2-dependent) CRL absorption parameters (SI units).
+        # mu_per_m: intensity linear attenuation coefficient of the lens
+        # material (1/m). radius_of_curvature_m: per-surface parabolic apex
+        # radius R (m). Both default to no-ops (0.0 and inf respectively).
+        mu_per_m = float(lens_data.get('mu_per_m', 0.0))
+        R_apex_m = float(lens_data.get('radius_of_curvature_m', np.inf))
+
+        # Each parabolic surface has profile r^2/(2R); a bi-parabolic lens has
+        # two surfaces, so the r^2-dependent material thickness per lens is
+        # t(r) = r^2/R. Intensity transmission through N lenses is therefore
+        # T(r) = exp(-mu * N * r^2 / R), and the AMPLITUDE gets
+        # sqrt(T) = exp(-mu * N * r^2 / (2R)).
+        # r^2 grids below are in m^2 (dx, dy are in meters), so no unit
+        # conversion is needed for the m^2 * (1/m) / m exponent.
+        apply_parabolic = (mu_per_m > 0.0) and np.isfinite(R_apex_m)
+        parab_coef = (mu_per_m * N_lenses / (2.0 * R_apex_m)) if apply_parabolic else 0.0
 
         Ny, Nx = int(field.shape[0]), int(field.shape[1])
         x_arr = np.arange(Nx, dtype=np.float32)
@@ -110,6 +133,11 @@ class optics(logging):
             if not cp.isinf(nsigma):
                 out *= cp.exp(- N_lenses * t / nsigma)
 
+            # Optional parabolic (r^2-dependent) CRL absorption:
+            # amplitude factor exp(-mu * N * r^2 / (2R)), R2 already in m^2.
+            if apply_parabolic:
+                out *= cp.exp(- parab_coef * R2)
+
             return out.get()
 
         # CPU path
@@ -128,6 +156,12 @@ class optics(logging):
                 val = field[iy, ix]
                 re2 = val.real * cph - val.imag * sph
                 im2 = val.real * sph + val.imag * cph
+                if apply_parabolic:
+                    # Parabolic (r^2-dependent) CRL absorption:
+                    # amplitude factor exp(-mu * N * r^2 / (2R)), r2 in m^2.
+                    amp = np.exp(- parab_coef * r2)
+                    re2 *= amp
+                    im2 *= amp
                 E_out[iy, ix] = re2 + 1j * im2
 
         if not np.isinf(nsigma):
@@ -716,6 +750,8 @@ class optics(logging):
                     comp["focal_length"] = float(comp.get("focal_length", 0.0))
                     comp["thickness"] = float(comp.get("thickness", 0.0))
                     comp["absorption_sigma"] = float(comp.get("absorption_sigma", np.inf))
+                    comp["mu_per_m"] = float(comp.get("mu_per_m", 0.0))
+                    comp["radius_of_curvature_m"] = float(comp.get("radius_of_curvature_m", np.inf))
                 elif kind == "bragg magnifier 2b":
                     comp["magnification_x"] = float(comp.get("magnification_x", 1.0))
                     comp["magnification_y"] = float(comp.get("magnification_y", 1.0))
@@ -794,7 +830,8 @@ class optics(logging):
         })
 
     def add_CRL_box(self, number, focal_length_mm, thickness_mm,
-                    absorption_sigma=np.inf):
+                    absorption_sigma=np.inf, mu_per_m=0.0,
+                    radius_of_curvature_m=float('inf')):
         """
         Add a compound refractive lens (CRL) box to the optics stack.
 
@@ -807,13 +844,23 @@ class optics(logging):
                 (used for absorption calculation).
             absorption_sigma (float): Absorption length in meters. Default is np.inf
                 (no absorption).
+            mu_per_m (float): Intensity linear attenuation coefficient of the
+                lens material in 1/m. Used for the parabolic (r^2-dependent)
+                CRL absorption factor. Default is 0.0 (no parabolic absorption).
+            radius_of_curvature_m (float): Per-surface parabolic apex radius R
+                in meters. With two parabolic surfaces per lens, the r^2-dependent
+                material thickness per lens is r^2/R, giving an intensity
+                transmission exp(-mu * N * r^2 / R). Default is inf (no
+                parabolic absorption).
         """
         self._components.append({
             'kind'           : 'lens box',
             'number'         : int(number),
             'focal_length'   : float(focal_length_mm),
             'thickness'      : float(thickness_mm),
-            'absorption_sigma': float(absorption_sigma)
+            'absorption_sigma': float(absorption_sigma),
+            'mu_per_m'       : float(mu_per_m),
+            'radius_of_curvature_m': float(radius_of_curvature_m)
         })
         
     def add_bragg_magnifier_2b(self, magnification_x, magnification_y,
