@@ -31,20 +31,6 @@ class experiment:
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
 
-    ## Data Handling Functions
-    def write_experiment_metadata(self): #incomplete
-        """
-        Serialize the experiment metadata to disk as human-readable JSON.
-
-        Writes the experiment object's critical internal fields to a JSON file
-        so that the state can be restored later.
-
-        Note:
-            This function is incomplete and not yet implemented.
-        """
-
-    # Static Function
-
     ## Main Functions
     def scan_nD(
         self,
