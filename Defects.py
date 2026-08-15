@@ -307,6 +307,7 @@ class defects(logging):
         "write_defect_metadata",
         "add_stacking_faults",
         "add_cracks",
+        "add_amorphous_band",
         "add_point_defects",
         "import_dislocation_network",
         "generate_nodal_field",
@@ -333,6 +334,7 @@ class defects(logging):
         self._stacking_faults = None
         self._cracks = None
         self._point_defects = None
+        self._amorphous_bands = None
         
     def read_defect_metadata(self, override_directory=None):
         """
@@ -544,6 +546,66 @@ class defects(logging):
                 of the convex hull representing the crack geometry.
         """
         self._cracks = self.crack(self.directory, crack_points)
+
+    def add_amorphous_band(self,
+                           band_points=None,
+                           center=None, length=None, width=None,
+                           thickness=None, orientation=None,
+                           period=None, n_stripes=None,
+                           density_ratio=1.0,
+                           number_density=None,
+                           seed=None):
+        """
+        Add an amorphous band defect to the defect object.
+
+        Defines a 3D region as either a convex hull from explicit boundary
+        points or as an oriented slab (center, length, width, thickness,
+        orientation). When applied to a sample, the crystalline atoms inside
+        the region are removed and replaced with a uniform random distribution
+        whose total count is set by either a relative density multiplier or
+        an absolute number density.
+
+        In periodic mode (slab only), passing `period` and `n_stripes` turns
+        the single slab into a stack of `n_stripes` parallel stripes spaced
+        `period` Angstroms apart along the slab normal. Each stripe has
+        thickness `thickness`. The total stack span along the normal is
+        `period * n_stripes`.
+
+        Args:
+            band_points: Array-like of shape (N, 3) defining the vertices of
+                the band's convex hull. Mutually exclusive with the slab
+                parameters.
+            center: (3,) center of the slab in Angstroms. Required for slab
+                mode.
+            length: Slab extent along its primary in-plane axis.
+            width: Slab extent along its secondary in-plane axis.
+            thickness: Slab extent along its normal direction. In periodic
+                mode this is the per-stripe thickness.
+            orientation: (3,) slab normal vector. Defaults to [0, 0, 1].
+            period: Optional centre-to-centre stripe spacing along the slab
+                normal (Angstroms). Slab mode only.
+            n_stripes: Number of parallel stripes when `period` is set.
+            density_ratio: Multiplier on the local crystal density of atoms
+                originally in the region. 1.0 preserves count, <1 removes
+                atoms, >1 adds atoms. Defaults to 1.0.
+            number_density: Absolute number density (atoms / Angstrom^3). If
+                given, overrides density_ratio. Defaults to None.
+            seed: Optional RNG seed for reproducible amorphization.
+
+        Note:
+            Exactly one of (band_points) or (center+length+width+thickness)
+            must be provided. `orientation`, `period`, and `n_stripes` are
+            only used in slab mode.
+        """
+        self._amorphous_bands = self.amorphous_band(
+            self.directory, band_points=band_points,
+            center=center, length=length, width=width,
+            thickness=thickness, orientation=orientation,
+            period=period, n_stripes=n_stripes,
+            density_ratio=density_ratio,
+            number_density=number_density,
+            seed=seed,
+        )
 
     def add_point_defects(self, **kwargs):
         """
@@ -4365,7 +4427,747 @@ class defects(logging):
             ax.set_title("Crack Geometry in Sample")
             plt.show()
             return fig, ax
-        
+
+    class amorphous_band(logging):
+        """
+        Represents an amorphous band defect: a 3D region in which crystalline
+        atoms are replaced by a uniform random distribution.
+
+        The region is defined either as a convex hull built from explicit
+        boundary points (mirrors `crack`) or as an oriented slab specified by
+        a center, length, width, thickness, and orientation vector. The total
+        number of replacement atoms is set by either a relative density
+        multiplier or an absolute number density.
+
+        Attributes:
+            directory: Output directory for modified sample data.
+            density_ratio: Multiplier on the original in-region atom count.
+            number_density: Absolute target number density (atoms / A^3) or None.
+            seed: Optional RNG seed for reproducible amorphization.
+            band_points: (N, 3) hull vertices in hull mode, else None.
+            hull, hull_equations: scipy ConvexHull and its plane equations,
+                hull mode only.
+            center, length, width, thickness, orientation: slab parameters,
+                slab mode only.
+        """
+
+        # -------------------------------------------------------------------------
+        # Logging configuration
+        # -------------------------------------------------------------------------
+        __log_top__ = (
+            "apply_to_sample",
+            "apply_amorphous_band_chunk",
+            "plot_band_geometry",
+        )
+
+        # -----------------------------------------------------------------------------
+        # Functions
+        # -----------------------------------------------------------------------------
+        ## Initialization
+        def __init__(self, directory,
+                     band_points=None,
+                     center=None, length=None, width=None,
+                     thickness=None, orientation=None,
+                     period=None, n_stripes=None,
+                     density_ratio=1.0,
+                     number_density=None,
+                     seed=None):
+            """
+            Initialize an amorphous band defect.
+
+            Args:
+                directory: Output directory for storing modified sample data.
+                band_points: Array-like of shape (N, 3) defining the vertices
+                    of a convex hull in 3D. Mutually exclusive with the slab
+                    parameters.
+                center: (3,) slab center in Angstroms. Required for slab mode.
+                length: Slab extent along its primary in-plane axis.
+                width: Slab extent along its secondary in-plane axis.
+                thickness: Slab extent along the slab normal. In periodic
+                    mode this is the per-stripe thickness.
+                orientation: (3,) slab normal vector. Defaults to [0, 0, 1].
+                period: Optional centre-to-centre stripe spacing along the
+                    slab normal (Angstroms). When set, the band becomes a
+                    stack of `n_stripes` parallel stripes. Slab mode only.
+                n_stripes: Number of parallel stripes when `period` is set.
+                    Stripes are placed symmetrically about `center`, spanning
+                    `period * n_stripes` along the normal.
+                density_ratio: Multiplier on the original in-region atom count.
+                    Defaults to 1.0.
+                number_density: Absolute number density (atoms / A^3). When
+                    provided, overrides density_ratio. Defaults to None.
+                seed: Optional RNG seed for reproducibility.
+
+            Raises:
+                ValueError: If both hull and slab parameters are provided, if
+                    neither is provided, if slab mode is chosen but any of
+                    center/length/width/thickness is missing, or if periodic
+                    parameters are passed in hull mode.
+            """
+            super().__init__(log_name="amorphous_band")
+            self.directory = directory
+
+            # Determine mode and validate exclusivity of hull vs slab params
+            slab_any = any(x is not None for x in (center, length, width, thickness))
+            hull_given = band_points is not None
+            if hull_given and slab_any:
+                raise ValueError(
+                    "amorphous_band: pass either `band_points` (hull mode) OR "
+                    "slab parameters (center, length, width, thickness), not both."
+                )
+            if not hull_given and not slab_any:
+                raise ValueError(
+                    "amorphous_band: must provide either `band_points` or the "
+                    "slab parameters (center, length, width, thickness)."
+                )
+
+            self.density_ratio = float(density_ratio)
+            self.number_density = None if number_density is None else float(number_density)
+            self.seed = seed
+
+            # Periodic-stripe state. Defaults degenerate to a single band
+            # at offset 0 along the normal so the same code paths handle both
+            # the single-band and periodic-stack cases.
+            self.period = None
+            self.n_stripes = 1
+            self._stripe_offsets = np.array([0.0])
+            self._stack_span = None
+            self._stripe_offsets_cp = None  # lazy GPU cache
+
+            # Hull mode
+            if hull_given:
+                if period is not None or n_stripes is not None:
+                    raise ValueError(
+                        "amorphous_band: periodic stripes are only supported in slab mode."
+                    )
+                self._mode = "hull"
+                from scipy.spatial import ConvexHull
+                self.band_points = np.asarray(band_points, dtype=float)
+                self.hull = ConvexHull(self.band_points)
+                # Each row [a, b, c, d] => a*x + b*y + c*z + d <= 0 for points inside
+                self.hull_equations = self.hull.equations
+                # Slab fields kept None for serialization symmetry
+                self.center = None
+                self.length = None
+                self.width = None
+                self.thickness = None
+                self.orientation = None
+                self._slab_origin = None
+                self._slab_axes = None
+                self._slab_extents = None
+                # Lazy GPU caches
+                self._hull_equations_cp = None
+                self._slab_origin_cp = None
+                self._slab_axes_cp = None
+                self._slab_extents_cp = None
+            # Slab mode
+            else:
+                missing = [n for n, v in (("center", center), ("length", length),
+                                          ("width", width), ("thickness", thickness))
+                           if v is None]
+                if missing:
+                    raise ValueError(
+                        f"amorphous_band slab mode requires {missing} to be provided."
+                    )
+                self._mode = "slab"
+                self.band_points = None
+                self.hull = None
+                self.hull_equations = None
+                self.center = np.asarray(center, dtype=float).reshape(3,)
+                self.length = float(length)
+                self.width = float(width)
+                self.thickness = float(thickness)
+                self.orientation = (np.asarray(orientation, dtype=float).reshape(3,)
+                                    if orientation is not None
+                                    else np.array([0.0, 0.0, 1.0]))
+                self._build_slab_geometry()
+                # Lazy GPU caches
+                self._hull_equations_cp = None
+                self._slab_origin_cp = None
+                self._slab_axes_cp = None
+                self._slab_extents_cp = None
+
+                # Periodic stripe stack
+                if period is not None:
+                    if n_stripes is None or int(n_stripes) < 1:
+                        raise ValueError(
+                            "amorphous_band: periodic mode requires n_stripes >= 1."
+                        )
+                    self.period = float(period)
+                    self.n_stripes = int(n_stripes)
+                    i = np.arange(self.n_stripes, dtype=float)
+                    # Stripe centres along the slab normal in slab-local
+                    # coordinates, placed symmetrically about 0.
+                    self._stripe_offsets = (i - (self.n_stripes - 1) / 2.0) * self.period
+                self._stack_span = (self.period * self.n_stripes
+                                    if self.period is not None
+                                    else self.thickness)
+
+        ## Geometry helpers
+        def _build_slab_geometry(self):
+            """
+            Build an orthonormal slab basis (u, v, n) and store extents.
+
+            The slab normal `n` is `orientation / ||orientation||`. In-plane
+            axes (u, v) are produced by Gram-Schmidt against a seed axis chosen
+            to be the global axis least aligned with `n`. Together (u, v, n)
+            form a right-handed orthonormal basis. The basis is stored as a
+            (3, 3) matrix whose rows are u, v, n; the half-extents are
+            (length/2, width/2, thickness/2) along (u, v, n).
+            """
+            n = self.orientation
+            n_norm = np.linalg.norm(n)
+            if n_norm <= 0.0:
+                raise ValueError("amorphous_band: orientation must be a non-zero vector.")
+            n = n / n_norm
+
+            # Seed axis: pick the global axis least aligned with n
+            seed_options = np.eye(3, dtype=float)
+            dots = np.abs(seed_options @ n)
+            seed = seed_options[int(np.argmin(dots))]
+
+            # Gram-Schmidt: u = (seed - (seed.n) n), normalized
+            u = seed - np.dot(seed, n) * n
+            u = u / np.linalg.norm(u)
+            # v = n x u so that (u, v, n) is right-handed
+            v = np.cross(n, u)
+
+            self._slab_origin = self.center.astype(float)
+            self._slab_axes = np.stack([u, v, n], axis=0)  # rows: u, v, n
+            self._slab_extents = np.array([self.length / 2.0,
+                                           self.width / 2.0,
+                                           self.thickness / 2.0], dtype=float)
+
+        def _in_region_mask(self, positions, use_gpu=False):
+            """
+            Boolean mask selecting positions inside the band region.
+
+            In hull mode, applies the convex-hull half-space inequalities
+            (mirrors `crack.apply_crack_chunk`). In slab mode, projects each
+            position onto the slab basis and tests against the half-extents.
+
+            Args:
+                positions: (N, 3) array of positions. Numpy or cupy.
+                use_gpu: If True and CuPy is available, the mask is computed
+                    on the device and returned as a cupy bool array.
+
+            Returns:
+                (N,) boolean mask, on the same device as the input when
+                `use_gpu=True`, otherwise on CPU.
+            """
+            on_gpu = (cp is not None) and bool(use_gpu)
+            xp = cp if on_gpu else np
+
+            if self._mode == "hull":
+                if on_gpu:
+                    if self._hull_equations_cp is None:
+                        self._hull_equations_cp = cp.asarray(self.hull_equations)
+                    eq = self._hull_equations_cp
+                else:
+                    eq = self.hull_equations
+                normals = eq[:, :3]
+                offsets = eq[:, 3]
+                dot_vals = normals @ positions.T + offsets[:, None]
+                return xp.all(dot_vals <= 1e-12, axis=0)
+            else:
+                if on_gpu:
+                    if self._slab_origin_cp is None:
+                        self._slab_origin_cp = cp.asarray(self._slab_origin)
+                        self._slab_axes_cp = cp.asarray(self._slab_axes)
+                        self._slab_extents_cp = cp.asarray(self._slab_extents)
+                    origin = self._slab_origin_cp
+                    axes = self._slab_axes_cp
+                    extents = self._slab_extents_cp
+                else:
+                    origin = self._slab_origin
+                    axes = self._slab_axes
+                    extents = self._slab_extents
+                rel = positions - origin
+                proj = rel @ axes.T  # (N, 3): components along (u, v, n)
+
+                # In-plane (u, v) test is identical for single-band and
+                # periodic stacks.
+                in_uv = (xp.abs(proj[:, 0]) <= extents[0] + 1e-12) & \
+                        (xp.abs(proj[:, 1]) <= extents[1] + 1e-12)
+
+                if self.period is None:
+                    in_n = xp.abs(proj[:, 2]) <= extents[2] + 1e-12
+                else:
+                    # Periodic stripe stack: stripes of half-thickness
+                    # extents[2] centred at multiples of `period`, the whole
+                    # stack spanning `n_stripes * period` along the normal.
+                    span = float(self._stack_span)
+                    P = float(self.period)
+                    in_stack = xp.abs(proj[:, 2]) <= span / 2.0 + 1e-12
+                    # Distance from each point to the nearest stripe centre.
+                    # Use floor() rather than `%` for cupy-portability of
+                    # floating-point modulo.
+                    shifted = proj[:, 2] + span / 2.0
+                    mod_q = shifted - xp.floor(shifted / P) * P
+                    d_mid = xp.abs(mod_q - P / 2.0)
+                    in_stripe = d_mid <= extents[2] + 1e-12
+                    in_n = in_stack & in_stripe
+
+                return in_uv & in_n
+
+        def _region_volume(self):
+            """
+            Return the geometric volume of the band region (Angstrom^3).
+
+            Hull mode uses scipy ConvexHull's reported volume. Slab mode
+            returns length * width * thickness, multiplied by `n_stripes`
+            in periodic mode (sum over the stripe stack).
+            """
+            if self._mode == "hull":
+                return float(self.hull.volume)
+            return float(self.length * self.width * self.thickness * self.n_stripes)
+
+        def _region_aabb(self):
+            """
+            Return the axis-aligned bounding box (lo, hi) of the band region.
+            For periodic stacks the AABB extends along the slab normal to
+            cover all stripes.
+            """
+            if self._mode == "slab":
+                # Half-extent along the normal axis: full stack span / 2 in
+                # periodic mode, otherwise the single-band thickness / 2.
+                half_n = (self._stack_span / 2.0
+                          if self.period is not None
+                          else self._slab_extents[2])
+                stack_extents = np.array([self._slab_extents[0],
+                                          self._slab_extents[1],
+                                          half_n], dtype=float)
+                signs = np.array([[sx, sy, sz]
+                                  for sx in (-1.0, 1.0)
+                                  for sy in (-1.0, 1.0)
+                                  for sz in (-1.0, 1.0)], dtype=float)
+                local = signs * stack_extents
+                slab_corners = local @ self._slab_axes + self._slab_origin
+                return slab_corners.min(axis=0), slab_corners.max(axis=0)
+            return self.band_points.min(axis=0), self.band_points.max(axis=0)
+
+        def _sample_uniform_in_region(self, n, rng,
+                                      sample_min=None, sample_max=None):
+            """
+            Draw `n` positions uniformly at random from the band region,
+            optionally further restricted to a sample axis-aligned bounding
+            box [sample_min, sample_max].
+
+            When no sample bounds are provided, slab mode uses the fast direct
+            sampler (uniform in slab-local coordinates) and hull mode uses
+            rejection sampling from the hull's AABB. When sample bounds are
+            provided, both modes use rejection sampling from the intersection
+            of the region AABB and the sample AABB, accepting only points
+            that satisfy `_in_region_mask`.
+
+            Args:
+                n: Number of samples to draw.
+                rng: numpy.random.RandomState (or compatible) instance.
+                sample_min: Optional (3,) array, lower corner of the sample
+                    AABB. New atoms are guaranteed to lie above this bound.
+                sample_max: Optional (3,) array, upper corner of the sample
+                    AABB. New atoms are guaranteed to lie below this bound.
+
+            Returns:
+                (n, 3) float32 array of positions.
+            """
+            if n <= 0:
+                return np.zeros((0, 3), dtype=np.float32)
+
+            clip = (sample_min is not None) and (sample_max is not None)
+
+            # Fast path: slab mode without sample clipping
+            if self._mode == "slab" and not clip:
+                local = rng.uniform(low=-self._slab_extents,
+                                    high=self._slab_extents,
+                                    size=(n, 3))
+                world = local @ self._slab_axes + self._slab_origin
+                return world.astype(np.float32)
+
+            # Rejection-sample within the AABB of (region) intersected with
+            # (sample box, if given).
+            region_lo, region_hi = self._region_aabb()
+            if clip:
+                lo = np.maximum(region_lo, np.asarray(sample_min, dtype=float))
+                hi = np.minimum(region_hi, np.asarray(sample_max, dtype=float))
+            else:
+                lo, hi = region_lo, region_hi
+
+            if np.any(hi <= lo):
+                return np.zeros((0, 3), dtype=np.float32)
+
+            out = np.empty((n, 3), dtype=np.float32)
+            filled = 0
+            # Heuristic batch size: oversample to limit loop iterations.
+            aabb_vol = float(np.prod(hi - lo))
+            region_vol = max(self._region_volume(), 1e-30)
+            accept = max(min(region_vol / max(aabb_vol, 1e-30), 1.0), 1e-3)
+            batch = max(int(np.ceil((n - filled) * 4.0 / accept)), 1024)
+            while filled < n:
+                cand = rng.uniform(low=lo, high=hi, size=(batch, 3))
+                mask = self._in_region_mask(cand, use_gpu=False)
+                cand = cand[mask]
+                take = min(cand.shape[0], n - filled)
+                out[filled:filled + take] = cand[:take].astype(np.float32)
+                filled += take
+                if filled < n and cand.shape[0] > 0:
+                    realized = max(cand.shape[0] / float(batch), 1e-3)
+                    batch = max(int(np.ceil((n - filled) * 1.5 / realized)), 1024)
+            return out
+
+        def _enumerate_polytope_vertices(self, planes):
+            """
+            Run the standard 'pick 3 hyperplanes -> solve linear system ->
+            test against all inequalities' vertex-enumeration algorithm on
+            a list of half-space planes (a, b) such that a . x <= b.
+
+            Args:
+                planes: list of (a, b) tuples; a is (3,), b is scalar.
+
+            Returns:
+                (M, 3) array of feasible vertices (deduplicated), or None
+                if the polytope is empty or degenerate.
+            """
+            tol = 1e-6
+            verts = []
+            n_planes = len(planes)
+            from itertools import combinations
+            for trip in combinations(range(n_planes), 3):
+                A = np.array([planes[t][0] for t in trip])
+                b = np.array([planes[t][1] for t in trip])
+                if abs(np.linalg.det(A)) < 1e-9:
+                    continue
+                try:
+                    p = np.linalg.solve(A, b)
+                except np.linalg.LinAlgError:
+                    continue
+                ok = True
+                for aq, bq in planes:
+                    if np.dot(aq, p) > bq + tol:
+                        ok = False
+                        break
+                if ok:
+                    verts.append(p)
+            if not verts:
+                return None
+            verts = np.asarray(verts)
+            keep = np.ones(len(verts), dtype=bool)
+            for i in range(len(verts)):
+                if not keep[i]:
+                    continue
+                for j in range(i + 1, len(verts)):
+                    if keep[j] and np.linalg.norm(verts[i] - verts[j]) < 1e-6:
+                        keep[j] = False
+            return verts[keep]
+
+        def _band_sample_intersection_polytopes(self, sample_min, sample_max):
+            """
+            Return the band-region / sample-AABB intersection as a list of
+            convex polytope vertex sets.
+
+            For hull mode and single-band slab mode this is always a list
+            of length 1 (the band region is itself convex). For periodic
+            slab mode each stripe is its own convex polytope, so the list
+            has up to `n_stripes` entries (stripes that fall fully outside
+            the sample are skipped).
+
+            Args:
+                sample_min: (3,) lower corner of the sample AABB.
+                sample_max: (3,) upper corner of the sample AABB.
+
+            Returns:
+                List of (M_k, 3) arrays of feasible vertices, one per
+                non-empty stripe. May be empty.
+            """
+            sample_min = np.asarray(sample_min, dtype=float)
+            sample_max = np.asarray(sample_max, dtype=float)
+
+            # Sample AABB half-spaces (shared by all stripes / hull)
+            sample_planes = []
+            for axis in range(3):
+                e = np.zeros(3); e[axis] = 1.0
+                sample_planes.append((e, sample_max[axis]))
+                sample_planes.append((-e, -sample_min[axis]))
+
+            polytopes = []
+            if self._mode == "hull":
+                planes = list(sample_planes)
+                for eq in self.hull_equations:
+                    planes.append((eq[:3], -eq[3]))
+                verts = self._enumerate_polytope_vertices(planes)
+                if verts is not None and verts.shape[0] >= 4:
+                    polytopes.append(verts)
+            else:
+                u, v, n_axis = self._slab_axes  # rows
+                ext_u, ext_v, ext_n = self._slab_extents
+                base_origin = self._slab_origin
+                for offset in self._stripe_offsets:
+                    stripe_origin = base_origin + float(offset) * n_axis
+                    planes = list(sample_planes)
+                    # u, v faces use the original origin (in-plane extents
+                    # are constant across stripes); the n faces are
+                    # recentred on `stripe_origin`.
+                    for axis_vec, extent, ref_origin in (
+                        (u,      ext_u, base_origin),
+                        (v,      ext_v, base_origin),
+                        (n_axis, ext_n, stripe_origin),
+                    ):
+                        c = np.dot(axis_vec, ref_origin)
+                        planes.append((axis_vec, c + extent))
+                        planes.append((-axis_vec, -c + extent))
+                    verts = self._enumerate_polytope_vertices(planes)
+                    if verts is not None and verts.shape[0] >= 4:
+                        polytopes.append(verts)
+
+            return polytopes
+
+        def _intersection_volume(self, sample_min, sample_max):
+            """
+            Return the volume of the band-region / sample-AABB intersection.
+
+            Sums scipy ConvexHull volumes across the polytope list returned
+            by `_band_sample_intersection_polytopes`. Returns 0.0 when the
+            intersection is empty.
+            """
+            polytopes = self._band_sample_intersection_polytopes(sample_min, sample_max)
+            if not polytopes:
+                return 0.0
+            from scipy.spatial import ConvexHull
+            total = 0.0
+            for verts in polytopes:
+                try:
+                    total += float(ConvexHull(verts).volume)
+                except Exception:
+                    pass
+            return total
+
+        ## Main Functions
+        def apply_to_sample(self, sample, use_gpu=True):
+            """
+            Apply the amorphous band to all chunks of a sample.
+
+            Two-pass over `sample.chunk_total`:
+              Pass 1 (count + species histogram): for each chunk, computes
+                the in-region mask on GPU (if available), counts in-region
+                atoms, and accumulates a per-species histogram via
+                `np.unique` on the in-region slice. Memory stays O(unique
+                species) rather than O(in-region atoms). Species loading is
+                skipped for chunks contributing zero in-region atoms.
+              Pass 2 (rewrite): for each chunk, recomputes the mask on GPU,
+                filters in-region atoms on the device, transfers only the
+                kept slice back to host, then **generates this chunk's share
+                of the new atoms in place** and appends them before writing
+                back to disk. Generating per-chunk (rather than allocating a
+                full (n_target, 3) buffer up front) keeps peak host memory
+                bounded by the per-chunk share, which is essential for very
+                large bands.
+
+            The total number of replacement atoms is `number_density *
+            volume(band ∩ sample_AABB)` when `number_density` is set, else
+            `density_ratio * n_in_region`. New atoms are clipped to the
+            sample's bounding box.
+
+            Args:
+                sample: Sample object providing chunk loading/writing methods.
+                use_gpu: If True and CuPy is available, the region inside-test
+                    and the in-region filter run on the GPU per chunk.
+                    Defaults to True.
+            """
+            rng = (np.random.RandomState(self.seed)
+                   if self.seed is not None else np.random.RandomState())
+            n_chunks = int(sample.chunk_total)
+            on_gpu = (cp is not None) and bool(use_gpu)
+
+            # Sample axis-aligned bounding box, used to clip new atoms so they
+            # cannot land outside the physical sample even when the band
+            # extends beyond it.
+            sample_corners = np.asarray(sample.corners, dtype=float)
+            sample_min = sample_corners.min(axis=0)
+            sample_max = sample_corners.max(axis=0)
+
+            # ---- Pass 1: count + per-chunk species histogram (no pool) ----
+            n_in_region = 0
+            hist_keys_parts = []     # list of (unique_per_chunk,) species arrays
+            hist_counts_parts = []   # list of (unique_per_chunk,) int arrays
+            species_dtype = None
+            for i in range(n_chunks):
+                if on_gpu:
+                    pos_cp = sample.load_chunk_positions(i + 1, use_gpu=True)
+                    mask_cp = self._in_region_mask(pos_cp, use_gpu=True)
+                    n_in = int(cp.count_nonzero(mask_cp))
+                    n_in_region += n_in
+                    if n_in > 0:
+                        spc_np = sample.load_chunk_species(i + 1, use_gpu=False)
+                        in_spc = spc_np[cp.asnumpy(mask_cp)]
+                        if species_dtype is None:
+                            species_dtype = spc_np.dtype
+                        u, c = np.unique(in_spc, return_counts=True)
+                        hist_keys_parts.append(u)
+                        hist_counts_parts.append(c)
+                    del pos_cp, mask_cp
+                else:
+                    pos_np = sample.load_chunk_positions(i + 1, use_gpu=False)
+                    mask_np = self._in_region_mask(pos_np, use_gpu=False)
+                    n_in = int(np.count_nonzero(mask_np))
+                    n_in_region += n_in
+                    if n_in > 0:
+                        spc_np = sample.load_chunk_species(i + 1, use_gpu=False)
+                        in_spc = spc_np[mask_np]
+                        if species_dtype is None:
+                            species_dtype = spc_np.dtype
+                        u, c = np.unique(in_spc, return_counts=True)
+                        hist_keys_parts.append(u)
+                        hist_counts_parts.append(c)
+
+            # Aggregate per-chunk histograms into a single (keys, counts) pair.
+            if hist_keys_parts:
+                all_keys = np.concatenate(hist_keys_parts)
+                all_counts = np.concatenate(hist_counts_parts)
+                hist_keys, inverse = np.unique(all_keys, return_inverse=True)
+                hist_counts = np.zeros(len(hist_keys), dtype=np.int64)
+                np.add.at(hist_counts, inverse, all_counts)
+            else:
+                hist_keys = np.array([], dtype=(species_dtype if species_dtype is not None else object))
+                hist_counts = np.array([], dtype=np.int64)
+
+            # ---- Target count (uses the band-sample intersection volume so
+            # ---- absolute number_density matches the physical region) ----
+            if self.number_density is not None:
+                vol = self._intersection_volume(sample_min, sample_max)
+                n_target = int(round(self.number_density * vol))
+            else:
+                n_target = int(round(self.density_ratio * n_in_region))
+            if n_target < 0:
+                n_target = 0
+            # No species histogram means there are no atoms to derive
+            # stoichiometry from; fall back to pure atom removal.
+            if hist_keys.size == 0:
+                n_target = 0
+
+            # Pre-compute species sampling probabilities once. New atoms are
+            # generated per-chunk inside the Pass 2 loop to keep peak memory
+            # bounded by the per-chunk share rather than the full n_target,
+            # which is essential for very large bands.
+            if n_target > 0:
+                probs = hist_counts.astype(np.float64)
+                probs /= probs.sum()
+            else:
+                probs = None
+
+            # ---- Pass 2: rewrite chunks (filter on device, generate + append on host) ----
+            remaining = n_target
+            for i in range(n_chunks):
+                if on_gpu:
+                    pos_cp = sample.load_chunk_positions(i + 1, use_gpu=True)
+                    spc_np = sample.load_chunk_species(i + 1, use_gpu=False)
+                    keep_cp = ~self._in_region_mask(pos_cp, use_gpu=True)
+                    # Filter on device, then transfer only the kept slice.
+                    pos_np = cp.asnumpy(pos_cp[keep_cp])
+                    keep_np = cp.asnumpy(keep_cp)
+                    spc_np = spc_np[keep_np]
+                    del pos_cp, keep_cp
+                else:
+                    pos_np = sample.load_chunk_positions(i + 1, use_gpu=False)
+                    spc_np = sample.load_chunk_species(i + 1, use_gpu=False)
+                    keep_np = ~self._in_region_mask(pos_np, use_gpu=False)
+                    pos_np = pos_np[keep_np]
+                    spc_np = spc_np[keep_np]
+
+                # This chunk's share of newly generated atoms (round-robin
+                # mirrors point-defect interstitial distribution).
+                chunks_left = n_chunks - i
+                to_take = int(np.ceil(remaining / float(chunks_left))) if chunks_left > 0 else 0
+                if to_take > 0:
+                    add_pos = self._sample_uniform_in_region(
+                        to_take, rng,
+                        sample_min=sample_min,
+                        sample_max=sample_max,
+                    )
+                    add_spc = rng.choice(hist_keys, size=to_take, replace=True, p=probs)
+                    pos_np = np.concatenate([pos_np.astype(np.float32, copy=False),
+                                             add_pos.astype(np.float32, copy=False)],
+                                            axis=0)
+                    spc_np = np.concatenate([spc_np, add_spc], axis=0)
+                    del add_pos, add_spc
+                    remaining -= to_take
+
+                sample.write_chunk_positions(pos_np, i + 1, override_directory=self.directory)
+                sample.write_chunk_species(spc_np, i + 1, override_directory=self.directory)
+
+            sample.write_sample_metadata(override_directory=self.directory)
+
+        def plot_band_geometry(self, sample, color='c', alpha=0.5,
+                               elev=20, azim=-60):
+            """
+            Plot the band-sample intersection inside the sample bounding box.
+
+            The sample is drawn as a gray wireframe and the band's intersection
+            with the sample's AABB is drawn as a filled convex polytope. Both
+            slab and hull band modes are supported. The plot's axis limits are
+            set to the sample bounds so the visualization shows only the
+            physical region where atoms are amorphized.
+
+            Args:
+                sample: Sample object with a `corners` attribute of shape (8, 3).
+                color: Matplotlib color for the intersection surface. Defaults
+                    to 'c'.
+                alpha: Face alpha for the intersection surface. Defaults to 0.5.
+                elev: Elevation angle for 3D view. Defaults to 20.
+                azim: Azimuth angle for 3D view. Defaults to -60.
+
+            Returns:
+                tuple: (fig, ax) matplotlib figure and axes objects.
+            """
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
+            fig = plt.figure()
+            ax = fig.add_subplot(projection='3d')
+
+            # 1) Sample wireframe
+            sample_corners = np.asarray(sample.corners)
+            sample_min = sample_corners.min(axis=0)
+            sample_max = sample_corners.max(axis=0)
+            edges = [
+                (0,1), (0,2), (0,3),
+                (1,4), (1,5),
+                (2,4), (2,6),
+                (3,5), (3,6),
+                (4,7), (5,7), (6,7)
+            ]
+            segs = [(sample_corners[i], sample_corners[j]) for i, j in edges]
+            ax.add_collection3d(Line3DCollection(segs, colors='gray', lw=1))
+
+            # 2) Band-sample intersection as one or more filled convex
+            # polytopes (one per stripe in periodic mode).
+            polytopes = self._band_sample_intersection_polytopes(sample_min, sample_max)
+            if polytopes:
+                from scipy.spatial import ConvexHull as _CH
+                all_faces = []
+                for verts in polytopes:
+                    try:
+                        hull = _CH(verts)
+                        for s in hull.simplices:
+                            all_faces.append(verts[s])
+                    except Exception:
+                        continue
+                if all_faces:
+                    poly = Poly3DCollection(all_faces, facecolors=color,
+                                            edgecolors='k', alpha=alpha,
+                                            linewidths=0.3)
+                    ax.add_collection3d(poly)
+
+            # 3) Axis limits exactly the sample bounds
+            ax.set_xlim(sample_min[0], sample_max[0])
+            ax.set_ylim(sample_min[1], sample_max[1])
+            ax.set_zlim(sample_min[2], sample_max[2])
+            ax.set_xlabel("X (A)")
+            ax.set_ylabel("Y (A)")
+            ax.set_zlabel("Z (A)")
+            ax.view_init(elev=elev, azim=azim)
+            ax.set_title("Amorphous Band \u2229 Sample")
+            plt.tight_layout()
+            return fig, ax
+
     class point_defect(logging):
         """
         Handles point defects: vacancies, substitutions, and interstitials.
