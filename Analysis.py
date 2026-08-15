@@ -7,7 +7,10 @@ import json
 import time
 from Logging import logging
 import numpy as np
-import cupy as cp
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
@@ -44,7 +47,7 @@ class analysis(logging):
 
     # Static Function
     @staticmethod
-    def surf_plot(X, Y, Z, title, xlabel="Frequency (1/px)", ylabel="Distance", zlabel="FFT Amplitude", figsize=(12, 12)):
+    def surf_plot(X, Y, Z, title, xlabel="Frequency (1/px)", ylabel="Distance", zlabel="FFT Amplitude", figsize=(12, 12), cmap="viridis", log=False):
         """
         Generate a 3D surface plot.
 
@@ -57,6 +60,8 @@ class analysis(logging):
             ylabel (str): Y-axis label.
             zlabel (str): Z-axis label.
             figsize (tuple): Size of the figure.
+            cmap (str): Matplotlib colormap name for the surface. Defaults to "viridis".
+            log (bool): If True, plot log10 of the z-values. Defaults to False.
 
         Returns:
             tuple: matplotlib Figure and Axes3DSubplot objects.
@@ -66,7 +71,10 @@ class analysis(logging):
             ax = fig.add_subplot(111, projection='3d')
             ax.set_proj_type('ortho')
             ax.set_title(title)
-            surf = ax.plot_surface(X, Y, Z, cmap='viridis', edgecolor='none', linewidth=0, antialiased=True)
+            if log:
+                Z = np.log10(Z + np.finfo(float).tiny)
+                zlabel = f"log10({zlabel})"
+            surf = ax.plot_surface(X, Y, Z, cmap=cmap, edgecolor='none', linewidth=0, antialiased=True)
             ax.set_xlabel(xlabel)
             ax.set_ylabel(ylabel)
             ax.set_zlabel(zlabel)
@@ -117,7 +125,7 @@ class analysis(logging):
         except Exception as e:
             raise e
     ## Main Functions
-    def distance_fft_dependance(self,sample,beam,stage,detector,distance_array,plot_prefix="Test",output_pixel_values=False,offset_list=None):
+    def distance_fft_dependance(self,sample,beam,stage,detector,distance_array,plot_prefix="Test",output_pixel_values=False,offset_list=None,use_gpu=True):
         """
         Compute amplitude/phase summations and their FFTs at various detector distances.
 
@@ -135,6 +143,8 @@ class analysis(logging):
             output_pixel_values (bool): If True, return pixel values list. Defaults to False.
             offset_list (list, optional): List of offset arrays to subtract from pixel values
                 at each distance. Defaults to None.
+            use_gpu (bool): If True, use the GPU path for the beam interaction
+                computation when available. Defaults to True.
 
         Returns:
             tuple: If output_pixel_values is False, returns (X_fft, Y_fft, Z_fft_amp, Z_fft_pha).
@@ -151,7 +161,7 @@ class analysis(logging):
             print(f"Processing distance: {d} || {idx+1}/{distance_array.size}")
             # Move detector to new distance and compute scattering
             detector.position_detector_absolute(d,detector.two_theta,detector.eta)
-            beam.atomic_direct_interaction(sample,detector,stage,scattering=True, scattering_params=[None], transmission=False, transmission_params=[1.7,1.0], use_gpu=True)
+            beam.atomic_direct_interaction(sample,detector,stage,scattering=True, scattering_params=[None], transmission=False, transmission_params=[1.7,1.0], use_gpu=use_gpu)
             if output_pixel_values:
                 pixel_values_list.append(detector.pixel_values)
             if offset_list != None:
