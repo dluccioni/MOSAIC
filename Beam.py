@@ -7,6 +7,7 @@ import json
 import os
 import gc
 import threading
+import warnings
 from Logging import logging
 try:
     import cupy as cp
@@ -188,7 +189,65 @@ class beam(logging):
         self._beam_v_centers = v_centers
         # Complex field with zero phase
         self._beam_E0_map = (A0.astype(np.float32) + 0.0j).astype(np.complex64)
-        
+
+    def set_wavefield(self, wavefield):
+        """
+        Set a user-defined complex entrance wavefield on the transverse beam grid.
+
+        Replaces the internally generated amplitude map (uniform, gaussian, ...)
+        with an arbitrary complex field E0(u, v) sampled on the current grid.
+
+        Args:
+            wavefield (np.ndarray): 2-D array of shape
+                (beam_samples[0], beam_samples[1]) = (Ny, Nz) with all values
+                finite. Real or complex; stored as C-contiguous complex64.
+
+        Sampling contract:
+            - 'ij' indexing with [u, v] = (y, z): axis 0 is u (parallel to +y),
+            axis 1 is v (parallel to +z); the beam propagates along +x.
+            - Grid pitch is du = beam_size[0]/Ny and dv = beam_size[1]/Nz in
+            angstrom, so sample (i, j) sits at u = (i - (Ny-1)/2)*du,
+            v = (j - (Nz-1)/2)*dv and the beam axis passes through the
+            fractional index center ((Ny-1)/2, (Nz-1)/2).
+
+        Amplitude convention:
+            No renormalization is applied. Built-in profiles peak at unity
+            amplitude; the supplied field is used as-is, so its amplitude
+            directly scales all downstream intensities.
+
+        Notes:
+            - create_beam() and read_beam_metadata() rebuild the field map from
+            the stored beam parameters, overwriting a custom wavefield. Call
+            set_wavefield() LAST, and call it again after any beam parameter
+            change or metadata reload.
+            - Sets _beam_profile to 'custom-<sha1[:12]>' of the field bytes so
+            on-disk Ein cache keys change with the field contents.
+
+        Raises:
+            ValueError: If the array is not 2-D of shape (Ny, Nz), or contains
+                non-finite values (NaN/Inf).
+        """
+        import hashlib
+        arr = np.asarray(wavefield)
+        if arr.ndim != 2:
+            raise ValueError(
+                f"set_wavefield: expected a 2-D array of shape "
+                f"({self._beam_Ny}, {self._beam_Nz}), got ndim={arr.ndim}"
+            )
+        expected_shape = (int(self._beam_Ny), int(self._beam_Nz))
+        if tuple(arr.shape) != expected_shape:
+            raise ValueError(
+                f"set_wavefield: expected shape {expected_shape} "
+                f"(beam_samples), got {tuple(arr.shape)}"
+            )
+        arr = np.ascontiguousarray(arr, dtype=np.complex64)
+        if not np.all(np.isfinite(arr.real)) or not np.all(np.isfinite(arr.imag)):
+            raise ValueError(
+                "set_wavefield: wavefield contains non-finite values (NaN/Inf)"
+            )
+        self._beam_E0_map = arr
+        self._beam_profile = "custom-" + hashlib.sha1(arr.tobytes()).hexdigest()[:12]
+
     def read_beam_metadata(self):
         """
         Read beam metadata from JSON and restore the beam state, including the
@@ -949,14 +1008,14 @@ class beam(logging):
 
         Args:
             phi_tol_rad (float): Desired maximum phase error per contribution in radians.
-                Default (if never set) is 1e-6 rad.
+                Default (if never set) is 1e-3 rad.
         """
         try:
             val = float(phi_tol_rad)
             if not (val > 0.0):
-                val = 1e-6
+                val = 1e-3
         except Exception:
-            val = 1e-6
+            val = 1e-3
         self._phase_tol_rad = val
         
     def _estimate_required_series_terms(self, a_max_m: float, R0_min_m: float, phi_tol_rad: float):
@@ -1059,7 +1118,7 @@ class beam(logging):
                 - self._global_use_series (bool): Whether to use series expansion.
                 - self._series_terms (int): Number of series terms to use.
 
-            Uses self._wavelength and self._phase_tol_rad (default 1e-2 rad if unset).
+            Uses self._wavelength and self._phase_tol_rad (default 1e-3 rad if unset).
         """
         # Sample half-diagonal radius (meters)
         dims_A = np.asarray(sample.dimensions, dtype=float)
@@ -1077,7 +1136,7 @@ class beam(logging):
         R0_min_m = (r2_min_A2 ** 0.5) * 1e-10
 
         # Phase tolerance
-        phi_tol = float(getattr(self, "_phase_tol_rad", 1e-2))
+        phi_tol = float(getattr(self, "_phase_tol_rad", 1e-3))
 
         # Estimate N and check convergence bound
         est = self._estimate_required_series_terms(a_max_m, R0_min_m, phi_tol)
@@ -1096,7 +1155,9 @@ class beam(logging):
         if verbose:
             mode_str = "SERIES" if use_series else "EXACT"
 
-    def build_interaction_kernel(self, series_terms: int | None = None, force_mode: str | None = None):
+    def build_interaction_kernel(self, series_terms: int | None = None,
+                                 force_mode: str | None = None,
+                                 m_beams: int = 1):
         """
         Build and cache the FP32-only kinematic interaction CUDA kernel.
 
@@ -1146,10 +1207,12 @@ class beam(logging):
 
         global_use_series = 1 if use_series else 0
 
-        # Cache by (N, mode)
+        M_compile = int(max(1, m_beams))
+
+        # Cache by (N, mode, M)
         if not hasattr(self, "_interaction_kernel_cache"):
             self._interaction_kernel_cache = {}
-        key = ("v2_analyser", N, global_use_series)
+        key = ("v3_dynamical", N, global_use_series, M_compile)
         if key in self._interaction_kernel_cache:
             return self._interaction_kernel_cache[key]
 
@@ -1173,6 +1236,17 @@ class beam(logging):
         #define GLOBAL_USE_SERIES 1
         #endif
 
+        // M_BEAMS_COMPILE controls the per-atom amplitude vector length.
+        // M=1 reproduces the kinematic kernel bit-identically (lattice-phase
+        // factor is exp(2*pi*i*0*r)=1 for the forward beam).
+        #ifndef M_BEAMS_COMPILE
+        #define M_BEAMS_COMPILE 1
+        #endif
+        #if M_BEAMS_COMPILE < 1
+        #undef M_BEAMS_COMPILE
+        #define M_BEAMS_COMPILE 1
+        #endif
+
         #define CHUNK_SIZE 128
 
         // Split constants for robust FP32 argument reduction
@@ -1187,6 +1261,49 @@ class beam(logging):
         {
             p = a * b;
             e = fmaf(a, b, -p);
+        }
+
+        // FP32-robust sincos(2*pi * g . r_a) using exact-split arithmetic.
+        // Required for sample-scale crystals at hard-X-ray reflections, where
+        // g.r_a may reach ~10^7 cycles. Algorithm:
+        //   (1) two_prod_fma each component product (g_i * a_i) into hi+lo
+        //   (2) Two-sum accumulation of three high parts (captures cancellation)
+        //   (3) Total low = sum of (h_err1, h_err2, low_x, low_y, low_z)
+        //   (4) Reduce modulo 1 cycle: q = round(s2 + low), frac = (s2 - q) + low
+        //   (5) Multiply frac by 2*pi via TWOPI_H + TWOPI_L double-FP32 split,
+        //       then __sincosf on the result (|arg| <= pi).
+        // For g = (0, 0, 0) returns exactly (sn=0, cs=1), preserving M=1
+        // bit-identical kinematic behavior.
+        __device__ __forceinline__ void sincos_2pi_dot_g_r(
+            float gx, float gy, float gz,
+            float ax, float ay, float az,
+            float& sn, float& cs)
+        {
+            // Step 1: exact-split component products
+            float hx, lx; two_prod_fma(gx, ax, hx, lx);
+            float hy, ly; two_prod_fma(gy, ay, hy, ly);
+            float hz, lz; two_prod_fma(gz, az, hz, lz);
+
+            // Step 2: two-sum accumulation of the high parts
+            float s1 = hx + hy;
+            float bb = s1 - hx;
+            float e1 = (hx - (s1 - bb)) + (hy - bb);
+
+            float s2 = s1 + hz;
+            bb = s2 - s1;
+            float e2 = (s1 - (s2 - bb)) + (hz - bb);
+
+            // Step 3: total = s2 (high) + low (small)
+            float low = e1 + e2 + lx + ly + lz;
+
+            // Step 4: reduce modulo 1 cycle
+            float q = nearbyintf(s2 + low);
+            float frac = (s2 - q) + low;          // |frac| <= 0.5 cycles
+
+            // Step 5: multiply by 2*pi using TWOPI_H + TWOPI_L double-split,
+            // then sincos.  |arg| <= pi, where __sincosf is FP32-accurate.
+            float arg = fmaf(frac, TWOPI_H, frac * TWOPI_L);
+            __sincosf(arg, &sn, &cs);
         }
 
         // Robust sincos of (k*s) with FP32-only modulo-2pi reduction
@@ -1244,6 +1361,12 @@ class beam(logging):
         }
 
         // analyser_kind: 0=off, 1=top_hat, 2=darwin
+        // g_vecs_in: (M_BEAMS_COMPILE * 3) floats in 1/m. Provides the
+        // reciprocal-lattice vectors for the per-atom M-channel coherent
+        // sum (Eq. 13 of the dynamical-method plan). For M=1 with all
+        // zeros the kernel reduces bit-identically to the kinematic case.
+        // initial_amp must have length nAtoms * M_BEAMS_COMPILE, indexed
+        // as initial_amp[a * M + m].
         __global__ void interaction_kernal(
             const int   nAtoms,
             const float* __restrict__ kx_atom,
@@ -1252,7 +1375,7 @@ class beam(logging):
             const float* __restrict__ px,   // atom positions in meters
             const float* __restrict__ py,
             const float* __restrict__ pz,
-            const float2* __restrict__ initial_amp,
+            const float2* __restrict__ initial_amp,  // (nAtoms * M) interleaved
             const float2* __restrict__ scattering_anom,
             const float*  __restrict__ f0_params,
             const float*  __restrict__ f0_zero,
@@ -1270,7 +1393,8 @@ class beam(logging):
             const int    analyser_kind,
             const float  centre_x, const float centre_y, const float centre_z,
             const float  accept_angle_rad,
-            const float  darwin_halfwidth_rad)
+            const float  darwin_halfwidth_rad,
+            const float* __restrict__ g_vecs_in)  // (M * 3) floats in 1/m
         {
             const float rE_F = 2.81794092e-15f;
 
@@ -1352,7 +1476,7 @@ class beam(logging):
             __shared__ float  s_px[CHUNK_SIZE];
             __shared__ float  s_py[CHUNK_SIZE];
             __shared__ float  s_pz[CHUNK_SIZE];
-            __shared__ float2 s_amp[CHUNK_SIZE];
+            __shared__ float2 s_amp_M[CHUNK_SIZE * M_BEAMS_COMPILE];
             __shared__ float2 s_anm[CHUNK_SIZE];
             __shared__ float  s_params[CHUNK_SIZE * 11];
             __shared__ float  s_f0z[CHUNK_SIZE];
@@ -1365,7 +1489,11 @@ class beam(logging):
                     int a = base + t;
                     if (a < nAtoms) {
                         s_px[t] = px[a]; s_py[t] = py[a]; s_pz[t] = pz[a];
-                        s_amp[t]= initial_amp[a];
+                        #pragma unroll
+                        for (int m = 0; m < M_BEAMS_COMPILE; ++m) {
+                            s_amp_M[t * M_BEAMS_COMPILE + m] =
+                                initial_amp[a * M_BEAMS_COMPILE + m];
+                        }
                         s_anm[t]= scattering_anom[a];
                         s_f0z[t]= f0_zero[a];
                         #pragma unroll
@@ -1412,7 +1540,23 @@ class beam(logging):
                             s_tot.y -= (s_anm[j].y);
                         }
 
-                        float2 amp = s_amp[j];
+                        // M-channel coherent sum with lattice-phase factors
+                        // (Eq. 13 first term of the dynamical-method plan).
+                        // For M=1 with g=(0,0,0), sincos_2pi_dot_g_r returns
+                        // (sn=0, cs=1) and amp reduces to s_amp_M[j*1+0],
+                        // bit-identical to the legacy single-amplitude path.
+                        float2 amp = make_float2(0.0f, 0.0f);
+                        #pragma unroll
+                        for (int m = 0; m < M_BEAMS_COMPILE; ++m) {
+                            float gx = g_vecs_in[m*3 + 0];
+                            float gy = g_vecs_in[m*3 + 1];
+                            float gz = g_vecs_in[m*3 + 2];
+                            float sg, cg;
+                            sincos_2pi_dot_g_r(gx, gy, gz, ax, ay, az, sg, cg);
+                            float2 Eg = s_amp_M[j * M_BEAMS_COMPILE + m];
+                            amp.x += Eg.x * cg - Eg.y * sg;
+                            amp.y += Eg.x * sg + Eg.y * cg;
+                        }
                         float real_part = amp.x * s_tot.x - amp.y * s_tot.y;
                         float imag_part = amp.x * s_tot.y + amp.y * s_tot.x;
 
@@ -1505,6 +1649,7 @@ class beam(logging):
                 '-O3', '--ftz=true', '--fmad=true',
                 f'-DN_SERIES={N}',
                 f'-DGLOBAL_USE_SERIES={global_use_series}',
+                f'-DM_BEAMS_COMPILE={M_compile}',
             )
         )
         kern = kernel_module.get_function('interaction_kernal')
@@ -1697,16 +1842,25 @@ class beam(logging):
         k_hat = k_hat / np.linalg.norm(k_hat)
         k0 = k_mag * k_hat  # (3,)
 
-        # Lattice vectors in sample frame -> lab frame
+        # Lattice vectors in sample frame -> lab frame.
+        # ``lattice_matrix_conventional`` is stored with COLUMNS as the
+        # cartesian lattice vectors (a, b, c) -- this matches Crystal's
+        # ``rotate_crystal`` which updates the matrix as ``R @ M`` (rotates
+        # each column by R).  ``stage.rotation`` is then applied as a
+        # left-multiply on each column too.
         R_stage = np.asarray(stage.rotation, dtype=np.float64)
         lat_conv = np.asarray(crystal.lattice_matrix_conventional, dtype=np.float64)
-        lat_lab = lat_conv @ R_stage  # rows = a, b, c in lab
+        # Lattice vectors in lab frame, columns = (a, b, c)_lab.
+        lat_lab = R_stage @ lat_conv
 
         V_cell = float(crystal.lattice_volume_conventional)
-        # Reciprocal lattice vectors (1/A, no 2pi): b_i* = cross(b_{j}, b_{k}) / V
+        # Reciprocal lattice vectors (1/A, no 2pi): b_i* = cross(a_j, a_k) / V.
+        # Use COLUMNS of lat_lab (lat_lab[:, k]) as the cartesian a/b/c vectors.
         recip = np.zeros((3, 3), dtype=np.float64)
         for i in range(3):
-            recip[i] = np.cross(lat_lab[(i + 1) % 3], lat_lab[(i + 2) % 3]) / V_cell
+            recip[i] = np.cross(
+                lat_lab[:, (i + 1) % 3], lat_lab[:, (i + 2) % 3]
+            ) / V_cell
 
         # Enumerate candidate (h,k,l) within accessible range
         h_max = max(1, int(np.ceil(2.0 * k_mag / max(two_pi * np.linalg.norm(recip[0]), 1e-12))))
@@ -1742,11 +1896,21 @@ class beam(logging):
             "G": np.zeros(3, dtype=np.float32),
             "k_vec": k0.astype(np.float32),
             "excitation_error": 0.0,
+            "cos_theta": 1.0,
         }]
         for c in candidates:
             if len(beams) >= M_max:
                 break
             beams.append(c)
+        # Annotate per-beam obliquity factor cos(theta_g) used by the
+        # angular-spectrum propagator (Eq. 11 of the dynamical-method plan).
+        for bd in beams:
+            kv = np.asarray(bd["k_vec"], dtype=np.float64)
+            kn = float(np.linalg.norm(kv))
+            if kn > 0.0:
+                bd["cos_theta"] = float(np.clip(np.dot(kv / kn, k_hat), -1.0, 1.0))
+            else:
+                bd["cos_theta"] = 1.0
         return beams
 
     def _auto_detect_beams(self, sample, stage, M_max=2,
@@ -1783,6 +1947,7 @@ class beam(logging):
             "G": np.zeros(3, dtype=np.float32),
             "k_vec": k0.astype(np.float32),
             "excitation_error": 0.0,
+            "cos_theta": 1.0,
         }
 
         # Collect atom positions
@@ -1793,7 +1958,7 @@ class beam(logging):
             pos = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float64)
             if pos.size == 0:
                 continue
-            positions.append(pos @ R + T)
+            positions.append(pos @ R.T + T)
 
         if not positions:
             return [forward_beam]
@@ -1872,6 +2037,13 @@ class beam(logging):
             if len(beams) >= M_max:
                 break
             beams.append(c)
+        for bd in beams:
+            kv = np.asarray(bd["k_vec"], dtype=np.float64)
+            kn = float(np.linalg.norm(kv))
+            if kn > 0.0:
+                bd["cos_theta"] = float(np.clip(np.dot(kv / kn, k_hat), -1.0, 1.0))
+            else:
+                bd["cos_theta"] = 1.0
         return beams
 
     @staticmethod
@@ -1889,27 +2061,36 @@ class beam(logging):
             list[dict]: Beam descriptors (forward beam + one per g_vector).
         """
         two_pi = 2.0 * np.pi
+        # Reference forward direction (unit) for the cos(theta) calculation.
+        k0_arr = np.asarray(k0, dtype=np.float64)
+        k0_norm = float(np.linalg.norm(k0_arr))
+        k_hat = k0_arr / k0_norm if k0_norm > 0.0 else np.array([1.0, 0.0, 0.0])
         beams = [{
             "hkl": (0, 0, 0),
             "G": np.zeros(3, dtype=np.float32),
-            "k_vec": k0.astype(np.float32),
+            "k_vec": k0_arr.astype(np.float32),
             "excitation_error": 0.0,
+            "cos_theta": 1.0,
         }]
         for i, g in enumerate(g_vectors):
             g = np.asarray(g, dtype=np.float64)
             g_phys = two_pi * g
-            k_g = k0 + g_phys
+            k_g = k0_arr + g_phys
             s_g = (np.dot(k_g, k_g) - k_mag ** 2) / (2.0 * k_mag)
+            kgn = float(np.linalg.norm(k_g))
+            ct = float(np.clip(np.dot(k_g / kgn, k_hat), -1.0, 1.0)) if kgn > 0.0 else 1.0
             beams.append({
                 "hkl": (i + 1, 0, 0),
                 "G": g.astype(np.float32),
                 "k_vec": k_g.astype(np.float32),
                 "excitation_error": float(abs(s_g)),
+                "cos_theta": ct,
             })
         return beams
 
     def _build_structure_factor_maps_gpu(self, sample, stage, slice_edges_A,
-                                         beam_info, kernel_radius=0):
+                                         beam_info, kernel_radius=0,
+                                         born_convention=False):
         """
         Build per-slice complex structure factor maps for each unique delta-g
         vector needed by the beam coupling matrix.
@@ -1920,12 +2101,29 @@ class beam(logging):
         exp(-2*pi*i * delta_g . r_atom) weighted by f(|delta_g|) onto the beam
         grid using TSC interpolation, for each unique delta_g.
 
+        Two normalization conventions are supported:
+
+        - ``born_convention=False`` (default, legacy column-integral form):
+          maps use prefactor ``r_e * lambda^2 / (2 * pi * du * dv)``.  This is
+          the form historically consumed by ``_beam_coupling_step_gpu`` where
+          the transmission propagator is applied as ``exp(i * k * chi)``
+          without an explicit dz factor.
+
+        - ``born_convention=True`` (Born/Authier voxel-density form):
+          per-slice maps use prefactor ``r_e * lambda^2 / (pi * du * dv * dz_k)``
+          where ``dz_k = slice_edges_A[k+1] - slice_edges_A[k]``.  Maps are
+          true voxel-density susceptibilities (Eq. 7 of the dynamical-method
+          plan).  The transmission propagator must then be applied with an
+          explicit dz factor: ``exp(i * k * chi * dz)``.
+
         Args:
             sample: Chunked sample object.
             stage: Stage object with rotation and translation.
             slice_edges_A: (n_slices+1,) array of depth edges in Angstrom.
             beam_info: List of beam descriptors from _auto_select_beams.
             kernel_radius: Gaussian blur radius in pixels (0 = off).
+            born_convention: Use the corrected per-slice voxel-density
+                normalization.
 
         Returns:
             dict: Maps (a, b) tuples to lists of n_slices complex64 NumPy
@@ -1941,7 +2139,18 @@ class beam(logging):
         du, dv = float(self._beam_du), float(self._beam_dv)
         NyB, NzB = int(self._beam_Ny), int(self._beam_Nz)
         A_pix_A2 = du * dv
+        # Legacy column-integral prefactor (per-slice constant).
         C = (r_e_A * lam_A * lam_A) / (two_pi * A_pix_A2)
+        # Per-slice Born/Authier voxel-density prefactor.
+        edges_arr = np.asarray(slice_edges_A, dtype=np.float64)
+        if nS > 0:
+            dz_per_slice = np.diff(edges_arr).astype(np.float64)
+            dz_per_slice = np.where(dz_per_slice > 0.0, dz_per_slice, 1.0)
+        else:
+            dz_per_slice = np.ones(0, dtype=np.float64)
+        C_born = (r_e_A * lam_A * lam_A) / (
+            np.pi * A_pix_A2 * dz_per_slice
+        )  # (nS,)
 
         # Unique delta_g vectors
         unique_dg = {}
@@ -1983,7 +2192,7 @@ class beam(logging):
             if pos.size == 0:
                 continue
 
-            pos = pos @ stage.rotation.astype(np.float32)
+            pos = pos @ stage.rotation.astype(np.float32).T
             pos += stage.translation.astype(np.float32)
             nA = pos.shape[0]
 
@@ -2075,12 +2284,16 @@ class beam(logging):
                             ms = (kis == s)
                             np.add.at(accum[key][s].ravel(), pidx[ms], vals[ms].astype(np.complex64))
 
-        # Apply constant C and optional blur
+        # Apply prefactor (per-slice for born_convention, scalar otherwise)
+        # and optional blur.
         result = {}
         for key in unique_dg:
             maps = accum[key]
             for i in range(nS):
-                maps[i] = (C * maps[i]).astype(np.complex64)
+                if born_convention:
+                    maps[i] = (np.complex64(C_born[i]) * maps[i]).astype(np.complex64)
+                else:
+                    maps[i] = (C * maps[i]).astype(np.complex64)
             result[key] = maps
 
         if int(kernel_radius) > 0:
@@ -2219,17 +2432,25 @@ class beam(logging):
         )
         return mod.get_function('beam_couple_2x2_kernel')
 
-    def _beam_coupling_step_gpu(self, E_beams, chi_maps_slice, k_A):
+    def _beam_transmission_step_gpu(self, E_beams, chi_maps_slice, k_A):
         """
-        Apply one beam coupling step on GPU using the matrix exponential kernel.
+        Apply per-pixel matrix-exponential transmission step (Eq. 10 of the
+        dynamical-method plan) on GPU.
 
-        For M=1: applies transmission-only update E0 *= exp(i*k_A*chi0).
-        For M=2: applies the full 2x2 matrix exponential coupling.
+        For M=1: applies the scalar update E0 *= exp(i*k_A*chi0).
+        For M=2: applies the closed-form 2x2 matrix exponential of
+                 i*k_A*[[chi0, chi_-h], [chi_h, chi0]].
+        For M>2: not yet implemented (PadÃ© path deferred).
+
+        Note on units: ``k_A`` should equal ``k * dz`` for true voxel-density
+        chi maps (born_convention=True in _build_structure_factor_maps_gpu).
+        For legacy column-integral chi maps, ``k_A`` should equal ``k`` only
+        (with no dz factor); the dz is already absorbed into the chi values.
 
         Args:
             E_beams: list of M CuPy arrays, each (NyB, NzB) complex64.
             chi_maps_slice: dict mapping (a,b) -> complex64 GPU array (NyB, NzB).
-            k_A: float, k * dz for this slice (unitless).
+            k_A: float, transmission-step phase prefactor.
 
         Returns:
             list of M CuPy arrays (modified in-place, also returned).
@@ -2278,7 +2499,457 @@ class beam(logging):
             E_beams[1] = E1_flat.reshape(NyB, NzB)
             return E_beams
 
-        raise NotImplementedError(f"Beam coupling for M={M} > 2 not yet implemented.")
+        raise NotImplementedError(
+            f"Beam transmission for M={M} > 2 not yet implemented.")
+
+    def _beam_propagation_step_gpu(self, E_beams, dz_A, beam_info):
+        """
+        Per-beam angular-spectrum propagation by ``dz_A`` Angstrom with
+        per-beam carrier-wave subtraction (Eq. 11 of the dynamical-method
+        plan, exact form).
+
+        Each beam m has its own carrier wave with k-vector beam_info[m]['k_vec'].
+        The propagator subtracts this carrier exactly, so the envelope phase
+        evolution for the Bragg beam (g != 0) preserves the chi_h voxel maps'
+        exp(-i 2 pi G_h . r) carrier across slices.  This is the key to coherent
+        E_g buildup over many slices.
+
+        Args:
+            E_beams: list of M CuPy arrays (NyB, NzB) complex64.
+            dz_A: slice thickness in Angstrom.
+            beam_info: list of M beam descriptors providing 'k_vec' (1/Angstrom,
+                with 2 pi) and 'cos_theta' (legacy fallback if k_vec missing).
+
+        Returns:
+            list of M propagated CuPy arrays.
+        """
+        if not hasattr(self, '_prop_kernel_cache') or self._prop_kernel_cache is None:
+            self._prop_kernel_cache = self.build_propagation_multiplier_kernel()
+        kernel = self._prop_kernel_cache
+
+        # Axis convention (critical -- see below).  The envelope arrays are
+        # shaped (_beam_Ny, _beam_Nz) = (axis0 = e1/u, axis1 = e2/v).
+        # _angular_spectrum_propagate_gpu does `Nz, Ny = F.shape[0],
+        # F.shape[1]`, then builds ky over Ny (= axis1 = e2/v) with the
+        # `dy` arg and kz over Nz (= axis0 = e1/u) with the `dz` arg; the
+        # multiplier kernel pairs k_g_perp_y with ky and k_g_perp_z with kz.
+        # So to stay consistent the e2/v quantities must be passed as the
+        # `dy`/`k_g_perp_y` arguments and the e1/u quantities as `dz`/
+        # `k_g_perp_z`.  (Passing them the other way round subtracts the
+        # Bragg carrier on the wrong grid axis -> E_g de-phases per slice
+        # and never builds coherently -> no Pendellosung.)
+        dy_m = float(self._beam_dv) * 1e-10      # e2/v pitch -> ky / axis1
+        dz_pix_m = float(self._beam_du) * 1e-10  # e1/u pitch -> kz / axis0
+        dz_m = float(dz_A) * 1e-10
+
+        # Beam-grid axes (in lab frame).  Convert k from 1/A to rad/m.
+        k_hat = np.asarray(self._direction, dtype=np.float64)
+        k_hat = k_hat / np.linalg.norm(k_hat)
+        e1 = np.asarray(self._beam_e1, dtype=np.float64)
+        e2 = np.asarray(self._beam_e2, dtype=np.float64)
+        # Convert 1/A (with 2 pi) to rad/m: multiply by 1e10.
+        for m in range(len(E_beams)):
+            kvec_iA = np.asarray(beam_info[m].get('k_vec', None), dtype=np.float64)
+            if kvec_iA is None or kvec_iA.size != 3:
+                # Fallback to cos_theta legacy path
+                cos_theta_m = float(beam_info[m].get("cos_theta", 1.0))
+                E_beams[m] = self._angular_spectrum_propagate_gpu(
+                    E_beams[m], dy_m, dz_pix_m, dz_m, kernel,
+                    step_max=0.02, pad_factor=1.0, padding_mode="edge",
+                    cos_theta=cos_theta_m,
+                )
+                continue
+            # Project k_vec onto beam-grid axes (1/A with 2 pi).  The
+            # carrier-subtraction kernel pairs k_g_perp_y with ky (= field
+            # axis1 = e2/v) and k_g_perp_z with kz (= field axis0 = e1/u),
+            # so the e2 component must go to k_g_perp_y and the e1 component
+            # to k_g_perp_z (see the axis-convention note above).
+            k_g_axis_iA = float(np.dot(kvec_iA, k_hat))
+            k_g_perp_y_iA = float(np.dot(kvec_iA, e2))  # ky <-> e2/axis1
+            k_g_perp_z_iA = float(np.dot(kvec_iA, e1))  # kz <-> e1/axis0
+            # Convert to rad/m for the kernel (which expects SI units consistent
+            # with dy_m, dz_pix_m, dz_m).  k [1/A with 2 pi] * 1e10 = k [rad/m].
+            k_g_axis_m = k_g_axis_iA * 1e10
+            k_g_perp_y_m = k_g_perp_y_iA * 1e10
+            k_g_perp_z_m = k_g_perp_z_iA * 1e10
+            E_beams[m] = self._angular_spectrum_propagate_gpu(
+                E_beams[m], dy_m, dz_pix_m, dz_m, kernel,
+                step_max=0.02, pad_factor=1.0, padding_mode="edge",
+                k_g_axis=k_g_axis_m,
+                k_g_perp_y=k_g_perp_y_m,
+                k_g_perp_z=k_g_perp_z_m,
+            )
+        return E_beams
+
+    def _beam_coupling_step_gpu(self, E_beams, chi_maps_slice, k_A,
+                                dz_A=None, beam_info=None):
+        """
+        Backward-compatibility wrapper.  Calls transmission-only by default
+        (legacy semantics).  When ``dz_A`` and ``beam_info`` are both
+        provided, additionally applies the per-beam ASP propagation step
+        (Lie-Trotter split-step).
+
+        Args:
+            E_beams: list of M CuPy arrays (NyB, NzB) complex64.
+            chi_maps_slice: dict (a,b) -> complex64 GPU array (NyB, NzB).
+            k_A: transmission-step phase prefactor.
+            dz_A: optional slice thickness in Angstrom for ASP propagation.
+            beam_info: optional list of M beam descriptors (need cos_theta).
+
+        Returns:
+            list of M CuPy arrays.
+        """
+        E_beams = self._beam_transmission_step_gpu(E_beams, chi_maps_slice, k_A)
+        if dz_A is not None and beam_info is not None:
+            E_beams = self._beam_propagation_step_gpu(E_beams, dz_A, beam_info)
+        return E_beams
+
+    # -------------------------------------------------------------------------
+    # FP32-robust atom-table builder for the dynamical multislice (Phase 4.2
+    # of the dynamical-method plan).  The integer/fractional voxel-coordinate
+    # split uses _two_prod_fp32 and _two_sum_fp32 so atoms at sample-scale
+    # positions (~mm) still resolve sub-voxel weights to FP32 precision.
+    # -------------------------------------------------------------------------
+    def _build_atom_table_for_multislice(self, sample, stage, edges_A, n_final):
+        """
+        Build per-chunk FP32-robust atom tables for the multislice + LS pipeline.
+
+        The previous implementation concatenated every per-chunk array into one
+        global aggregated buffer (all_pos, all_iu_int, ...).  For
+        billion-atom samples this peaks at >20 GB host RAM (positions +
+        int64 indices + fractions + species + atom_M_amps), which OOMs the
+        process.  This version keeps each chunk's atom table independent so
+        the multislice loop and the LS step can iterate per-chunk and keep
+        peak memory bounded by the largest single chunk (~30 MB for 1M
+        atoms).
+
+        ``iu_int`` / ``iv_int`` are stored as int32 instead of int64 to
+        halve their memory footprint -- voxel grids never exceed 2^31 - 1
+        cells per axis in practice.
+
+        Args:
+            sample: Chunked sample object.
+            stage: Stage with rotation (3x3) and translation (3,) in Angstrom.
+            edges_A: (n_final + 1,) array of slice depth edges in Angstrom.
+            n_final: Number of slices.
+
+        Returns:
+            dict mapping ``cid`` (int chunk id, 1-indexed) to a per-chunk
+            table dict with keys:
+
+                all_pos    (N_chunk, 3) float32 lab-frame positions (A)
+                all_spc    (N_chunk,) species labels
+                iu_int     (N_chunk,) int32 voxel integer indices (sorted by slice)
+                iv_int     (N_chunk,) int32 voxel integer indices (sorted by slice)
+                iu_frac    (N_chunk,) float32 fractional weights in [0, 1)
+                iv_frac    (N_chunk,) float32 fractional weights in [0, 1)
+                slice_starts (n_final + 1,) int64 slice-boundary indices
+                              into THIS chunk's sorted arrays
+                N_total    int  -- atoms in this chunk
+
+            Plus a special key ``"_meta"`` with:
+                N_total_all int  -- total atoms across all chunks
+                chunk_ids   list[int] -- ordered list of populated chunk ids
+
+            Returns None if no atoms.
+        """
+        NyB = int(self._beam_Ny)
+        NzB = int(self._beam_Nz)
+        du_A = float(self._beam_du)
+        dv_A = float(self._beam_dv)
+        inv_du = np.float32(1.0 / du_A)
+        inv_dv = np.float32(1.0 / dv_A)
+        e1 = self._beam_e1.astype(np.float32)
+        e2 = self._beam_e2.astype(np.float32)
+        k_hat = (self._direction / np.linalg.norm(self._direction)).astype(np.float32)
+        uc = np.float32(self._beam_uc)
+        vc = np.float32(self._beam_vc)
+
+        per_chunk = {}
+        chunk_ids = []
+        N_total_all = 0
+
+        chunk_total = int(sample.chunk_total or 0)
+        for cid in range(1, chunk_total + 1):
+            spc_host = sample.load_chunk_species(cid, use_gpu=False)
+            pos_host = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float32)
+            if pos_host.size == 0:
+                continue
+            pos_lab = pos_host @ stage.rotation.astype(np.float32).T
+            pos_lab = pos_lab + stage.translation.astype(np.float32)
+
+            # ---- FP32-robust dot products pos_lab . e1 and pos_lab . e2 ----
+            hx, lx = self._two_prod_fp32(pos_lab[:, 0], e1[0])
+            hy, ly = self._two_prod_fp32(pos_lab[:, 1], e1[1])
+            hz, lz = self._two_prod_fp32(pos_lab[:, 2], e1[2])
+            s1, e_s1 = self._two_sum_fp32(hx, hy)
+            au_high, e_s2 = self._two_sum_fp32(s1, hz)
+            au_low = (e_s1 + e_s2 + lx + ly + lz).astype(np.float32)
+
+            hx2, lx2 = self._two_prod_fp32(pos_lab[:, 0], e2[0])
+            hy2, ly2 = self._two_prod_fp32(pos_lab[:, 1], e2[1])
+            hz2, lz2 = self._two_prod_fp32(pos_lab[:, 2], e2[2])
+            s1v, e_s1v = self._two_sum_fp32(hx2, hy2)
+            av_high, e_s2v = self._two_sum_fp32(s1v, hz2)
+            av_low = (e_s1v + e_s2v + lx2 + ly2 + lz2).astype(np.float32)
+
+            # ---- FP32-robust division au / du_A and av / dv_A ----
+            iu_h_high, iu_h_low = self._two_prod_fp32(au_high, inv_du)
+            iu_total_low = (iu_h_low + au_low * inv_du).astype(np.float32)
+            iu_h_high = (iu_h_high + uc).astype(np.float32)
+
+            iv_h_high, iv_h_low = self._two_prod_fp32(av_high, inv_dv)
+            iv_total_low = (iv_h_low + av_low * inv_dv).astype(np.float32)
+            iv_h_high = (iv_h_high + vc).astype(np.float32)
+
+            # Extract integer + fractional parts (FP32-robust).  We keep the
+            # integer indices in int32 to halve memory vs the previous int64
+            # implementation -- voxel-grid sizes never need more.
+            iu_int_h = np.floor(iu_h_high).astype(np.int32)
+            frac_h_u = (iu_h_high - iu_int_h.astype(np.float32)).astype(np.float32)
+            iu_frac = (frac_h_u + iu_total_low).astype(np.float32)
+            wrap_u = np.floor(iu_frac).astype(np.int32)
+            iu_int = (iu_int_h + wrap_u).astype(np.int32)
+            iu_frac = (iu_frac - wrap_u.astype(np.float32)).astype(np.float32)
+
+            iv_int_h = np.floor(iv_h_high).astype(np.int32)
+            frac_h_v = (iv_h_high - iv_int_h.astype(np.float32)).astype(np.float32)
+            iv_frac = (frac_h_v + iv_total_low).astype(np.float32)
+            wrap_v = np.floor(iv_frac).astype(np.int32)
+            iv_int = (iv_int_h + wrap_v).astype(np.int32)
+            iv_frac = (iv_frac - wrap_v.astype(np.float32)).astype(np.float32)
+
+            # Slice index along the beam direction
+            s_vals = (pos_lab[:, 0] * k_hat[0]
+                      + pos_lab[:, 1] * k_hat[1]
+                      + pos_lab[:, 2] * k_hat[2])
+            k_idx = np.clip(
+                np.searchsorted(edges_A, s_vals, side="right") - 1,
+                0, n_final - 1,
+            ).astype(np.int32)
+
+            # Sort THIS chunk's atoms by slice in place; keeps slice atoms
+            # contiguous so the multislice loop can do range slices directly.
+            sort_idx = np.argsort(k_idx, kind='stable')
+            pos_lab = pos_lab[sort_idx]
+            spc_host = np.asarray(spc_host)[sort_idx]
+            iu_int = iu_int[sort_idx]
+            iv_int = iv_int[sort_idx]
+            iu_frac = iu_frac[sort_idx]
+            iv_frac = iv_frac[sort_idx]
+            k_idx = k_idx[sort_idx]
+
+            # Per-chunk slice_starts indexing into THIS chunk's arrays.
+            chunk_slice_starts = np.zeros(n_final + 1, dtype=np.int64)
+            counts = np.bincount(k_idx, minlength=n_final)
+            np.cumsum(counts, out=chunk_slice_starts[1:])
+
+            N_chunk = int(pos_lab.shape[0])
+            per_chunk[cid] = {
+                "all_pos": pos_lab,
+                "all_spc": spc_host,
+                "iu_int": iu_int,
+                "iv_int": iv_int,
+                "iu_frac": iu_frac,
+                "iv_frac": iv_frac,
+                "slice_starts": chunk_slice_starts,
+                "N_total": N_chunk,
+            }
+            chunk_ids.append(cid)
+            N_total_all += N_chunk
+
+        if not chunk_ids:
+            return None
+        per_chunk["_meta"] = {
+            "N_total_all": int(N_total_all),
+            "chunk_ids": chunk_ids,
+        }
+        return per_chunk
+
+    def _sample_envelopes_at_atoms_inplace(
+        self, E_beams_gpu, iu_int, iv_int, iu_frac, iv_frac,
+        out_M_amps_slice, NyB, NzB,
+    ):
+        """
+        Bilinear-interpolate the M envelope wavefields at atom positions.
+
+        Consumes the FP32-robust pre-split (int, frac) coordinate schema from
+        ``_build_atom_table_for_multislice``.  Atoms outside the grid are
+        zeroed.  Modifies ``out_M_amps_slice`` in place.
+
+        Args:
+            E_beams_gpu: list of M CuPy complex64 arrays (NyB, NzB).
+            iu_int, iv_int: (N_atoms_in_slice,) int64 voxel indices.
+            iu_frac, iv_frac: (N_atoms_in_slice,) float32 weights in [0, 1).
+            out_M_amps_slice: (N_atoms_in_slice, M) numpy complex64 (modified).
+            NyB, NzB: grid dimensions.
+        """
+        M = len(E_beams_gpu)
+        in_grid = ((iu_int >= 0) & (iu_int < NyB - 1) &
+                   (iv_int >= 0) & (iv_int < NzB - 1))
+        iy0 = np.clip(iu_int, 0, NyB - 2)
+        iz0 = np.clip(iv_int, 0, NzB - 2)
+        iy1 = iy0 + 1
+        iz1 = iz0 + 1
+        fy = iu_frac
+        fz = iv_frac
+
+        for m_idx in range(M):
+            E_m = cp.asnumpy(E_beams_gpu[m_idx])
+            v00 = E_m[iy0, iz0]
+            v10 = E_m[iy1, iz0]
+            v01 = E_m[iy0, iz1]
+            v11 = E_m[iy1, iz1]
+            interp = (v00 * (1.0 - fy) * (1.0 - fz)
+                      + v10 * fy * (1.0 - fz)
+                      + v01 * (1.0 - fy) * fz
+                      + v11 * fy * fz)
+            interp = interp.astype(np.complex64, copy=False)
+            interp[~in_grid] = 0.0
+            out_M_amps_slice[:, m_idx] = interp
+
+    def _run_multislice_with_sampling(
+        self, chi_maps, beam_info, transmission_k_A, dz_A, n_final,
+        per_chunk_tables, atom_M_amps_per_chunk,
+        NyB, NzB, M, thickness_A,
+        apply_propagation=True,
+        slice_iter_reverse=False,
+        initial_envelope=None,
+    ):
+        """
+        Stage-2 multislice driver with inline Stage-3 envelope sampling.
+
+        Implements Eq. (9-11) of the dynamical-method plan. Iterates the
+        Lie-Trotter split-step transmission + ASP propagation through the
+        crystal, sampling envelopes at atom positions inside each slice as
+        they are encountered.
+
+        Forward semantics (slice_iter_reverse=False):
+            Loop k = 0, 1, ..., n_final - 1.
+            Per slice: T(+dz, chi) then P(+dz), then sample atoms in slice k.
+            Initial condition: E_0 = self._beam_E0_map (forward beam = unity),
+            E_m = 0 for m > 0, unless initial_envelope is provided.
+
+        Reverse semantics (slice_iter_reverse=True), used by the reciprocal
+        multislice for output-side correction (master_plan II.7, Lorentz
+        reciprocity):
+            Loop k = n_final - 1, n_final - 2, ..., 0.
+            Per slice: P(-dz) then T(+dz, chi), then sample atoms in slice k.
+            chi maps are the SAME as forward (no conjugation -- Lorentz
+            reciprocity in absorbing media uses the symmetric, non-Hermitian
+            structure of the Helmholtz operator; chi -> chi* is the wrong
+            time-reversal duality which yields the gain-medium inverse).
+            Empirically validated in validation_simulation.py to 0.16% rel err
+            on the forward + physical-backward round-trip symmetric mode.
+            initial_envelope must be supplied (the entrance wave at the EXIT
+            face of the crystal, in the -k_out direction).
+
+        Args:
+            chi_maps: dict (a, b) -> list of n_final complex64 NumPy arrays
+                each shaped (NyB, NzB).  Voxel-density susceptibility maps
+                from _build_structure_factor_maps_gpu(born_convention=True).
+            beam_info: list of M beam descriptors (provides cos_theta for
+                the propagation step).
+            transmission_k_A: float, transmission-step phase prefactor
+                (= pi / lambda * dz_A for born-convention chi maps).
+            dz_A: float, slice thickness in Angstrom (always positive; the
+                helper handles sign internally based on slice_iter_reverse).
+            n_final: int, number of slices.
+            per_chunk_tables: dict cid -> table with iu_int, iv_int, iu_frac,
+                iv_frac, slice_starts (built by _build_atom_table_for_multislice).
+            atom_M_amps_per_chunk: dict cid -> (N_chunk, M) complex64 array
+                (modified in-place by Stage 3).
+            NyB, NzB: int, beam-grid dimensions.
+            M: int, number of beams.
+            thickness_A: float, total crystal thickness in Angstrom.
+            apply_propagation: if True, apply ASP step (default).  Disabled
+                automatically for thickness-degenerate cases.
+            slice_iter_reverse: if True, run the physical-backward variant
+                described above.
+            initial_envelope: optional list of M CuPy complex64 arrays of
+                shape (NyB, NzB), used as the initial condition.  If None,
+                defaults to (self._beam_E0_map, 0, 0, ...).
+
+        Returns:
+            None.  atom_M_amps_per_chunk modified in-place.
+        """
+        chunk_ids = per_chunk_tables["_meta"]["chunk_ids"]
+
+        # Initial envelope state on GPU
+        if initial_envelope is None:
+            E_beams_gpu = [cp.asarray(self._beam_E0_map.astype(np.complex64))]
+            for _m in range(1, M):
+                E_beams_gpu.append(cp.zeros((NyB, NzB), dtype=cp.complex64))
+        else:
+            if len(initial_envelope) != M:
+                raise ValueError(
+                    f"initial_envelope must have {M} entries (got "
+                    f"{len(initial_envelope)})")
+            E_beams_gpu = []
+            for em in initial_envelope:
+                if isinstance(em, cp.ndarray):
+                    E_beams_gpu.append(em.astype(cp.complex64, copy=True))
+                else:
+                    E_beams_gpu.append(cp.asarray(em, dtype=cp.complex64))
+
+        # Per-step propagation distance (signed for reverse pass)
+        propagate_ok = bool(apply_propagation) and (thickness_A > 0.0) and (dz_A > 0.0)
+        prop_dz_A = -dz_A if slice_iter_reverse else dz_A
+
+        # Slice iteration order
+        slice_order = range(n_final - 1, -1, -1) if slice_iter_reverse else range(n_final)
+
+        for k in slice_order:
+            chi_slice = {key: cp.asarray(chi_maps[key][k], dtype=cp.complex64)
+                         for key in chi_maps}
+
+            if slice_iter_reverse:
+                # Reverse: P(-dz) then T(+dz, chi).  This is the *physical*
+                # backward wave through the same absorbing medium, NOT the
+                # mathematical inverse of forward.
+                if propagate_ok:
+                    try:
+                        self._beam_propagation_step_gpu(E_beams_gpu, prop_dz_A, beam_info)
+                    except Exception:
+                        pass
+                self._beam_transmission_step_gpu(
+                    E_beams_gpu, chi_slice, transmission_k_A)
+            else:
+                # Forward: T(+dz, chi) then P(+dz)
+                self._beam_transmission_step_gpu(
+                    E_beams_gpu, chi_slice, transmission_k_A)
+                if propagate_ok:
+                    try:
+                        self._beam_propagation_step_gpu(E_beams_gpu, prop_dz_A, beam_info)
+                    except Exception:
+                        pass
+
+            del chi_slice
+            cp.get_default_memory_pool().free_all_blocks()
+
+            # Sample envelopes at atoms in slice k of every chunk that has
+            # atoms in this slice.  Same call for both forward and reverse:
+            # we sample AFTER the slice's operations have been applied.
+            for cid in chunk_ids:
+                tbl = per_chunk_tables[cid]
+                a_start = int(tbl["slice_starts"][k])
+                a_end = int(tbl["slice_starts"][k + 1])
+                if a_end <= a_start:
+                    continue
+                self._sample_envelopes_at_atoms_inplace(
+                    E_beams_gpu,
+                    tbl["iu_int"][a_start:a_end],
+                    tbl["iv_int"][a_start:a_end],
+                    tbl["iu_frac"][a_start:a_end],
+                    tbl["iv_frac"][a_start:a_end],
+                    atom_M_amps_per_chunk[cid][a_start:a_end, :],
+                    NyB, NzB,
+                )
+
+        # Free envelope grids
+        for _i in range(len(E_beams_gpu)):
+            del E_beams_gpu[0]
+        cp.get_default_memory_pool().free_all_blocks()
 
     def atomic_scattering_dynamical(self, sample, detector, stage,
                                     crystal=None,
@@ -2294,52 +2965,105 @@ class beam(logging):
                                     absorption_multiplier=1.0,
                                     apply_polarization=False,
                                     remove_forward=True,
-                                    spherical_decay=False):
+                                    spherical_decay=False,
+                                    apply_propagation=True,
+                                    analyser_mode="off",
+                                    analyser_acceptance_angle_rad=25e-4,
+                                    analyser_darwin_halfwidth_rad=0.0,
+                                    NN_dist_A=None,
+                                    convergent_regime_check="warn",
+                                    commensurate_supercell=False,
+                                    force_unconverged=False,
+                                    dynamical_mode="forward_only",
+                                    multi_gpu=False,
+                                    n_gpus=None):
         """
-        Beam-coupling multislice dynamical X-ray diffraction (v3).
+        Atomistic dynamical X-ray scattering via voxelized multi-beam
+        multislice with per-atom Lippmann-Schwinger rescattering.
 
-        Tracks M coupled beam wavefields through the sample using a multislice
-        approach.  At each slice the wavefields are sampled at atom positions
-        in that slice, storing per-atom per-beam amplitudes.  After the slice
-        loop, each beam's stored amplitudes are scattered to the detector using
-        the existing kinematic scatter kernel with k_in set to that beam's
-        wavevector.
+        Implements the master equation (Eq. 6 of the dynamical-method plan):
+            psi(r_det) = psi_0(r_det) - (r_e * lambda^2 * k_0^2 / pi)
+                         * sum_a F_a(Q) * G_0(r_det, r_a) * psi_dyn(r_a)
+        where psi_dyn is recovered by trilinear sampling of the multislice
+        envelope wavefields E_g_m at every atom position and recombining via
+        the per-(atom, beam, pixel) phase
+            Phi_{a,m,p} = 2*pi * g_m . r_a + k_0 |r_det - r_a| - k_in . r_a.
 
-        For M=1 this reproduces kinematic + transmission.  For M=2 it produces
-        Pendelloesung oscillations and the Borrmann effect.
+        Recovers vacuum kinematic (M=1, chi=0), refractive forward (M=1,
+        amorphous), Beer-Lambert absorption (M=1, absorbing), two-beam
+        Pendelloesung (M=2, perfect crystal at exact Bragg), Borrmann
+        anomalous transmission (M=2, absorbing centrosymmetric crystal),
+        and Takagi-Taupin defect imaging (M=2, defected crystal) as exact
+        limits.
 
-        Beam selection for M > 1 uses one of three strategies (in priority
-        order):
-          1. Explicit g_vectors — user specifies which reflections to track.
-          2. Crystal object — enumerates reciprocal lattice points, picks
-             those closest to the Ewald sphere (fast, exact).
-          3. Auto-detect — 3D FFT of the atomic density to find Bragg
-             peaks automatically.  Falls back to M=1 if the material
-             is amorphous.
+        Beam selection (M > 1) priority:
+            1. Explicit ``g_vectors``: user-supplied reciprocal-lattice list.
+            2. ``crystal`` object: nearest reflections to the Ewald sphere.
+            3. Auto-detect: 3D FFT of atomic density (amorphous fallback to M=1).
 
         Args:
             sample: Chunked sample object.
-            detector: Detector with pixel_coordinates (3, Ny*Nz) in Angstrom.
-            stage: Stage providing rotation (3x3) and translation (3,).
-            crystal: Crystal object (optional). Provides
-                lattice_matrix_conventional and lattice_volume_conventional.
-                Used for fast beam selection when available.
-            M (int): Number of coupled beams (1 = kinematic, 2 = two-beam).
-            g_vectors: Optional list of (3,) arrays — reciprocal lattice
-                vectors in crystallographic convention (1/Angstrom, no 2pi).
-                If provided, overrides crystal-based and auto beam selection.
-                Length determines M (len + 1 including forward beam).
+            detector: Detector with ``pixel_coordinates`` (3, Ny*Nz) in Angstrom.
+            stage: Stage providing ``rotation`` (3x3) and ``translation`` (3,).
+            crystal: Optional crystal for fast beam selection.
+            M (int): Number of coupled beams (1 = kinematic + transmission).
+            g_vectors: Optional list of (3,) crystallographic-convention G
+                vectors (1/Angstrom, no 2pi).
             offset: Optional complex field to subtract from the result.
             use_gpu (bool): Use GPU acceleration.
             n_slices (int or None): Number of depth slices; auto if None.
             target_phase_step (float): Per-slice phase step for auto-slicer.
-            kernel_radius (int): Gaussian blur radius for slice maps.
+            kernel_radius (int): Gaussian blur radius for chi maps.
             pad_factor (float): FFT padding factor for ASP propagation.
-            padding_mode (str): "edge" or "constant" for propagation padding.
+            padding_mode (str): "edge" or "constant".
             absorption_multiplier (float): Scale absorption (1.0 = physical).
-            apply_polarization (bool): Apply polarization factor in scattering.
-            remove_forward (bool): Remove forward scattering component.
+            apply_polarization (bool): Apply per-pixel polarization factor.
+            remove_forward (bool): Remove forward scattering at the kernel.
             spherical_decay (bool): Apply 1/R decay.
+            apply_propagation (bool): If True, apply per-beam ASP propagation
+                step in the Lie-Trotter split-step (Eq. 11).  If False, the
+                multislice is transmission-only, useful for column-approximation
+                regimes (uniform crystal) and for backward compatibility.
+            NN_dist_A (float or None): Nearest-neighbor distance in Angstrom,
+                used by the convergent-regime check (master_plan I.6).
+                If None and M > 1, estimated from a random subset of sample
+                atoms; if estimation fails, the check is skipped with a
+                warning.
+            convergent_regime_check (str): One of {"off", "warn", "error"}.
+                Controls behaviour when the existing beam grid pitch falls
+                outside the convergent window [NN_dist/3, 1/(2*|g_max|)] for
+                M > 1.  Default "warn".  Use "error" for validation pipelines
+                that must not silently produce kinematic-only or biased
+                output.
+            commensurate_supercell (bool): If True, allow aggressive-mode
+                voxel pitch (down to NN_dist/2) for perfect commensurate
+                supercells.
+            force_unconverged (bool): If True, suppress the RuntimeError
+                that would otherwise be raised when |g_max|*NN_dist >= 1.5
+                (collapsed window).  For diagnostic use only.
+            dynamical_mode (str): One of {"forward_only", "full"}.
+                "forward_only" (default) runs a single forward multislice
+                and uses kinematic free-space output-side propagation
+                (column approximation; correct for thin samples and weak
+                reflections).  "full" additionally runs a reciprocal
+                multislice via Lorentz reciprocity (master_plan II.7) to
+                capture output-side dynamical corrections; the per-atom
+                amplitude becomes the elementwise product of forward and
+                reciprocal envelopes.  At symmetric Laue exact Bragg the
+                two modes give the same answer at the Bragg peak (the
+                output-side correction "absorbs" into the per-atom factor
+                already present from the forward multislice exit value);
+                differences are visible at off-Bragg detector pixels and
+                in asymmetric geometries.
+            multi_gpu (bool): If True, parallelise the Stage-4 LS kernel
+                pass across all available CUDA devices.  Stages 1-3
+                (chi_g build, multislice, atom-position envelope sampling)
+                are replicated per the master_plan II.6a "default
+                replicated" recommendation; only the LS pass is partitioned.
+                Bit-identical to single-GPU within FP32 reduction-order noise.
+                Default False.
+            n_gpus (int or None): If multi_gpu=True, cap the number of GPUs
+                used.  Default None = use all available.
 
         Returns:
             np.ndarray: Complex64 array of shape (Nz, Ny).
@@ -2360,83 +3084,175 @@ class beam(logging):
                 final_result -= offset
             return final_result
 
-        # constants
+        # Constants (Angstrom units)
         NyB, NzB = int(self._beam_Ny), int(self._beam_Nz)
-        du_A = float(self._beam_du)
-        dv_A = float(self._beam_dv)
         two_pi = 2.0 * np.pi
         lam_A = float(self._wavelength) * 1e10
-        kA = two_pi / lam_A  # 1/Angstrom
+        kA = two_pi / lam_A   # 1/Angstrom
         abs_m = float(absorption_multiplier)
 
-        # Depth bounds and slicing
+        # ---------------- 1. Depth bounds and slicing ----------------------
         s_min_A, s_max_A = self._compute_global_depth_bounds(sample, stage)
         thickness_A = float(max(0.0, s_max_A - s_min_A))
 
+        delta_list_cached = None
+        beta_list_cached = None
         if thickness_A <= 0.0:
             n_final = 1
             edges_A = np.array([0.0, 1.0], dtype=np.float32)
         else:
             if n_slices is None:
-                n_final, edges_A, delta_list_cached, beta_list_cached, _ = \
+                (n_final, edges_A,
+                 delta_list_cached, beta_list_cached, _) = \
                     self._auto_slice_count_linear_regime(
                         sample=sample, stage=stage,
                         kernel_radius=kernel_radius,
                         target_step=float(target_phase_step),
                         use_gpu=use_gpu, max_slices=2048,
-                        n_init=None, absorption_multiplier=abs_m
+                        n_init=None, absorption_multiplier=abs_m,
                     )
             else:
                 n_final = int(max(1, n_slices))
                 edges_A = np.linspace(s_min_A, s_max_A, n_final + 1, dtype=np.float32)
-                delta_list_cached = None
-                beta_list_cached = None
 
-        dz_A = thickness_A / max(n_final, 1)
+        dz_A = float(thickness_A) / max(n_final, 1)
 
-        # Beam selection
+        # ---------------- 2. Beam selection (with cos_theta) ----------------
         k_hat = np.asarray(self._direction, dtype=np.float64)
         k_hat = k_hat / np.linalg.norm(k_hat)
         k0_vec = (kA * k_hat).astype(np.float64)
 
         if M > 1:
             if g_vectors is not None:
-                # Strategy 1: explicit g vectors
                 beam_info = self._beams_from_g_vectors(g_vectors, k0_vec, kA)
-                M = len(beam_info)
             elif crystal is not None:
-                # Strategy 2: crystal reciprocal lattice
                 beam_info = self._auto_select_beams(crystal, stage, M_max=M)
-                M = len(beam_info)
             else:
-                # Strategy 3: auto-detect from atom positions (FFT)
                 beam_info = self._auto_detect_beams(sample, stage, M_max=M)
-                M = len(beam_info)
+            M = len(beam_info)
         else:
             beam_info = [{
                 "hkl": (0, 0, 0),
                 "G": np.zeros(3, dtype=np.float32),
                 "k_vec": k0_vec.astype(np.float32),
                 "excitation_error": 0.0,
+                "cos_theta": 1.0,
             }]
 
-        # Build structure factor maps
-        if M == 1:
-            # Reuse existing forward-scattering TSC for M=1
-            if thickness_A > 0.0:
+        # ---------------- 2.5 Convergent-regime check (master_plan I.6) -----
+        # The existing beam grid (du, dv) was set up by _init_beam_grid; for
+        # M > 1 we validate that its in-plane pitch falls inside the convergent
+        # window [NN_dist/3, 1/(2*|g_max|)].  Outside this window the
+        # simulation runs but produces silently wrong results:
+        #   - too coarse (du > 1/(2|g_max|)):  chi_g aliased -> refractive
+        #     only; multislice misses Bragg-channel coupling, recovers
+        #     kinematic Born series.
+        #   - too fine   (du < NN_dist/3):     bimodal chi field -> per-atom
+        #     amplitudes biased by 30-40%.
+        # This check surfaces the issue via a UserWarning (or RuntimeError if
+        # convergent_regime_check="error"); it does NOT auto-resize the beam
+        # grid, since that would silently invalidate caller-managed grid
+        # setup downstream of this method.
+        if M > 1 and convergent_regime_check != "off":
+            check_mode = str(convergent_regime_check).lower().strip()
+            if check_mode not in ("off", "warn", "error"):
+                check_mode = "warn"
+
+            NN_resolved = NN_dist_A
+            if NN_resolved is None:
+                NN_resolved = self._estimate_nearest_neighbor_distance(
+                    sample, n_samples=2048)
+
+            if NN_resolved is not None and NN_resolved > 0:
+                g_list = [np.asarray(b["G"], dtype=np.float64) for b in beam_info]
+                Lx_A_check = float(NyB) * float(self._beam_du)
+                Ly_A_check = float(NzB) * float(self._beam_dv)
+                Lz_A_check = float(max(thickness_A, 1.0))
                 try:
-                    delta_list = delta_list_cached
-                    beta_list = beta_list_cached
-                except NameError:
-                    delta_list = None
-                    beta_list = None
-                if delta_list is None or beta_list is None:
+                    Nx_auto, Ny_auto, _Nz_auto, dx_target, dy_target, _dz_target, diag = \
+                        beam._auto_voxel_grid(
+                            g_list, (Lx_A_check, Ly_A_check, Lz_A_check),
+                            float(NN_resolved),
+                            float(dz_A) if dz_A > 0 else 1.0,
+                            strict_nyquist=(not commensurate_supercell),
+                            force_unconverged=force_unconverged,
+                        )
+                except RuntimeError as _e:
+                    if check_mode == "error":
+                        raise
+                    warnings.warn(
+                        f"[atomic_scattering_dynamical] convergent-regime "
+                        f"window collapsed: {_e}.  Continuing in unconverged "
+                        f"regime; expect 30-40% bias on Bragg-channel "
+                        f"amplitudes.")
+                else:
+                    du_now = float(self._beam_du)
+                    dv_now = float(self._beam_dv)
+                    in_regime = (
+                        diag["dx_tsc_lower"] <= du_now <= diag["dx_nyquist_upper"]
+                        and diag["dx_tsc_lower"] <= dv_now <= diag["dx_nyquist_upper"]
+                    )
+                    if not in_regime:
+                        msg = (
+                            f"Beam grid (du={du_now:.4f} A, dv={dv_now:.4f} A) "
+                            f"is outside the convergent window for M={M}: "
+                            f"[{diag['dx_tsc_lower']:.4f}, "
+                            f"{diag['dx_nyquist_upper']:.4f}] A.  "
+                            f"_auto_voxel_grid recommends ~{dx_target:.4f} A.  "
+                        )
+                        if du_now > diag["dx_nyquist_upper"]:
+                            msg += ("Current grid is TOO COARSE: chi_g is "
+                                    "aliased; simulation will silently "
+                                    "produce KINEMATIC-only / refractive "
+                                    "results (no Pendellosung, no Borrmann). "
+                                    " ")
+                        elif du_now < diag["dx_tsc_lower"]:
+                            msg += ("Current grid is TOO FINE: chi field is "
+                                    "bimodal; per-atom amplitudes biased by "
+                                    "30-40%.  ")
+                        msg += (f"Suggested action: increase beam_samples so "
+                                f"that du = dv ~ {dx_target:.4f} A (e.g. "
+                                f"beam_samples=({Nx_auto},{Ny_auto}) for the "
+                                f"current sample cross-section).")
+                        if check_mode == "error":
+                            raise RuntimeError(
+                                "[atomic_scattering_dynamical] " + msg)
+                        warnings.warn(
+                            "[atomic_scattering_dynamical] " + msg)
+            else:
+                warnings.warn(
+                    "[atomic_scattering_dynamical] convergent-regime check "
+                    "skipped: NN_dist_A could not be resolved (pass NN_dist_A "
+                    "explicitly to enable the check).")
+
+        # ---------------- 3. Build chi maps --------------------------------
+        # M=1: legacy column-integral chi_0 from _compute_beam_slice_integrals_*.
+        #      Transmission step uses k_A = kA = 2*pi/lambda (no dz; dz is
+        #      absorbed into the column-integral chi).  This is the legacy
+        #      convention, kept for backward compatibility with the M=1 code
+        #      path of the simulator (atomic_transmission, etc.).
+        # M>1: voxel-density Born-convention chi_g maps.  Per Eq. 10 of the
+        #      dynamical-method plan, the transmission propagator is
+        #      exp(-i * pi * dz / lambda * X), so the transmission-step
+        #      phase prefactor is k_A = pi / lambda * dz_A (NOT 2*pi/lambda *
+        #      dz_A -- the (1/pi) in the chi prefactor (Eq. 7) is paired
+        #      with the (pi) in the transmission propagator; using 2*pi
+        #      doubles the Pendellosung frequency).
+        if M == 1:
+            transmission_k_A = float(kA)
+            if thickness_A > 0.0:
+                if delta_list_cached is None or beta_list_cached is None:
                     delta_list, beta_list = self._compute_beam_slice_integrals_gpu(
                         sample, stage, edges_A, kernel_radius)
+                else:
+                    delta_list = delta_list_cached
+                    beta_list = beta_list_cached
                 chi_maps = {(0, 0): []}
                 for k in range(n_final):
-                    dk = delta_list[k] if isinstance(delta_list[k], np.ndarray) else delta_list[k].get()
-                    bk = beta_list[k] if isinstance(beta_list[k], np.ndarray) else beta_list[k].get()
+                    dk = delta_list[k] if isinstance(delta_list[k], np.ndarray) \
+                        else delta_list[k].get()
+                    bk = beta_list[k] if isinstance(beta_list[k], np.ndarray) \
+                        else beta_list[k].get()
                     chi_k = np.empty((NyB, NzB), dtype=np.complex64)
                     chi_k.real = -dk.astype(np.float32)
                     chi_k.imag = np.maximum((abs_m * bk).astype(np.float32), 0.0)
@@ -2445,10 +3261,14 @@ class beam(logging):
                 chi_maps = {(0, 0): [np.zeros((NyB, NzB), dtype=np.complex64)
                                      for _ in range(n_final)]}
         else:
-            # M > 1: structure factor maps with Bragg phase
+            # Eq. 10:  E(z+dz) = exp(-i * pi * dz / lambda * X) E(z)
+            # so the kernel prefactor (kernel multiplies M = i * k_dz * X)
+            # must equal (pi / lambda) * dz, not (2*pi / lambda) * dz.
+            transmission_k_A = float(np.pi / lam_A) * float(dz_A)
             if thickness_A > 0.0:
                 sf_maps = self._build_structure_factor_maps_gpu(
-                    sample, stage, edges_A, beam_info, kernel_radius)
+                    sample, stage, edges_A, beam_info, kernel_radius,
+                    born_convention=True)
                 chi_maps = {}
                 for key in sf_maps:
                     chi_maps[key] = []
@@ -2461,260 +3281,514 @@ class beam(logging):
                 for a in range(M):
                     for b in range(M):
                         chi_maps[(a, b)] = [np.zeros((NyB, NzB), dtype=np.complex64)
-                                           for _ in range(n_final)]
+                                            for _ in range(n_final)]
 
-        # Initialize wavefield grids
-        E_beams_gpu = [cp.asarray(self._beam_E0_map.astype(np.complex64))]
-        for m_idx in range(1, M):
-            E_beams_gpu.append(cp.zeros((NyB, NzB), dtype=cp.complex64))
+        # ---------------- 4. (Initial envelopes are now set inside the
+        #                       _run_multislice_with_sampling helper.) -------
 
-        # Prepare per-atom storage
-        # Load all atom positions, species, compute slice assignments once.
-        # Store per-atom M-vector of complex amplitudes.
-        e1 = self._beam_e1.astype(np.float32)
-        e2 = self._beam_e2.astype(np.float32)
-        k_hat = (self._direction / np.linalg.norm(self._direction)).astype(np.float32)
-
-        # Build atom table: positions, species, slice index, beam-grid coords
-        all_pos = []       # lab-frame positions (Angstrom)
-        all_spc = []       # species arrays
-        all_slice = []     # slice index per atom
-        all_iu = []        # beam-grid fractional u index
-        all_iv = []        # beam-grid fractional v index
-
-        for cid in range(1, chunk_total + 1):
-            spc_host = sample.load_chunk_species(cid, use_gpu=False)
-            pos_host = sample.load_chunk_positions(cid, use_gpu=False).astype(np.float32)
-            if pos_host.size == 0:
-                continue
-            pos_lab = pos_host @ stage.rotation.astype(np.float32)
-            pos_lab += stage.translation.astype(np.float32)
-            nA = pos_lab.shape[0]
-
-            au = pos_lab[:, 0] * e1[0] + pos_lab[:, 1] * e1[1] + pos_lab[:, 2] * e1[2]
-            av = pos_lab[:, 0] * e2[0] + pos_lab[:, 1] * e2[1] + pos_lab[:, 2] * e2[2]
-            iu = au / du_A + float(self._beam_uc)
-            iv = av / dv_A + float(self._beam_vc)
-
-            s_vals = (pos_lab[:, 0] * k_hat[0] + pos_lab[:, 1] * k_hat[1]
-                      + pos_lab[:, 2] * k_hat[2])
-            k_idx = np.clip(
-                np.searchsorted(edges_A, s_vals, side="right") - 1, 0, n_final - 1)
-
-            all_pos.append(pos_lab)
-            all_spc.append(spc_host)
-            all_slice.append(k_idx)
-            all_iu.append(iu)
-            all_iv.append(iv)
-
-        if len(all_pos) == 0:
+        # ---------------- 5. FP32-robust per-chunk atom tables -------------
+        per_chunk_tables = self._build_atom_table_for_multislice(
+            sample, stage, edges_A, n_final)
+        if per_chunk_tables is None:
             if offset is not None:
                 final_result -= offset
             return final_result
 
-        all_pos = np.concatenate(all_pos, axis=0)
-        all_spc = np.concatenate(all_spc, axis=0)
-        all_slice = np.concatenate(all_slice, axis=0)
-        all_iu = np.concatenate(all_iu, axis=0)
-        all_iv = np.concatenate(all_iv, axis=0)
-        N_total = all_pos.shape[0]
+        chunk_ids = per_chunk_tables["_meta"]["chunk_ids"]
+        N_total = int(per_chunk_tables["_meta"]["N_total_all"])
 
-        # Sort atoms by slice for efficient per-slice iteration
-        sort_idx = np.argsort(all_slice, kind='stable')
-        all_pos = all_pos[sort_idx]
-        all_spc = all_spc[sort_idx]
-        all_slice = all_slice[sort_idx]
-        all_iu = all_iu[sort_idx]
-        all_iv = all_iv[sort_idx]
+        # Per-chunk M-vector amplitudes (host-resident).  Each chunk's
+        # buffer is at most ~M * (typical chunk atom count) * 8 bytes
+        # = ~16 MB for M=2 and 1M atoms, so total host footprint is bounded
+        # by the same ~M * N_total * 8 bytes as the previous concatenated
+        # buffer -- the gain is that the multislice and LS steps below can
+        # process one chunk at a time and never need to touch the full
+        # array on the GPU.
+        atom_M_amps_per_chunk = {
+            cid: np.zeros((per_chunk_tables[cid]["N_total"], M),
+                          dtype=np.complex64)
+            for cid in chunk_ids
+        }
 
-        # Compute slice start/count for fast lookup
-        slice_starts = np.zeros(n_final + 1, dtype=np.int64)
-        for k in range(n_final):
-            mask = (all_slice == k)
-            count = int(mask.sum())
-            slice_starts[k + 1] = slice_starts[k] + count
+        # ---------------- 6. Multislice loop (Lie-Trotter split-step) ------
+        # Forward pass: builds A_g_F (input-side dynamical illumination at
+        # every atom) into atom_M_amps_per_chunk via inline Stage-3 sampling.
+        self._run_multislice_with_sampling(
+            chi_maps, beam_info, transmission_k_A, dz_A, n_final,
+            per_chunk_tables, atom_M_amps_per_chunk,
+            NyB, NzB, M, thickness_A,
+            apply_propagation=apply_propagation,
+            slice_iter_reverse=False,
+            initial_envelope=None,
+        )
 
-        # Allocate per-atom amplitude storage for all M beams
-        # atom_beam_amps[i, m] = complex amplitude of beam m at atom i
-        atom_beam_amps = np.zeros((N_total, M), dtype=np.complex64)
+        # ---------------- 6b. Reciprocal multislice (dynamical_mode="full") -
+        # Output-side dynamical correction via Lorentz reciprocity
+        # (master_plan II.7).  Runs a SECOND multislice physically backward
+        # through the same absorbing medium with the entrance plane at the
+        # exit face of the crystal.  The per-atom amplitude sampled from the
+        # reciprocal envelopes (A_g_R) is multiplied elementwise into A_g_F
+        # so that Stage 4 (the LS far-field kernel pass) sees the combined
+        # illumination factor for each atom.
+        #
+        # At symmetric Laue exact Bragg the per-atom product
+        #     A_g_F(z_a) * A_g_R(z_a)
+        # is constant in z_a (= env_in); see master_plan II.7 z-cancellation
+        # discussion.  The output-side correction is visible at off-Bragg
+        # detector pixels, in asymmetric Laue, and at thick absorbing
+        # crystals near the Borrmann condition.
+        dyn_mode_str = str(dynamical_mode or "forward_only").lower().strip()
+        if dyn_mode_str not in ("forward_only", "full"):
+            warnings.warn(
+                f"[atomic_scattering_dynamical] unknown dynamical_mode="
+                f"{dynamical_mode!r}; defaulting to 'forward_only'.")
+            dyn_mode_str = "forward_only"
 
-        # Multislice loop with per-slice sampling
-        e1g = cp.asarray(e1)
-        e2g = cp.asarray(e2)
-        khatg = cp.asarray(k_hat)
+        if dyn_mode_str == "full" and M > 1 and thickness_A > 0.0 and dz_A > 0.0:
+            # Build the central detector direction k_out_central (used as the
+            # virtual source direction for the reciprocal multislice).  The
+            # detector pixel at the geometric centre of the array is the
+            # natural choice: it minimises the per-output-direction sampling
+            # error for compact detector ROIs.  For wide ROIs the user can
+            # call the routine multiple times with different detector
+            # crops and combine; multi-direction interpolation is left as a
+            # follow-up optimisation (see implementation_plan 4b.3).
+            mp_h = np.asarray(detector.pixel_coordinates)
+            cidx_pix = (Nz // 2) * Ny + (Ny // 2)
+            cx_A = float(mp_h[0, cidx_pix])
+            cy_A = float(mp_h[1, cidx_pix])
+            cz_A = float(mp_h[2, cidx_pix])
+            cnorm_A = float(np.sqrt(cx_A * cx_A + cy_A * cy_A + cz_A * cz_A))
+            if cnorm_A > 0:
+                k_out_central = (kA / cnorm_A) * np.array(
+                    [cx_A, cy_A, cz_A], dtype=np.float64)
+            else:
+                k_out_central = beam_info[0]["k_vec"].astype(np.float64) + \
+                                np.asarray(beam_info[1]["G"], dtype=np.float64)
 
-        for k in range(n_final):
-            # 6a. Apply beam coupling for this slice
-            chi_slice = {}
-            for key in chi_maps:
-                chi_slice[key] = cp.asarray(chi_maps[key][k], dtype=cp.complex64)
+            # Reciprocal beam set: each reciprocal beam channel is centred on
+            # k_in_recip + g_m where k_in_recip = -k_out_central.  The chi
+            # maps are reused unchanged (Lorentz reciprocity, NOT chi -> chi*).
+            beam_info_recip = []
+            for m_idx in range(M):
+                G_m = np.asarray(beam_info[m_idx]["G"], dtype=np.float64)
+                k_recip_m = -k_out_central + G_m
+                cos_theta_recip = float(abs(k_recip_m[2]) / kA) if kA > 0 else 1.0
+                beam_info_recip.append({
+                    "hkl": beam_info[m_idx].get("hkl", (0, 0, 0)),
+                    "G": G_m.astype(np.float32),
+                    "k_vec": k_recip_m.astype(np.float32),
+                    "excitation_error": 0.0,
+                    "cos_theta": cos_theta_recip,
+                })
 
-            self._beam_coupling_step_gpu(E_beams_gpu, chi_slice, float(kA))
+            # Initial envelope for the reciprocal pass: unit plane wave in
+            # the forward (m=0) reciprocal channel, zero in the others.  The
+            # pass marches backward from z = thickness_A toward z = 0, so the
+            # "initial" envelope is the entrance condition at the exit face.
+            initial_env_recip = [cp.ones((NyB, NzB), dtype=cp.complex64)]
+            for _m in range(1, M):
+                initial_env_recip.append(cp.zeros((NyB, NzB), dtype=cp.complex64))
 
-            del chi_slice
+            # Allocate a separate per-chunk buffer for the reciprocal-pass
+            # amplitudes A_g_R; combine them with A_g_F afterwards.
+            atom_M_amps_recip = {
+                cid: np.zeros((per_chunk_tables[cid]["N_total"], M),
+                              dtype=np.complex64)
+                for cid in chunk_ids
+            }
+            self._run_multislice_with_sampling(
+                chi_maps, beam_info_recip, transmission_k_A, dz_A, n_final,
+                per_chunk_tables, atom_M_amps_recip,
+                NyB, NzB, M, thickness_A,
+                apply_propagation=apply_propagation,
+                slice_iter_reverse=True,
+                initial_envelope=initial_env_recip,
+            )
+
+            # Combine: A_g[a, m] <- A_g_F[a, m] * A_g_R[a, m] elementwise.
+            # The Stage-4 kernel ingests the combined buffer unchanged.
+            for cid in chunk_ids:
+                atom_M_amps_per_chunk[cid] *= atom_M_amps_recip[cid]
+            del atom_M_amps_recip
+            del initial_env_recip
             cp.get_default_memory_pool().free_all_blocks()
 
-            # 6b. Sample wavefields at atoms in this slice
-            a_start = int(slice_starts[k])
-            a_end = int(slice_starts[k + 1])
-            if a_end <= a_start:
-                continue
 
-            # Bilinear interpolation of each beam wavefield at atom (u,v)
-            iu_slice = all_iu[a_start:a_end]
-            iv_slice = all_iv[a_start:a_end]
+        # ---------------- 7. Per-chunk LS far-field kernel pass ------------
+        # We process the LS step ONE CHUNK AT A TIME so the per-atom GPU
+        # buffers (positions, M-vector amplitudes, form factors, k-vectors)
+        # are bounded by chunk size, not by N_total.  This is what allows
+        # billion-atom samples to be processed without OOM-ing the GPU.
 
-            # Clamp to valid range for interpolation
-            iu_c = np.clip(iu_slice, 0.0, NyB - 1.001)
-            iv_c = np.clip(iv_slice, 0.0, NzB - 1.001)
-            iy0 = np.floor(iu_c).astype(np.int64)
-            iz0 = np.floor(iv_c).astype(np.int64)
-            iy1 = np.minimum(iy0 + 1, NyB - 1)
-            iz1 = np.minimum(iz0 + 1, NzB - 1)
-            fy = (iu_c - iy0).astype(np.float32)
-            fz = (iv_c - iz0).astype(np.float32)
-
-            # In-bounds mask
-            in_grid = ((iu_slice >= 0.0) & (iu_slice <= NyB - 1) &
-                       (iv_slice >= 0.0) & (iv_slice <= NzB - 1))
-
-            for m_idx in range(M):
-                E_m = E_beams_gpu[m_idx].get()  # (NyB, NzB) complex64
-                # Bilinear interpolation
-                v00 = E_m[iy0, iz0]
-                v10 = E_m[iy1, iz0]
-                v01 = E_m[iy0, iz1]
-                v11 = E_m[iy1, iz1]
-                interp = (v00 * (1 - fy) * (1 - fz) +
-                          v10 * fy * (1 - fz) +
-                          v01 * (1 - fy) * fz +
-                          v11 * fy * fz)
-                interp[~in_grid] = 0.0
-                atom_beam_amps[a_start:a_end, m_idx] = interp.astype(np.complex64)
-
-        # Clean up wavefield grids
-        for eb in E_beams_gpu:
-            del eb
-        cp.get_default_memory_pool().free_all_blocks()
-
-        # Scatter each beam to detector
         db_f0 = self.parse_f0_db_all('f0_WaasKirf.dat')
         db_f1f2 = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
 
-        interaction_kernel = self.build_interaction_kernel()
+        # Precompute per-element f0(0) and anomalous (f1, f2) once -- these
+        # are tiny dictionaries indexed by element symbol, not by atom.
+        f0_zero_lookup = {}
+        anom_lookup = {}
+        for el_sym, f0p in db_f0.items():
+            f0_zero_lookup[el_sym] = float(
+                f0p[5] + f0p[0] + f0p[1] + f0p[2] + f0p[3] + f0p[4]
+            )
+        for el_sym, tbl in db_f1f2.items():
+            anom_lookup[el_sym] = self.get_f1f2_from_params(self._energy, tbl)
 
-        # Detector pixel coordinates (meters, pinned)
+        # Build kernel with this specific M (cached by build_interaction_kernel)
+        if not hasattr(self, "_phase_tol_rad"):
+            self._phase_tol_rad = 1e-3
+        if not hasattr(self, "_series_terms"):
+            self._series_terms = 2
+        if not hasattr(self, "_global_use_series"):
+            self._global_use_series = True
+
+        interaction_kernel = self.build_interaction_kernel(
+            series_terms=self._series_terms,
+            force_mode=("series" if self._global_use_series else "exact"),
+            m_beams=M,
+        )
+
+        # Pack g vectors (1/Angstrom) -> 1/m for the kernel.  Tiny GPU array,
+        # constant across all atoms, allocated once for the whole pass.
+        g_vecs_host = np.zeros((M, 3), dtype=np.float32)
+        for m_idx in range(M):
+            g_vecs_host[m_idx, :] = (
+                np.asarray(beam_info[m_idx]["G"], dtype=np.float32) * 1e10
+            )
+        g_vecs_d = cp.asarray(g_vecs_host.ravel())
+
+        # Forward beam wavevector (1/m) used by the kernel for the global
+        # phase reference (sincos_k_times_reduced).  The lattice-vector
+        # phase factors for m > 0 are added INSIDE the kernel via the
+        # M-channel sum (Eq. 13).
+        k_vec_A0 = beam_info[0]["k_vec"]
+        k_in_x = np.float32(float(k_vec_A0[0]) * 1e10)
+        k_in_y = np.float32(float(k_vec_A0[1]) * 1e10)
+        k_in_z = np.float32(float(k_vec_A0[2]) * 1e10)
+
+        # Detector coordinates (meters) -- constant across chunks.
         mp = detector.pixel_coordinates
-        px_pin = self.allocate_pinned_array(mp[0, :].astype(np.float32) / 1e10)
-        py_pin = self.allocate_pinned_array(mp[1, :].astype(np.float32) / 1e10)
-        pz_pin = self.allocate_pinned_array(mp[2, :].astype(np.float32) / 1e10)
-        xg = cp.asarray(px_pin)
-        yg = cp.asarray(py_pin)
-        zg = cp.asarray(pz_pin)
+        xg = cp.asarray((mp[0, :].astype(np.float32) / 1e10))
+        yg = cp.asarray((mp[1, :].astype(np.float32) / 1e10))
+        zg = cp.asarray((mp[2, :].astype(np.float32) / 1e10))
 
         dfield_gpu = cp.zeros((Ny * Nz,), dtype=cp.complex64)
-
         block2d = (16, 16)
         grid2d = ((Ny + block2d[0] - 1) // block2d[0],
                   (Nz + block2d[1] - 1) // block2d[1])
 
-        k_val_m = np.float32(2.0 * np.pi / float(self._wavelength))  # rad/m
-        remove_forward_flag = 1 if remove_forward else 0
-        apply_spherical_decay_flag = 1 if spherical_decay else 0
-        pol_rate = float(getattr(self, "_pol_perp_rate", 0.5))
+        remove_forward_flag = np.int32(1 if remove_forward else 0)
+        apply_polarization_flag = np.int32(1 if apply_polarization else 0)
+        apply_decay_flag = np.int32(1 if spherical_decay else 0)
+        pol_rate = np.float32(getattr(self, "_pol_perp_rate", 0.5))
 
-        # Analyser parameters (disabled)
-        apply_analyser = np.int32(0)
-        analyser_kind = np.int32(0)
-        centre_x = np.float32(0.0)
-        centre_y = np.float32(0.0)
-        centre_z = np.float32(0.0)
-        accept_angle = np.float32(0.0)
-        darwin_hw = np.float32(0.0)
+        # Resolve analyser arguments (mirror atomic_direct_interaction's
+        # convention).  ``analyser_mode``: "off" (default), "top-hat" /
+        # "tophat" / "top_hat", or "darwin" / "rolloff".  When enabled, the
+        # analyser centre direction is the unit vector from sample origin
+        # to the geometric centre of the detector pixel array.
+        if isinstance(analyser_mode, str):
+            _am = analyser_mode.strip().lower()
+            if _am in ("off", "none", "disabled"):
+                analyser_kind_int = 0
+            elif _am in ("top_hat", "tophat", "top-hat", "top"):
+                analyser_kind_int = 1
+            elif _am in ("darwin", "rolloff", "roll-off"):
+                analyser_kind_int = 2
+            else:
+                analyser_kind_int = 0
+        else:
+            analyser_kind_int = int(analyser_mode)
+            if analyser_kind_int not in (0, 1, 2):
+                analyser_kind_int = 0
+        apply_analyser_flag = np.int32(1 if analyser_kind_int != 0 else 0)
+        analyser_kind_flag = np.int32(analyser_kind_int)
 
-        # Precompute per-atom scattering factor data
-        unique_elements = np.unique(all_spc)
-        f0_params_host = np.zeros((N_total, 11), dtype=np.float32)
-        f0_zero_host = np.zeros(N_total, dtype=np.float32)
-        anom_host = np.zeros(N_total, dtype=np.complex64)
-        for el in unique_elements:
-            el_s = str(el)
-            mask_np = (all_spc == el_s)
-            f0p = db_f0.get(el_s)
-            if f0p is not None:
-                f0_params_host[mask_np] = f0p
-                f0_zero_host[mask_np] = float(
-                    f0p[5] + f0p[0] + f0p[1] + f0p[2] + f0p[3] + f0p[4])
-            tbl = db_f1f2.get(el_s)
-            if tbl is not None:
-                anom_host[mask_np] = self.get_f1f2_from_params(self._energy, tbl)
+        # Centre direction for the analyser = unit vector from origin to the
+        # geometric centre pixel of the detector.
+        if apply_analyser_flag:
+            mp_h = np.asarray(detector.pixel_coordinates)
+            cidx = (Nz // 2) * Ny + (Ny // 2)
+            cx_m = float(mp_h[0, cidx]) / 1e10
+            cy_m = float(mp_h[1, cidx]) / 1e10
+            cz_m = float(mp_h[2, cidx]) / 1e10
+            cnorm = float(np.sqrt(cx_m * cx_m + cy_m * cy_m + cz_m * cz_m))
+            if cnorm > 0:
+                cx_m /= cnorm
+                cy_m /= cnorm
+                cz_m /= cnorm
+        else:
+            cx_m = cy_m = cz_m = 0.0
+        centre_x_f = np.float32(cx_m)
+        centre_y_f = np.float32(cy_m)
+        centre_z_f = np.float32(cz_m)
+        accept_angle_f = np.float32(float(analyser_acceptance_angle_rad))
+        darwin_hw_f = np.float32(float(analyser_darwin_halfwidth_rad))
 
-        f0_params_gpu = cp.asarray(f0_params_host)
-        f0_zero_gpu = cp.asarray(f0_zero_host)
-        anom_gpu = cp.asarray(anom_host)
+        # Auto-size the scatter sub-chunk to use up to 90 % of the free
+        # GPU memory at the time of the call.  Each scatter sub-chunk
+        # allocates roughly:
+        #   amp slice: nA * M * 8 bytes (complex64)
+        #   pos / k / form-factor slices: ~50 bytes / atom (already on GPU)
+        # so the GPU peak per call ~ nA * (50 + 8*M) bytes.  Dividing
+        # 90 % of the free GPU memory by that gives the largest nA we
+        # can afford; we cap at a generous 50M to bound kernel runtime.
+        try:
+            free_gpu_b, _ = cp.cuda.runtime.memGetInfo()
+            bytes_per_atom = 50 + 8 * M
+            SCATTER_CHUNK = int(min(
+                50_000_000,
+                max(500_000, (0.9 * free_gpu_b) // max(bytes_per_atom, 1))
+            ))
+        except Exception:
+            SCATTER_CHUNK = 500_000
 
-        # Atom positions in meters
-        px_at_all = cp.asarray((all_pos[:, 0] / 1e10).astype(np.float32))
-        py_at_all = cp.asarray((all_pos[:, 1] / 1e10).astype(np.float32))
-        pz_at_all = cp.asarray((all_pos[:, 2] / 1e10).astype(np.float32))
+        # ---------------- 7b. Multi-GPU dispatch (optional) ----------------
+        # If multi_gpu=True, partition chunk_ids across N_GPUs and run the
+        # Stage-4 LS kernel pass on each GPU in a thread.  Stages 1-3 are
+        # already complete (chi_g maps + multislice envelopes are sampled
+        # into atom_M_amps_per_chunk above), so multi-GPU only parallelises
+        # the LS kernel pass.  This matches master_plan II.6a's "default
+        # replicated" mode: each GPU has full chi_g, full multislice work
+        # is replicated (no parallelism gain there since multislice is
+        # serial along z), and the LS kernel pass is partitioned.
+        #
+        # Bit-identical to single-GPU within FP32 noise: the LS sum is
+        # mathematically additive over atom partitions, so summing the
+        # partial detector arrays from each GPU recovers the single-GPU
+        # answer exactly modulo the order of FP32 reductions.
+        try:
+            n_gpus_avail = int(cp.cuda.runtime.getDeviceCount())
+        except Exception:
+            n_gpus_avail = 1
+        if multi_gpu and n_gpus is not None:
+            n_gpus_use = int(min(max(1, n_gpus), n_gpus_avail))
+        elif multi_gpu:
+            n_gpus_use = max(1, n_gpus_avail)
+        else:
+            n_gpus_use = 1
 
-        # Scatter in chunks to manage GPU memory
-        SCATTER_CHUNK = 500_000
+        if n_gpus_use > 1 and len(chunk_ids) > 1:
+            # Partition chunk_ids round-robin across GPUs
+            shards = [[] for _ in range(n_gpus_use)]
+            for i, cid in enumerate(chunk_ids):
+                shards[i % n_gpus_use].append(cid)
 
-        for m_idx in range(M):
-            k_vec_A = beam_info[m_idx]["k_vec"]  # 1/Angstrom
-            k_in_x = np.float32(float(k_vec_A[0]) * 1e10)
-            k_in_y = np.float32(float(k_vec_A[1]) * 1e10)
-            k_in_z = np.float32(float(k_vec_A[2]) * 1e10)
+            partial_results = [None] * n_gpus_use
 
-            amp_m_all = cp.asarray(atom_beam_amps[:, m_idx])
+            def _ls_worker(dev_id, my_chunks, result_index):
+                if not my_chunks:
+                    partial_results[result_index] = np.zeros((Nz, Ny),
+                                                              dtype=np.complex64)
+                    return
+                cp.cuda.Device(dev_id).use()
 
-            for c_start in range(0, N_total, SCATTER_CHUNK):
-                c_end = min(c_start + SCATTER_CHUNK, N_total)
-                nA_chunk = c_end - c_start
+                # Per-device copies of the static detector and beam-set
+                # state.  Each device builds its own kernel handle (cached
+                # per-device by build_interaction_kernel via CuPy's per-
+                # device kernel cache).
+                _interaction_kernel = self.build_interaction_kernel(
+                    series_terms=self._series_terms,
+                    force_mode=("series" if self._global_use_series else "exact"),
+                    m_beams=M,
+                )
+                _g_vecs_d = cp.asarray(g_vecs_host.ravel())
+                _xg = cp.asarray((mp[0, :].astype(np.float32) / 1e10))
+                _yg = cp.asarray((mp[1, :].astype(np.float32) / 1e10))
+                _zg = cp.asarray((mp[2, :].astype(np.float32) / 1e10))
+                _dfield_gpu = cp.zeros((Ny * Nz,), dtype=cp.complex64)
 
-                kx_arr = cp.full((nA_chunk,), k_in_x, dtype=cp.float32)
-                ky_arr = cp.full((nA_chunk,), k_in_y, dtype=cp.float32)
-                kz_arr = cp.full((nA_chunk,), k_in_z, dtype=cp.float32)
+                for cid in my_chunks:
+                    tbl = per_chunk_tables[cid]
+                    N_chunk = int(tbl["N_total"])
+                    if N_chunk == 0:
+                        continue
+                    spc_chunk = tbl["all_spc"]
+                    _f0p_host = np.zeros((N_chunk, 11), dtype=np.float32)
+                    _f0z_host = np.zeros(N_chunk, dtype=np.float32)
+                    _anom_host = np.zeros(N_chunk, dtype=np.complex64)
+                    for el in np.unique(spc_chunk):
+                        el_s = str(el)
+                        mask_np = (spc_chunk == el_s)
+                        f0p = db_f0.get(el_s)
+                        if f0p is not None:
+                            _f0p_host[mask_np] = f0p
+                            _f0z_host[mask_np] = f0_zero_lookup.get(el_s, 0.0)
+                        if el_s in anom_lookup:
+                            _anom_host[mask_np] = anom_lookup[el_s]
+                    _f0p_d = cp.asarray(_f0p_host)
+                    _f0z_d = cp.asarray(_f0z_host)
+                    _anom_d = cp.asarray(_anom_host)
 
+                    pos_chunk = tbl["all_pos"]
+                    _px = cp.asarray((pos_chunk[:, 0] / 1e10).astype(np.float32))
+                    _py = cp.asarray((pos_chunk[:, 1] / 1e10).astype(np.float32))
+                    _pz = cp.asarray((pos_chunk[:, 2] / 1e10).astype(np.float32))
+
+                    _kx = cp.full((N_chunk,), k_in_x, dtype=cp.float32)
+                    _ky = cp.full((N_chunk,), k_in_y, dtype=cp.float32)
+                    _kz = cp.full((N_chunk,), k_in_z, dtype=cp.float32)
+
+                    amps_chunk = atom_M_amps_per_chunk[cid]
+
+                    for c_start in range(0, N_chunk, SCATTER_CHUNK):
+                        c_end = min(c_start + SCATTER_CHUNK, N_chunk)
+                        nA_sub = c_end - c_start
+                        amp_M_slice = cp.asarray(
+                            amps_chunk[c_start:c_end, :].reshape(-1)
+                        )
+                        _interaction_kernel(
+                            grid2d, block2d,
+                            (
+                                np.int32(nA_sub),
+                                _kx[c_start:c_end],
+                                _ky[c_start:c_end],
+                                _kz[c_start:c_end],
+                                _px[c_start:c_end],
+                                _py[c_start:c_end],
+                                _pz[c_start:c_end],
+                                amp_M_slice,
+                                _anom_d[c_start:c_end],
+                                _f0p_d[c_start:c_end],
+                                _f0z_d[c_start:c_end],
+                                _xg, _yg, _zg,
+                                _dfield_gpu,
+                                np.int32(Ny), np.int32(Nz),
+                                remove_forward_flag,
+                                apply_polarization_flag,
+                                apply_decay_flag,
+                                pol_rate,
+                                apply_analyser_flag, analyser_kind_flag,
+                                centre_x_f, centre_y_f, centre_z_f,
+                                accept_angle_f, darwin_hw_f,
+                                _g_vecs_d,
+                            )
+                        )
+                        cp.cuda.stream.get_current_stream().synchronize()
+                        del amp_M_slice
+                    del _f0p_d, _f0z_d, _anom_d, _px, _py, _pz, _kx, _ky, _kz
+                    cp.get_default_memory_pool().free_all_blocks()
+
+                partial_results[result_index] = (
+                    _dfield_gpu.reshape((Nz, Ny)).get()
+                )
+                del _dfield_gpu, _xg, _yg, _zg, _g_vecs_d
+                cp.get_default_memory_pool().free_all_blocks()
+
+            threads = []
+            for gid in range(n_gpus_use):
+                t = threading.Thread(target=_ls_worker,
+                                     args=(gid, shards[gid], gid))
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join()
+
+            # Sum partial detector arrays from each GPU
+            final_result = np.zeros((Nz, Ny), dtype=np.complex64)
+            for pr in partial_results:
+                if pr is not None:
+                    final_result += pr
+
+            # Cleanup placeholder buffers from the single-GPU prep above
+            del dfield_gpu, xg, yg, zg, g_vecs_d
+            cp.get_default_memory_pool().free_all_blocks()
+
+            if offset is not None:
+                final_result -= offset
+            return final_result
+
+        # ---------------- 7c. Single-GPU Stage-4 LS pass (default) ---------
+        for cid in chunk_ids:
+            tbl = per_chunk_tables[cid]
+            N_chunk = int(tbl["N_total"])
+            if N_chunk == 0:
+                continue
+            # Build per-chunk per-atom form factors from the species labels.
+            spc_chunk = tbl["all_spc"]
+            f0_params_host = np.zeros((N_chunk, 11), dtype=np.float32)
+            f0_zero_host = np.zeros(N_chunk, dtype=np.float32)
+            anom_host = np.zeros(N_chunk, dtype=np.complex64)
+            unique_elements = np.unique(spc_chunk)
+            for el in unique_elements:
+                el_s = str(el)
+                mask_np = (spc_chunk == el_s)
+                f0p = db_f0.get(el_s)
+                if f0p is not None:
+                    f0_params_host[mask_np] = f0p
+                    f0_zero_host[mask_np] = f0_zero_lookup.get(el_s, 0.0)
+                if el_s in anom_lookup:
+                    anom_host[mask_np] = anom_lookup[el_s]
+
+            # Per-chunk GPU arrays.  Allocated once per chunk; freed at
+            # the end of the chunk loop.
+            f0_params_chunk = cp.asarray(f0_params_host)
+            f0_zero_chunk = cp.asarray(f0_zero_host)
+            anom_chunk = cp.asarray(anom_host)
+            del f0_params_host, f0_zero_host, anom_host
+
+            pos_chunk = tbl["all_pos"]
+            px_chunk = cp.asarray((pos_chunk[:, 0] / 1e10).astype(np.float32))
+            py_chunk = cp.asarray((pos_chunk[:, 1] / 1e10).astype(np.float32))
+            pz_chunk = cp.asarray((pos_chunk[:, 2] / 1e10).astype(np.float32))
+
+            kx_chunk = cp.full((N_chunk,), k_in_x, dtype=cp.float32)
+            ky_chunk = cp.full((N_chunk,), k_in_y, dtype=cp.float32)
+            kz_chunk = cp.full((N_chunk,), k_in_z, dtype=cp.float32)
+
+            atom_M_amps_chunk = atom_M_amps_per_chunk[cid]
+
+            # Stream within this chunk in scatter-sub-chunks so the
+            # GPU-side amp slice stays small even for jumbo chunks.
+            for c_start in range(0, N_chunk, SCATTER_CHUNK):
+                c_end = min(c_start + SCATTER_CHUNK, N_chunk)
+                nA_sub = c_end - c_start
+                amp_M_slice = cp.asarray(
+                    atom_M_amps_chunk[c_start:c_end, :].reshape(-1)
+                )
                 interaction_kernel(
                     grid2d, block2d,
                     (
-                        np.int32(nA_chunk),
-                        kx_arr, ky_arr, kz_arr,
-                        px_at_all[c_start:c_end],
-                        py_at_all[c_start:c_end],
-                        pz_at_all[c_start:c_end],
-                        amp_m_all[c_start:c_end],
-                        anom_gpu[c_start:c_end],
-                        f0_params_gpu[c_start:c_end],
-                        f0_zero_gpu[c_start:c_end],
+                        np.int32(nA_sub),
+                        kx_chunk[c_start:c_end],
+                        ky_chunk[c_start:c_end],
+                        kz_chunk[c_start:c_end],
+                        px_chunk[c_start:c_end],
+                        py_chunk[c_start:c_end],
+                        pz_chunk[c_start:c_end],
+                        amp_M_slice,
+                        anom_chunk[c_start:c_end],
+                        f0_params_chunk[c_start:c_end],
+                        f0_zero_chunk[c_start:c_end],
                         xg, yg, zg,
                         dfield_gpu,
                         np.int32(Ny), np.int32(Nz),
-                        np.int32(remove_forward_flag),
-                        np.int32(1 if apply_polarization else 0),
-                        np.int32(apply_spherical_decay_flag),
-                        np.float32(pol_rate),
-                        apply_analyser,
-                        analyser_kind,
-                        centre_x, centre_y, centre_z,
-                        accept_angle, darwin_hw
+                        remove_forward_flag,
+                        apply_polarization_flag,
+                        apply_decay_flag,
+                        pol_rate,
+                        apply_analyser_flag, analyser_kind_flag,
+                        centre_x_f, centre_y_f, centre_z_f,
+                        accept_angle_f, darwin_hw_f,
+                        g_vecs_d,
                     )
                 )
                 cp.cuda.stream.get_current_stream().synchronize()
-
-                del kx_arr, ky_arr, kz_arr
+                del amp_M_slice
                 cp.get_default_memory_pool().free_all_blocks()
 
-            del amp_m_all
+            # Free this chunk's GPU arrays before moving on.
+            del f0_params_chunk, f0_zero_chunk, anom_chunk
+            del px_chunk, py_chunk, pz_chunk
+            del kx_chunk, ky_chunk, kz_chunk
             cp.get_default_memory_pool().free_all_blocks()
 
-        # Return result
         final_result = dfield_gpu.reshape((Nz, Ny)).get()
+
+        # Cleanup
         del dfield_gpu, xg, yg, zg
-        del f0_params_gpu, f0_zero_gpu, anom_gpu
-        del px_at_all, py_at_all, pz_at_all
+        del g_vecs_d
         cp.get_default_memory_pool().free_all_blocks()
 
         if offset is not None:
@@ -2828,9 +3902,19 @@ class beam(logging):
         """
         Build a CUDA kernel that multiplies a spectrum by the free-space propagator.
 
-        For each spatial frequency (ky, kz), the kernel applies
-            H = exp(+i*z*sqrt(k^2 - kt^2)) for propagating components (kt^2 <= k^2),
-            H = exp(-|z|*sqrt(kt^2 - k^2)) for evanescent components (pure decay).
+        For each spatial frequency (ky, kz), the kernel applies the exact
+        carrier-subtracted propagator:
+            H = exp(+i*z*(sqrt(k^2 - (kyt)^2 - (kzt)^2) - k_g_axis))   [propagating]
+            H = exp(-|z|*sqrt(...) - i*z*k_g_axis)                      [evanescent]
+        where (kyt, kzt) = (ky + k_g_perp_y, kz + k_g_perp_z) is the
+        carrier-shifted transverse k.
+
+        For the forward beam, pass k_g_axis=k, k_g_perp_y=k_g_perp_z=0,
+        which recovers the on-axis form phase = z*(sqrt(k^2 - kt^2) - k).
+        For the Bragg beam, pass k_g_axis=k_g . axis, k_g_perp_y=k_g . e_y,
+        k_g_perp_z=k_g . e_z, which makes the propagator preserve the
+        chi_h(r) voxel map's exp(-i*2*pi*G_h.r) carrier across slices,
+        enabling coherent buildup of E_g in the multislice forward pass.
 
         The spectrum F is updated in place.
 
@@ -2848,7 +3932,10 @@ class beam(logging):
             const float  z,                 // propagation [m]
             const int    Ny,
             const int    Nz,
-            float2* __restrict__ F)         // spectrum (Nz*Ny), row-major
+            float2* __restrict__ F,         // spectrum (Nz*Ny), row-major
+            const float  k_g_axis,          // beam k along propagation axis [rad/m]
+            const float  k_g_perp_y,        // beam k along y of beam grid [rad/m]
+            const float  k_g_perp_z)        // beam k along z of beam grid [rad/m]
         {
             int ix = blockIdx.x * blockDim.x + threadIdx.x;
             int iy = blockIdx.y * blockDim.y + threadIdx.y;
@@ -2858,22 +3945,36 @@ class beam(logging):
 
             const float kyv = ky[ix];
             const float kzv = kz[iy];
-            const float kt2 = kyv * kyv + kzv * kzv;
+
+            // Exact propagator with the beam's own carrier wave subtracted.
+            // For an envelope E_g whose carrier is k_g, the FFT spatial frequency
+            // qy, qz represents the deviation from carrier in the lab beam grid.
+            // The total wave's transverse k is (qy + k_g_perp_y, qz + k_g_perp_z).
+            // The total kx along propagation axis is sqrt(k^2 - (qy+k_gy)^2 - (qz+k_gz)^2).
+            // Subtracting the carrier's axis component k_g_axis gives the envelope phase.
+            //
+            // For the forward beam (k_g = k_in along axis): k_g_axis=k, k_g_perp_y=k_g_perp_z=0.
+            // This reduces to phase = (sqrt(k^2 - kt^2) - k) z, the original
+            // carrier-subtracted exact form.
+            //
+            // For the Bragg beam (k_g = k_in + 2*pi*G_h): k_g_axis=k_g . axis, k_g_perp =
+            // k_g . (e_y, e_z). The exact formula correctly handles the chi_h voxel
+            // maps' exp(-i 2*pi G_h . r) carrier factor: it gives propagator phase
+            // approx +(k - k_g_axis)*z at the chi_h spatial frequency, which equals
+            // -2*pi*G_h_axis*z, exactly compensating chi_h's per-slice DC phase
+            // advance and allowing coherent buildup of E_g across slices.
+            const float kyt = kyv + k_g_perp_y;
+            const float kzt = kzv + k_g_perp_z;
+            const float kt2 = kyt * kyt + kzt * kzt;
             const float kx2 = k * k - kt2;
 
-            // Build multiplier H(kt):
-            // - exp(+i z sqrt(k^2 - kt^2)) for propagating components
-            // - exp(-|z| sqrt(kt^2 - k^2)) for evanescent components (decay only)
-            float phase = 0.0f;
-            float amp   = 1.0f;
-
+            float phase, amp;
             if (kx2 >= 0.0f) {
-                phase = z * sqrtf(kx2);
+                phase = z * (sqrtf(kx2) - k_g_axis);
                 amp   = 1.0f;
             } else {
-                // strictly decaying, never growing (note fabsf(z))
                 amp   = expf(-fabsf(z) * sqrtf(-kx2));
-                phase = 0.0f;
+                phase = -z * k_g_axis;
             }
 
             const float cph = cosf(phase);
@@ -3174,7 +4275,7 @@ class beam(logging):
                         futures.append(saver.submit(np.savez_compressed, cache_path, ein=np.zeros((0,), np.complex64)))
                         continue
                     # Apply stage transform before sampling
-                    pos = pos @ R_np
+                    pos = pos @ R_np.T
                     pos = pos + T_np
                     ein_np = self._ein_bilinear_cpu(
                         pos_np=pos, tau=tau_np, phi=phi_np, E0=E0_np,
@@ -3289,7 +4390,7 @@ class beam(logging):
 
                 with st:
                     pos_g = cp.asarray(pos)
-                    pos_g = pos_g @ Rg
+                    pos_g = pos_g @ Rg.T
                     pos_g += Tg
 
                     # Compute Ein on device
@@ -3351,6 +4452,294 @@ class beam(logging):
 
         return cache_dir, key_hash
     
+    # -------------------------------------------------------------------------
+    # FP32 extended-precision helpers (Phase 1.4 of dynamical-method plan).
+    # Mirror the kernel-side ``two_prod_fma`` (Veltkamp-Dekker exact split) but
+    # in NumPy.  Used for FP32-robust atom-table coordinate conversion when
+    # atomic positions are at sample-scale (~10^7 A).
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _two_prod_fp32(a, b):
+        """
+        Veltkamp-Dekker exact split of FP32 product ``a * b`` into ``(p, e)``.
+
+        ``a*b == p + e`` at FP32 precision (so adding ``e`` to ``p`` in FP32
+        recovers the un-rounded product).  Vectorized over arrays.
+
+        Args:
+            a, b: Array-like, FP32-castable.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: ``(p, e)`` both float32.
+        """
+        SPLIT = np.float32(4097.0)  # 2**12 + 1; valid for FP32 (23-bit mantissa)
+        a32 = np.asarray(a, dtype=np.float32)
+        b32 = np.asarray(b, dtype=np.float32)
+        p = (a32 * b32).astype(np.float32)
+        ca = (SPLIT * a32).astype(np.float32)
+        a_hi = (ca - (ca - a32)).astype(np.float32)
+        a_lo = (a32 - a_hi).astype(np.float32)
+        cb = (SPLIT * b32).astype(np.float32)
+        b_hi = (cb - (cb - b32)).astype(np.float32)
+        b_lo = (b32 - b_hi).astype(np.float32)
+        e = ((((a_hi * b_hi - p).astype(np.float32) + a_hi * b_lo).astype(np.float32)
+              + a_lo * b_hi).astype(np.float32) + a_lo * b_lo).astype(np.float32)
+        return p, e
+
+    @staticmethod
+    def _two_sum_fp32(a, b):
+        """
+        Knuth's two-sum: split ``a + b`` into ``(s, e)`` such that ``a + b == s + e``
+        exactly in FP32.  Vectorized.
+
+        Args:
+            a, b: Array-like, FP32-castable.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: ``(s, e)`` both float32.
+        """
+        a32 = np.asarray(a, dtype=np.float32)
+        b32 = np.asarray(b, dtype=np.float32)
+        s = (a32 + b32).astype(np.float32)
+        bb = (s - a32).astype(np.float32)
+        e = ((a32 - (s - bb)).astype(np.float32)
+             + (b32 - bb).astype(np.float32)).astype(np.float32)
+        return s, e
+
+    @staticmethod
+    def _auto_voxel_grid(
+        g_vectors_invA,
+        supercell_extent_A,
+        NN_dist_A,
+        dz_slice_A,
+        *,
+        safety=0.9,
+        strict_nyquist=True,
+        force_unconverged=False,
+    ):
+        """
+        Determine the minimum-Nx voxel grid for the convergent regime.
+
+        Bounds (master plan I.6):
+            Lower:  dx > NN_dist / 3            (TSC stencil overlap)
+            Upper:  dx < 1 / (2 * |g_max|)      (chi_g Nyquist for general crystals)
+
+        Window-existence condition:  |g_max| * NN_dist < 3/2.
+
+        Args:
+            g_vectors_invA: Iterable of (3,) ndarrays in 1/Angstrom (no 2pi),
+                including the forward beam (g=0).
+            supercell_extent_A: (Lx, Ly, Lz) tuple in Angstrom.
+            NN_dist_A: Nearest-neighbor distance in Angstrom.
+            dz_slice_A: Requested z-slice thickness.
+            safety: Multiplicative safety factor below the upper bound for
+                strict mode (default 0.9).
+            strict_nyquist: True for general/defected crystals; False for
+                commensurate perfect supercells (aggressive mode).
+            force_unconverged: If True, do not raise when the convergent window
+                has collapsed; choose dx in the inverted range and emit a
+                warning.
+
+        Returns:
+            tuple: ``(Nx, Ny, Nz_slices, dx_A, dy_A, dz_A, diagnostics_dict)``.
+
+        Raises:
+            RuntimeError: If the convergent window is empty AND
+                ``force_unconverged`` is False AND ``strict_nyquist`` is True.
+        """
+        import math
+        import warnings
+
+        # |g_max| over (g_m - g_n) pairs
+        gv = [np.asarray(g, dtype=np.float64) for g in g_vectors_invA]
+        pair_mags = []
+        for i, gi in enumerate(gv):
+            for j, gj in enumerate(gv):
+                if i != j:
+                    pair_mags.append(float(np.linalg.norm(gi - gj)))
+        g_max = max(pair_mags) if pair_mags else 1e-9
+
+        dx_nyquist_upper = 1.0 / (2.0 * g_max)
+        dx_tsc_lower = float(NN_dist_A) / 3.0
+
+        window_collapsed = (dx_tsc_lower > dx_nyquist_upper)
+        if window_collapsed and strict_nyquist and not force_unconverged:
+            raise RuntimeError(
+                f"_auto_voxel_grid: convergent window has collapsed for the "
+                f"requested beam set + material. |g_max| = {g_max:.4f} 1/A, "
+                f"NN_dist = {NN_dist_A:.4f} A, product = "
+                f"{g_max * NN_dist_A:.3f} (must be < 1.5).\n"
+                f"  Lower bound (TSC overlap):    dx > {dx_tsc_lower:.4f} A\n"
+                f"  Upper bound (chi_g Nyquist):  dx < {dx_nyquist_upper:.4f} A\n"
+                f"Suggested actions: (a) restrict to a lower-order reflection "
+                f"such that |g| < {1.5/NN_dist_A:.4f} 1/A; (b) use a denser "
+                f"material with NN_dist < {1.5/g_max:.4f} A; or (c) pass "
+                f"force_unconverged=True to proceed at reduced accuracy "
+                f"(rel_err typically 30-40% for h-coupling reflections)."
+            )
+
+        if strict_nyquist and not window_collapsed:
+            dx_target = dx_nyquist_upper * float(safety)
+            if dx_target < dx_tsc_lower:
+                dx_target = dx_tsc_lower * 1.05
+        elif window_collapsed:
+            dx_target = 0.5 * (dx_tsc_lower + dx_nyquist_upper)
+            warnings.warn(
+                f"_auto_voxel_grid: proceeding with collapsed window at user "
+                f"request. dx={dx_target:.4f} A is outside both bounds "
+                f"[{dx_tsc_lower:.4f}, {dx_nyquist_upper:.4f}]. "
+                f"Result will not be quantitatively converged.")
+        else:
+            # strict_nyquist=False: aggressive mode (commensurate perfect supercells)
+            dx_target = float(NN_dist_A) * float(safety) * 0.5
+
+        Lx, Ly, Lz = (float(v) for v in supercell_extent_A)
+        Nx = max(1, int(math.ceil(Lx / dx_target)))
+        Ny = max(1, int(math.ceil(Ly / dx_target)))
+        Nz_slices = max(1, int(math.ceil(Lz / float(dz_slice_A))))
+        dx = Lx / Nx
+        dy = Ly / Ny
+
+        diagnostics = {
+            "g_max_invA": float(g_max),
+            "NN_dist_A": float(NN_dist_A),
+            "dx_nyquist_upper": float(dx_nyquist_upper),
+            "dx_tsc_lower": float(dx_tsc_lower),
+            "dx_target": float(dx_target),
+            "dx_achieved": float(dx),
+            "Nx": int(Nx), "Ny": int(Ny), "Nz_slices": int(Nz_slices),
+            "in_convergent_regime": bool(
+                (1.0 / (2.0 * dx)) > g_max and 3.0 * dx >= float(NN_dist_A)),
+            "window_collapsed": bool(window_collapsed),
+            "mode": "strict" if strict_nyquist else "aggressive",
+        }
+        return Nx, Ny, Nz_slices, dx, dy, float(dz_slice_A), diagnostics
+
+    def _estimate_nearest_neighbor_distance(self, sample, n_samples=2048):
+        """
+        Estimate the nearest-neighbor distance in a chunked sample.
+
+        Strategy: pick a few "anchor" atoms; for each, extract atoms within a
+        small axis-aligned bounding box centred on the anchor, then run a
+        brute-force pairwise minimum on that small local set.  The bounding
+        box guarantees spatial locality, so the local set always contains the
+        anchor's true nearest neighbours regardless of how atoms are stored
+        in the chunk.
+
+        Why naive uniform random subsampling fails on large samples: for a
+        sample of N atoms with coordination number c, the expected number of
+        true NN pairs in a random subset of size n is ~ 2*n*c/N.  For N=10^8,
+        n=2048, c=4 this is ~10^-4 -- the random subset almost never contains
+        any true NN pair, so the reported "minimum" is dominated by accidental
+        near-misses and can be 3-10x too large (we observed 8.0 A for a Ge
+        sample whose true NN is 2.45 A).
+
+        The bounding-box approach is O(N) for the mask op and O(M^2) for the
+        brute-force where M is the local set size (~10^3 for typical crystals
+        with a 30 A box).  Total cost: ~1-3 seconds even for 10^8-atom samples.
+
+        Args:
+            sample: chunked sample object with chunk_total chunks and
+                load_chunk_positions(cid).
+            n_samples: kept for backward compatibility; unused.
+
+        Returns:
+            float NN distance in Angstrom, or None if estimation fails.
+        """
+        try:
+            chunk_total = int(sample.chunk_total or 0)
+            if chunk_total == 0:
+                return None
+            try:
+                first_chunk = sample.load_chunk_positions(1, use_gpu=False)
+            except Exception:
+                return None
+            positions = np.asarray(first_chunk, dtype=np.float32)
+            N = int(positions.shape[0])
+            if N < 2:
+                return None
+
+            # Box half-edge for the local-neighbourhood selection.  15 A
+            # contains ~10^3 atoms in any conceivable crystal (NN spans
+            # ~0.7-5 A across all materials), so the local brute force is
+            # bounded by a constant cost regardless of sample size.
+            R_box_A = 15.0
+            # Two anchors gives belt-and-suspenders against the rare case of
+            # an anchor landing on a surface atom or defect site.  For bulk
+            # crystals one anchor is exact; multiple anchors guarantee the
+            # answer for any sample including defected/surface ones.
+            n_anchors = 2
+            best_d2 = np.inf
+            rng = np.random.default_rng(seed=0xBEEF)
+            anchor_idx = rng.choice(N, size=min(n_anchors, N), replace=False)
+            for ai in anchor_idx:
+                anchor = positions[int(ai)]
+                # Axis-aligned bounding-box mask (vectorized; one pass over N).
+                mask = (
+                    (np.abs(positions[:, 0] - anchor[0]) < R_box_A) &
+                    (np.abs(positions[:, 1] - anchor[1]) < R_box_A) &
+                    (np.abs(positions[:, 2] - anchor[2]) < R_box_A)
+                )
+                local = positions[mask]
+                M = int(local.shape[0])
+                if M < 2:
+                    # Anchor is isolated (very sparse sample or surface atom);
+                    # try the next anchor.
+                    continue
+
+                # Adaptive: if the local box is too sparse, expand it.  This
+                # handles edge cases like surface atoms or unusual crystals.
+                if M < 8:
+                    mask2 = (
+                        (np.abs(positions[:, 0] - anchor[0]) < 4 * R_box_A) &
+                        (np.abs(positions[:, 1] - anchor[1]) < 4 * R_box_A) &
+                        (np.abs(positions[:, 2] - anchor[2]) < 4 * R_box_A)
+                    )
+                    local = positions[mask2]
+                    M = int(local.shape[0])
+                    if M < 2:
+                        continue
+
+                # Brute-force pairwise minimum on the local set.  M is small
+                # (~10^3 for typical crystals), so the O(M^2) compute is fast.
+                if M <= 4096:
+                    d2_mat = np.sum(
+                        (local[:, None, :] - local[None, :, :]) ** 2, axis=-1)
+                    np.fill_diagonal(d2_mat, np.inf)
+                    d2_min = float(np.min(d2_mat))
+                else:
+                    # Local set unexpectedly large; use scipy KD-tree if
+                    # available, else block-wise pairwise.
+                    try:
+                        from scipy.spatial import cKDTree
+                        tree = cKDTree(local)
+                        d, _ = tree.query(local, k=2)
+                        d_nn = d[:, 1]
+                        d_nn = d_nn[np.isfinite(d_nn) & (d_nn > 0.0)]
+                        d2_min = float(d_nn.min() ** 2) if d_nn.size else np.inf
+                    except ImportError:
+                        d2_min = np.inf
+                        block = 256
+                        for i in range(0, M, block):
+                            Si = local[i:i + block]
+                            d2 = np.sum(
+                                (Si[:, None, :] - local[None, :, :]) ** 2, axis=-1)
+                            upper = min(block, M - i)
+                            for r in range(upper):
+                                d2[r, i + r] = np.inf
+                            db = float(np.min(d2))
+                            if db < d2_min:
+                                d2_min = db
+
+                if d2_min < best_d2 and d2_min > 0.0:
+                    best_d2 = d2_min
+
+            if not np.isfinite(best_d2) or best_d2 <= 0.0:
+                return None
+            return float(np.sqrt(best_d2))
+        except Exception:
+            return None
+
     def _compute_global_depth_bounds(self, sample, stage):
         """
         Compute global front-to-back bounds along the beam direction in angstrom.
@@ -3379,7 +4768,7 @@ class beam(logging):
             if pos.size == 0:
                 continue
             # Transform positions by the stage
-            pos = pos @ R
+            pos = pos @ R.T
             pos += T
             # Project onto beam direction
             s_vals = pos @ k_hat
@@ -3463,7 +4852,7 @@ class beam(logging):
 
         # Stage transform, convert to meters for the C kernel
         positions_chunk = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
-        positions_chunk = positions_chunk @ stage.rotation
+        positions_chunk = positions_chunk @ stage.rotation.T
         positions_chunk += stage.translation
         positions_chunk_m = positions_chunk / 1e10
 
@@ -3690,7 +5079,7 @@ class beam(logging):
 
             # Stage transform to sample frame and convert to meters for the C kernel
             positions_chunk = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
-            positions_chunk = positions_chunk @ stage.rotation
+            positions_chunk = positions_chunk @ stage.rotation.T
             positions_chunk += stage.translation
             positions_chunk_m = positions_chunk / 1e10
 
@@ -3841,8 +5230,15 @@ class beam(logging):
 
         analyser_mode: "off" | "top_hat" | "darwin" or 0|1|2
         """
+        _analyser_off = (
+            analyser_mode is None
+            or (isinstance(analyser_mode, str) and analyser_mode.strip().lower() in ("off", "none", "disabled"))
+            or (not isinstance(analyser_mode, str) and analyser_mode == 0)
+        )
         if cp is None:
             self._log("normal", "[beam] CuPy not installed, falling back to CPU.")
+            if not _analyser_off:
+                warnings.warn("analyser acceptance is GPU-only; ignored on CPU path")
             return self.interact_beam_cpu(
                 sample,
                 measurement_positions,
@@ -3854,15 +5250,17 @@ class beam(logging):
                 ein_cache_dir=ein_cache_dir,
                 recompute_cache=recompute_cache,
                 apply_polarization=apply_polarization,
-                apply_spherical_decay=spherical_decay,
-                analyser_mode=analyser_mode,
-                analyser_acceptance_angle_rad=analyser_acceptance_angle_rad,
-                analyser_darwin_halfwidth_rad=analyser_darwin_halfwidth_rad
+                apply_spherical_decay=spherical_decay
             )
 
-        n_gpus = cp.cuda.runtime.getDeviceCount()
+        try:
+            n_gpus = cp.cuda.runtime.getDeviceCount()
+        except Exception:
+            n_gpus = 0
         if n_gpus < 1:
             self._log("normal", "[beam] No GPUs found, falling back to CPU.")
+            if not _analyser_off:
+                warnings.warn("analyser acceptance is GPU-only; ignored on CPU path")
             return self.interact_beam_cpu(
                 sample,
                 measurement_positions,
@@ -3874,10 +5272,7 @@ class beam(logging):
                 ein_cache_dir=ein_cache_dir,
                 recompute_cache=recompute_cache,
                 apply_polarization=apply_polarization,
-                apply_spherical_decay=spherical_decay,
-                analyser_mode=analyser_mode,
-                analyser_acceptance_angle_rad=analyser_acceptance_angle_rad,
-                analyser_darwin_halfwidth_rad=analyser_darwin_halfwidth_rad
+                apply_spherical_decay=spherical_decay
             )
 
         import hashlib
@@ -3888,7 +5283,7 @@ class beam(logging):
         _det_for_mode = _TmpDet(measurement_positions)
 
         if not hasattr(self, "_phase_tol_rad"):
-            self._phase_tol_rad = 1e-2
+            self._phase_tol_rad = 1e-3
         self._select_series_mode_once(sample, _det_for_mode, safety_t_thresh=0.5, verbose=True)
 
         interaction_kernel = self.build_interaction_kernel(
@@ -3994,6 +5389,10 @@ class beam(logging):
             Rg = cp.asarray(R_pin, dtype=cp.float32)
             Tg = cp.asarray(T_pin, dtype=cp.float32)
             xg = cp.asarray(x_coords); yg = cp.asarray(y_coords); zg = cp.asarray(z_coords)
+            # M=1 forward beam: g = (0,0,0) per beam channel.  The kernel's
+            # M-channel loop reduces to a single channel with sincos returning
+            # (0, 1), bit-identical to the legacy single-amplitude path.
+            g_vecs_d = cp.zeros(3, dtype=cp.float32)
 
             # Static beam maps for E0/EIN sampling on this device
             E0_g  = cp.asarray(self._beam_E0_map.astype(np.complex64))
@@ -4035,7 +5434,7 @@ class beam(logging):
                 with streams[s_id]:
                     # Positions to device, transform, then meters
                     pos = cp.array(sample.load_chunk_positions(cidx, use_gpu=True), dtype=cp.float32)
-                    pos = pos @ Rg
+                    pos = pos @ Rg.T
                     pos += Tg
 
                     if use_depth_ein:
@@ -4088,7 +5487,8 @@ class beam(logging):
                             np.int32(int(analyser_kind)),
                             np.float32(centre_x), np.float32(centre_y), np.float32(centre_z),
                             np.float32(analyser_acceptance_angle_rad),
-                            np.float32(analyser_darwin_halfwidth_rad)
+                            np.float32(analyser_darwin_halfwidth_rad),
+                            g_vecs_d,
                         ),
                         stream=streams[s_id]
                     )
@@ -4172,6 +5572,7 @@ class beam(logging):
                 Defaults to False.
             analyser_mode (str or int, optional): Analyser filtering mode.
                 "off"/0, "top_hat"/1, or "darwin"/2. Defaults to "off".
+                GPU path only; ignored with a warning on the CPU path.
             analyser_acceptance_angle_rad (float, optional): Acceptance angle for
                 top_hat mode in radians. Defaults to 0.0.
             analyser_darwin_halfwidth_rad (float, optional): Half-width for darwin
@@ -4204,6 +5605,17 @@ class beam(logging):
             # CPU path
             if cp is None and use_gpu:
                 self._log("normal", "[beam] Cupy not installed, running CPU mode.")
+            # Analyser acceptance is implemented only in the GPU kernels;
+            # interact_beam_cpu does not accept the analyser kwargs, so they
+            # are not forwarded here. Warn if an analyser was requested.
+            analyser_off = (
+                analyser_mode is None
+                or (isinstance(analyser_mode, str)
+                    and analyser_mode.strip().lower() in ("off", "none", "disabled"))
+                or (not isinstance(analyser_mode, str) and analyser_mode == 0)
+            )
+            if not analyser_off:
+                warnings.warn("analyser acceptance is GPU-only; ignored on CPU path")
             final_field = self.interact_beam_cpu(
                 sample,
                 measurement_positions,
@@ -4215,10 +5627,7 @@ class beam(logging):
                 ein_cache_dir=ein_cache_dir,
                 recompute_cache=recompute_cache,
                 apply_polarization=apply_polarization,
-                apply_spherical_decay=spherical_decay,
-                analyser_mode=analyser_mode,
-                analyser_acceptance_angle_rad=analyser_acceptance_angle_rad,
-                analyser_darwin_halfwidth_rad=analyser_darwin_halfwidth_rad
+                apply_spherical_decay=spherical_decay
             )
 
         # Offset subtraction
@@ -4301,7 +5710,7 @@ class beam(logging):
                 continue
 
             # Stage transform in Angstrom
-            pos = pos @ stage.rotation.astype(np.float32)
+            pos = pos @ stage.rotation.astype(np.float32).T
             pos += stage.translation.astype(np.float32)
 
             nA = pos.shape[0]
@@ -4502,7 +5911,7 @@ class beam(logging):
             avail_host_b = int(psutil.virtual_memory().available)
         except Exception:
             avail_host_b = 4 * 1024**3  # conservative 4 GB fallback
-        cache_budget = max(int(0.3 * avail_host_b), 256 * 1024**2)
+        cache_budget = max(int(0.9 * avail_host_b), 256 * 1024**2)
 
         total_chunks = int(sample.chunk_total or 0)
         chunk_cache = {}      # cid -> (pos, fr_h, fi_h)
@@ -4630,7 +6039,7 @@ class beam(logging):
                         fr = fr_g[b_start:b_end]
                         fi = fi_g[b_start:b_end]
 
-                        posg = pos_b @ Rg
+                        posg = pos_b @ Rg.T
                         posg = posg + Tg
 
                         au = posg[:, 0]*e1g[0] + posg[:, 1]*e1g[1] + posg[:, 2]*e1g[2]
@@ -4922,7 +6331,7 @@ class beam(logging):
                 continue
 
             # Stage transform in real space (angstrom)
-            pos = pos @ stage.rotation
+            pos = pos @ stage.rotation.T
             pos += stage.translation
 
             nA = pos.shape[0]
@@ -5099,7 +6508,7 @@ class beam(logging):
                 fi_g = cp.asarray(f2,         dtype=cp.float32)  # imag forward part
 
                 posg = cp.asarray(pos, dtype=cp.float32)
-                posg = posg @ Rg; posg += Tg
+                posg = posg @ Rg.T; posg += Tg
 
                 e1g = cp.asarray(self._beam_e1)
                 e2g = cp.asarray(self._beam_e2)
@@ -5622,7 +7031,11 @@ class beam(logging):
             self, field, dy, dz, z, kernel,
             step_max=0.02, pad_factor=1.0,
             padding_mode: str = "edge",
-            pad_constant: float = 0.0
+            pad_constant: float = 0.0,
+            cos_theta: float = 1.0,
+            k_g_axis: float = None,
+            k_g_perp_y: float = 0.0,
+            k_g_perp_z: float = 0.0,
         ):
         """
         Band-limited angular spectrum propagation on GPU with symmetric padding.
@@ -5667,7 +7080,9 @@ class beam(logging):
                 out = self._angular_spectrum_propagate_gpu(
                     out, dy, dz, dz_step, kernel,
                     step_max=step_max, pad_factor=pad_factor,
-                    padding_mode=padding_mode, pad_constant=pad_constant
+                    padding_mode=padding_mode, pad_constant=pad_constant,
+                    cos_theta=cos_theta,
+                    k_g_axis=k_g_axis, k_g_perp_y=k_g_perp_y, k_g_perp_z=k_g_perp_z,
                 )
             return out
 
@@ -5698,6 +7113,16 @@ class beam(logging):
         ky = (2.0 * np.pi) * cp.fft.fftfreq(Ny2, d=float(dy)).astype(cp.float32)
         kz = (2.0 * np.pi) * cp.fft.fftfreq(Nz2, d=float(dz)).astype(cp.float32)
 
+        # Backward compatibility: if k_g_axis not provided, derive from cos_theta.
+        # For a beam tilted at angle theta from the propagation axis with NO
+        # transverse carrier shift, k_g_axis = k*cos_theta and k_g_perp = 0.
+        # This recovers the old behavior for callers that haven't been updated
+        # to pass full k_g vectors.
+        if k_g_axis is None:
+            k_g_axis_v = float(k) * float(cos_theta)
+        else:
+            k_g_axis_v = float(k_g_axis)
+
         # Forward FFT
         Fp = cp.fft.fft2(Fp)
 
@@ -5707,7 +7132,10 @@ class beam(logging):
                 (Nz2 + block[1] - 1)//block[1])
         kernel(grid, block,
             (ky, kz, cp.float32(k), cp.float32(z),
-                np.int32(Ny2), np.int32(Nz2), Fp))
+                np.int32(Ny2), np.int32(Nz2), Fp,
+                cp.float32(k_g_axis_v),
+                cp.float32(k_g_perp_y),
+                cp.float32(k_g_perp_z)))
 
         # Inverse FFT and center crop back to original size
         out = cp.fft.ifft2(Fp)
