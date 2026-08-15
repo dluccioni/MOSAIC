@@ -588,36 +588,6 @@ class deformation(logging):
             return P, F9, inside
         return P, F9
 
-    # ---------------------- high-level orchestrator -----------------------------
-    def transform_field(
-        self,
-        scale_factor=1.0,
-        translate=None,
-        rotate_axis=None,
-        rotate_angle=None,
-        rotate_matrix=None,
-        degrees=True,
-        origin=(0.0, 0.0, 0.0),
-        clip_bounds=None,
-        return_mask=False,
-        use_gpu=True):
-        """
-        Transform a deformation field (placeholder API).
-
-        The intended operation order is:
-            1) Position scaling
-            2) Rotation about origin
-            3) Translation
-            4) Optional F scaling about identity
-            5) Rotation of F tensors
-
-        Notes:
-            This method is intentionally left unimplemented here. It documents
-            the intended pipeline and parameters for a potential orchestrator.
-        """
-        # Intentionally left as a placeholder for pipeline orchestration.
-        return None
-
     def clip_field_to_sample(
         self,
         field_positions,
@@ -1410,7 +1380,8 @@ class deformation(logging):
                 iterable of (Mi, 3) chunks. If an ndarray and yield_chunks=False,
                 returns a single concatenated array (GPU: CuPy; CPU: NumPy).
             chunk_size (int): Chunk size used when `sample` is a single array.
-            k (int): Number of neighbors for kNN.
+            k (int): Number of neighbors for the inverse-distance-weighted
+                interpolation of the deformation gradient. Defaults to 8.
             origin (sequence): 3-vector origin for affine application.
             use_gpu (bool): Use CUDA path if True and CuPy is available.
             power (float): IDW power for weighting distances.
@@ -2924,7 +2895,7 @@ class deformation(logging):
             power (float): Inverse-distance weight power.
             eps (float): Small constant for stability.
             reg (float): Tikhonov regularization scaling applied as
-                        A_i += (reg * sum_j w_ij) * I.
+                        A_i += (reg * sum_j w_ij) * I. Defaults to 1e-6.
             use_gpu (bool): Use CuPy if True and available, else NumPy.
             dtype (dtype or None): Floating dtype to enforce.
 
@@ -3062,6 +3033,10 @@ class deformation(logging):
         Args:
             sample (object): Provides chunked IO for positions and cell-list helpers.
             use_gpu (bool): If True and CuPy is available, prefer GPU path.
+
+        Notes:
+            The MLS fit uses k = 48 nearest FE nodes per atom and a Tikhonov
+            regularization of reg = 1e-6 (both fixed internally).
 
         Returns:
             None
