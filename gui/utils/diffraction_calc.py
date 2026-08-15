@@ -444,6 +444,14 @@ class DiffractionCalculator:
         specified (h,k,l) reflection into the Bragg condition with
         scattering into the desired azimuthal direction.
 
+        The stage convention is detected from the attached stage object's
+        motor names/axes (see _detect_stage_convention). The shipped default
+        goniometer (mu/phi/chi/omega) uses the original numerical solver;
+        a Busing-Levy four-circle stage (omega/chi/phi about lab z/x/z,
+        created via Stage.create_stage(convention='busing-levy')) uses the
+        closed-form Busing & Levy (1967) angle formulas. If no stage is set,
+        the default convention is assumed.
+
         Args:
             hkl: Target Miller indices (h, k, l).
             target_eta: Desired azimuthal angle for scattering (radians).
@@ -478,20 +486,38 @@ class DiffractionCalculator:
             np.cos(theta) * np.cos(target_eta),
         ])
 
-        # Directly compute Euler angles (phi, chi, omega) that align Q_sample with Q_target
-        # Stage rotation: R = R_Z(-ω) @ R_X(-χ) @ R_Y(-φ)
-        motor_values = self._compute_euler_angles_for_alignment(
-            Q_sample_norm, Q_target_norm
-        )
+        if self._detect_stage_convention() == 'busing-levy':
+            # Closed-form Busing & Levy (1967) angles for the omega/chi/phi
+            # four-circle (detector arm supplies 2theta separately)
+            motor_values = self._compute_busing_levy_angles_for_alignment(
+                Q_sample_norm, Q_target_norm
+            )
 
-        if motor_values is None:
-            return None
+            if motor_values is None:
+                return None
 
-        # Reconstruct the rotation matrix from motor values
-        phi_rad = np.radians(motor_values['phi'])
-        chi_rad = np.radians(motor_values['chi'])
-        omega_rad = np.radians(motor_values['omega'])
-        rotation_matrix = self._build_stage_rotation(phi_rad, chi_rad, omega_rad)
+            # Reconstruct the rotation matrix from motor values
+            omega_rad = np.radians(motor_values['omega'])
+            chi_rad = np.radians(motor_values['chi'])
+            phi_rad = np.radians(motor_values['phi'])
+            rotation_matrix = self._build_stage_rotation_busing_levy(
+                omega_rad, chi_rad, phi_rad
+            )
+        else:
+            # Directly compute Euler angles (phi, chi, omega) that align Q_sample with Q_target
+            # Stage rotation: R = R_Z(-ω) @ R_X(-χ) @ R_Y(-φ)
+            motor_values = self._compute_euler_angles_for_alignment(
+                Q_sample_norm, Q_target_norm
+            )
+
+            if motor_values is None:
+                return None
+
+            # Reconstruct the rotation matrix from motor values
+            phi_rad = np.radians(motor_values['phi'])
+            chi_rad = np.radians(motor_values['chi'])
+            omega_rad = np.radians(motor_values['omega'])
+            rotation_matrix = self._build_stage_rotation(phi_rad, chi_rad, omega_rad)
 
         result = {
             'two_theta': two_theta,
@@ -547,6 +573,145 @@ class DiffractionCalculator:
         # Total rotation: apply phi first, then chi, then omega
         # R_total = R_omega @ R_chi @ R_phi
         return R_omega @ R_chi @ R_phi
+
+    def _detect_stage_convention(self) -> str:
+        """Detect the attached stage's motor convention from its motor lists.
+
+        Reads the stage object's _motor_name, _motor_type, _motor_axis and
+        _motor_coupling attributes (as created by Stage.create_stage).
+
+        Returns:
+            'busing-levy' if the rotation motors are (omega, chi, phi),
+            uncoupled, about axes [0,0,-1], [-1,0,0], [0,0,-1] (the negated
+            lab z/x/z axes, matching get_rotation()'s row-vector convention,
+            as created by Stage.create_stage(convention='busing-levy')).
+            'default' otherwise (including when no stage is set), which
+            preserves the original solver for the shipped default goniometer.
+        """
+        if self.stage is None:
+            return 'default'
+        names = getattr(self.stage, '_motor_name', None)
+        types = getattr(self.stage, '_motor_type', None)
+        axes = getattr(self.stage, '_motor_axis', None)
+        couplings = getattr(self.stage, '_motor_coupling', None)
+        if names is None or types is None or axes is None or couplings is None:
+            return 'default'
+
+        try:
+            rot_idx = [i for i, t in enumerate(types) if str(t) == 'R']
+            rot_names = [str(names[i]) for i in rot_idx]
+            if rot_names != ['omega', 'chi', 'phi']:
+                return 'default'
+
+            expected_axes = {
+                'omega': np.array([0.0, 0.0, -1.0]),
+                'chi': np.array([-1.0, 0.0, 0.0]),
+                'phi': np.array([0.0, 0.0, -1.0]),
+            }
+            for i, motor in zip(rot_idx, rot_names):
+                if not np.allclose(np.asarray(axes[i], dtype=float),
+                                   expected_axes[motor], atol=1e-9):
+                    return 'default'
+                # Rotation motors must be uncoupled (fixed lab axes)
+                if any(c is not None for c in couplings[i]):
+                    return 'default'
+        except Exception:
+            return 'default'
+
+        return 'busing-levy'
+
+    def _build_stage_rotation_busing_levy(
+        self, omega: float, chi: float, phi: float
+    ) -> np.ndarray:
+        """Build the Busing-Levy stage rotation matrix from motor angles.
+
+        Matches Stage.get_rotation() for a stage created with
+        Stage.create_stage(convention='busing-levy'): the rotation motors
+        (omega, chi, phi) are uncoupled with fixed axes [0,0,-1], [-1,0,0],
+        [0,0,-1], and get_rotation() composes them in motor order as
+        R = R_phi @ R_chi @ R_omega (row-vector convention).
+
+        Its transpose is the column-vector sample-to-lab rotation
+        R.T = R_z(omega) @ R_x(chi) @ R_z(phi), i.e. the Busing & Levy
+        (1967) four-circle composition with phi innermost.
+
+        Args:
+            omega: Omega angle in radians
+            chi: Chi angle in radians
+            phi: Phi angle in radians
+
+        Returns:
+            3x3 rotation matrix matching Stage.get_rotation()
+        """
+        omega_axis = np.array([0.0, 0.0, -1.0])
+        chi_axis = np.array([-1.0, 0.0, 0.0])
+        phi_axis = np.array([0.0, 0.0, -1.0])
+
+        R_omega = self._axis_angle_rotation(omega_axis, omega)
+        R_chi = self._axis_angle_rotation(chi_axis, chi)
+        R_phi = self._axis_angle_rotation(phi_axis, phi)
+
+        # Stage.get_rotation() iterates motors in list order (omega, chi,
+        # phi), left-multiplying each: R = R_phi @ R_chi @ R_omega
+        return R_phi @ R_chi @ R_omega
+
+    def _compute_busing_levy_angles_for_alignment(
+        self,
+        Q_sample: np.ndarray,
+        Q_target: np.ndarray
+    ) -> Optional[dict]:
+        """Compute Busing-Levy angles to align Q_sample with Q_target direction.
+
+        Solves in closed form for (omega, chi, phi) such that the
+        column-vector sample-to-lab rotation
+        R = R_z(omega) @ R_x(chi) @ R_z(phi) maps Q_sample onto Q_target
+        (standard Busing & Levy (1967) four-circle angle formulas):
+        - phi rotates Q_sample about z into the +y half of the y-z plane,
+        - omega rotates Q_target about z into the +y half of the y-z plane,
+        - chi rotates about x within that plane between the two.
+
+        Args:
+            Q_sample: Normalized Q-vector in sample frame
+            Q_target: Normalized target Q direction in lab frame
+
+        Returns:
+            Dictionary with omega, chi, phi in degrees, or None if failed.
+        """
+        Qs = Q_sample / np.linalg.norm(Q_sample)
+        Qt = Q_target / np.linalg.norm(Q_target)
+
+        # In-plane (xy) magnitudes; both are >= 0
+        rho_s = np.hypot(Qs[0], Qs[1])
+        rho_t = np.hypot(Qt[0], Qt[1])
+
+        # phi about z: R_z(phi) @ Qs = (0, rho_s, Qs[2])
+        # (arbitrary when Qs is along +/-z; atan2(0, 0) = 0)
+        phi = np.arctan2(Qs[0], Qs[1])
+
+        # omega about z: R_z(-omega) @ Qt = (0, rho_t, Qt[2])
+        # (arbitrary when Qt is along +/-z; atan2(0, 0) = 0)
+        omega = np.arctan2(-Qt[0], Qt[1])
+
+        # chi about x within the y-z plane: (rho_s, Qs[2]) -> (rho_t, Qt[2])
+        chi = np.arctan2(Qt[2], rho_t) - np.arctan2(Qs[2], rho_s)
+
+        # Sanity check against the stage composition (row-vector matrix, so
+        # the column-vector sample-to-lab rotation is its transpose)
+        R = self._build_stage_rotation_busing_levy(omega, chi, phi)
+        Q_lab = R.T @ Qs
+        if 1.0 - np.dot(Q_lab / np.linalg.norm(Q_lab), Qt) > 1e-8:
+            return None
+
+        # Wrap to [-180, 180]
+        omega_deg = ((np.degrees(omega) + 180) % 360) - 180
+        chi_deg = ((np.degrees(chi) + 180) % 360) - 180
+        phi_deg = ((np.degrees(phi) + 180) % 360) - 180
+
+        return {
+            'omega': omega_deg,
+            'chi': chi_deg,
+            'phi': phi_deg,
+        }
 
     def _axis_angle_rotation(self, axis: np.ndarray, angle: float) -> np.ndarray:
         """Compute rotation matrix for rotation around an axis by an angle.

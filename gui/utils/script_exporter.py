@@ -35,17 +35,17 @@ Date: {date}
 import numpy as np
 from pathlib import Path
 
-# Import simulation modules
-from Crystal import Crystal
-from Sample import Sample
-from Beam import Beam
-from Detector import Detector
-from Stage import Stage
-from Optics import Optics
-from Defects import Defects
-from Deformation import Deformation
-from Experiment import Experiment
-from Analysis import Analysis
+# Import simulation modules (classes are lowercase: Crystal.crystal, etc.)
+import Crystal
+import Sample
+import Beam
+import Detector
+import Stage
+import Optics
+import Defects
+import Deformation
+import Experiment
+import Analysis
 
 '''
 
@@ -189,10 +189,10 @@ from Analysis import Analysis
 
         # Check if loaded from CIF
         if hasattr(crystal, 'cif_path') and crystal.cif_path:
-            lines.append(f'crystal = Crystal("{crystal.cif_path}")')
+            lines.append(f'crystal = Crystal.crystal("{crystal.cif_path}")')
         else:
             # Manual construction
-            lines.append("crystal = Crystal()")
+            lines.append("crystal = Crystal.crystal()")
             if hasattr(crystal, 'a'):
                 lines.append(f"crystal.a = {crystal.a}")
             if hasattr(crystal, 'b'):
@@ -218,9 +218,9 @@ from Analysis import Analysis
         lines = ["# Crystal Setup", "# " + "-" * 60]
 
         if "cif_file" in params:
-            lines.append(f'crystal = Crystal("{params["cif_file"]}")')
+            lines.append(f'crystal = Crystal.crystal("{params["cif_file"]}")')
         else:
-            lines.append("crystal = Crystal()")
+            lines.append("crystal = Crystal.crystal()")
             lp = params.get("lattice_parameters", {})
             for key in ["a", "b", "c", "alpha", "beta", "gamma"]:
                 if key in lp and lp[key] is not None:
@@ -238,7 +238,7 @@ from Analysis import Analysis
         Ly = getattr(sample, 'Ly', 10000)
         Lz = getattr(sample, 'Lz', 10000)
 
-        lines.append(f"sample = Sample(crystal, Lx={Lx}, Ly={Ly}, Lz={Lz})")
+        lines.append(f"sample = Sample.sample(crystal, Lx={Lx}, Ly={Ly}, Lz={Lz})")
 
         # Temperature if enabled
         if hasattr(sample, 'temperature_enabled') and sample.temperature_enabled:
@@ -257,7 +257,7 @@ from Analysis import Analysis
         Ly = dims.get("Ly", 10000)
         Lz = dims.get("Lz", 10000)
 
-        lines.append(f"sample = Sample(crystal, Lx={Lx}, Ly={Ly}, Lz={Lz})")
+        lines.append(f"sample = Sample.sample(crystal, Lx={Lx}, Ly={Ly}, Lz={Lz})")
         lines.append("sample.generate()")
         lines.append("")
         return "\n".join(lines)
@@ -269,7 +269,7 @@ from Analysis import Analysis
         energy = getattr(beam, 'energy', 17000)
         shape = getattr(beam, 'shape', 'rectangular')
 
-        lines.append(f"beam = Beam(sample, energy={energy})")
+        lines.append(f"beam = Beam.beam(sample, energy={energy})")
         lines.append(f'beam.shape = "{shape}"')
 
         # Size parameters
@@ -298,7 +298,7 @@ from Analysis import Analysis
         lines = ["# Beam Setup", "# " + "-" * 60]
 
         energy = params.get("energy", 17000)
-        lines.append(f"beam = Beam(sample, energy={energy})")
+        lines.append(f"beam = Beam.beam(sample, energy={energy})")
 
         for key in ["shape", "Ny", "Nz", "Ly", "Lz", "profile", "polarization_rate"]:
             if key in params and params[key] is not None:
@@ -315,8 +315,7 @@ from Analysis import Analysis
         """Export Detector setup code."""
         lines = ["# Detector Setup", "# " + "-" * 60]
 
-        lines.append("from Detector import detector")
-        lines.append("detector_obj = detector(directory='./detector_data')")
+        lines.append("detector_obj = Detector.detector(directory='./detector_data')")
         lines.append("")
 
         # Export create_detector call
@@ -368,8 +367,7 @@ from Analysis import Analysis
         """Export Detector setup from preset params."""
         lines = ["# Detector Setup", "# " + "-" * 60]
 
-        lines.append("from Detector import detector")
-        lines.append("detector_obj = detector(directory='./detector_data')")
+        lines.append("detector_obj = Detector.detector(directory='./detector_data')")
         lines.append("")
 
         # Export create_detector call
@@ -415,7 +413,7 @@ from Analysis import Analysis
         """Export Stage setup code."""
         lines = ["# Stage Setup", "# " + "-" * 60]
 
-        lines.append("stage = Stage(sample)")
+        lines.append("stage = Stage.stage(sample)")
 
         if hasattr(stage, 'motors'):
             for name, motor in stage.motors.items():
@@ -430,7 +428,7 @@ from Analysis import Analysis
         """Export Stage setup from preset params."""
         lines = ["# Stage Setup", "# " + "-" * 60]
 
-        lines.append("stage = Stage(sample)")
+        lines.append("stage = Stage.stage(sample)")
 
         motors = params.get("motors", {})
         for name, value in motors.items():
@@ -444,7 +442,7 @@ from Analysis import Analysis
         """Export Optics setup code."""
         lines = ["# Optics Setup", "# " + "-" * 60]
 
-        lines.append("optics = Optics()")
+        lines.append("optics = Optics.optics()")
 
         # Export component stack if available
         if hasattr(optics, 'components'):
@@ -459,7 +457,7 @@ from Analysis import Analysis
         """Export Defects setup code."""
         lines = ["# Defects Setup", "# " + "-" * 60]
 
-        lines.append("defects = Defects(sample)")
+        lines.append("defects = Defects.defects(sample)")
         lines.append("# Configure defects as needed")
 
         lines.append("")
@@ -469,7 +467,7 @@ from Analysis import Analysis
         """Export Deformation setup code."""
         lines = ["# Deformation Setup", "# " + "-" * 60]
 
-        lines.append("deformation = Deformation(sample)")
+        lines.append("deformation = Deformation.deformation(sample)")
 
         if hasattr(deformation, 'field_path') and deformation.field_path:
             lines.append(f'deformation.load_field("{deformation.field_path}")')
@@ -484,10 +482,10 @@ from Analysis import Analysis
             "# " + "-" * 60,
             "",
             "# Run simulation",
-            "beam.atomic_direct_interaction()",
+            "beam.atomic_direct_interaction(sample, detector_obj, stage)",
             "",
             "# Display results",
-            "detector.plot()",
+            "detector_obj.plot_detector()",
             "",
             'print("Simulation complete!")',
         ]
@@ -500,10 +498,10 @@ from Analysis import Analysis
             "# " + "-" * 60,
             "",
             "# Run simulation",
-            "beam.atomic_direct_interaction()",
+            "beam.atomic_direct_interaction(sample, detector_obj, stage)",
             "",
             "# Display results",
-            "detector.plot()",
+            "detector_obj.plot_detector()",
             "",
             'print("Simulation complete!")',
         ]
@@ -530,13 +528,13 @@ from Analysis import Analysis
 
         # Setup code (abbreviated)
         lines.append("# Setup simulation objects")
-        lines.append("# ... (configure crystal, sample, beam, detector as needed)")
+        lines.append("# ... (configure crystal, sample, beam, detector, stage as needed)")
         lines.append("")
 
         # Experiment setup
         lines.append("# Experiment/Scan Setup")
         lines.append("# " + "-" * 60)
-        lines.append("experiment = Experiment(beam, detector, stage)")
+        lines.append("experiment = Experiment.experiment()")
         lines.append("")
 
         # Scan parameters
@@ -548,15 +546,21 @@ from Analysis import Analysis
         lines.append(f"motors = {motors}")
         lines.append(f"ranges = {ranges}")
         lines.append(f"steps = {steps}")
+        lines.append("# Convert step counts to step sizes for scan_nD")
+        lines.append("stepsizes = [(stop - start) / max(n - 1, 1) for (start, stop), n in zip(ranges, steps)]")
         lines.append("")
 
         # Execute scan
         lines.append("# Run scan")
         lines.append("results = experiment.scan_nD(")
-        lines.append("    motors=motors,")
+        lines.append("    sample=sample,")
+        lines.append("    beam=beam,")
+        lines.append("    detector=detector,")
+        lines.append("    stage=stage,")
         lines.append("    ranges=ranges,")
-        lines.append("    steps=steps,")
-        lines.append(f'    output_dir="{scan_config.output_directory or "scan_output"}"')
+        lines.append("    stepsizes=stepsizes,")
+        lines.append("    motors=motors,")
+        lines.append(f'    save_dir="{scan_config.output_directory or "scan_output"}"')
         lines.append(")")
         lines.append("")
         lines.append('print("Scan complete!")')

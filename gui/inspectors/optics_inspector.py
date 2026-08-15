@@ -184,6 +184,28 @@ class OpticsInspector(InspectorPanel):
         self.crl_thickness.setSuffix(" Å")
         self.crl_thickness.setSingleStep(10)
         crl_layout.addRow("Thickness:", self.crl_thickness)
+        self.crl_mu = QDoubleSpinBox()
+        self.crl_mu.setDecimals(2)
+        self.crl_mu.setRange(0, 1e9)
+        self.crl_mu.setValue(0)  # 0 = parabolic absorption disabled
+        self.crl_mu.setSuffix(" 1/m")
+        self.crl_mu.setSingleStep(10)
+        self.crl_mu.setToolTip(
+            "Intensity linear attenuation coefficient of the lens material (1/m).\n"
+            "0 disables the parabolic (r^2-dependent) CRL absorption."
+        )
+        crl_layout.addRow("Attenuation μ:", self.crl_mu)
+        self.crl_radius = QDoubleSpinBox()
+        self.crl_radius.setDecimals(6)
+        self.crl_radius.setRange(0, 1e6)
+        self.crl_radius.setValue(0)  # 0 = treated as infinite (disabled)
+        self.crl_radius.setSuffix(" m")
+        self.crl_radius.setSingleStep(1e-4)
+        self.crl_radius.setToolTip(
+            "Per-surface parabolic apex radius R in meters.\n"
+            "0 is treated as infinite (parabolic absorption disabled)."
+        )
+        crl_layout.addRow("Apex radius R:", self.crl_radius)
         self.param_stack.addWidget(crl_widget)
 
         # Bragg Magnifier parameters - add_bragg_magnifier_2b(mag_x, mag_y, reflectivity, phase_shift, ...)
@@ -375,11 +397,16 @@ class OpticsInspector(InspectorPanel):
                 optics_obj.add_free_space(self.fs_length.value() * A_to_mm)
 
             elif comp_type == "crl":
-                # add_CRL_box(number, focal_length_mm, thickness_mm) - convert from Å to mm
+                # add_CRL_box(number, focal_length_mm, thickness_mm, ...) - convert from Å to mm
+                # mu_per_m and radius_of_curvature_m are SI (1/m, m); a radius of
+                # 0 in the UI means "infinite" (parabolic absorption disabled).
+                crl_radius_m = self.crl_radius.value()
                 optics_obj.add_CRL_box(
                     number=self.crl_number.value(),
                     focal_length_mm=self.crl_focal_length.value() * A_to_mm,
-                    thickness_mm=self.crl_thickness.value() * A_to_mm
+                    thickness_mm=self.crl_thickness.value() * A_to_mm,
+                    mu_per_m=self.crl_mu.value(),
+                    radius_of_curvature_m=(crl_radius_m if crl_radius_m > 0 else float('inf'))
                 )
 
             elif comp_type == "bragg":

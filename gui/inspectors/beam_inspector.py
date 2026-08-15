@@ -264,7 +264,7 @@ class BeamInspector(InspectorPanel):
         self.phase_tol = QDoubleSpinBox()
         self.phase_tol.setDecimals(4)
         self.phase_tol.setRange(0.001, 10)
-        self.phase_tol.setValue(0.1)
+        self.phase_tol.setValue(0.001)
         self.phase_tol.setSuffix(" rad")
         advanced_layout.addRow("Phase Tolerance:", self.phase_tol)
 
@@ -567,6 +567,10 @@ class BeamInspector(InspectorPanel):
                 kwargs['gaussian_waist'] = gaussian_waist
 
             beam_obj.create_beam(**kwargs)
+
+            # Apply advanced settings
+            if hasattr(beam_obj, 'set_phase_tolerance'):
+                beam_obj.set_phase_tolerance(self.phase_tol.value())
 
             # Save metadata after creation
             if hasattr(beam_obj, 'write_beam_metadata'):

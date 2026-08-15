@@ -385,12 +385,14 @@ class SimulationState:
         self.sample = SampleType(dimensions, **kwargs)
         return self.sample
 
-    def create_beam(self, energy: float, **kwargs) -> BeamType:
+    def create_beam(self, energy: float, phase_tolerance: Optional[float] = None, **kwargs) -> BeamType:
         """
         Create a new beam.
 
         Args:
             energy: Beam energy in eV
+            phase_tolerance: Optional phase accuracy threshold in radians,
+                applied via set_phase_tolerance after creation
             **kwargs: Additional arguments for beam constructor
 
         Returns:
@@ -398,6 +400,8 @@ class SimulationState:
         """
         self.beam = BeamType()
         self.beam.create_beam(energy=energy, **kwargs)
+        if phase_tolerance is not None:
+            self.beam.set_phase_tolerance(phase_tolerance)
         return self.beam
 
     def create_detector(self, shape: tuple, pixel_size: tuple, **kwargs) -> DetectorType:
@@ -651,6 +655,7 @@ class SimulationState:
             "beam_samples": beam_samples,
             "beam_profile": getattr(self._beam, '_beam_profile', "uniform"),
             "pol_perp_rate": getattr(self._beam, '_pol_perp_rate', 0.5),
+            "phase_tolerance": getattr(self._beam, '_phase_tol_rad', None),
         }
 
     def _serialize_detector(self) -> Optional[Dict]:
@@ -1012,6 +1017,11 @@ class SimulationState:
                         beam_profile=beam_profile,
                         pol_perp_rate=pol_perp_rate
                     )
+
+            # Restore phase tolerance if available
+            phase_tolerance = data.get('phase_tolerance')
+            if phase_tolerance is not None and hasattr(self._beam, 'set_phase_tolerance'):
+                self._beam.set_phase_tolerance(phase_tolerance)
         except Exception as e:
             print(f"Error loading beam: {e}")
             self._beam = None

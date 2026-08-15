@@ -426,6 +426,7 @@ class SampleInspector(InspectorPanel):
         self.orientation_mode = QComboBox()
         self.orientation_mode.addItem("Random", "random")
         self.orientation_mode.addItem("Textured", "textured")
+        self.orientation_mode.addItem("March-Dollase", "march-dollase")
         self.orientation_mode.currentIndexChanged.connect(self._on_orientation_mode_changed)
         poly_layout.addRow("Grain Orientations:", self.orientation_mode)
 
@@ -467,12 +468,22 @@ class SampleInspector(InspectorPanel):
         self.texture_spread_label = QLabel("Texture Spread:")
         poly_layout.addRow(self.texture_spread_label, self.texture_spread)
 
+        # March-Dollase r parameter - shown only for march-dollase mode
+        self.march_r = QDoubleSpinBox()
+        self.march_r.setRange(0.1, 10.0)
+        self.march_r.setDecimals(3)
+        self.march_r.setValue(1.0)
+        self.march_r_label = QLabel("March-Dollase r:")
+        poly_layout.addRow(self.march_r_label, self.march_r)
+
         # Initially hide polycrystalline group and texture controls
         self.poly_group.setVisible(False)
         self.texture_axis_label.setVisible(False)
         self.texture_axis_widget.setVisible(False)
         self.texture_spread_label.setVisible(False)
         self.texture_spread.setVisible(False)
+        self.march_r_label.setVisible(False)
+        self.march_r.setVisible(False)
 
         # GPU Settings Group (for sample generation)
         gpu_group = self.add_group("GPU Settings")
@@ -871,11 +882,15 @@ class SampleInspector(InspectorPanel):
 
     def _on_orientation_mode_changed(self, index):
         """Show/hide texture controls based on orientation mode."""
-        is_textured = self.orientation_mode.currentData() == "textured"
-        self.texture_axis_label.setVisible(is_textured)
-        self.texture_axis_widget.setVisible(is_textured)
+        mode = self.orientation_mode.currentData()
+        is_textured = mode == "textured"
+        is_march = mode == "march-dollase"
+        self.texture_axis_label.setVisible(is_textured or is_march)
+        self.texture_axis_widget.setVisible(is_textured or is_march)
         self.texture_spread_label.setVisible(is_textured)
         self.texture_spread.setVisible(is_textured)
+        self.march_r_label.setVisible(is_march)
+        self.march_r.setVisible(is_march)
 
     def _on_temp_enabled_changed(self, state):
         """Handle temperature checkbox change."""
@@ -1166,6 +1181,7 @@ class SampleInspector(InspectorPanel):
                             self.texture_axis_z.value()
                         )
                         texture_spread_deg = self.texture_spread.value()
+                        march_r = self.march_r.value()
 
                         new_sample.generate_sample_poly(
                             material=crystal,
@@ -1175,6 +1191,7 @@ class SampleInspector(InspectorPanel):
                             orientation_mode=orientation_mode,
                             texture_axis=texture_axis,
                             texture_spread_deg=texture_spread_deg,
+                            march_r=march_r,
                             n_gpus=n_gpus_param
                         )
                     else:
