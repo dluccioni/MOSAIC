@@ -2715,54 +2715,144 @@ class sample(logging):
 
         # How many chunks along each axis
         chunk_units = np.ceil(lattice_units / chunk_dimensions).astype(np.int64)
-
-        # Candidate chunk origins in crystal frame
-        chunk_positions_C = self.get_flat_grid(chunk_units, use_gpu=False) * chunk_dimensions
+        N_x = int(chunk_units[0])
+        N_y = int(chunk_units[1])
+        N_z = int(chunk_units[2])
 
         # Convert to sample frame and center relative to sample [0..dimensions]
         adj_val = (lattice_units * 0.5) - (self.dimensions @ inv_lattice_matrix * 0.5)
-        chunk_positions_S = (chunk_positions_C - adj_val) @ lattice_matrix  # (N, 3)
 
         # Precompute corner offsets once: 8x3 offsets in sample frame for one chunk
         u8 = self.get_unit_corners().astype(np.float32)
-        corner_offsets_S = (u8 * chunk_dimensions.astype(np.float32)) @ lattice_matrix.astype(np.float32)
+        corner_offsets_S = (
+            u8 * chunk_dimensions.astype(np.float32)
+        ) @ lattice_matrix.astype(np.float32)
 
-        # All chunk corners in sample frame: (N, 8, 3)
-        chunk_corners_S = chunk_positions_S[:, np.newaxis, :] + corner_offsets_S[np.newaxis, :, :]
-
-        # AABB prefilter against [0, dimensions]
+        # AABB bounds for the sample box
         sample_min = np.zeros(3, dtype=np.float32)
         sample_max = self.dimensions.astype(np.float32)
 
-        cc_min = chunk_corners_S.min(axis=1)
-        cc_max = chunk_corners_S.max(axis=1)
+        # Reference 8 corners of the sample in sample frame (for SAT)
+        sample_corners_S = (self.get_unit_corners() @ self.matrix)
 
-        aabb_mask = (
-            (cc_max[:, 0] >= sample_min[0]) & (cc_min[:, 0] <= sample_max[0]) &
-            (cc_max[:, 1] >= sample_min[1]) & (cc_min[:, 1] <= sample_max[1]) &
-            (cc_max[:, 2] >= sample_min[2]) & (cc_min[:, 2] <= sample_max[2])
+        # Batched candidate-chunk enumeration.
+        try:
+            import psutil
+            avail_host_b = int(psutil.virtual_memory().available)
+            TARGET_BATCH_BYTES = max(256 * 1024**2, int(0.9 * avail_host_b))
+        except Exception:
+            # psutil missing -- fall back to a generous default.
+            TARGET_BATCH_BYTES = 4 * 1024**3
+        # Per-candidate cost.  Live allocations during a batch include:
+        #   ii, jj, kk (3 * float32)           = 12 B
+        #   grid_C   (3 * float32)             = 12 B
+        #   grid_S   (3 * float32)             = 12 B
+        #   chunk_corners_S (8 * 3 * float32)  = 96 B
+        #   cc_min / cc_max (2 * 3 * float32)  = 24 B
+        #   aabb_mask + temporaries            ~  4 B
+        #   matmul temporary (grid_C - adj_val + output) ~ 24 B
+        #   broadcast temporary for corners_S construction ~ 96 B
+        #   SAT pts1 float64 (192 B) on AABB survivors only -- usually tiny
+        # Total live peak ~ 280 B/candidate, plus numpy overhead and
+        # intermediate matmul buffers brings real peak closer to 800 B.
+        BYTES_PER_CANDIDATE = 800
+
+        # Choose the longest axis of the candidate grid as the batched axis
+        # (so within-batch arrays stay close to the target bound).
+        axis_lens = [N_x, N_y, N_z]
+        axis_order = sorted(range(3), key=lambda i: axis_lens[i], reverse=True)
+        long_axis = axis_order[0]
+        cross_size = max(1, axis_lens[axis_order[1]] * axis_lens[axis_order[2]])
+        max_per_batch = max(
+            1, TARGET_BATCH_BYTES // (BYTES_PER_CANDIDATE * cross_size)
         )
+        batch_along_long = max(1, min(axis_lens[long_axis], int(max_per_batch)))
 
-        # No candidates survived the AABB test
-        if not np.any(aabb_mask):
-            return chunk_positions_S[:0, :], chunk_dimensions
+        survivors = []
 
-        # SAT on survivors only
-        sample_corners_S = (self.get_unit_corners() @ self.matrix)  # 8x3 in sample frame
-        sat_mask_sub = self.parallelepipeds_intersect_cffi(
-            self._intersect_function,
-            self._ffi_object,
-            chunk_corners_S[aabb_mask, :, :],
-            sample_corners_S,
-            eps=1e-12
-        )
+        def _build_grid_C_batch(start_long, end_long):
+            """Build chunk-origin grid (in lattice/crystal frame) for one
+            batch slice along ``long_axis``.  Returns float32 (M, 3)."""
+            batch_lens = list(axis_lens)
+            batch_lens[long_axis] = end_long - start_long
+            d0, d1, d2 = batch_lens
+            # The standard (i, j, k) flat-grid pattern, but only over the
+            # long-axis sub-range [start_long, end_long).
+            ii = np.repeat(
+                np.arange(d0, dtype=np.float32) +
+                (start_long if long_axis == 0 else 0),
+                d1 * d2,
+            )
+            jj = np.tile(
+                np.repeat(
+                    np.arange(d1, dtype=np.float32) +
+                    (start_long if long_axis == 1 else 0),
+                    d2,
+                ),
+                d0,
+            )
+            kk = np.tile(
+                np.arange(d2, dtype=np.float32) +
+                (start_long if long_axis == 2 else 0),
+                d0 * d1,
+            )
+            return np.stack((ii, jj, kk), axis=1) * chunk_dimensions.astype(np.float32)
 
-        # Reconstruct full mask and select survivors
-        full_mask = np.zeros(chunk_positions_S.shape[0], dtype=bool)
-        full_mask[np.flatnonzero(aabb_mask)] = sat_mask_sub
+        for start_long in range(0, axis_lens[long_axis], batch_along_long):
+            end_long = min(start_long + batch_along_long,
+                           axis_lens[long_axis])
 
-        chunk_positions_S = chunk_positions_S[full_mask, :]
-        return chunk_positions_S.astype(np.float32, copy=False), chunk_dimensions.astype(np.float32, copy=False)
+            # Candidate chunk origins for this batch (lattice -> sample frame)
+            grid_C_batch = _build_grid_C_batch(start_long, end_long)
+            grid_S_batch = (grid_C_batch - adj_val) @ lattice_matrix
+
+            # AABB prefilter for this batch.  corner_offsets_S is identical
+            # for every chunk, so the per-chunk AABB is just grid_S + (min/max)
+            # of those 8 offsets -- avoid materialising the (M, 8, 3) broadcast
+            # and the axis=1 reduction (multi-GB, single-threaded NumPy).
+            offsets_min = corner_offsets_S.min(axis=0)   # (3,)
+            offsets_max = corner_offsets_S.max(axis=0)   # (3,)
+            cc_min = grid_S_batch + offsets_min[np.newaxis, :]
+            cc_max = grid_S_batch + offsets_max[np.newaxis, :]
+            aabb_mask = (
+                (cc_max[:, 0] >= sample_min[0]) & (cc_min[:, 0] <= sample_max[0]) &
+                (cc_max[:, 1] >= sample_min[1]) & (cc_min[:, 1] <= sample_max[1]) &
+                (cc_max[:, 2] >= sample_min[2]) & (cc_min[:, 2] <= sample_max[2])
+            )
+            if not np.any(aabb_mask):
+                # Free batch arrays and continue
+                del grid_C_batch, grid_S_batch, cc_min, cc_max
+                continue
+
+            # Build (M, 8, 3) corners only for the AABB survivors -- this is
+            # typically a few thousand chunks even when the batch is millions.
+            survivor_grid_S = grid_S_batch[aabb_mask, :]
+            survivor_corners_S = (
+                survivor_grid_S[:, np.newaxis, :] +
+                corner_offsets_S[np.newaxis, :, :]
+            )
+
+            # SAT test on AABB survivors only
+            sat_mask_sub = self.parallelepipeds_intersect_cffi(
+                self._intersect_function,
+                self._ffi_object,
+                survivor_corners_S,
+                sample_corners_S,
+                eps=1e-12,
+            )
+            if np.any(sat_mask_sub):
+                survivors.append(
+                    survivor_grid_S[sat_mask_sub, :].astype(np.float32, copy=False)
+                )
+            del (grid_C_batch, grid_S_batch, cc_min, cc_max,
+                 survivor_grid_S, survivor_corners_S)
+
+        if survivors:
+            chunk_positions_S = np.concatenate(survivors, axis=0)
+        else:
+            chunk_positions_S = np.zeros((0, 3), dtype=np.float32)
+        return (chunk_positions_S.astype(np.float32, copy=False),
+                chunk_dimensions.astype(np.float32, copy=False))
         
     def parallelepipeds_intersect_cffi(self, compiled_code, ffi_object, pts1, pts2, eps=1e-12):
         """
@@ -3536,21 +3626,29 @@ class sample(logging):
     def _orientation_matrices_from_mode(self, n_grains, mode="random",
                                         texture_axis=(0.0, 0.0, 1.0),
                                         spread_deg=5.0,
-                                        random_seed=None):
+                                        random_seed=None,
+                                        march_r=1.0):
         """
         Build per-grain orientation matrices.
+
+        Modes: 'random' (uniform SO(3)), 'textured' (half-Gaussian tilt about
+        texture_axis), 'march-dollase' (tilt drawn from the March-Dollase
+        distribution with parameter march_r; r=1 reduces to isotropic).
         """
         rng = np.random.RandomState(None if random_seed is None else int(random_seed))
         R = np.zeros((int(n_grains), 3, 3), dtype=np.float32)
-        if mode not in ("random", "textured"):
-            mode = "random"
+        if mode not in ("random", "textured", "march-dollase"):
+            raise ValueError(
+                "unknown orientation mode '%s'; valid modes are "
+                "'random', 'textured', 'march-dollase'" % (mode,)
+            )
 
         if mode == "random":
             for g in range(int(n_grains)):
                 R[g] = self._random_rotation_matrix(rng)
             return R
 
-        # textured: align lattice z to texture_axis, then apply small-angle Gaussian tilt and random twist
+        # textured / march-dollase: align lattice z to texture_axis, then apply tilt and random twist
         t = np.asarray(texture_axis, dtype=np.float64)
         if np.linalg.norm(t) < 1e-12:
             t = np.array([0.0, 0.0, 1.0], dtype=np.float64)
@@ -3566,15 +3664,34 @@ class sample(logging):
         e2 = np.cross(t, e1)
 
         spread_rad = float(spread_deg) * np.pi / 180.0
+
+        # march-dollase: precompute inverse-CDF grid for the tilt angle
+        # P(alpha) ~ sin(alpha) * (r^2 cos^2(alpha) + sin^2(alpha)/r)^(-3/2), alpha in [0, pi/2]
+        md_alpha = None
+        md_cdf = None
+        if mode == "march-dollase":
+            r_md = float(march_r)
+            if r_md <= 0.0:
+                raise ValueError("march_r must be positive")
+            md_alpha = np.linspace(0.0, 0.5 * np.pi, 4096)
+            pdf = np.sin(md_alpha) * (r_md**2 * np.cos(md_alpha)**2 +
+                                      np.sin(md_alpha)**2 / r_md) ** (-1.5)
+            md_cdf = np.concatenate(([0.0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(md_alpha))))
+            md_cdf = md_cdf / md_cdf[-1]
+
         for g in range(int(n_grains)):
             # random twist about t
             twist = rng.uniform(0.0, 2.0*np.pi)
             Rt = sample.get_rotation(t, twist).astype(np.float32)
 
-            # small tilt around axis in plane perp to t
+            # tilt around axis in plane perp to t
             phi = rng.uniform(0.0, 2.0*np.pi)
             axis = (np.cos(phi) * e1 + np.sin(phi) * e2)
-            angle = abs(rng.normal(loc=0.0, scale=spread_rad))
+            if mode == "march-dollase":
+                # inverse-CDF draw of the March-Dollase tilt angle
+                angle = float(np.interp(rng.uniform(0.0, 1.0), md_cdf, md_alpha))
+            else:
+                angle = abs(rng.normal(loc=0.0, scale=spread_rad))
             Rtilt = sample.get_rotation(axis, angle).astype(np.float32)
 
             R[g] = (Rtilt @ R0 @ Rt).astype(np.float32)
@@ -3790,6 +3907,7 @@ class sample(logging):
         orientation_mode="random",
         texture_axis=(0.0, 0.0, 1.0),
         texture_spread_deg=5.0,
+        march_r=1.0,
         flush_size=100000000,
         use_gpu=True,
         gpu_streams=4,
@@ -3819,10 +3937,13 @@ class sample(logging):
             voronoi_method (str): 'uniform' (default) or 'random' when generating seeds.
             randomness_seed (int|None): RNG seed for reproducibility of seeds and, if
                 needed, random orientations.
-            orientation_mode (str): 'random' (default) or 'textured'.
-            texture_axis (3,): for 'textured' mode, principal texture axis.
+            orientation_mode (str): 'random' (default), 'textured', or 'march-dollase'.
+            texture_axis (3,): for 'textured'/'march-dollase' modes, principal texture axis.
             texture_spread_deg (float): Gaussian stddev (degrees) of misorientation
-                cone around `texture_axis` (small angle approx).
+                cone around `texture_axis` (small angle approx; 'textured' mode only).
+            march_r (float): March-Dollase r parameter for 'march-dollase' mode.
+                r=1 is isotropic; r<1 concentrates grain z-axes toward
+                `texture_axis`, r>1 toward the perpendicular plane.
             flush_size (int): atoms per on-disk chunk.
             use_gpu (bool): enable GPU path if CuPy + device available.
             gpu_streams (int): CUDA streams for GPU path per GPU.
@@ -3866,7 +3987,8 @@ class sample(logging):
                 mode=orientation_mode,
                 texture_axis=texture_axis,
                 spread_deg=texture_spread_deg,
-                random_seed=randomness_seed
+                random_seed=randomness_seed,
+                march_r=march_r
             )
             self._grain_orientations = R
         else:
