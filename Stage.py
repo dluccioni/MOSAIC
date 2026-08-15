@@ -71,7 +71,7 @@ class stage(logging):
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
     
-    def create_stage(self, name=['goniometer'], motor_name=['mu','phi','chi','omega','x','y','z'], motor_type=['R','R','R','R','T','T','T'], motor_coupling=[[None],[0],[0],[0,1,2],[0,1,2,3],[0,1,2,3],[0,1,2,3]], motor_axis=[[0.0,-1.0,0.0],[0.0,-1.0,0.0],[-1.0,0.0,0.0],[0.0,0.0,-1.0],[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]], motor_value=[0.0,0.0,0.0,0.0,0.0,0.0,0.0], motor_resolution=[0.0,0.0,0.0,0.0,0.0,0.0,0.0]):
+    def create_stage(self, name=['goniometer'], motor_name=['mu','phi','chi','omega','x','y','z'], motor_type=['R','R','R','R','T','T','T'], motor_coupling=[[None],[0],[0],[0,1,2],[0,1,2,3],[0,1,2,3],[0,1,2,3]], motor_axis=[[0.0,-1.0,0.0],[0.0,-1.0,0.0],[-1.0,0.0,0.0],[0.0,0.0,-1.0],[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]], motor_value=[0.0,0.0,0.0,0.0,0.0,0.0,0.0], motor_resolution=[0.0,0.0,0.0,0.0,0.0,0.0,0.0], convention=None):
         """
         Creates the stage with a specified mode/convention.
 
@@ -79,19 +79,50 @@ class stage(logging):
 
         Args:
             name (list of str, optional): Mode identifier(s). Defaults to ['goniometer'].
-            motor_name (list of str, optional): Names of the motors. 
+            motor_name (list of str, optional): Names of the motors.
                 Defaults to ['mu','phi','chi','omega','x','y','z'].
             motor_type (list of str, optional): Motor types ('R' for rotation, 'T' for translation).
                 Defaults to ['R','R','R','R','T','T','T'].
             motor_coupling (list of list, optional): Coupling relationships between motors. Defaults to [[None],[0],[0],[0,1,2],[0,1,2,3],[0,1,2,3],[0,1,2,3]].
-            motor_axis (list of list, optional): Axes (x,y,z) for each motor. Defaults to 
+            motor_axis (list of list, optional): Axes (x,y,z) for each motor. Defaults to
                 [[0.0,-1.0,0.0],[0.0,-1.0,0.0],[-1.0,0.0,0.0],[0.0,0.0,-1.0],[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]].
             motor_value (list of float, optional): Initial motor positions. Defaults to [0.0,0.0,0.0,0.0,0.0,0.0,0.0].
             motor_resolution (list of float, optional): Resolution for each motor. Defaults to [0.0,0.0,0.0,0.0,0.0,0.0,0.0].
+            convention (str, optional): Named stage convention. Defaults to None,
+                which uses the motor lists exactly as passed (the shipped default
+                goniometer). If 'busing-levy', the motor lists above are overridden
+                with the Busing & Levy four-circle convention (Busing, W. R. &
+                Levy, H. A. (1967). Acta Cryst. 22, 457-464):
+                motors ['omega','chi','phi','x','y','z'] with omega, chi and phi
+                rotating about the lab z, x and z axes respectively, composed so
+                that the sample-to-lab rotation (column-vector convention,
+                i.e. `get_rotation().T`) is
+                R = R_omega(about z) @ R_chi(about x) @ R_phi(about z),
+                with phi INNERMOST (applied first to the sample). Because
+                `get_rotation()` is composed for the row-vector convention
+                (pos_lab = pos_sample @ R), this is realised with uncoupled
+                rotation motors about the negated axes
+                [0,0,-1], [-1,0,0], [0,0,-1]. Translations x, y, z behave as in
+                the default stage (coupled to all rotation motors). Note the
+                detector arm supplies the fourth circle (2theta) separately;
+                it is not a stage motor.
 
         Returns:
             None
         """
+        if convention is not None:
+            if str(convention).lower().replace('_', '-') == 'busing-levy':
+                if name == ['goniometer']:
+                    name = ['busing-levy']
+                motor_name = ['omega', 'chi', 'phi', 'x', 'y', 'z']
+                motor_type = ['R', 'R', 'R', 'T', 'T', 'T']
+                motor_coupling = [[None], [None], [None], [0, 1, 2], [0, 1, 2], [0, 1, 2]]
+                motor_axis = [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0],
+                              [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+                motor_value = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                motor_resolution = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            else:
+                raise ValueError(f"Unknown stage convention: {convention!r}. Supported: 'busing-levy' or None.")
         self._name = name
         self._motor_name = np.array(motor_name)
         self._motor_type = np.array(motor_type)
