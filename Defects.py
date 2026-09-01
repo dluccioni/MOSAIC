@@ -678,7 +678,7 @@ class defects(logging):
                 raise ValueError("Unknown burgers_family '{}' and burgers_magnitude is None".format(burgers_family))
         bmag = float(burgers_magnitude)
 
-        # Crystal-space -> real-space mapping
+        # Crystal-space -> real-space mapping (rows are the unit vectors a, b, c)
         L = np.asarray(crystal.lattice_matrix_conventional, dtype=np.float64)
         Lens = np.asarray(crystal.lattice_lengths_conventional, dtype=np.float64).reshape(3,1)
         Bmap = (L / Lens)  # 3x3
@@ -756,7 +756,7 @@ class defects(logging):
                 if nrm == 0:
                     continue
                 b_dir_crys /= nrm
-                b_dir_real = (Bmap @ b_dir_crys.reshape(3,1)).reshape(3)
+                b_dir_real = (Bmap.T @ b_dir_crys.reshape(3,1)).reshape(3)
                 bn = np.linalg.norm(b_dir_real)
                 if bn == 0:
                     continue
@@ -2496,7 +2496,7 @@ class defects(logging):
             if d.size:
                 dmin = min(dmin, float(d.min()))
         if not np.isfinite(dmin):
-            dmin = float(np.linalg.norm(R[:, 0]))  # fallback
+            dmin = float(np.linalg.norm(R[0, :]))  # fallback
         return float(dmin)
 
     def _ensure_cuda_segU_phys_kernel(self, gp_ng=4, dtype="float32"):
@@ -4068,9 +4068,11 @@ class defects(logging):
                 use_gpu: If True and CuPy is available, prepare GPU arrays for
                     later processing. Defaults to True.
             """
-            # Calculates the position of stacking faults
-            self.rotated_fault_normal = (crystal.lattice_matrix_conventional/crystal.lattice_lengths_conventional[:,None])@self.fault_normal
-            self.rotated_burgers_vector = (crystal.lattice_matrix_conventional/crystal.lattice_lengths_conventional[:,None])@self.burgers_vector
+            # Calculates the position of stacking faults.  The conventional
+            # lattice matrix holds a, b, c as its rows, so the Cartesian vector
+            # of a crystal direction is the transpose acting on its indices.
+            self.rotated_fault_normal = (crystal.lattice_matrix_conventional/crystal.lattice_lengths_conventional[:,None]).T@self.fault_normal
+            self.rotated_burgers_vector = (crystal.lattice_matrix_conventional/crystal.lattice_lengths_conventional[:,None]).T@self.burgers_vector
             sample_center = sample.offset
             sample_center_proj = np.dot(sample_center,self.rotated_fault_normal)
             fault_offest_proj = np.dot(self.fault_offset,self.rotated_fault_normal)
