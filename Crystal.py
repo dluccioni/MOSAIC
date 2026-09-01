@@ -22,6 +22,7 @@ class crystal(logging):
         "write_crystal_metadata",
         "to_conventional",
         "to_primitive",
+        "get_cartesian_from_indices",
         "align_axes",
         "rotate_crystal",
         "get_dhkl",
@@ -108,6 +109,13 @@ class crystal(logging):
         with open(metadata_filename, "r") as f:
             data = json.load(f)
 
+        # Files written before the lattice matrices were made row-consistent
+        # carry no convention key, and a rotated crystal in one of them holds
+        # its lattice vectors as columns instead
+        if data.get("lattice_convention") != "rows":
+            print(f"{metadata_filename} predates the row lattice convention; "
+                  "a rotated crystal in it will be read transposed")
+
         self.filepath = data["filepath"]
         
         if data["lattice_matrix"] is not None:
@@ -161,6 +169,7 @@ class crystal(logging):
         metadata_filename = os.path.join(base_dir, "crystal_metadata.json")
 
         crystal_metadata = {
+            "lattice_convention":        "rows",
             "filepath":                  self.filepath,
             "lattice_matrix":            self._lattice_matrix.tolist() if self._lattice_matrix is not None else None,
             "lattice_corners":           self._lattice_corners.tolist() if self._lattice_corners is not None else None,
@@ -343,30 +352,72 @@ class crystal(logging):
         """
         self.structure = self.structure.to_primitive()
 
-    def align_axes(self, orientation_array, alignment_array=np.array([[0, 0, 1], [0, 1, 0]]).T):
+    def get_cartesian_from_indices(self, indices, index_type="plane"):
+        """
+        Convert Miller indices to Cartesian vectors in the current orientation.
+
+        A set of indices names two different vectors, which coincide only for
+        cubic and other orthogonal cells:
+        - as a plane (h, k, l), the vector is the plane normal, h*a* + k*b* +
+          l*c*, built from the reciprocal lattice;
+        - as a direction [u, v, w], the vector is u*a + v*b + w*c.
+        For alpha-quartz the two are 30 degrees apart for (100) and 23 degrees
+        for (111), so which one is meant has to be stated rather than assumed.
+
+        Args:
+            indices (array_like): Shape (3,) or (3, N) array of Miller indices,
+                as columns if two-dimensional.
+            index_type (str, optional): 'plane' (default) treats the indices as
+                (h, k, l) and returns plane normals; 'direction' treats them as
+                [u, v, w] and returns real-space directions.
+
+        Returns:
+            np.ndarray: Cartesian vectors in the same shape as ``indices``.
+
+        Raises:
+            ValueError: If index_type is neither 'plane' nor 'direction'.
+        """
+        indices = np.asarray(indices, dtype=np.float64)
+        if index_type == "plane":
+            # Columns of the inverse are the reciprocal vectors a*, b*, c*
+            return np.linalg.inv(self.lattice_matrix_conventional)@indices
+        elif index_type == "direction":
+            return self.lattice_matrix_conventional.T@indices
+        else:
+            raise ValueError(f"index_type must be 'plane' or 'direction', got '{index_type}'")
+
+    def align_axes(self, orientation_array, alignment_array=np.array([[0, 0, 1], [0, 1, 0]]).T, index_type="plane"):
         """
         Align crystal axes to specified laboratory directions.
 
-        Performs a two-step rotation: first aligns the primary crystal direction
+        Performs a two-step rotation: first aligns the primary crystal vector
         with the primary alignment direction, then rotates around that axis to
-        bring the secondary direction into the specified plane.
+        bring the secondary vector into the specified plane.
 
         Args:
             orientation_array (np.ndarray): Shape (3, 2) array of Miller indices.
-                Column 0 is the primary direction, column 1 is the secondary.
+                Column 0 is the primary, column 1 is the secondary. They are
+                converted to Cartesian vectors by `get_cartesian_from_indices`
+                according to index_type.
             alignment_array (np.ndarray, optional): Shape (3, 2) array of target
-                lab directions. Column 0 is the primary axis, column 1 defines
-                the plane. Defaults to [[0,0,1],[0,1,0]].T (z-axis primary, y-plane).
+                lab directions. Column 0 is the axis the primary is brought onto;
+                column 1 is the NORMAL of the plane the secondary is brought into.
+                Defaults to [[0,0,1],[0,1,0]].T, i.e. the primary onto +z and the
+                secondary into the plane normal to +y.
+            index_type (str, optional): 'plane' (default) reads the indices as
+                (h, k, l) plane normals, which is what a reflection means;
+                'direction' reads them as [u, v, w] real-space directions. The
+                two are identical for cubic cells and differ otherwise.
         """
         # Normalize alignment array
         alignment_array = alignment_array / np.linalg.norm(alignment_array, axis=0, keepdims=True)
         #Align first orientation_array axis with first alignment_array axis
-        orientation_array_1 = self.lattice_matrix_conventional@orientation_array
+        orientation_array_1 = self.get_cartesian_from_indices(orientation_array, index_type)
         orientation_array_1 = orientation_array_1/np.linalg.norm(orientation_array_1, axis=0, keepdims=True)
         rotation_matrix_1 = self.get_rotation_matrix_vector_to_vector(orientation_array_1[:,0],alignment_array[:,0])
         self.rotate_crystal(rotation_matrix_1)
         #Align second axis with desired plane
-        orientation_array_2 = self.lattice_matrix_conventional@orientation_array
+        orientation_array_2 = self.get_cartesian_from_indices(orientation_array, index_type)
         orientation_array_2 = orientation_array_2/np.linalg.norm(orientation_array_2, axis=0, keepdims=True)
         rotation_matrix_2 = self.get_rotation_matrix_vector_to_plane(alignment_array[:,0],orientation_array_2[:,1],alignment_array[:,1])
         self.rotate_crystal(rotation_matrix_2)
@@ -378,17 +429,24 @@ class crystal(logging):
         Applies the rotation to all lattice vectors, atom positions, and updates
         the cumulative rotation tracker. Small values below eps are zeroed.
 
+        The lattice matrices hold the Cartesian vectors a, b, c as their rows
+        (pymatgen's convention, as loaded by get_lattice_from_cif), so a rotation
+        that maps a column vector v to rotation_matrix@v acts on the matrix as
+        M -> M@rotation_matrix.T.
+
         Args:
-            rotation_matrix (np.ndarray): 3x3 rotation matrix to apply.
+            rotation_matrix (np.ndarray): 3x3 rotation matrix to apply. The
+                caller's array is not modified.
             eps (float, optional): Threshold below which matrix elements are
                 set to zero. Defaults to 1e-15.
         """
+        rotation_matrix = np.array(rotation_matrix, dtype=np.float64)
         rotation_matrix[np.abs(rotation_matrix)<eps] = 0
-        self._lattice_matrix = rotation_matrix@self.lattice_matrix
-        self._lattice_corners = self.get_unit_corners()@self.lattice_matrix.T
+        self._lattice_matrix = self.lattice_matrix@rotation_matrix.T
+        self._lattice_corners = self.get_unit_corners()@self.lattice_matrix
         self._lattice_center = self.lattice_matrix/2
-        self._lattice_atom_cartesian = self.lattice_atom_fractional@self.lattice_matrix.T
-        self._lattice_matrix_conventional = rotation_matrix@self.lattice_matrix_conventional
+        self._lattice_atom_cartesian = self.lattice_atom_fractional@self.lattice_matrix
+        self._lattice_matrix_conventional = self.lattice_matrix_conventional@rotation_matrix.T
         self._lattice_orientation = np.linalg.inv(self.lattice_matrix_conventional)/np.linalg.norm(np.linalg.inv(self.lattice_matrix_conventional), axis=0, keepdims=True)
         self._cumulative_rotation = rotation_matrix@self.cumulative_rotation
     
@@ -557,13 +615,15 @@ class crystal(logging):
     @property
     def lattice_orientation(self):
         """
-        Return the crystal axis directions in Cartesian coordinates.
+        Return the unit reciprocal-lattice vectors in Cartesian coordinates.
 
         The orientation is computed from the inverse of the conventional
-        lattice matrix, normalized column-wise.
+        lattice matrix, normalized column-wise, so its columns are the unit
+        normals of the (100), (010) and (001) planes. These coincide with the
+        crystal axis directions only for cubic and other orthogonal cells.
 
         Returns:
-            np.ndarray: 3x3 array of unit vectors for crystal axes.
+            np.ndarray: 3x3 array whose columns are unit plane normals.
         """
         if self._lattice_orientation is None:
             print("self._lattice_orientation has not been initialized yet")
