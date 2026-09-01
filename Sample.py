@@ -86,6 +86,9 @@ class sample(logging):
         self._grain_seeds = None
         self._grain_orientations = None
         self._grain_count = None
+        self._grain_cell_bounds = None
+        self._grain_candidates = None
+        self._grain_regions = None
 
         # Temperature/displacement configuration (disabled by default)
         self.enable_temp = False
@@ -564,15 +567,21 @@ class sample(logging):
             material: Crystal material object.
             flush_size (int): Number of atoms per file chunk.
         """
-        num_geom = self._chunk_positions.shape[0]
+        poly = (self._sample_type == "poly")
+        num_geom = self._grain_regions.shape[0] if poly else self._chunk_positions.shape[0]
         flush_size = int(flush_size)
 
         # Count atoms in each geometric chunk
         geom_counts = []
         for i in range(num_geom):
-            count = self._get_chunk_atom_count(
-                material, self._chunk_positions[i], self._chunk_dimensions
-            )
+            if poly:
+                count = self._get_region_atom_count(
+                    material, i, use_gpu=getattr(self, '_streaming_use_gpu', True)
+                )
+            else:
+                count = self._get_chunk_atom_count(
+                    material, self._chunk_positions[i], self._chunk_dimensions
+                )
             geom_counts.append(count)
 
         self._streaming_geom_atom_counts = np.array(geom_counts, dtype=np.int64)
@@ -623,46 +632,46 @@ class sample(logging):
 
     def _generate_geometric_chunk(self, geom_idx, use_gpu=True):
         """
-        Generate atoms for a single geometric chunk.
+        Generate atoms for a single geometric unit.
 
         Dispatches to single-crystal or polycrystal generation as appropriate.
+        For a single crystal the unit is a geometric chunk; for a polycrystal it
+        is a grain region, since each grain carries its own rotated lattice.
         Uses GPU acceleration when available for better performance.
 
         Args:
-            geom_idx (int): 0-based geometric chunk index.
+            geom_idx (int): 0-based chunk index, or region index for a polycrystal.
             use_gpu (bool): Whether to use GPU acceleration. Defaults to True.
 
         Returns:
-            tuple: (positions, species) NumPy arrays for this geometric chunk.
+            tuple: (positions, species) NumPy arrays for this unit.
         """
         material = self._streaming_material
-        chunk_pos = self._chunk_positions[geom_idx]
-        chunk_dims = self._chunk_dimensions
 
         if self._sample_type == "poly":
             return self._generate_poly_geometric_chunk(geom_idx, use_gpu=use_gpu)
         else:
             # Single crystal: pass use_gpu to get_atomic_data
             # Note: get_atomic_data returns numpy arrays when use_gpu=True but return_on_gpu=False (default)
-            return self.get_atomic_data(material, chunk_pos, chunk_dims, use_gpu=use_gpu)
+            return self.get_atomic_data(material, self._chunk_positions[geom_idx],
+                                        self._chunk_dimensions, use_gpu=use_gpu)
 
     def _generate_poly_geometric_chunk(self, geom_idx, use_gpu=True):
         """
-        Generate polycrystal atoms for a single geometric chunk.
+        Generate polycrystal atoms for a single generation region.
 
-        Applies Voronoi grain assignment and per-grain rotations.
+        For polycrystals the geometric unit is a grain region rather than a
+        shared chunk, because every grain carries its own rotated lattice.
         Uses GPU acceleration when available for better performance.
 
         Args:
-            geom_idx (int): 0-based geometric chunk index.
+            geom_idx (int): 0-based region index.
             use_gpu (bool): Whether to use GPU acceleration. Defaults to True.
 
         Returns:
-            tuple: (positions, species) NumPy arrays for this geometric chunk.
+            tuple: (positions, species) NumPy arrays for this region.
         """
         material = self._streaming_material
-        chunk_pos = self._chunk_positions[geom_idx]
-        chunk_dims = self._chunk_dimensions
 
         # Determine if GPU path is available
         gpu_available = (use_gpu and cp is not None)
@@ -678,7 +687,7 @@ class sample(logging):
         # Try GPU path first
         if gpu_available:
             try:
-                return self._generate_poly_geometric_chunk_gpu(material, chunk_pos, chunk_dims)
+                return self._generate_grain_region(material, geom_idx, use_gpu=True)
             except (cp.cuda.memory.OutOfMemoryError, cp.cuda.runtime.CUDARuntimeError) as e:
                 # GPU memory or runtime error -> fall through to CPU path
                 self._log("normal", f"[sample] GPU streaming chunk generation failed (OOM/runtime), falling back to CPU: {e}")
@@ -692,150 +701,7 @@ class sample(logging):
                 raise
 
         # CPU fallback path
-        return self._generate_poly_geometric_chunk_cpu(material, chunk_pos, chunk_dims)
-
-    def _generate_poly_geometric_chunk_gpu(self, material, chunk_pos, chunk_dims):
-        """
-        GPU-accelerated polycrystal chunk generation.
-
-        Internal helper for _generate_poly_geometric_chunk.
-
-        Args:
-            material: Material object with lattice data.
-            chunk_pos: Chunk position array.
-            chunk_dims: Chunk dimensions array.
-
-        Returns:
-            tuple: (positions, species) NumPy arrays.
-
-        Raises:
-            CuPy exceptions on GPU errors (caught by caller).
-        """
-        # Initialize GPU cache if needed
-        if self._streaming_gpu_seeds_cp is None:
-            if not self._init_streaming_gpu_cache():
-                raise RuntimeError("Failed to initialize GPU cache")
-
-        seeds_cp = self._streaming_gpu_seeds_cp
-        R_cp = self._streaming_gpu_rotations_cp
-
-        # Generate atoms on GPU
-        pos_cp, mask_cp, site_count = self.get_atomic_data(
-            material,
-            chunk_pos,
-            chunk_dims,
-            use_gpu=True,
-            return_on_gpu=True,
-            lattice_atom_cartesian_cp=self._streaming_gpu_lattice_cp,
-            offset_gpu=self._streaming_gpu_offset_cp,
-            dim_half_gpu=self._streaming_gpu_dim_half_cp
-        )
-
-        if pos_cp.size == 0:
-            return np.zeros((0, 3), dtype=np.float32), np.array([], dtype=object)
-
-        # GPU Voronoi assignment (memory-safe streaming)
-        grain_labels = self._voronoi_assign_gpu_streaming(pos_cp, seeds_cp)
-
-        # Species array (on CPU for memory efficiency, matching non-streaming path)
-        mask_np = mask_cp.get()
-        spc_sample = self._build_species(material.species, site_count, mask_np)
-
-        # Batched per-grain rotation using einsum
-        # R_per_atom[i] = R_cp[grain_labels[i]] for each atom i
-        R_per_atom = R_cp[grain_labels]  # (N, 3, 3)
-        pos_rotated = cp.einsum('nij,nj->ni', R_per_atom, pos_cp)
-
-        # Transfer results to CPU
-        pos_np = pos_rotated.get().astype(np.float32)
-
-        # Cleanup per-chunk GPU memory (keep invariant cache)
-        del pos_cp, mask_cp, grain_labels, R_per_atom, pos_rotated
-        try:
-            cp.get_default_memory_pool().free_all_blocks()
-        except Exception:
-            pass
-
-        return pos_np, spc_sample
-
-    def _generate_poly_geometric_chunk_cpu(self, material, chunk_pos, chunk_dims):
-        """
-        CPU fallback for polycrystal chunk generation.
-
-        Internal helper for _generate_poly_geometric_chunk.
-
-        Args:
-            material: Material object with lattice data.
-            chunk_pos: Chunk position array.
-            chunk_dims: Chunk dimensions array.
-
-        Returns:
-            tuple: (positions, species) NumPy arrays.
-        """
-        seeds_np = np.asarray(self._grain_seeds, dtype=np.float32)
-        R = np.asarray(self._grain_orientations, dtype=np.float32)
-        G = int(seeds_np.shape[0])
-
-        # Generate base atoms (CPU path)
-        pos_np, spc_np = self.get_atomic_data(material, chunk_pos, chunk_dims, use_gpu=False)
-
-        if pos_np.shape[0] == 0:
-            return np.zeros((0, 3), dtype=np.float32), np.array([], dtype=spc_np.dtype if spc_np.size > 0 else object)
-
-        # Voronoi assignment (CPU method)
-        grain_labels = self._voronoi_min_index_cpu(pos_np, seeds_np)
-
-        # Apply per-grain rotations
-        pos_parts = []
-        spc_parts = []
-        for g in range(G):
-            mask_g = (grain_labels == g)
-            if not np.any(mask_g):
-                continue
-            pos_g = (pos_np[mask_g, :] @ R[g].T).astype(np.float32)
-            pos_parts.append(pos_g)
-            spc_parts.append(spc_np[mask_g])
-
-        if pos_parts:
-            return np.concatenate(pos_parts, axis=0), np.concatenate(spc_parts, axis=0)
-        return np.zeros((0, 3), dtype=np.float32), np.array([], dtype=spc_np.dtype if spc_np.size > 0 else object)
-
-    def _init_streaming_gpu_cache(self):
-        """
-        Initialize GPU cache for streaming mode invariants.
-
-        Uploads seeds, rotation matrices, and get_atomic_data invariants
-        to GPU once for reuse across all chunk generations.
-
-        Returns:
-            bool: True if GPU cache initialized successfully, False otherwise.
-        """
-        if cp is None:
-            return False
-
-        try:
-            # Check GPU availability
-            if int(cp.cuda.runtime.getDeviceCount()) < 1:
-                return False
-
-            material = self._streaming_material
-            if material is None:
-                return False
-
-            # Upload invariants to GPU
-            if self._grain_seeds is not None:
-                self._streaming_gpu_seeds_cp = cp.asarray(self._grain_seeds, dtype=cp.float32)
-            if self._grain_orientations is not None:
-                self._streaming_gpu_rotations_cp = cp.asarray(self._grain_orientations, dtype=cp.float32)
-            self._streaming_gpu_lattice_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
-            self._streaming_gpu_offset_cp = cp.asarray(self.offset, dtype=cp.float32)
-            self._streaming_gpu_dim_half_cp = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
-
-            return True
-
-        except Exception:
-            self._clear_streaming_gpu_cache()
-            return False
+        return self._generate_grain_region(material, geom_idx, use_gpu=False)
 
     def _clear_streaming_gpu_cache(self):
         """
@@ -2618,7 +2484,7 @@ class sample(logging):
 
         with stream:
             # Crystal -> sample transforms
-            lattice_matrix_cp = cp.asarray(material.lattice_matrix.T, dtype=cp.float32)
+            lattice_matrix_cp = cp.asarray(material.lattice_matrix, dtype=cp.float32)
             chunk_position_cp = cp.asarray(chunk_position, dtype=cp.float32)
 
             # Lattice points of this chunk in sample frame
@@ -2664,7 +2530,7 @@ class sample(logging):
 
         Args:
             material: An object with fields:
-                - lattice_matrix: 3x3 matrix (crystal-to-sample). Transposed inside.
+                - lattice_matrix: 3x3 matrix with row vectors a, b, c.
                 - lattice_volume: Scalar volume of one lattice unit cell.
 
         Returns:
@@ -2678,7 +2544,7 @@ class sample(logging):
             Uses an AABB prefilter for speed and then a robust SAT test through
             :meth:`parallelepipeds_intersect_cffi`.
         """
-        lattice_matrix = material.lattice_matrix.T
+        lattice_matrix = material.lattice_matrix
         lattice_volume = material.lattice_volume
 
         inv_lattice_matrix = np.linalg.inv(lattice_matrix)
@@ -2900,7 +2766,7 @@ class sample(logging):
         Compute lattice point positions in the sample frame for one chunk.
 
         Args:
-            material: Object with ``lattice_matrix`` (3x3). Transposed internally.
+            material: Object with ``lattice_matrix`` (3x3), row vectors a, b, c.
             chunk_position (array-like): Length-3 origin for this chunk in the
                 sample frame.
             chunk_dimensions (array-like): Integer-like extents (cells) per axis.
@@ -2911,7 +2777,7 @@ class sample(logging):
             np.ndarray or cp.ndarray: Array of shape (d0*d1*d2, 3), dtype float32,
             with lattice points transformed into the sample frame.
         """
-        lattice_matrix = material.lattice_matrix.T
+        lattice_matrix = material.lattice_matrix
 
         if use_gpu and (cp is not None):
             # GPU path
@@ -3486,8 +3352,9 @@ class sample(logging):
         Set user-provided grain orientation map.
 
         Args:
-            orientation_matrices (array-like): shape (G, 3, 3). Each 3x3 is a
-                rotation/transform matrix applied to the crystal lattice of each grain.
+            orientation_matrices (array-like): shape (G, 3, 3). Each 3x3 is an
+                active crystal-to-sample rotation applied to the lattice of that
+                grain, while its Voronoi cell stays fixed in the sample frame.
 
         Returns:
             np.ndarray: stored orientation matrices (G, 3, 3), float32
@@ -3704,8 +3571,8 @@ class sample(logging):
         """
         # R is 3x3 in sample frame
         mat = type("MatLike", (), {})()
-        # rotate lattice vectors (columns) -> R @ lattice_matrix
-        mat.lattice_matrix = (R @ np.asarray(material.lattice_matrix, dtype=np.float32)).astype(np.float32)
+        # rotate lattice vectors (rows) -> lattice_matrix @ R.T
+        mat.lattice_matrix = (np.asarray(material.lattice_matrix, dtype=np.float32) @ R.T).astype(np.float32)
         # rotate unit cell atom offsets
         mat.lattice_atom_cartesian = (np.asarray(material.lattice_atom_cartesian, dtype=np.float32) @ R.T).astype(np.float32)
         # copy-through scalars/arrays
@@ -3898,6 +3765,362 @@ class sample(logging):
 
         return result_idx
 
+    def _gpu_is_available(self):
+        """
+        Report whether a CUDA device is present and usable.
+
+        Returns:
+            bool: True if CuPy is importable and at least one device is visible.
+        """
+        if cp is None:
+            return False
+        try:
+            return int(cp.cuda.runtime.getDeviceCount()) > 0
+        except Exception as e:
+            self._log("debug", f"[sample] GPU detection failed: {type(e).__name__}: {e}")
+            return False
+
+    def _voronoi_assign(self, positions, seeds, use_gpu=True):
+        """
+        Nearest-seed index for each position, on whichever backend fits.
+
+        Args:
+            positions: (N, 3) array of positions, NumPy or CuPy.
+            seeds: (G, 3) array of seed positions on the same backend.
+            use_gpu (bool, optional): Allow the CuPy path. Defaults to True.
+
+        Returns:
+            np.ndarray or cp.ndarray: Array of shape (N,), dtype int32, holding
+            the grain index of each position, on the same backend as the input.
+        """
+        if use_gpu and (cp is not None) and isinstance(positions, cp.ndarray):
+            return self._voronoi_assign_gpu_streaming(positions, seeds)
+        return self._voronoi_min_index_cpu(positions, seeds)
+
+    def _compute_grain_cell_bounds(self, n_probe=None, use_gpu=True):
+        """
+        Bounding box of every Voronoi cell, measured on a coarse probe grid.
+
+        Each grain is built by enumerating its own rotated lattice, so it needs
+        to know where its cell is. Enumerating over the whole sample for every
+        grain would cost one pass per grain; probing the tessellation once gives
+        each cell its own extent and the enumeration only has to cover that.
+
+        The probe is deliberately padded by one and a half of its own spacing,
+        so a cell whose extremes fall between probe points is still enclosed.
+
+        Args:
+            use_gpu (bool, optional): Use the CuPy path if available. Defaults to True.
+            n_probe (int | None, optional): Probe points per axis. None (default)
+                scales it as (100 * grain_count)^(1/3), a hundred probes per
+                cell, with a floor of 72.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: (lo, hi), each (G, 3) float64, clipped
+            to the sample box.
+        """
+        seeds_np = np.asarray(self._grain_seeds, dtype=np.float32)
+        G = int(seeds_np.shape[0])
+
+        if n_probe is None:
+            n_probe = max(72, int(np.ceil((100.0 * G) ** (1.0 / 3.0))))
+        n_probe = int(n_probe)
+
+        dims = np.asarray(self.dimensions, dtype=np.float64)
+        box_min = np.asarray(self.offset, dtype=np.float64) - 0.5 * dims
+
+        axes = [np.linspace(box_min[a], box_min[a] + dims[a], n_probe) for a in range(3)]
+        probe = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+        probe = probe.astype(np.float32)
+
+        labels = None
+        if use_gpu and self._gpu_is_available():
+            try:
+                labels = self._voronoi_assign_gpu_streaming(
+                    cp.asarray(probe), cp.asarray(seeds_np)
+                ).get()
+            except Exception as e:
+                self._log("debug", f"[sample] GPU cell probe failed, using CPU: {type(e).__name__}: {e}")
+        if labels is None:
+            labels = self._voronoi_min_index_cpu(probe, seeds_np)
+
+        pad = 1.5 * dims / float(n_probe)
+        lo = np.empty((G, 3), dtype=np.float64)
+        hi = np.empty((G, 3), dtype=np.float64)
+        n_missed = 0
+        for g in range(G):
+            pts = probe[labels == g]
+            if pts.shape[0] == 0:
+                # Cell smaller than the probe spacing; fall back to the seed
+                n_missed += 1
+                lo[g] = seeds_np[g] - pad
+                hi[g] = seeds_np[g] + pad
+            else:
+                lo[g] = pts.min(axis=0) - pad
+                hi[g] = pts.max(axis=0) + pad
+
+        if n_missed > 0:
+            self._log("normal", f"[sample] {n_missed} of {G} Voronoi cells were smaller than the "
+                                f"{n_probe}-point probe; their bounds fall back to the seed")
+
+        lo = np.maximum(lo, box_min)
+        hi = np.minimum(hi, box_min + dims)
+        return lo, hi
+
+    @staticmethod
+    def _grain_candidate_seeds(seeds_np, lo, hi):
+        """
+        For each cell, the only seeds that can claim a point inside its own box.
+
+        A point p in cell g's bounding box lies at most R_g from seed g, so a
+        seed s can only beat s_g at p if |s - s_g| <= |s - p| + |p - s_g| < 2 R_g.
+        The bound is exact, so nothing is approximated, but testing that handful
+        instead of every seed is what makes thousands of grains affordable.
+
+        Args:
+            seeds_np (np.ndarray): (G, 3) seed positions.
+            lo (np.ndarray): (G, 3) lower cell bounds.
+            hi (np.ndarray): (G, 3) upper cell bounds.
+
+        Returns:
+            list[np.ndarray]: Per grain, a sorted array of candidate seed indices.
+        """
+        seeds_np = np.asarray(seeds_np, dtype=np.float64)
+        corners = sample.get_unit_corners().astype(np.float64)
+        out = []
+        for g in range(seeds_np.shape[0]):
+            box_corners = lo[g] + corners * (hi[g] - lo[g])
+            radius = float(np.linalg.norm(box_corners - seeds_np[g], axis=1).max())
+            d = np.linalg.norm(seeds_np - seeds_np[g], axis=1)
+            out.append(np.flatnonzero(d < 2.0 * radius + 1.0e-9))
+        return out
+
+    def _build_grain_regions(self, use_gpu=True):
+        """
+        Split every Voronoi cell into generation regions of bounded volume.
+
+        A region is one axis-aligned block of one grain's bounding box, no larger
+        than `chunk_volume`; a general rotation makes the enumeration cover a
+        somewhat larger index range than that, bounded by a factor of the order
+        of sqrt(3) per axis. The region replaces the geometric chunk as the unit
+        of work for polycrystals, because each grain carries its own rotated
+        lattice and so cannot share one tiling with its neighbors.
+
+        Blocks tile the bounding box exactly and are half-open in their upper
+        bound, so a site landing on a shared face is emitted by one block only.
+
+        Args:
+            use_gpu (bool, optional): Use the CuPy path for the cell probe if
+                available. Defaults to True.
+
+        Returns:
+            np.ndarray: (M, 7) float64 array; column 0 is the grain index and
+            columns 1:4 and 4:7 are the region bounds.
+        """
+        lo, hi = self._compute_grain_cell_bounds(use_gpu=use_gpu)
+        self._grain_cell_bounds = (lo, hi)
+        self._grain_candidates = self._grain_candidate_seeds(self._grain_seeds, lo, hi)
+
+        # Region edge from the chunk budget, in the same units as the box
+        edge = float(self.chunk_volume) ** (1.0 / 3.0)
+
+        regions = []
+        for g in range(lo.shape[0]):
+            extent = hi[g] - lo[g]
+            if np.any(extent <= 0.0):
+                continue
+            n_blocks = np.maximum(1, np.ceil(extent / edge).astype(np.int64))
+            step = extent / n_blocks
+            for i in range(int(n_blocks[0])):
+                for j in range(int(n_blocks[1])):
+                    for k in range(int(n_blocks[2])):
+                        start = lo[g] + step * np.array([i, j, k], dtype=np.float64)
+                        regions.append(np.concatenate(
+                            ([float(g)], start, np.minimum(start + step, hi[g]))
+                        ))
+
+        self._grain_regions = np.asarray(regions, dtype=np.float64).reshape(-1, 7)
+        self._log("normal", f"[sample] Polycrystal: {lo.shape[0]} grains mapped to "
+                            f"{self._grain_regions.shape[0]} generation regions")
+        return self._grain_regions
+
+    def _rotated_lattice_in_box(self, material, R, lo, hi, use_gpu=True):
+        """
+        Sites of the R-rotated lattice that fall inside an axis-aligned box.
+
+        The lattice vectors are the rows of `lattice_matrix`, so a lattice point
+        with cell indices n sits at (n @ lattice_matrix) @ R.T once the grain is
+        rotated. Working back through R gives the range of cell indices that can
+        reach the box; a general rotation inflates that range beyond the box
+        itself, which is why the caller keeps the boxes bounded.
+
+        Args:
+            material: Material object with `lattice_matrix` (rows a, b, c) and
+                `lattice_atom_cartesian`.
+            R (np.ndarray): 3x3 crystal-to-sample rotation for this grain.
+            lo (array-like): Length-3 lower corner of the box.
+            hi (array-like): Length-3 upper corner of the box.
+            use_gpu (bool, optional): Use the CuPy path if available. Defaults to True.
+
+        Returns:
+            tuple: (positions, mask, site_count) where positions holds every
+            enumerated site, mask selects those inside the box, and site_count is
+            the number of unit cells enumerated.
+        """
+        xp = cp if (use_gpu and (cp is not None)) else np
+
+        R = np.asarray(R, dtype=np.float64)
+        lo = np.asarray(lo, dtype=np.float64)
+        hi = np.asarray(hi, dtype=np.float64)
+
+        # Rotate the unit cell once, so the enumeration below runs in the frame
+        # the atoms are wanted in and the lattice vectors stay its rows
+        lattice = np.asarray(material.lattice_matrix, dtype=np.float64) @ R.T
+        basis = np.asarray(material.lattice_atom_cartesian, dtype=np.float64) @ R.T
+
+        # Cell-index range that can reach the box
+        corners = lo + self.get_unit_corners().astype(np.float64) * (hi - lo)
+        frac = corners @ np.linalg.inv(lattice)
+        n_lo = np.floor(frac.min(axis=0)).astype(np.int64) - 1
+        n_hi = np.ceil(frac.max(axis=0)).astype(np.int64) + 1
+
+        grid = self.get_flat_grid(n_hi - n_lo + 1, use_gpu=(xp is cp))
+        grid = grid + xp.asarray(n_lo, dtype=xp.float32)
+
+        # n0*a + n1*b + n2*c, written out rather than as an (N, 3) @ (3, 3)
+        # product: that product enters BLAS, which several threads cannot always
+        # safely enter at once, and one thread per region is how this is called
+        lattice_x = xp.asarray(lattice, dtype=xp.float32)
+        cells = (grid[:, 0:1] * lattice_x[0]
+                 + grid[:, 1:2] * lattice_x[1]
+                 + grid[:, 2:3] * lattice_x[2])
+
+        basis_x = xp.asarray(basis, dtype=xp.float32)
+        positions = (cells[:, None, :] + basis_x[None, :, :]).reshape(-1, 3)
+
+        # Half-open in the upper bound: neighboring blocks of the same cell
+        # share a face, and a site landing exactly on one must be emitted once
+        lo_x = xp.asarray(lo, dtype=xp.float32)
+        hi_x = xp.asarray(hi, dtype=xp.float32)
+        mask = xp.all((positions >= lo_x) & (positions < hi_x), axis=1)
+
+        return positions, mask, int(cells.shape[0])
+
+    def _generate_grain_region(self, material, region_idx, use_gpu=True):
+        """
+        Generate the atoms of one grain that fall inside one generation region.
+
+        The Voronoi cell stays fixed in the sample frame and the grain's own
+        rotated lattice is enumerated inside it, so the grains tile the box
+        exactly: every site is claimed by the cell it actually falls in, and a
+        grain neither leaves its cell nor overlaps its neighbors.
+
+        Args:
+            material: Material object with lattice data.
+            region_idx (int): 0-based index into `_grain_regions`.
+            use_gpu (bool, optional): Use the CuPy path if available. Defaults to True.
+
+        Returns:
+            tuple: (positions, species) NumPy arrays for this region.
+        """
+        region = self._grain_regions[region_idx]
+        g = int(region[0])
+        lo = region[1:4]
+        hi = region[4:7]
+
+        gpu_available = (use_gpu and self._gpu_is_available())
+        xp = cp if gpu_available else np
+        R = np.asarray(self._grain_orientations[g], dtype=np.float64)
+
+        positions, mask, site_count = self._rotated_lattice_in_box(
+            material, R, lo, hi, use_gpu=gpu_available
+        )
+
+        # Ellipsoid samples discard everything outside the inscribed ellipsoid
+        if getattr(self, '_sample_shape', 'box') == 'ellipsoid':
+            semi = xp.asarray(np.asarray(self.dimensions, dtype=np.float64) * 0.5,
+                              dtype=xp.float32)
+            center = xp.asarray(np.asarray(self.offset, dtype=np.float64), dtype=xp.float32)
+            norm_sq = (((positions[:, 0] - center[0]) / semi[0]) ** 2 +
+                       ((positions[:, 1] - center[1]) / semi[1]) ** 2 +
+                       ((positions[:, 2] - center[2]) / semi[2]) ** 2)
+            mask = mask & (norm_sq <= 1.0)
+
+        # Keep only the sites this grain's own cell claims
+        candidates = self._grain_candidates[g]
+        own = int(np.searchsorted(candidates, g))
+        seeds_sub = xp.asarray(np.asarray(self._grain_seeds, dtype=np.float32)[candidates])
+
+        inside = positions[mask, :]
+        if inside.shape[0] > 0:
+            labels = self._voronoi_assign(inside, seeds_sub, use_gpu=gpu_available)
+            keep = (labels == own)
+            selected = xp.flatnonzero(mask)[keep]
+            mask = xp.zeros_like(mask)
+            mask[selected] = True
+            inside = inside[keep, :]
+
+        mask_np = mask.get() if gpu_available else mask
+        species = self._build_species(material.species, site_count, mask_np)
+        positions_np = inside.get() if gpu_available else inside
+
+        if gpu_available:
+            del positions, mask, inside, seeds_sub
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+
+        return np.asarray(positions_np, dtype=np.float32), species
+
+    def _get_region_atom_count(self, material, region_idx, use_gpu=True):
+        """
+        Count atoms in a generation region without storing positions.
+
+        Uses the same logic as _generate_grain_region but only returns the
+        count, so the streaming mapping pass does not build species arrays (and
+        so does not draw from the alloy RNG, which would leave the counting pass
+        and the serving pass disagreeing).
+
+        Args:
+            material: Material object with lattice data.
+            region_idx (int): 0-based index into `_grain_regions`.
+            use_gpu (bool, optional): Use the CuPy path if available. Defaults to True.
+
+        Returns:
+            int: Number of atoms in this region.
+        """
+        region = self._grain_regions[region_idx]
+        g = int(region[0])
+
+        gpu_available = (use_gpu and self._gpu_is_available())
+        xp = cp if gpu_available else np
+        R = np.asarray(self._grain_orientations[g], dtype=np.float64)
+
+        positions, mask, _ = self._rotated_lattice_in_box(
+            material, R, region[1:4], region[4:7], use_gpu=gpu_available
+        )
+
+        if getattr(self, '_sample_shape', 'box') == 'ellipsoid':
+            semi = xp.asarray(np.asarray(self.dimensions, dtype=np.float64) * 0.5,
+                              dtype=xp.float32)
+            center = xp.asarray(np.asarray(self.offset, dtype=np.float64), dtype=xp.float32)
+            norm_sq = (((positions[:, 0] - center[0]) / semi[0]) ** 2 +
+                       ((positions[:, 1] - center[1]) / semi[1]) ** 2 +
+                       ((positions[:, 2] - center[2]) / semi[2]) ** 2)
+            mask = mask & (norm_sq <= 1.0)
+
+        candidates = self._grain_candidates[g]
+        own = int(np.searchsorted(candidates, g))
+        seeds_sub = xp.asarray(np.asarray(self._grain_seeds, dtype=np.float32)[candidates])
+
+        inside = positions[mask, :]
+        if inside.shape[0] == 0:
+            return 0
+
+        labels = self._voronoi_assign(inside, seeds_sub, use_gpu=gpu_available)
+        return int((labels == own).sum())
+
     def generate_sample_poly(
         self,
         material,
@@ -3924,8 +4147,12 @@ class sample(logging):
         Each grain gets:
         - a Voronoi cell (from seeds provided or generated),
         - an orientation (random or textured),
-        - its own lattice generation over the sample,
+        - its own rotated lattice, enumerated inside that cell's bounding box,
         - masking to the Voronoi region.
+
+        The cell stays fixed in the sample frame while the lattice rotates
+        inside it, so the grains tile the box exactly rather than carrying their
+        cell walls around with them.
 
         Supports multi-GPU acceleration when n_gpus > 1.
 
@@ -3978,7 +4205,6 @@ class sample(logging):
             G = int(self._grain_seeds.shape[0])
             if n_grains is not None and int(n_grains) != G:
                 raise ValueError("n_grains does not match existing seed map")
-        seeds_np = np.asarray(self._grain_seeds, dtype=np.float32)
 
         # Orientations
         if self._grain_orientations is None:
@@ -3996,9 +4222,12 @@ class sample(logging):
             if R.shape[0] != G:
                 raise ValueError("orientation map size does not match number of seeds")
 
-        # Compute chunk geometry (needed for both streaming and disk modes)
+        # Chunk geometry is not what a polycrystal generates over, but it is
+        # what the chunk_positions/chunk_dimensions properties report, so it is
+        # still computed; the generation unit is the grain region below
         self._chunk_positions, self._chunk_dimensions = self.get_chunk_positions(material)
-        num_geom = int(self.chunk_positions.shape[0])
+        self._build_grain_regions(use_gpu=use_gpu)
+        num_regions = int(self._grain_regions.shape[0])
 
         # STREAMING MODE: store material reference, compute mapping, and exit without writing files
         if self._streaming_mode:
@@ -4084,81 +4313,35 @@ class sample(logging):
         else:
             use_n_gpus = min(int(n_gpus), available_gpus) if available_gpus > 0 else 0
 
-        # Single-pass generation: generate atoms once per chunk, compute Voronoi once,
-        # Get geometric chunks using the base (unrotated) material
-        chunk_positions, chunk_dims = self.get_chunk_positions(material)
-        num_geom_chunks = int(chunk_positions.shape[0])
+        # Per-region generation: each region carries one grain's own rotated
+        # lattice, cut to the Voronoi cell it actually falls in
 
-        # Multi-GPU path: distribute chunks across multiple GPUs
+        # Multi-GPU path: distribute regions across multiple GPUs
         if gpu_ok and use_n_gpus > 1:
             try:
-                # Round-robin distribute chunks to GPUs
+                # Round-robin distribute regions to GPUs
                 shards = [[] for _ in range(use_n_gpus)]
-                for i in range(num_geom_chunks):
+                for i in range(num_regions):
                     shards[i % use_n_gpus].append(i)
 
                 # Shared state for multi-GPU accumulation
                 gpu_errors = [None] * use_n_gpus
 
-                def gpu_worker_poly(dev_id, my_chunks):
-                    """Process assigned chunks on a specific GPU."""
+                def gpu_worker_poly(dev_id, my_regions):
+                    """Process assigned regions on a specific GPU."""
                     try:
                         cp.cuda.Device(dev_id).use()
 
-                        # Pre-allocate invariants on this GPU
-                        seeds_cp = cp.asarray(seeds_np, dtype=cp.float32)
-                        R_cp = cp.asarray(R, dtype=cp.float32)
-                        lattice_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
-                        offset_cp = cp.asarray(self.offset, dtype=cp.float32)
-                        dim_half_cp = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
-
-                        for chunk_idx in my_chunks:
-                            pos_cp, mask_cp, site_count = self.get_atomic_data(
-                                material,
-                                chunk_positions[chunk_idx, :],
-                                chunk_dims,
-                                use_gpu=True,
-                                return_on_gpu=True,
-                                lattice_atom_cartesian_cp=lattice_cp,
-                                offset_gpu=offset_cp,
-                                dim_half_gpu=dim_half_cp
+                        for region_idx in my_regions:
+                            pos_np, spc_np = self._generate_grain_region(
+                                material, region_idx, use_gpu=True
                             )
-
-                            if pos_cp.size == 0:
+                            if pos_np.shape[0] == 0:
                                 continue
 
-                            # Voronoi assignment (streaming for memory safety)
-                            grain_labels = self._voronoi_assign_gpu_streaming(pos_cp, seeds_cp)
+                            # Thread-safe accumulation (lock is inside _accumulate_to_buffers)
+                            _accumulate_to_buffers(pos_np, spc_np)
 
-                            # Species array on CPU
-                            mask_np = mask_cp.get()
-                            spc_sample = self._build_species(material.species, site_count, mask_np)
-
-                            # Partition by grain and apply rotations
-                            for g in range(G):
-                                mask_g = (grain_labels == g)
-                                if not bool(cp.any(mask_g)):
-                                    continue
-
-                                pos_g_unrotated = pos_cp[mask_g, :]
-                                pos_g_rotated = pos_g_unrotated @ R_cp[g].T
-                                pos_np = pos_g_rotated.get().astype(np.float32)
-
-                                mask_g_np = mask_g.get()
-                                spc_g = spc_sample[mask_g_np]
-
-                                # Thread-safe accumulation (lock is inside _accumulate_to_buffers)
-                                _accumulate_to_buffers(pos_np, spc_g)
-
-                            # Cleanup after each chunk
-                            del pos_cp, mask_cp, grain_labels
-                            try:
-                                cp.get_default_memory_pool().free_all_blocks()
-                            except Exception:
-                                pass
-
-                        # Cleanup this GPU's invariants
-                        del seeds_cp, R_cp, lattice_cp, offset_cp, dim_half_cp
                         try:
                             cp.get_default_memory_pool().free_all_blocks()
                         except Exception:
@@ -4196,68 +4379,18 @@ class sample(logging):
                     pass
                 gpu_ok = False
 
-        # Single-GPU path (original implementation)
+        # Single-GPU path
         elif gpu_ok:
-            # GPU path: single-pass with memory-bounded Voronoi
             try:
-                # Pre-allocate invariants on GPU
-                seeds_cp = cp.asarray(seeds_np, dtype=cp.float32)
-                R_cp = cp.asarray(R, dtype=cp.float32)  # (G, 3, 3) rotation matrices
-                lattice_atom_cartesian_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
-                offset_gpu = cp.asarray(self.offset, dtype=cp.float32)
-                dim_half_gpu = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
-
-                for chunk_idx in range(num_geom_chunks):
-                    # Generate atoms ONCE per chunk using unrotated material
-                    pos_cp, mask_cp, site_count = self.get_atomic_data(
-                        material,
-                        chunk_positions[chunk_idx, :],
-                        chunk_dims,
-                        use_gpu=True,
-                        return_on_gpu=True,
-                        lattice_atom_cartesian_cp=lattice_atom_cartesian_cp,
-                        offset_gpu=offset_gpu,
-                        dim_half_gpu=dim_half_gpu
+                for region_idx in range(num_regions):
+                    pos_np, spc_np = self._generate_grain_region(
+                        material, region_idx, use_gpu=True
                     )
-
-                    if pos_cp.size == 0:
+                    if pos_np.shape[0] == 0:
                         continue
 
-                    # Compute Voronoi membership ONCE for all atoms in this chunk
-                    # This is O(N_chunk * G) instead of O(G * N_chunk * G)
-                    # Uses streaming to guarantee memory stays bounded for any G or N
-                    grain_labels = self._voronoi_assign_gpu_streaming(pos_cp, seeds_cp)
+                    _accumulate_to_buffers(pos_np, spc_np)
 
-                    # Species array for this chunk (on CPU for memory efficiency)
-                    mask_np = mask_cp.get()
-                    spc_sample = self._build_species(material.species, site_count, mask_np)
-
-                    # Partition atoms by grain and apply rotations
-                    for g in range(G):
-                        mask_g = (grain_labels == g)
-                        if not bool(cp.any(mask_g)):
-                            continue
-
-                        # Extract grain atoms and apply rotation ON GPU
-                        pos_g_unrotated = pos_cp[mask_g, :]  # (N_g, 3)
-                        pos_g_rotated = pos_g_unrotated @ R_cp[g].T  # Apply grain rotation
-                        pos_np = pos_g_rotated.get().astype(np.float32)
-
-                        # Extract species for this grain
-                        mask_g_np = mask_g.get()
-                        spc_g = spc_sample[mask_g_np]
-
-                        _accumulate_to_buffers(pos_np, spc_g)
-
-                    # Memory cleanup after each chunk
-                    del pos_cp, mask_cp, grain_labels
-                    try:
-                        cp.get_default_memory_pool().free_all_blocks()
-                    except Exception:
-                        pass
-
-                # Final cleanup of GPU invariants
-                del seeds_cp, R_cp, lattice_atom_cartesian_cp, offset_gpu, dim_half_gpu
                 try:
                     cp.get_default_memory_pool().free_all_blocks()
                 except Exception:
@@ -4272,49 +4405,30 @@ class sample(logging):
                 gpu_ok = False  # Fall through to CPU path
 
         if not gpu_ok:
-            # CPU path: single-pass with chunk-level parallelism
-            def _process_chunk_cpu(chunk_idx):
-                # Generate atoms ONCE per chunk using unrotated material
-                pos_np, spc_np = self.get_atomic_data(
-                    material,
-                    chunk_positions[chunk_idx, :],
-                    chunk_dims,
-                    use_gpu=False
+            # CPU path: region-level parallelism
+            def _process_region_cpu(region_idx):
+                pos_np, spc_np = self._generate_grain_region(
+                    material, region_idx, use_gpu=False
                 )
-
                 if pos_np.shape[0] == 0:
                     return
 
-                # Compute Voronoi membership ONCE for all atoms in this chunk
-                grain_labels = self._voronoi_min_index_cpu(pos_np, seeds_np)
+                _accumulate_to_buffers(pos_np, spc_np)
 
-                # Partition atoms by grain and apply rotations
-                for g in range(G):
-                    mask_g = (grain_labels == g)
-                    if not np.any(mask_g):
-                        continue
-
-                    # Extract grain atoms and apply rotation
-                    pos_g_unrotated = pos_np[mask_g, :]
-                    pos_g_rotated = (pos_g_unrotated @ R[g].T).astype(np.float32)
-                    spc_g = spc_np[mask_g]
-
-                    _accumulate_to_buffers(pos_g_rotated, spc_g)
-
-            # Process chunks (can be parallelized with threads if needed)
+            # Process regions (can be parallelized with threads if needed)
             if grain_workers is None or int(grain_workers) <= 0:
                 try:
-                    grain_workers = min(num_geom_chunks, os.cpu_count() or 1)
+                    grain_workers = min(num_regions, os.cpu_count() or 1)
                 except Exception:
-                    grain_workers = min(num_geom_chunks, 4)
+                    grain_workers = min(num_regions, 4)
 
-            if num_geom_chunks > 1 and grain_workers > 1:
-                with ThreadPoolExecutor(max_workers=int(grain_workers), thread_name_prefix="chunk") as pool:
-                    futs = [pool.submit(_process_chunk_cpu, i) for i in range(num_geom_chunks)]
+            if num_regions > 1 and grain_workers > 1:
+                with ThreadPoolExecutor(max_workers=int(grain_workers), thread_name_prefix="grain") as pool:
+                    futs = [pool.submit(_process_region_cpu, i) for i in range(num_regions)]
                     wait(futs, return_when=ALL_COMPLETED)
             else:
-                for i in range(num_geom_chunks):
-                    _process_chunk_cpu(i)
+                for i in range(num_regions):
+                    _process_region_cpu(i)
 
         # Flush and finalize
         _flush_tail()
