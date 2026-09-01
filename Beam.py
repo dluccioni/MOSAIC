@@ -1843,15 +1843,14 @@ class beam(logging):
         k0 = k_mag * k_hat  # (3,)
 
         # Lattice vectors in sample frame -> lab frame.
-        # ``lattice_matrix_conventional`` is stored with COLUMNS as the
-        # cartesian lattice vectors (a, b, c) -- this matches Crystal's
-        # ``rotate_crystal`` which updates the matrix as ``R @ M`` (rotates
-        # each column by R).  ``stage.rotation`` is then applied as a
-        # left-multiply on each column too.
+        # ``lattice_matrix_conventional`` holds the cartesian lattice vectors
+        # (a, b, c) as its ROWS, so transposing it gives a matrix whose columns
+        # are those vectors and ``stage.rotation`` can then be applied as a
+        # left-multiply on each column.
         R_stage = np.asarray(stage.rotation, dtype=np.float64)
         lat_conv = np.asarray(crystal.lattice_matrix_conventional, dtype=np.float64)
         # Lattice vectors in lab frame, columns = (a, b, c)_lab.
-        lat_lab = R_stage @ lat_conv
+        lat_lab = R_stage @ lat_conv.T
 
         V_cell = float(crystal.lattice_volume_conventional)
         # Reciprocal lattice vectors (1/A, no 2pi): b_i* = cross(a_j, a_k) / V.
