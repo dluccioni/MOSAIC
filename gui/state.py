@@ -948,12 +948,12 @@ class SimulationState:
             self._crystal = CrystalType(cif_path)
             self._crystal.get_lattice_from_cif()
 
-            # Restore cumulative rotation if available
+            # Restore cumulative rotation if available. Replaying it through
+            # rotate_crystal rebuilds every derived field, rather than dropping
+            # in a saved matrix that may have been written in the pre-row
+            # convention and leaving the rest of the crystal unrotated.
             if data.get('cumulative_rotation'):
-                self._crystal._cumulative_rotation = np.array(data['cumulative_rotation'])
-                # Also update the lattice matrix if rotation was applied
-                if data.get('lattice_matrix_conventional'):
-                    self._crystal._lattice_matrix_conventional = np.array(data['lattice_matrix_conventional'])
+                self._crystal.rotate_crystal(np.array(data['cumulative_rotation']))
         except Exception as e:
             print(f"Error loading crystal: {e}")
             self._crystal = None

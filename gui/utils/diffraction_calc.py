@@ -153,13 +153,13 @@ class DiffractionCalculator:
         """Calculate reciprocal lattice matrix from conventional cell.
 
         For direct lattice matrix L (with rows as lattice vectors, as used by
-        Crystal.py), the reciprocal lattice matrix is B = (L^-1)^T.
+        Crystal.py), the reciprocal lattice matrix is B = L^-1.
         The COLUMNS of B are the reciprocal lattice vectors b1, b2, b3.
 
-        Note: This correctly handles the transformation L' = R @ L used by
-        Crystal.py when rotating the crystal. When L' = R @ L, we get
-        B' = (L'^-1)^T = (L^-1 @ R^-1)^T = R^-T @ (L^-1)^T = R @ B
-        (for orthogonal R), so Q' = R @ Q as expected.
+        Note: This correctly handles the transformation L' = L @ R.T used by
+        Crystal.py when rotating the crystal. When L' = L @ R.T, we get
+        B' = (L @ R^T)^-1 = R^-T @ L^-1 = R @ B (for orthogonal R), so
+        Q' = R @ Q as expected.
 
         Returns:
             3x3 reciprocal lattice matrix with columns as reciprocal vectors.
@@ -168,7 +168,7 @@ class DiffractionCalculator:
             raise ValueError("Crystal object not set")
 
         L = self.crystal.lattice_matrix_conventional
-        return np.linalg.inv(L).T
+        return np.linalg.inv(L)
 
     def get_q_vector_crystal(self, hkl: Tuple[int, int, int]) -> np.ndarray:
         """Calculate Q-vector in crystal reference frame (sample frame).
@@ -176,9 +176,9 @@ class DiffractionCalculator:
         The Q-vector (scattering vector) is G = h*b1 + k*b2 + l*b3
         where bi are the reciprocal lattice vectors (columns of B matrix).
 
-        This can be computed as Q = B @ hkl where B = (L^-1)^T.
+        This can be computed as Q = B @ hkl where B = L^-1.
 
-        Note: Since Crystal.py rotates the lattice as L' = R @ L, the
+        Note: Since Crystal.py rotates the lattice as L' = L @ R.T, the
         resulting Q is already in the sample reference frame (after any
         crystal rotations from align_axes or rotate_crystal).
 
