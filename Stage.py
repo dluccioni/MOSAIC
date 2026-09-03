@@ -75,7 +75,21 @@ class stage(logging):
         """
         Creates the stage with a specified mode/convention.
 
-        This method initializes all angles to zero and the translation to [0,0,0].
+        Rotation convention: `get_rotation()` returns the sample-to-lab matrix R
+        in the column-vector convention, pos_lab = R @ pos_sample, which is what
+        Beam applies (`pos @ R.T` on row-stacked positions). Each motor rotates
+        about its axis by the right-hand rule; a motor's axis is first rotated by
+        the motors listed in its coupling entry (the motors that carry it), so a
+        coupling list describes a physical stack. Motors are composed in list
+        order with each new rotation applied on the left.
+
+        For the default goniometer this gives
+        R = R(-y, mu) @ R(-x, chi) @ R(-y, phi) @ R(-z, omega)
+        (omega is applied first to sample coordinates). In the lab frame a
+        positive omega rotates the sample about -z, so at +10 deg the sample +x
+        axis moves to (0.985, -0.174, 0), i.e. toward -y; positive phi and mu
+        rotate about -y, moving sample +x toward +z; positive chi rotates about
+        -x, moving sample +y toward -z.
 
         Args:
             name (list of str, optional): Mode identifier(s). Defaults to ['goniometer'].
@@ -93,22 +107,22 @@ class stage(logging):
                 goniometer). If 'busing-levy', the motor lists above are overridden
                 with the Busing & Levy four-circle convention (Busing, W. R. &
                 Levy, H. A. (1967). Acta Cryst. 22, 457-464):
-                motors ['omega','chi','phi','x','y','z'] with omega, chi and phi
-                rotating about the lab z, x and z axes respectively, composed so
-                that the sample-to-lab rotation (column-vector convention,
-                i.e. `get_rotation().T`) is
-                R = R_omega(about z) @ R_chi(about x) @ R_phi(about z),
-                with phi INNERMOST (applied first to the sample). Because
-                `get_rotation()` is composed for the row-vector convention
-                (pos_lab = pos_sample @ R), this is realised with uncoupled
-                rotation motors about the negated axes
-                [0,0,-1], [-1,0,0], [0,0,-1]. Translations x, y, z behave as in
-                the default stage (coupled to all rotation motors). Note the
-                detector arm supplies the fourth circle (2theta) separately;
-                it is not a stage motor.
+                motors ['omega','chi','phi','x','y','z'], omega about the lab z
+                axis, chi about x carried by omega, phi about z carried by omega
+                and chi, so that `get_rotation()` equals
+                R = R_z(omega) @ R_x(chi) @ R_z(phi)
+                with phi innermost (applied first to the sample) in the same
+                column-vector convention Beam applies. Translations x, y, z
+                are carried by all rotation motors as in the default stage.
+                The detector arm supplies the fourth circle (2theta); it is
+                not a stage motor.
 
         Returns:
             None
+
+        Raises:
+            ValueError: If the motor lists differ in length or the convention
+                is unknown.
         """
         if convention is not None:
             if str(convention).lower().replace('_', '-') == 'busing-levy':
@@ -116,20 +130,31 @@ class stage(logging):
                     name = ['busing-levy']
                 motor_name = ['omega', 'chi', 'phi', 'x', 'y', 'z']
                 motor_type = ['R', 'R', 'R', 'T', 'T', 'T']
-                motor_coupling = [[None], [None], [None], [0, 1, 2], [0, 1, 2], [0, 1, 2]]
-                motor_axis = [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0],
+                motor_coupling = [[None], [0], [0, 1], [0, 1, 2], [0, 1, 2], [0, 1, 2]]
+                motor_axis = [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0],
                               [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
                 motor_value = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
                 motor_resolution = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
             else:
                 raise ValueError(f"Unknown stage convention: {convention!r}. Supported: 'busing-levy' or None.")
+        n_motors = len(motor_name)
+        lengths = {
+            "motor_type": len(motor_type),
+            "motor_coupling": len(motor_coupling),
+            "motor_axis": len(motor_axis),
+            "motor_value": len(motor_value),
+            "motor_resolution": len(motor_resolution),
+        }
+        bad = {k: v for k, v in lengths.items() if v != n_motors}
+        if bad:
+            raise ValueError(f"Motor lists must all have {n_motors} entries (one per motor_name); got {bad}.")
         self._name = name
         self._motor_name = np.array(motor_name)
         self._motor_type = np.array(motor_type)
         self._motor_coupling = motor_coupling
-        self._motor_axis = np.array(motor_axis)
-        self._motor_value = np.array(motor_value)
-        self._motor_resolution = np.array(motor_resolution)
+        self._motor_axis = np.array(motor_axis, dtype=np.float64)
+        self._motor_value = np.array(motor_value, dtype=np.float64)
+        self._motor_resolution = np.array(motor_resolution, dtype=np.float64)
         self._rotation = np.eye(3, dtype=np.float32)
         self._translation = np.zeros(3, dtype=np.float32)
         print(f"{name} stage created with all angles and translations set to 0.")
@@ -162,9 +187,9 @@ class stage(logging):
         if stage_metadata["motor_axis"] is not None:
             self._motor_axis = np.array(stage_metadata["motor_axis"], dtype=np.float32)
         if stage_metadata["motor_value"] is not None:
-            self._motor_value = np.array(stage_metadata["motor_value"], dtype=np.float32)
+            self._motor_value = np.array(stage_metadata["motor_value"], dtype=np.float64)
         if stage_metadata["motor_resolution"] is not None:
-            self._motor_resolution = np.array(stage_metadata["motor_resolution"], dtype=np.float32)
+            self._motor_resolution = np.array(stage_metadata["motor_resolution"], dtype=np.float64)
         if stage_metadata["rotation"] is not None:
             self._rotation = np.array(stage_metadata["rotation"], dtype=np.float32)
         if stage_metadata["translation"] is not None:
@@ -245,6 +270,64 @@ class stage(logging):
                          [d*z*x - y*s,   d*z*y + x*s,   c + d*z*z]], dtype=np.float32)
     
     ## Main Functions
+    def get_motor_index(self, name):
+        """
+        Returns the index of a motor given its name.
+
+        Args:
+            name (str): Name of the motor.
+
+        Returns:
+            int: Index of the motor in the motor arrays.
+
+        Raises:
+            ValueError: If no motor has that name.
+        """
+        if self._motor_name is None:
+            raise ValueError("Stage motors not initialized. Please call create_stage(...) first.")
+        idx = np.flatnonzero(self._motor_name == str(name))
+        if idx.size == 0:
+            raise ValueError(f"Unknown motor {name!r}. Available motors: {self.motor_names}")
+        return int(idx[0])
+
+    def get_single_motor_value(self, name, degrees=True):
+        """
+        Returns the current value of a single motor.
+
+        Args:
+            name (str): Name of the motor.
+            degrees (bool, optional): If True, returns a rotational motor's value
+                in degrees; otherwise radians. Defaults to True.
+
+        Returns:
+            float: The motor value.
+        """
+        idx = self.get_motor_index(name)
+        value = float(self._motor_value[idx])
+        if self._motor_type[idx] == "R" and degrees is True:
+            value = float(np.rad2deg(value))
+        return value
+
+    def _coerce_motor_values(self, values):
+        """
+        Converts a per-motor value list to a float64 array of the right length.
+
+        Args:
+            values (array-like): One value per motor.
+
+        Returns:
+            numpy.ndarray: A float64 copy of `values`.
+
+        Raises:
+            ValueError: If the number of values does not match the number of motors.
+        """
+        if self._motor_value is None:
+            raise ValueError("Stage motors not initialized. Please call create_stage(...) first.")
+        arr = np.array(values, dtype=np.float64).ravel()
+        if arr.size != self._motor_value.size:
+            raise ValueError(f"Expected {self._motor_value.size} motor values for motors {self.motor_names}, got {arr.size}.")
+        return arr
+
     def get_motor_axis(self,motor_idx):
         """
         Returns the motion axis for a given motor, accounting for couplings.
@@ -266,10 +349,10 @@ class stage(logging):
 
     def get_rotation(self):
         """
-        Returns the 3x3 rotation matrix given the current motor values.
+        Returns the 3x3 sample-to-lab rotation matrix given the current motor values.
 
-        The calculation accounts for any rotational couplings defined in
-        `motor_coupling`.
+        Column-vector convention: pos_lab = R @ pos_sample. The calculation
+        accounts for any rotational couplings defined in `motor_coupling`.
 
         Returns:
             numpy.ndarray: A 3x3 rotation matrix.
@@ -311,13 +394,11 @@ class stage(logging):
         Returns:
             None
         """
-        motor_value_rel = np.array(motor_value_rel)
+        motor_value_rel = self._coerce_motor_values(motor_value_rel)
         if degrees is True:
             motor_mask = (self._motor_type == "R")
             motor_value_rel[motor_mask] = np.deg2rad(motor_value_rel[motor_mask])
-            self._motor_value += motor_value_rel
-        else:
-            self._motor_value += motor_value_rel
+        self._motor_value = self._motor_value.astype(np.float64) + motor_value_rel
         self.clip_motor_value()
         self.get_rotation()
         self.get_translation()
@@ -336,13 +417,11 @@ class stage(logging):
         Returns:
             None
         """
-        motor_value_abs = np.array(motor_value_abs)
+        motor_value_abs = self._coerce_motor_values(motor_value_abs)
         if degrees is True:
             motor_mask = (self._motor_type == "R")
             motor_value_abs[motor_mask] = np.deg2rad(motor_value_abs[motor_mask])
-            self._motor_value = motor_value_abs
-        else:
-            self._motor_value = motor_value_abs
+        self._motor_value = motor_value_abs
         self.clip_motor_value()
         self.get_rotation()
         self.get_translation()
@@ -361,10 +440,12 @@ class stage(logging):
         Returns:
             None
         """
-        motor_mask = (self._motor_name == name)
-        if self._motor_type[motor_mask] == "R" and degrees is True:
+        idx = self.get_motor_index(name)
+        value = float(value)
+        if self._motor_type[idx] == "R" and degrees is True:
             value = np.deg2rad(value)
-        self._motor_value[motor_mask] += value
+        self._motor_value = self._motor_value.astype(np.float64)
+        self._motor_value[idx] += value
         self.clip_motor_value()
         self.get_rotation()
         self.get_translation()
@@ -383,10 +464,12 @@ class stage(logging):
         Returns:
             None
         """
-        motor_mask = (self._motor_name == name)
-        if self._motor_type[motor_mask] == "R" and degrees is True:
+        idx = self.get_motor_index(name)
+        value = float(value)
+        if self._motor_type[idx] == "R" and degrees is True:
             value = np.deg2rad(value)
-        self._motor_value[motor_mask] = value
+        self._motor_value = self._motor_value.astype(np.float64)
+        self._motor_value[idx] = value
         self.clip_motor_value()
         self.get_rotation()
         self.get_translation()
@@ -397,13 +480,16 @@ class stage(logging):
         Clips motor values according to their resolution.
 
         If `_motor_resolution` is nonzero for a particular motor, that motor's value
-        is quantized to an integer multiple of its resolution.
+        is rounded to the nearest integer multiple of its resolution.
 
         Returns:
             None
         """
-        motor_mask = (self._motor_resolution is not None) & (self._motor_resolution != 0)
-        self._motor_value[motor_mask] = self._motor_resolution[motor_mask]*(self._motor_value[motor_mask]/self._motor_resolution[motor_mask]).astype(int)
+        if self._motor_resolution is None:
+            return
+        motor_mask = (self._motor_resolution != 0)
+        res = self._motor_resolution[motor_mask]
+        self._motor_value[motor_mask] = np.round(self._motor_value[motor_mask] / res) * res
 
     def zero_stage(self):
         """
@@ -461,8 +547,8 @@ class stage(logging):
         ax = fig.add_subplot(111, projection='3d')
         # Get the cube corners
         corners_local = self.get_unit_corners() - 0.5
-        # Apply rotation + translation to each corner
-        corners_lab = (corners_local @ self.get_rotation()) + self.get_translation()
+        # Apply rotation + translation to each corner (row-stacked points, so R.T)
+        corners_lab = (corners_local @ self.get_rotation().T) + self.get_translation()
         edges = [
             (0,1), (0,2), (0,3),
             (1,4), (1,5),
