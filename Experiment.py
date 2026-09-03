@@ -51,15 +51,16 @@ class experiment:
         save_dir=None,
         adi_kwargs=None,
         prop_kwargs=None,
+        step_callback=None,
     ):
         """
         Perform a general n-dimensional scan over stage motors and/or detector axes.
 
         Executes a scan with n <= 3 dimensions, moving specified motors through
         their ranges while collecting intensity data at each step. In both absolute
-        and relative modes, the per-step delta is computed as (target - last_applied)
-        in the same user units used to build axis_vals, keeping the real motor
-        positions identical to the labels shown in plots.
+        and relative modes, the per-step delta is computed as (target - current
+        motor value) in the same user units used to build axis_vals, so motor
+        resolution rounding does not accumulate from step to step.
 
         Args:
             sample (Sample): The sample object to interact with.
@@ -77,10 +78,17 @@ class experiment:
             per_step_outputs (tuple): Output types to plot at each step.
                 Defaults to ("Intensity",).
             plot_in_angle_space (bool): If True, plot in angle space. Defaults to False.
-            show_plots (bool): If True, display plots interactively. Defaults to True.
+            show_plots (bool): If True, display each per-step figure briefly
+                (plt.pause) and the summary figure with plt.show(). Every figure
+                is closed afterwards. Defaults to True.
             save_dir (str, optional): Directory to save output images.
             adi_kwargs (dict, optional): Additional kwargs for atomic_direct_interaction.
             prop_kwargs (dict, optional): Additional kwargs for wavefield_propagation.
+            step_callback (callable, optional): Called after each step with one
+                dict: step (1-based), total, index (grid tuple), position (label
+                string), sum_intensity, figures ({output name: Figure}, still
+                open) and image_paths ({output name: saved path or None}).
+                Figures are closed after the callback returns.
 
         Returns:
             dict: A dictionary containing:
@@ -88,12 +96,27 @@ class experiment:
                 - motor_names (list): Names of scanned motors.
                 - sum_intensity (ndarray): Summed intensity at each scan position.
                 - step_count (int): Total number of scan steps.
+                - summary_image (str or None): Path of the saved summary figure.
 
         Raises:
             ValueError: If number of axes is not 1, 2, or 3, or if ranges/stepsizes/motors
-                have mismatched lengths, or if step size is zero or wrong sign.
+                have mismatched lengths, if step size is zero or wrong sign, or if a
+                scan axis or coupling motor name is not a stage motor or detector axis.
         """
+        import warnings
         import matplotlib.pyplot as plt
+
+        def _finish_figure(fig, block):
+            # Show a figure if requested, then close it so nothing accumulates.
+            if show_plots:
+                with warnings.catch_warnings():
+                    # Non-interactive backends cannot show; that is not an error here
+                    warnings.simplefilter("ignore", UserWarning)
+                    if block:
+                        plt.show()
+                    else:
+                        plt.pause(0.001)
+            plt.close(fig)
 
         # ------------------------ helpers ------------------------
         def _canon_det_name(name):
@@ -133,21 +156,34 @@ class experiment:
                 else:
                     raise ValueError("Unsupported detector axis '{}'".format(motor_name))
             else:
-                # stage motor: read by name
-                if not hasattr(_current_value, "_stage_name_to_index"):
-                    try:
-                        names = np.array(stage._motor_name).astype(str)
-                    except Exception:
-                        raise RuntimeError("Cannot access stage motor names. Ensure stage.create_stage(...) was called.")
-                    _current_value._stage_name_to_index = {str(n): i for i, n in enumerate(names)}
-                    _current_value._stage_type = np.array(stage._motor_type)
-                idx = _current_value._stage_name_to_index.get(motor_name)
-                if idx is None:
-                    raise ValueError("Unknown stage motor '{}'".format(motor_name))
+                idx = _stage_index(motor_name)
                 val = float(stage.motor_value[idx])
-                if _current_value._stage_type[idx] == "R" and degrees:
+                if stage_types[idx] == "R" and degrees:
                     val = np.degrees(val)
                 return val
+
+        # Stage motor lookup; unknown names raise
+        try:
+            stage_names = [str(n) for n in np.asarray(stage._motor_name)]
+            stage_types = [str(t) for t in np.asarray(stage._motor_type)]
+        except Exception:
+            raise RuntimeError("Cannot access stage motor names. Ensure stage.create_stage(...) was called.")
+        stage_name_to_index = {n: i for i, n in enumerate(stage_names)}
+
+        def _stage_index(motor_name):
+            idx = stage_name_to_index.get(str(motor_name))
+            if idx is None:
+                raise ValueError("Unknown stage motor '{}'. Stage motors: {}; detector axes: two_theta (2theta, tth), eta, distance.".format(motor_name, stage_names))
+            return idx
+
+        def _check_axis(name, role):
+            # Validate a scan axis or coupling motor name before any motor moves
+            if _is_detector_axis(name):
+                return
+            try:
+                _stage_index(name)
+            except ValueError as e:
+                raise ValueError("{} '{}': {}".format(role, name, e)) from None
 
         def _apply_stage_relative(name, delta):
             stage.set_single_motor_value_relative(name, float(delta), degrees=degrees)
@@ -169,6 +205,10 @@ class experiment:
             else:
                 _apply_stage_relative(name, delta)
 
+        # Validate every scan axis and coupling motor up front
+        for m in motors:
+            _check_axis(m, "Scan axis")
+
         # Build fast lookup for "primary-takes-precedence" on coupling targets
         primary_set = { _canon_det_name(m) if _is_detector_axis(m) else str(m) for m in motors }
 
@@ -176,9 +216,11 @@ class experiment:
         coup_map = {}
         if couplings:
             for src, lst in couplings.items():
+                _check_axis(src, "Coupling source")
                 src_key = _canon_det_name(src) if _is_detector_axis(src) else str(src)
                 out = []
                 for (tgt, ratio) in lst:
+                    _check_axis(tgt, "Coupling target")
                     tgt_key = _canon_det_name(tgt) if _is_detector_axis(tgt) else str(tgt)
                     out.append((tgt_key, _parse_ratio(ratio)))
                 coup_map[src_key] = out
@@ -214,9 +256,6 @@ class experiment:
         grid_shape = tuple(len(a) for a in axis_vals)
         sumI = np.zeros(grid_shape, dtype=float)
 
-        # Track last applied value for each primary axis in user units
-        last_applied = [ _current_value(m) for m in motors ]
-
         # Utility: format a position string from labels (what we show on plots)
         def _pos_str(idx_tuple):
             parts = []
@@ -234,12 +273,13 @@ class experiment:
 
         # ------------------------ scan loops ------------------------
         for idx in np.ndindex(*grid_shape):
-            # Move each primary axis to its target for this index by relative delta = target - last_applied
+            # Move each primary axis to its target for this index by relative delta = target - current value
             for j in range(n):
                 target_val = float(axis_vals[j][idx[j]])
-                step_delta = target_val - float(last_applied[j])
+                step_delta = target_val - _current_value(motors[j])
 
-                if step_delta != 0.0:
+                # Skip moves below unit round-off of the target value
+                if abs(step_delta) > 1e-12 * max(1.0, abs(target_val)):
                     _move_primary_relative(motors[j], step_delta)
 
                     # Apply couplings tied to this primary motor (relative to this step)
@@ -250,9 +290,6 @@ class experiment:
                                 continue
                             coupled_delta = float(ratio) * step_delta
                             _move_primary_relative(tgt_key, coupled_delta)
-
-                    # Update last applied for this axis
-                    last_applied[j] = target_val
 
             # ---- physics: atomic + optics ----
             beam.atomic_direct_interaction(
@@ -274,6 +311,8 @@ class experiment:
             # detector.input_pixel_values(np.flip(detector.pixel_values))
 
             # ---- per-step plots ----
+            step_figs = {}
+            step_paths = {}
             if per_step_outputs:
                 for out_name in per_step_outputs:
                     title = "Step {}/{} : {}".format(flat_index + 1, total_steps, _pos_str(idx))
@@ -281,20 +320,36 @@ class experiment:
                         fig, ax = detector.plot_detector_angles(type=str(out_name), title=title, cmap="viridis")
                     else:
                         fig, ax = detector.plot_detector(type=str(out_name), title=title, cmap="viridis")
+                    path = None
                     if save_dir:
                         safe_out = str(out_name).lower()
-                        fig.savefig(os.path.join(
-                            save_dir,
-                            "step_{:05d}_{}.png".format(flat_index + 1, safe_out)
-                        ), dpi=300)
-                    if show_plots:
-                        plt.show()
-                    else:
+                        path = os.path.join(save_dir, "step_{:05d}_{}.png".format(flat_index + 1, safe_out))
+                        fig.savefig(path, dpi=300)
+                    step_figs[str(out_name)] = fig
+                    step_paths[str(out_name)] = path
+
+            if step_callback is not None:
+                try:
+                    step_callback({
+                        "step": flat_index + 1,
+                        "total": total_steps,
+                        "index": tuple(int(i) for i in idx),
+                        "position": _pos_str(idx),
+                        "sum_intensity": cur_sum,
+                        "figures": step_figs,
+                        "image_paths": step_paths,
+                    })
+                finally:
+                    for fig in step_figs.values():
                         plt.close(fig)
+            else:
+                for fig in step_figs.values():
+                    _finish_figure(fig, block=False)
 
             flat_index += 1
 
         # ------------------------ summary plots ------------------------
+        summary_path = None
         if n == 1:
             fig, ax = plt.subplots()
             ax.plot(axis_vals[0], sumI)
@@ -302,11 +357,9 @@ class experiment:
             ax.set_ylabel("sum(Intensity)")
             ax.set_title("Summed intensity vs {}".format(motors[0]))
             if save_dir:
-                fig.savefig(os.path.join(save_dir, "summary_1d.png"), dpi=300)
-            if show_plots:
-                plt.show()
-            else:
-                plt.close(fig)
+                summary_path = os.path.join(save_dir, "summary_1d.png")
+                fig.savefig(summary_path, dpi=300)
+            _finish_figure(fig, block=True)
         elif n == 2:
             X, Y = np.meshgrid(axis_vals[0], axis_vals[1], indexing="xy")
             fig, ax = plt.subplots()
@@ -316,11 +369,9 @@ class experiment:
             ax.set_ylabel(motors[1])
             ax.set_title("Summed intensity vs {} and {}".format(motors[0], motors[1]))
             if save_dir:
-                fig.savefig(os.path.join(save_dir, "summary_2d.png"), dpi=300)
-            if show_plots:
-                plt.show()
-            else:
-                plt.close(fig)
+                summary_path = os.path.join(save_dir, "summary_2d.png")
+                fig.savefig(summary_path, dpi=300)
+            _finish_figure(fig, block=True)
         else:
             from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
             A0, A1, A2 = np.meshgrid(axis_vals[0], axis_vals[1], axis_vals[2], indexing="ij")
@@ -332,17 +383,16 @@ class experiment:
             ax.set_xlabel(motors[0]); ax.set_ylabel(motors[1]); ax.set_zlabel(motors[2])
             ax.set_title("Summed intensity vs {}, {}, {}".format(motors[0], motors[1], motors[2]))
             if save_dir:
-                fig.savefig(os.path.join(save_dir, "summary_3d.png"), dpi=300)
-            if show_plots:
-                plt.show()
-            else:
-                plt.close(fig)
+                summary_path = os.path.join(save_dir, "summary_3d.png")
+                fig.savefig(summary_path, dpi=300)
+            _finish_figure(fig, block=True)
 
         return {
             "axes": axis_vals,
             "motor_names": list(motors),
             "sum_intensity": sumI,
             "step_count": total_steps,
+            "summary_image": summary_path,
         }
         
     def plot_geometry_3d(self,
@@ -482,8 +532,8 @@ class experiment:
                 Lx = 1000.0
         else:
             Lx = float(beam_length)
-        # Build 8 corners for an axis-aligned box spanning x=[0, Lx], y,z by beam size
-        x0, x1 = -detector.distance, float(sample.dimensions[0])
+        # Build 8 corners for an axis-aligned box spanning x=[-distance, Lx], y,z by beam size
+        x0, x1 = -detector.distance, Lx
         y0, y1 = -0.5 * float(Sy), 0.5 * float(Sy)
         z0, z1 = -0.5 * float(Sz), 0.5 * float(Sz)
         beam_corners = np.array([
