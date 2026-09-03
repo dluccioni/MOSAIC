@@ -73,7 +73,8 @@ class optics(logging):
             use_gpu (bool): If True and CuPy is available, use a GPU path.
 
         Returns:
-            np.ndarray: Complex64 array with the lens applied (NumPy array).
+            array: Complex64 array with the lens applied. A CuPy array on the
+            GPU path, otherwise NumPy.
         """
         if wavelength is None:
             wavelength = getattr(self, "_wavelength", None)
@@ -106,66 +107,25 @@ class optics(logging):
         parab_coef = (mu_per_m * N_lenses / (2.0 * R_apex_m)) if apply_parabolic else 0.0
 
         Ny, Nx = int(field.shape[0]), int(field.shape[1])
-        x_arr = np.arange(Nx, dtype=np.float32)
-        y_arr = np.arange(Ny, dtype=np.float32)
-        cx = (Nx - 1) / 2.0
-        cy = (Ny - 1) / 2.0
+        xp = cp if (use_gpu and cp is not None) else np
 
-        if use_gpu and (cp is not None):
-            # Coordinate grids on GPU (meters from pixel indices)
-            x_gpu = cp.asarray((x_arr - cx) * dx, dtype=cp.float32)
-            y_gpu = cp.asarray((y_arr - cy) * dy, dtype=cp.float32)
-            Xgpu = x_gpu[None, :].repeat(Ny, axis=0)
-            Ygpu = y_gpu[:, None].repeat(Nx, axis=1)
-            R2 = Xgpu * Xgpu + Ygpu * Ygpu
+        # Centred coordinate axes in metres; the r^2 grid is built by broadcasting
+        x = (xp.arange(Nx, dtype=xp.float32) - (Nx - 1) / 2.0) * float(dx)
+        y = (xp.arange(Ny, dtype=xp.float32) - (Ny - 1) / 2.0) * float(dy)
+        R2 = x[None, :] ** 2 + y[:, None] ** 2
 
-            # Thin-lens phase
-            phase_lens = -0.5 * (k_val / f) * R2
-            cph = cp.cos(phase_lens)
-            sph = cp.sin(phase_lens)
+        # Thin-lens phase exp(-i k r^2 / (2f))
+        phase_lens = (-0.5 * (k_val / f)) * R2
+        E_out = xp.asarray(field, dtype=xp.complex64) * xp.exp(1j * phase_lens).astype(xp.complex64)
 
-            F_gpu = cp.asarray(field, dtype=cp.complex64)
-            real_part = F_gpu.real * cph - F_gpu.imag * sph
-            imag_part = F_gpu.real * sph + F_gpu.imag * cph
-            out = real_part + 1j * imag_part
+        # Optional parabolic (r^2-dependent) CRL absorption:
+        # amplitude factor exp(-mu * N * r^2 / (2R)), R2 in m^2.
+        if apply_parabolic:
+            E_out *= xp.exp(- parab_coef * R2).astype(xp.float32)
 
-            # Optional uniform absorption
-            if not cp.isinf(nsigma):
-                out *= cp.exp(- N_lenses * t / nsigma)
-
-            # Optional parabolic (r^2-dependent) CRL absorption:
-            # amplitude factor exp(-mu * N * r^2 / (2R)), R2 already in m^2.
-            if apply_parabolic:
-                out *= cp.exp(- parab_coef * R2)
-
-            return out.get()
-
-        # CPU path
-        xx = (x_arr - cx) * dx
-        yy = (y_arr - cy) * dy
-        E_out = np.empty_like(field, dtype=np.complex64)
-
-        for iy in range(Ny):
-            r_y = yy[iy]
-            for ix in range(Nx):
-                r_x = xx[ix]
-                r2 = r_x * r_x + r_y * r_y
-                phase = -0.5 * (k_val / f) * r2
-                cph = np.cos(phase)
-                sph = np.sin(phase)
-                val = field[iy, ix]
-                re2 = val.real * cph - val.imag * sph
-                im2 = val.real * sph + val.imag * cph
-                if apply_parabolic:
-                    # Parabolic (r^2-dependent) CRL absorption:
-                    # amplitude factor exp(-mu * N * r^2 / (2R)), r2 in m^2.
-                    amp = np.exp(- parab_coef * r2)
-                    re2 *= amp
-                    im2 *= amp
-                E_out[iy, ix] = re2 + 1j * im2
-
-        if not np.isinf(nsigma):
-            E_out *= np.exp(- N_lenses * t / nsigma)
+        # Optional uniform absorption
+        if np.isfinite(nsigma):
+            E_out *= np.float32(np.exp(- N_lenses * t / nsigma))
 
         return E_out
     
@@ -190,11 +150,11 @@ class optics(logging):
             use_gpu (bool): If True and CuPy is available, use GPU path.
 
         Returns:
-            np.ndarray: Complex64 array with magnifier applied (NumPy array).
+            array: Complex64 array with the magnifier applied, on the same
+            (Ny, Nx) grid and pixel size as the input. A CuPy array on the
+            GPU path, otherwise NumPy.
         """
-        xp = None
-        if use_gpu and (cp is not None):
-            xp = cp
+        xp = cp if (use_gpu and cp is not None) else np
 
         Ny, Nx = int(field.shape[0]), int(field.shape[1])
         Mx = float(mag_data.get('magnification_x', 1.0))
@@ -205,109 +165,48 @@ class optics(logging):
         pad_mode = str(mag_data.get('pad_mode', 'zeros')).lower()
         conserve = bool(mag_data.get('conserve_energy', True))
 
-        if xp is not None:
-            F = cp.asarray(field, dtype=cp.complex64)
-            xx = cp.arange(Nx, dtype=cp.float32)
-            yy = cp.arange(Ny, dtype=cp.float32)
-        else:
-            F = np.asarray(field, dtype=np.complex64)
-            xx = np.arange(Nx, dtype=np.float32)
-            yy = np.arange(Ny, dtype=np.float32)
-
+        F = xp.asarray(field, dtype=xp.complex64)
         cx = (Nx - 1) / 2.0
         cy = (Ny - 1) / 2.0
 
-        # Output grid
-        if xp is not None:
-            Xo = xx[None, :].repeat(Ny, axis=0)
-            Yo = yy[:, None].repeat(Nx, axis=1)
-        else:
-            Xo = np.repeat(xx[None, :], Ny, axis=0)
-            Yo = np.repeat(yy[:, None], Nx, axis=1)
-
-        # Map output -> input coords (centered anisotropic scaling)
-        Xi = cx + (Xo - cx) / Mx
-        Yi = cy + (Yo - cy) / My
+        # Map output -> input coords (centered anisotropic scaling). The 1-D
+        # axes are kept as (1, Nx) and (Ny, 1) and broadcast in the indexing.
+        Xi = cx + (xp.arange(Nx, dtype=xp.float32)[None, :] - cx) / Mx
+        Yi = cy + (xp.arange(Ny, dtype=xp.float32)[:, None] - cy) / My
 
         # Interpolation
         if order == 0:
             # Nearest
-            if xp is not None:
-                Xi_n = cp.rint(Xi).astype(cp.int32)
-                Yi_n = cp.rint(Yi).astype(cp.int32)
-                valid = (Xi_n >= 0) & (Xi_n < Nx) & (Yi_n >= 0) & (Yi_n < Ny)
-                out = cp.zeros((Ny, Nx), dtype=cp.complex64)
-                out[valid] = F[Yi_n[valid], Xi_n[valid]]
-            else:
-                Xi_n = np.rint(Xi).astype(np.int32)
-                Yi_n = np.rint(Yi).astype(np.int32)
-                valid = (Xi_n >= 0) & (Xi_n < Nx) & (Yi_n >= 0) & (Yi_n < Ny)
-                out = np.zeros((Ny, Nx), dtype=np.complex64)
-                out[valid] = F[Yi_n[valid], Xi_n[valid]]
+            Xi_n = xp.rint(Xi).astype(xp.int32)
+            Yi_n = xp.rint(Yi).astype(xp.int32)
+            valid = (Xi_n >= 0) & (Xi_n < Nx) & (Yi_n >= 0) & (Yi_n < Ny)
+            out = F[xp.clip(Yi_n, 0, Ny - 1), xp.clip(Xi_n, 0, Nx - 1)]
+            out = xp.where(valid, out, xp.complex64(0.0))
         else:
             # Bilinear
-            if xp is not None:
-                floor = cp.floor; clip = cp.clip
-                x0 = floor(Xi).astype(cp.int32)
-                y0 = floor(Yi).astype(cp.int32)
-                x1 = x0 + 1
-                y1 = y0 + 1
+            x0 = xp.floor(Xi).astype(xp.int32)
+            y0 = xp.floor(Yi).astype(xp.int32)
+            wx = (Xi - x0).astype(xp.float32)
+            wy = (Yi - y0).astype(xp.float32)
 
-                if pad_mode == 'edge':
-                    x0 = clip(x0, 0, Nx - 1); x1 = clip(x1, 0, Nx - 1)
-                    y0 = clip(y0, 0, Ny - 1); y1 = clip(y1, 0, Ny - 1)
-                    wx = Xi - x0; wy = Yi - y0
-                    f00 = F[y0, x0]; f10 = F[y0, x1]
-                    f01 = F[y1, x0]; f11 = F[y1, x1]
-                    out = (f00 * (1 - wx) * (1 - wy) +
-                        f10 * wx * (1 - wy) +
-                        f01 * (1 - wx) * wy +
-                        f11 * wx * wy).astype(cp.complex64)
-                else:
-                    valid = (Xi >= 0) & (Xi < Nx - 1) & (Yi >= 0) & (Yi < Ny - 1)
-                    x0c = clip(x0, 0, Nx - 2)
-                    y0c = clip(y0, 0, Ny - 2)
-                    x1c = x0c + 1
-                    y1c = y0c + 1
-                    wx = Xi - x0; wy = Yi - y0
-                    f00 = F[y0c, x0c]; f10 = F[y0c, x1c]
-                    f01 = F[y1c, x0c]; f11 = F[y1c, x1c]
-                    out = (f00 * (1 - wx) * (1 - wy) +
-                        f10 * wx * (1 - wy) +
-                        f01 * (1 - wx) * wy +
-                        f11 * wx * wy).astype(cp.complex64)
-                    out = cp.where(valid, out, 0.0 + 0.0j)
+            if pad_mode == 'edge':
+                x0c = xp.clip(x0, 0, Nx - 1); x1c = xp.clip(x0 + 1, 0, Nx - 1)
+                y0c = xp.clip(y0, 0, Ny - 1); y1c = xp.clip(y0 + 1, 0, Ny - 1)
+                wx = Xi - x0c; wy = Yi - y0c
+                valid = None
             else:
-                floor = np.floor; clip = np.clip
-                x0 = floor(Xi).astype(np.int32)
-                y0 = floor(Yi).astype(np.int32)
-                x1 = x0 + 1
-                y1 = y0 + 1
+                valid = (Xi >= 0) & (Xi < Nx - 1) & (Yi >= 0) & (Yi < Ny - 1)
+                x0c = xp.clip(x0, 0, Nx - 2); x1c = x0c + 1
+                y0c = xp.clip(y0, 0, Ny - 2); y1c = y0c + 1
 
-                if pad_mode == 'edge':
-                    x0 = clip(x0, 0, Nx - 1); x1 = clip(x1, 0, Nx - 1)
-                    y0 = clip(y0, 0, Ny - 1); y1 = clip(y1, 0, Ny - 1)
-                    wx = Xi - x0; wy = Yi - y0
-                    f00 = F[y0, x0]; f10 = F[y0, x1]
-                    f01 = F[y1, x0]; f11 = F[y1, x1]
-                    out = (f00 * (1 - wx) * (1 - wy) +
-                        f10 * wx * (1 - wy) +
-                        f01 * (1 - wx) * wy +
-                        f11 * wx * wy).astype(np.complex64)
-                else:
-                    valid = (Xi >= 0) & (Xi < Nx - 1) & (Yi >= 0) & (Yi < Ny - 1)
-                    x0c = clip(x0, 0, Nx - 2)
-                    y0c = clip(y0, 0, Ny - 2)
-                    x1c = x0c + 1
-                    y1c = y0c + 1
-                    wx = Xi - x0; wy = Yi - y0
-                    f00 = F[y0c, x0c]; f10 = F[y0c, x1c]
-                    f01 = F[y1c, x0c]; f11 = F[y1c, x1c]
-                    out = (f00 * (1 - wx) * (1 - wy) +
-                        f10 * wx * (1 - wy) +
-                        f01 * (1 - wx) * wy +
-                        f11 * wx * wy).astype(np.complex64)
-                    out = np.where(valid, out, 0.0 + 0.0j)
+            f00 = F[y0c, x0c]; f10 = F[y0c, x1c]
+            f01 = F[y1c, x0c]; f11 = F[y1c, x1c]
+            out = (f00 * (1 - wx) * (1 - wy) +
+                   f10 * wx * (1 - wy) +
+                   f01 * (1 - wx) * wy +
+                   f11 * wx * wy).astype(xp.complex64)
+            if valid is not None:
+                out = xp.where(valid, out, xp.complex64(0.0))
 
         amp = np.sqrt(max(refl, 0.0))
         if conserve:
@@ -315,20 +214,9 @@ class optics(logging):
             if jac > 0:
                 amp *= (1.0 / np.sqrt(jac))
 
-        if xp is not None:
-            cph = cp.cos(phi, dtype=cp.float32)
-            sph = cp.sin(phi, dtype=cp.float32)
-            re = out.real * cph - out.imag * sph
-            im = out.real * sph + out.imag * cph
-            out = amp * (re + 1j * im)
-            return out.get()
-        else:
-            cph = np.cos(phi, dtype=np.float32)
-            sph = np.sin(phi, dtype=np.float32)
-            re = out.real * cph - out.imag * sph
-            im = out.real * sph + out.imag * cph
-            out = amp * (re + 1j * im)
-            return out.astype(np.complex64)
+        # Uniform reflectivity and phase as one complex scalar
+        out *= np.complex64(amp * np.exp(1j * phi))
+        return out
         
     def _apply_angular_filter_kspace(self, field, dx, dy, filt, wavelength, use_gpu=True):
         """
@@ -349,7 +237,8 @@ class optics(logging):
             use_gpu (bool): If True and CuPy is available, use GPU path.
 
         Returns:
-            np.ndarray: Complex64 field with the angular filter applied (NumPy array).
+            array: Complex64 field with the angular filter applied. A CuPy
+            array on the GPU path, otherwise NumPy.
 
         Note:
             - delta is the small-angle deviation (radians) in the paraxial limit:
@@ -440,28 +329,27 @@ class optics(logging):
         amp_peak = float(filt.get('transmission', 1.0))
         amp = float(np.sqrt(max(amp_peak, 0.0)))
         phase = float(filt.get('phase_shift', 0.0))
-        cph0 = float(np.cos(phase))
-        sph0 = float(np.sin(phase))
-        phasor = (cph0 + 1j * sph0)
+        phasor = np.complex64(amp * np.exp(1j * phase))
 
         # FFT -> mask -> iFFT
         E = xp.asarray(field, dtype=xp.complex64)
         F = xp.fft.fft2(E)
-        F = F * H.astype(xp.complex64)
-        Eo = xp.fft.ifft2(F) * amp * phasor
-
-        out = Eo.get() if on_gpu else np.asarray(Eo)
-        return out.astype(np.complex64)
+        F *= H.astype(xp.complex64)
+        Eo = xp.fft.ifft2(F).astype(xp.complex64)
+        Eo *= phasor
+        return Eo
 
     def _apply_fresnel_zone_plate(self, field, dx, dy, zp_data,
                                   wavelength=None, use_gpu=True):
         """
         Apply a Fresnel zone plate as a real-space binary transmission mask.
 
-        Zone boundaries are at r_n = sqrt(n * lambda * f), where n is the zone
-        index. For an amplitude FZP, even zones transmit and odd zones are
-        opaque. For a phase FZP, even zones transmit with phase 0 and odd zones
-        with phase pi. All diffraction orders are naturally produced.
+        Zone boundaries are at r_n = sqrt(n * lambda * f1) with the first-order
+        focal length f1 = D * dr_N / lambda, so the plate geometry is fixed by
+        D and dr_N alone. For an amplitude FZP, even zones transmit and odd
+        zones are opaque. For a phase FZP, even zones transmit with phase 0 and
+        odd zones with phase pi. All diffraction orders are naturally produced;
+        'order' only selects the working focus f1 / m of the 'ideal' lens model.
 
         Args:
             field (array-like): Complex field, shape (Ny, Nx).
@@ -472,20 +360,23 @@ class optics(logging):
             use_gpu (bool): If True and CuPy is available, use GPU path.
 
         Returns:
-            np.ndarray: Complex64 field after FZP transmission.
+            array: Complex64 field after FZP transmission. A CuPy array on the
+            GPU path, otherwise NumPy.
         """
         if wavelength is None:
             raise ValueError("wavelength must be provided to _apply_fresnel_zone_plate")
 
         dr_N_m  = float(zp_data['outermost_zone_width_nm']) * 1e-9
         D_m     = float(zp_data['diameter_um']) * 1e-6
-        order   = int(zp_data.get('order', 1))
+        order   = max(1, int(zp_data.get('order', 1)))
         eff     = float(zp_data.get('efficiency', 1.0))
         cs      = float(zp_data.get('central_stop_fraction', 0.0))
         zp_type = str(zp_data.get('zone_plate_type', 'amplitude')).lower()
 
-        # Focal length and radius
-        f   = D_m * dr_N_m / (order * float(wavelength))
+        # First-order focal length sets the zone geometry; the m-th order
+        # focuses at f1 / m.
+        f   = D_m * dr_N_m / float(wavelength)
+        f_work = f / order
         R   = D_m / 2.0
         amp = float(np.sqrt(max(eff, 0.0)))
 
@@ -515,10 +406,10 @@ class optics(logging):
         # Build transmission
         T = xp.zeros((Ny, Nx), dtype=xp.complex64)
         if zp_type == 'ideal':
-            # Ideal thin-lens phase within circular aperture (1st order only)
-            k_val = 2.0 * xp.pi / float(wavelength)
-            phase = -0.5 * (k_val / f) * R2
-            T[inside] = amp * (xp.cos(phase[inside]) + 1j * xp.sin(phase[inside]))
+            # Ideal thin-lens phase within circular aperture, focus at f1 / m
+            k_val = 2.0 * np.pi / float(wavelength)
+            phase = (-0.5 * (k_val / f_work)) * R2
+            T[inside] = amp * xp.exp(1j * phase[inside]).astype(xp.complex64)
         elif zp_type == 'phase':
             # Phase FZP: even zones +amp, odd zones -amp (pi phase shift)
             T[inside & (zone_parity == 0)] = amp
@@ -537,10 +428,8 @@ class optics(logging):
             T[taper_zone] *= window.astype(xp.float32)
 
         # Apply transmission
-        E = xp.asarray(field, dtype=xp.complex64)
-        E = E * T
-
-        return (E.get() if on_gpu else np.asarray(E)).astype(np.complex64)
+        E = xp.asarray(field, dtype=xp.complex64) * T
+        return E.astype(xp.complex64, copy=False)
 
     def _apply_aperture(self, field, dx, dy, aperture_data, use_gpu=True):
         """
@@ -556,55 +445,71 @@ class optics(logging):
             use_gpu (bool): If True and CuPy is available, use GPU path.
 
         Returns:
-            np.ndarray: Complex64 field with the aperture applied (NumPy array).
+            array: Complex64 field with the aperture applied. A CuPy array on
+            the GPU path, otherwise NumPy.
         """
         Ny, Nx = int(field.shape[0]), int(field.shape[1])
         shape_key = aperture_data.get('shape', aperture_data.get('type', 'square'))
         shape_type = str(shape_key).lower()
         width_mm = float(aperture_data['width'])
         width_m  = width_mm * 1e-3
-
-        # Build coordinate arrays centered at field center
-        x_arr = (np.arange(Nx, dtype=np.float32) - (Nx - 1) / 2.0) * float(dx)
-        y_arr = (np.arange(Ny, dtype=np.float32) - (Ny - 1) / 2.0) * float(dy)
         half = 0.5 * width_m
 
-        if use_gpu and (cp is not None):
-            x_gpu = cp.asarray(x_arr)
-            y_gpu = cp.asarray(y_arr)
-            Xgpu = x_gpu[None, :].repeat(Ny, axis=0)
-            Ygpu = y_gpu[:, None].repeat(Nx, axis=1)
+        xp = cp if (use_gpu and cp is not None) else np
 
-            if shape_type == 'square':
-                mask = (cp.abs(Xgpu) <= half) & (cp.abs(Ygpu) <= half)
-            elif shape_type == 'circular':
-                R2 = Xgpu * Xgpu + Ygpu * Ygpu
-                r0 = half
-                mask = (R2 <= (r0 * r0))
-            else:
-                mask = (cp.abs(Xgpu) <= half) & (cp.abs(Ygpu) <= half)
+        # Centred coordinate axes in metres, broadcast to the (Ny, Nx) mask
+        x = (xp.arange(Nx, dtype=xp.float32) - (Nx - 1) / 2.0) * float(dx)
+        y = (xp.arange(Ny, dtype=xp.float32) - (Ny - 1) / 2.0) * float(dy)
+        if shape_type == 'circular':
+            mask = (x[None, :] ** 2 + y[:, None] ** 2) <= (half * half)
+        else:
+            # 'square' and any unrecognised shape
+            mask = (xp.abs(x) <= half)[None, :] & (xp.abs(y) <= half)[:, None]
 
-            F_gpu = cp.asarray(field, dtype=cp.complex64)
-            F_gpu[~mask] = 0.0 + 0.0j
-            return F_gpu.get()
-
-        # CPU path
-        E_out = np.array(field, copy=True)
-        for iy in range(Ny):
-            yy = y_arr[iy]
-            for ix in range(Nx):
-                xx = x_arr[ix]
-                if shape_type == 'square':
-                    if (abs(xx) > half) or (abs(yy) > half):
-                        E_out[iy, ix] = 0.0
-                elif shape_type == 'circular':
-                    if (xx * xx + yy * yy) > (half * half):
-                        E_out[iy, ix] = 0.0
-                else:
-                    if (abs(xx) > half) or (abs(yy) > half):
-                        E_out[iy, ix] = 0.0
+        E_out = xp.array(field, dtype=xp.complex64, copy=True)
+        E_out[~mask] = 0.0
         return E_out
     
+    def _check_quadratic_phase_sampling(self, index, label, k_val, f, dx, dy,
+                                        shape, r_limit=None):
+        """
+        Warn when a quadratic phase exp(-i k r^2 / 2f) is under-sampled.
+
+        The phase step between neighbouring pixels along x is k dx x / f, so
+        the largest step occurs at the field edge. A step above pi aliases.
+
+        Args:
+            index (int): 1-based component index, for the log message.
+            label (str): Component description, for the log message.
+            k_val (float): Wavenumber 2 pi / lambda in 1/m.
+            f (float): Focal length of the phase term in meters.
+            dx (float): Pixel size along x in meters.
+            dy (float): Pixel size along y in meters.
+            shape (tuple[int, int]): Field shape (Ny, Nx).
+            r_limit (float or None): Aperture radius in meters; the edge is
+                taken as min(field half-extent, r_limit) when given.
+
+        Returns:
+            float: Largest per-pixel phase step at the field edge in radians.
+        """
+        Ny, Nx = int(shape[0]), int(shape[1])
+        x_max = (Nx - 1) / 2.0 * dx
+        y_max = (Ny - 1) / 2.0 * dy
+        if r_limit is not None:
+            x_max = min(x_max, float(r_limit))
+            y_max = min(y_max, float(r_limit))
+        f = abs(float(f))
+        if f <= 0.0:
+            return float('inf')
+        step = max(k_val * dx * x_max / f, k_val * dy * y_max / f)
+        if step > np.pi:
+            self._log("normal",
+                      f"Component {index}: {label} phase is under-sampled at the "
+                      f"field edge: {step:.2f} rad/pixel > pi. The grid resolves "
+                      f"angles up to lambda/(2 dx) = {np.pi / (k_val * max(dx, dy)) * 1e3:.3f} mrad; "
+                      f"the edge ray angle is {max(x_max, y_max) / f * 1e3:.3f} mrad.")
+        return float(step)
+
     def apply_stack(
         self,
         field,
@@ -612,25 +517,34 @@ class optics(logging):
         dy,
         wavelength,
         propagate_free_space,
-        use_gpu=True
+        use_gpu=True,
+        diagnostics=False
     ):
         """
         Apply all components in this optics stack to 'field' in-order.
 
+        The field is moved to the device once at entry (when use_gpu and CuPy
+        are available) and back to the host once at exit; components pass
+        device arrays between them. The pixel size is the same for every
+        component: the Bragg magnifier resamples the magnified field onto the
+        input grid instead of changing the grid spacing.
+
         Args:
-            field (array-like): Input complex field, shape (Ny, Nx), complex64 (NumPy).
-                If the free-space propagator returns a CuPy array, this function will
-                fetch it back to host automatically.
+            field (array-like): Input complex field, shape (Ny, Nx), complex64.
             dx (float): Pixel size along x in meters.
             dy (float): Pixel size along y in meters.
             wavelength (float): Wavelength in meters. Required by some components
                 (e.g., angular filter, lenses).
             propagate_free_space (callable): Function with signature
                 ``out = propagate_free_space(field, dx, dy, z)``. It should apply
-                free-space propagation over distance 'z' (meters) and return a NumPy
-                complex64 array (or a CuPy array, which will be converted to NumPy here).
+                free-space propagation over distance 'z' (meters) and return a
+                NumPy or CuPy complex64 array. On the GPU path it receives a
+                CuPy array.
             use_gpu (bool): Whether to request GPU-accelerated paths for optics-internal
                 operations when available.
+            diagnostics (bool): If True, log the mean field amplitude before and
+                after each component. Off by default: each value is a full
+                reduction over the field.
 
         Returns:
             np.ndarray: Field after applying all components, shape (Ny, Nx), complex64.
@@ -638,54 +552,55 @@ class optics(logging):
         if wavelength is None:
             raise ValueError("wavelength must be provided to optics.apply_stack")
 
-        E = np.asarray(field, dtype=np.complex64)
+        on_gpu = bool(use_gpu and cp is not None)
+        xp = cp if on_gpu else np
+        E = xp.asarray(field, dtype=xp.complex64)
         dx = float(dx)
         dy = float(dy)
+        lam = float(wavelength)
+        k_val = 2.0 * np.pi / lam
 
-        print(f"[Optics] apply_stack: processing {len(self.components)} component(s)")
+        self._log("normal", f"apply_stack: processing {len(self.components)} component(s)")
 
         for i, elem in enumerate(self.components):
             kind = str(elem.get("kind", "")).lower()
-            pre_amp = np.abs(E).mean()
+            if diagnostics:
+                pre_amp = float(xp.abs(E).mean())
 
             if kind == "free space":
                 z = float(elem.get("length", 0.0)) * 1e-3
-                print(f"[Optics] Component {i+1}: free space, z={z:.6e} m ({elem.get('length', 0.0):.2f} mm)")
+                self._log("normal", f"Component {i+1}: free space, z={z:.6e} m ({elem.get('length', 0.0):.2f} mm)")
                 E = propagate_free_space(E, dx, dy, z)
-                # Ensure NumPy on return so downstream ops are consistent
-                if cp is not None and hasattr(cp, "ndarray") and isinstance(E, cp.ndarray):
+                if (not on_gpu) and cp is not None and isinstance(E, cp.ndarray):
                     E = E.get()
-                E = np.asarray(E, dtype=np.complex64)
+                E = xp.asarray(E, dtype=xp.complex64)
 
             elif kind == "lens box":
-                print(f"[Optics] Component {i+1}: lens box, N={elem.get('number')}, f={elem.get('focal_length')} mm")
+                self._log("normal", f"Component {i+1}: lens box, N={elem.get('number')}, f={elem.get('focal_length')} mm")
+                self._check_quadratic_phase_sampling(
+                    i + 1, "lens box", k_val, float(elem['focal_length']) * 1e-3,
+                    dx, dy, E.shape
+                )
                 E = self._apply_thin_lens_box(
-                    E, dx, dy, elem, wavelength=wavelength, use_gpu=use_gpu
+                    E, dx, dy, elem, wavelength=lam, use_gpu=on_gpu
                 )
 
             elif kind == "bragg magnifier 2b":
-                print(f"[Optics] Component {i+1}: bragg magnifier, Mx={elem.get('magnification_x')}, My={elem.get('magnification_y')}")
+                self._log("normal", f"Component {i+1}: bragg magnifier, Mx={elem.get('magnification_x')}, My={elem.get('magnification_y')}")
                 E = self._apply_bragg_magnifier_2b(
-                    E, dx, dy, elem, use_gpu=use_gpu
+                    E, dx, dy, elem, use_gpu=on_gpu
                 )
-                Mx = abs(float(elem.get('magnification_x', 1.0)))
-                My = abs(float(elem.get('magnification_y', 1.0)))
-                if Mx > 0:
-                    dx = dx / Mx
-                if My > 0:
-                    dy = dy / My
-                print(f"[Optics]   -> pixel size updated: dx={dx:.4e} m, dy={dy:.4e} m")
 
             elif kind == "angular filter":
-                print(f"[Optics] Component {i+1}: angular filter, half_angle={elem.get('half_angle_x_mrad')} mrad")
+                self._log("normal", f"Component {i+1}: angular filter, half_angle={elem.get('half_angle_x_mrad')} mrad")
                 E = self._apply_angular_filter_kspace(
-                    E, dx, dy, elem, wavelength=wavelength, use_gpu=use_gpu
+                    E, dx, dy, elem, wavelength=lam, use_gpu=on_gpu
                 )
 
             elif kind == "aperture":
-                print(f"[Optics] Component {i+1}: aperture, width={elem.get('width')} mm, shape={elem.get('type', elem.get('shape'))}")
+                self._log("normal", f"Component {i+1}: aperture, width={elem.get('width')} mm, shape={elem.get('type', elem.get('shape'))}")
                 E = self._apply_aperture(
-                    E, dx, dy, elem, use_gpu=use_gpu
+                    E, dx, dy, elem, use_gpu=on_gpu
                 )
 
             elif kind == "zone plate":
@@ -693,26 +608,34 @@ class optics(logging):
                 dr_m  = dr_nm * 1e-9
                 D_um  = float(elem.get('diameter_um'))
                 D_m   = D_um * 1e-6
-                m_ord = int(elem.get('order', 1))
-                NA_zp = min(m_ord * float(wavelength) / (2.0 * dr_m), 1.0)
-                res_nm = 1.22 * dr_nm
-                f_m = D_m * dr_m / (m_ord * float(wavelength))
-                f_mm = f_m * 1e3
-                N_zones = int(D_m / (2.0 * dr_m))
+                m_ord = max(1, int(elem.get('order', 1)))
+                # Plate geometry is that of the first order; order m works at f1 / m
+                f1_m = D_m * dr_m / lam
+                f_m = f1_m / m_ord
+                NA_zp = min(m_ord * lam / (2.0 * dr_m), 1.0)
+                res_nm = 1.22 * dr_nm / m_ord
+                N_zones = int(round(D_m / (4.0 * dr_m)))
                 zp_type = elem.get('zone_plate_type', 'amplitude')
-                print(f"[Optics] Component {i+1}: zone plate ({zp_type}), dr_N={dr_nm} nm, "
-                      f"D={D_um} um, NA={NA_zp:.4f}, res={res_nm:.2f} nm, "
-                      f"f={f_mm:.4e} mm, N_zones={N_zones}")
+                self._log("normal", f"Component {i+1}: zone plate ({zp_type}), dr_N={dr_nm} nm, "
+                          f"D={D_um} um, order={m_ord}, NA={NA_zp:.4f}, res={res_nm:.2f} nm, "
+                          f"f1={f1_m * 1e3:.4e} mm, f={f_m * 1e3:.4e} mm, N_zones={N_zones}")
+                self._check_quadratic_phase_sampling(
+                    i + 1, f"zone plate (order {m_ord})", k_val, f_m,
+                    dx, dy, E.shape, r_limit=0.5 * D_m
+                )
                 E = self._apply_fresnel_zone_plate(
-                    E, dx, dy, elem, wavelength=wavelength, use_gpu=use_gpu
+                    E, dx, dy, elem, wavelength=lam, use_gpu=on_gpu
                 )
 
             else:
                 raise ValueError(f'Unknown optics element "{kind}"')
 
-            post_amp = np.abs(E).mean()
-            print(f"[Optics]   -> amplitude: {pre_amp:.6e} -> {post_amp:.6e}")
+            if diagnostics:
+                post_amp = float(xp.abs(E).mean())
+                self._log("normal", f"  -> amplitude: {pre_amp:.6e} -> {post_amp:.6e}")
 
+        if on_gpu:
+            E = E.get()
         return np.asarray(E, dtype=np.complex64)
 
     def read_optics_metadata(self):
@@ -871,7 +794,10 @@ class optics(logging):
 
         Appends a component dict describing an anisotropic magnification that
         mimics a two-bounce asymmetric Bragg magnifier pair: the first bounce
-        magnifies one axis, the second bounce the orthogonal axis.
+        magnifies one axis, the second bounce the orthogonal axis. The
+        magnified field is resampled onto the input pixel grid, so the pixel
+        size seen by later components (and written back to the detector) is
+        unchanged; features simply cover Mx (My) times more pixels.
 
         Args:
             magnification_x (float): Net magnification along x.
@@ -982,20 +908,25 @@ class optics(logging):
         Add a Fresnel zone plate to the optics stack.
 
         The FZP is modeled as a real-space binary transmission mask. Zone
-        boundaries are defined by r_n = sqrt(n * lambda * f), where
-        f = D * dr_N / (m * lambda). Even zones transmit and odd zones are
-        either opaque (amplitude FZP) or pi-shifted (phase FZP).
+        boundaries are defined by r_n = sqrt(n * lambda * f1), where
+        f1 = D * dr_N / lambda is the first-order focal length. Even zones
+        transmit and odd zones are either opaque (amplitude FZP) or
+        pi-shifted (phase FZP).
 
         Args:
             outermost_zone_width_nm (float): Width of the outermost zone in
-                nanometers. Determines resolution (1.22 * dr_N) and NA
-                (lambda / (2 * dr_N)) for the 1st order.
+                nanometers. Determines resolution (1.22 * dr_N / m) and NA
+                (m * lambda / (2 * dr_N)) for order m.
             diameter_um (float): Zone plate diameter in micrometers.
-                Determines focal length f = D * dr_N / (m * lambda) and
-                the number of zones N = D / (2 * dr_N).
+                Determines the focal length f1 = D * dr_N / lambda and
+                the number of zones N = D / (4 * dr_N).
             efficiency (float): Diffraction efficiency into the imaging order
                 (0-1). Amplitude is scaled by sqrt(efficiency). Default 1.0.
-            order (int): Diffraction order used for imaging. Default 1.
+            order (int): Diffraction order used for imaging. The plate
+                geometry is that of order 1; the working focus is f1 / m.
+                For the binary types all orders are present in the mask, so
+                'order' only affects the reported focus and the 'ideal' lens
+                phase. Default 1.
             central_stop_fraction (float): Fraction of the zone plate radius
                 blocked by a central stop (0-1). Default 0.0.
             zone_plate_type (str): 'ideal' (thin-lens phase, 1st order only),
