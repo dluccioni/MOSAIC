@@ -53,6 +53,12 @@ class deformation(logging):
         self._Xref = None         # shape (N, 3) reference nodal coordinates
         self._Xcurr = None        # shape (N, 3) current nodal coordinates
         self._elem_nodes = None   # shape (E, k) element connectivity (0-based)
+        self._Xref_import = None  # import-order reference coordinates (host, float64)
+        self._mesh_points = None  # COMSOL mesh point coordinates (host, float64)
+        self._fe_field_file = None
+        self._fe_mesh_file = None
+        self._fe_position_scale = 1.0
+        self._fe_nodes_matched = False
         if self.directory is not None and not os.path.isdir(self.directory):
             os.makedirs(self.directory)
 
@@ -875,128 +881,23 @@ class deformation(logging):
         self._ensure_field_cuda_kernels(dtype=dtype, k=k)
         return self._field_kernels[("field_kernels", np.dtype(dtype).name, int(k))]
 
-    def _ensure_fe_nodal_cuda_kernels(self, dtype=np.float32, k=48):
+    def _get_cell_cull_kernel(self):
         """
-        Compile and cache optimized CUDA kernels for FE nodal field operations.
+        Compile (once) and return the cell-list candidate gathering kernel.
 
-        Creates highly optimized kernels targeting:
-        - Bitonic sort-based kNN
-        - GPU-native cell culling
-        - Fused MLS basis + weighted normal equations
-        - Custom batched 10x10 Cholesky solver
+        The kernel appends the node indices of every cell in an integer cell
+        range to an output buffer. It has no dtype or K dependence, so it is
+        shared by every kernel bundle.
 
-        Args:
-            dtype (numpy dtype): Floating dtype (np.float32 or np.float64).
-            k (int): Number of neighbors (up to 64 recommended).
+        Returns:
+            cupy.RawKernel or None: None if CuPy is unavailable.
         """
         if cp is None:
-            return
-        dt = np.dtype(dtype)
-        key = ("fe_nodal_kernels", dt.name, int(k))
-        if hasattr(self, "_fe_nodal_kernels") and key in self._fe_nodal_kernels:
-            return
-        if not hasattr(self, "_fe_nodal_kernels"):
-            self._fe_nodal_kernels = {}
-
-        T = "double" if dt == np.float64 else "float"
-        POW = "pow" if dt == np.float64 else "powf"
-        SQRT = "sqrt" if dt == np.float64 else "sqrtf"
-        INF = "1e300" if dt == np.float64 else "1e30f"
-        K = int(k)
-
-        # Bitonic sort-based kNN kernel
-        src_knn_bitonic = r'''
-        extern "C" __global__
-        void knn_bitonic_sqdist(const %(T)s* __restrict__ P, const int N,
-                                const %(T)s* __restrict__ X, const int M,
-                                int* __restrict__ out_idx,
-                                %(T)s* __restrict__ out_d2)
-        {
-            int tid = threadIdx.x;
-            int q = blockIdx.x * blockDim.x + tid;
-
-            %(T)s qx = 0, qy = 0, qz = 0;
-            if (q < M) {
-                qx = X[3*q+0];
-                qy = X[3*q+1];
-                qz = X[3*q+2];
-            }
-
-            extern __shared__ unsigned char smem_raw[];
-            %(T)s* sPx = (%(T)s*)smem_raw;
-            %(T)s* sPy = sPx + blockDim.x;
-            %(T)s* sPz = sPy + blockDim.x;
-
-            const %(T)s INFV = (%(INF)s);
-            %(T)s best_d[%(K)d];
-            int   best_i[%(K)d];
-            #pragma unroll
-            for (int a=0; a<%(K)d; ++a) { best_d[a] = INFV; best_i[a] = -1; }
-
-            for (int j0 = 0; j0 < N; j0 += blockDim.x) {
-                int pj = j0 + tid;
-                if (pj < N) {
-                    sPx[tid] = P[3*pj+0];
-                    sPy[tid] = P[3*pj+1];
-                    sPz[tid] = P[3*pj+2];
-                }
-                __syncthreads();
-
-                int tileCount = min(blockDim.x, N - j0);
-                if (q < M) {
-                    for (int t=0; t<tileCount; ++t) {
-                        %(T)s dx = qx - sPx[t];
-                        %(T)s dy = qy - sPy[t];
-                        %(T)s dz = qz - sPz[t];
-                        %(T)s d2 = dx*dx + dy*dy + dz*dz;
-                        int id = j0 + t;
-
-                        // Bitonic insertion: find position and shift
-                        if (d2 < best_d[%(K)d-1]) {
-                            best_d[%(K)d-1] = d2;
-                            best_i[%(K)d-1] = id;
-
-                            // Bitonic sort network for k elements
-                            #pragma unroll
-                            for (int stage = 1; stage < %(K)d; stage *= 2) {
-                                #pragma unroll
-                                for (int stride = stage; stride > 0; stride /= 2) {
-                                    #pragma unroll
-                                    for (int i = 0; i < %(K)d; i++) {
-                                        int j = i ^ stride;
-                                        if (j > i) {
-                                            bool ascending = ((i & stage) == 0);
-                                            bool swap = (best_d[i] > best_d[j]) == ascending;
-                                            if (swap) {
-                                                %(T)s tmp_d = best_d[i];
-                                                int tmp_i = best_i[i];
-                                                best_d[i] = best_d[j];
-                                                best_i[i] = best_i[j];
-                                                best_d[j] = tmp_d;
-                                                best_i[j] = tmp_i;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                __syncthreads();
-            }
-
-            if (q < M) {
-                #pragma unroll
-                for (int a=0; a<%(K)d; ++a) {
-                    out_idx[q*%(K)d + a] = best_i[a];
-                    out_d2[q*%(K)d + a] = best_d[a];
-                }
-            }
-        }
-        ''' % {"T": T, "K": K, "INF": INF}
-
-        # GPU cell culling kernel
-        src_cell_cull = r'''
+            return None
+        kern = getattr(self, "_cell_cull_kernel", None)
+        if kern is not None:
+            return kern
+        src = r'''
         extern "C" __global__
         void gather_cell_candidates(
             const int* __restrict__ sortedIdx,
@@ -1043,6 +944,112 @@ class deformation(logging):
             }
         }
         '''
+        self._cell_cull_kernel = cp.RawKernel(src, "gather_cell_candidates")
+        return self._cell_cull_kernel
+
+    def _ensure_fe_nodal_cuda_kernels(self, dtype=np.float32, k=48):
+        """
+        Compile and cache optimized CUDA kernels for FE nodal field operations.
+
+        Creates kernels for:
+        - kNN over node positions (sorted top-K list per query)
+        - GPU-native cell culling
+        - Fused MLS basis + weighted normal equations
+        - Batched 10x10 Cholesky solver with a per-row status flag
+
+        Args:
+            dtype (numpy dtype): Floating dtype (np.float32 or np.float64).
+            k (int): Number of neighbors (up to 64 recommended).
+        """
+        if cp is None:
+            return
+        dt = np.dtype(dtype)
+        key = ("fe_nodal_kernels", dt.name, int(k))
+        if hasattr(self, "_fe_nodal_kernels") and key in self._fe_nodal_kernels:
+            return
+        if not hasattr(self, "_fe_nodal_kernels"):
+            self._fe_nodal_kernels = {}
+
+        T = "double" if dt == np.float64 else "float"
+        POW = "pow" if dt == np.float64 else "powf"
+        SQRT = "sqrt" if dt == np.float64 else "sqrtf"
+        INF = "1e300" if dt == np.float64 else "1e30f"
+        K = int(k)
+
+        # kNN kernel: per-thread sorted top-K list filled by insertion.
+        src_knn_insert = r'''
+        extern "C" __global__
+        void knn_insert_sqdist(const %(T)s* __restrict__ P, const int N,
+                                const %(T)s* __restrict__ X, const int M,
+                                int* __restrict__ out_idx,
+                                %(T)s* __restrict__ out_d2)
+        {
+            int tid = threadIdx.x;
+            int q = blockIdx.x * blockDim.x + tid;
+
+            %(T)s qx = 0, qy = 0, qz = 0;
+            if (q < M) {
+                qx = X[3*q+0];
+                qy = X[3*q+1];
+                qz = X[3*q+2];
+            }
+
+            extern __shared__ unsigned char smem_raw[];
+            %(T)s* sPx = (%(T)s*)smem_raw;
+            %(T)s* sPy = sPx + blockDim.x;
+            %(T)s* sPz = sPy + blockDim.x;
+
+            const %(T)s INFV = (%(INF)s);
+            %(T)s best_d[%(K)d];
+            int   best_i[%(K)d];
+            #pragma unroll
+            for (int a=0; a<%(K)d; ++a) { best_d[a] = INFV; best_i[a] = -1; }
+
+            for (int j0 = 0; j0 < N; j0 += blockDim.x) {
+                int pj = j0 + tid;
+                if (pj < N) {
+                    sPx[tid] = P[3*pj+0];
+                    sPy[tid] = P[3*pj+1];
+                    sPz[tid] = P[3*pj+2];
+                }
+                __syncthreads();
+
+                int tileCount = min(blockDim.x, N - j0);
+                if (q < M) {
+                    for (int t=0; t<tileCount; ++t) {
+                        %(T)s dx = qx - sPx[t];
+                        %(T)s dy = qy - sPy[t];
+                        %(T)s dz = qz - sPz[t];
+                        %(T)s d2 = dx*dx + dy*dy + dz*dz;
+                        int id = j0 + t;
+
+                        // Insertion into the sorted top-K list (ascending d2).
+                        if (d2 < best_d[%(K)d-1]) {
+                            int ins = -1;
+                            for (int a=%(K)d-1; a>=0; --a) {
+                                if (d2 < best_d[a]) ins = a;
+                            }
+                            for (int a=%(K)d-1; a>ins; --a) {
+                                best_d[a] = best_d[a-1];
+                                best_i[a] = best_i[a-1];
+                            }
+                            best_d[ins] = d2;
+                            best_i[ins] = id;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (q < M) {
+                #pragma unroll
+                for (int a=0; a<%(K)d; ++a) {
+                    out_idx[q*%(K)d + a] = best_i[a];
+                    out_d2[q*%(K)d + a] = best_d[a];
+                }
+            }
+        }
+        ''' % {"T": T, "K": K, "INF": INF}
 
         # Fused MLS basis + weighted normal equations kernel
         src_mls_fused = r'''
@@ -1231,7 +1238,8 @@ class deformation(logging):
             const %(T)s* __restrict__ A,  // (M, 10, 10)
             const %(T)s* __restrict__ b,  // (M, 10, 3)
             const int M,
-            %(T)s* __restrict__ x_out)    // (M, 10, 3)
+            %(T)s* __restrict__ x_out,    // (M, 10, 3)
+            int* __restrict__ status_out) // (M,) 1 if the factorization succeeded
         {
             int i = blockIdx.x * blockDim.x + threadIdx.x;
             if (i >= M) return;
@@ -1303,7 +1311,7 @@ class deformation(logging):
                     }
                 }
             } else {
-                // Fallback: return zeros
+                // Not positive definite: zero the row and flag it for the caller.
                 #pragma unroll
                 for (int a = 0; a < 30; a++) x[a] = 0;
             }
@@ -1313,13 +1321,14 @@ class deformation(logging):
             for (int a = 0; a < 30; a++) {
                 x_out[i*30 + a] = x[a];
             }
+            status_out[i] = success ? 1 : 0;
         }
         ''' % {"T": T, "SQRT": SQRT}
 
         # Compile all kernels
         kernels = {
-            "knn_bitonic": cp.RawKernel(src_knn_bitonic, "knn_bitonic_sqdist"),
-            "cell_cull": cp.RawKernel(src_cell_cull, "gather_cell_candidates"),
+            "knn": cp.RawKernel(src_knn_insert, "knn_insert_sqdist"),
+            "cell_cull": self._get_cell_cull_kernel(),
             "mls_fused": cp.RawKernel(src_mls_fused, "mls_fused_weighted_neq"),
             "cholesky_solve": cp.RawKernel(src_cholesky_10x10, "batched_cholesky_solve_10x10"),
             "dtype": dt,
@@ -1354,7 +1363,7 @@ class deformation(logging):
         use_gpu=True,
         power=2.0,
         threads=None,
-        tile_size=None,        # kept for API compatibility; unused on CUDA path, need to update CPU
+        tile_size=None,
         yield_chunks=False,
         dtype=None,
         clip_to_sample=True,
@@ -1362,23 +1371,25 @@ class deformation(logging):
         use_cell_list=True,
         cell_r_cut=None,
         cell_pad_cells=1,
+        force=False,
     ):
         """
-        Apply a deformation field to sample points in chunks.
+        Apply a deformation gradient field to sample points in chunks.
 
-        This accelerated path uses custom CUDA kernels for:
-        - kNN over field nodes,
-        - inverse-distance weighting of F,
-        - row-vector affine application.
-
-        A CPU fallback preserves the previous behavior (tiled kNN using NumPy).
+        Each point receives the inverse-distance-weighted average of the k
+        nearest field tensors and is mapped by x' = origin + F (x - origin).
+        The GPU path uses custom CUDA kernels for kNN, weighting and
+        application, with optional cell-list culling of the field; the CPU
+        path uses a k-d tree for the kNN.
 
         Args:
             field_positions (ndarray): Field node positions, shape (Nf, 3).
             field_F (ndarray): Field F tensors, shape (Nf, 9), row-major.
-            sample (ndarray or iterable): Either a single (M, 3) array or an
-                iterable of (Mi, 3) chunks. If an ndarray and yield_chunks=False,
-                returns a single concatenated array (GPU: CuPy; CPU: NumPy).
+            sample (Sample, ndarray or iterable): A Sample object with chunked
+                position IO, a single (M, 3) array, or an iterable of (Mi, 3)
+                chunks. For a Sample the stored chunks are read raw, deformed,
+                written back, and the sample metadata is updated; nothing is
+                returned.
             chunk_size (int): Chunk size used when `sample` is a single array.
             k (int): Number of neighbors for the inverse-distance-weighted
                 interpolation of the deformation gradient. Defaults to 8.
@@ -1386,36 +1397,47 @@ class deformation(logging):
             use_gpu (bool): Use CUDA path if True and CuPy is available.
             power (float): IDW power for weighting distances.
             threads (int or None): Reserved; not used.
-            tile_size (int or None): CPU-only tile size override.
-            yield_chunks (bool): If True, return a generator of output chunks.
+            tile_size (int or None): Kept for API compatibility; not used.
+            yield_chunks (bool): If True, return a generator of output chunks
+                (array or iterable input only).
             dtype (numpy dtype or None): Output dtype; inferred if None.
-            clip_to_sample (bool): If True, clip field to sample AABB first.
+            clip_to_sample (bool): If True and `sample` exposes `corners`, clip
+                the field to the sample AABB first.
             clip_margin (float): Margin for clipping AABB.
-            use_cell_list (bool): If True (GPU), build a cell list over field.
+            use_cell_list (bool): If True (GPU) and `sample` provides
+                `build_cell_list_gpu`, build a cell list over the field.
             cell_r_cut (float or None): Optional cell list cutoff radius.
             cell_pad_cells (int): Halo cells around each chunk AABB for culling.
+            force (bool): For Sample input, apply even if the same field was
+                already applied to the sample.
 
         Returns:
-            ndarray or list or generator:
-                - If `sample` is an ndarray and yield_chunks=False:
-                    returns a single array of deformed positions.
-                - If `sample` is an ndarray and yield_chunks=True:
-                    returns a generator of chunk outputs (backend-specific arrays).
-                - If `sample` is an iterable of chunks:
-                    returns a list of outputs (or a generator if yield_chunks=True).
+            None, ndarray, list or generator:
+                - Sample input: None (chunks rewritten on disk).
+                - ndarray input, yield_chunks=False: one array of deformed
+                  positions (CuPy on GPU, NumPy on CPU).
+                - ndarray input, yield_chunks=True: generator of chunk outputs.
+                - iterable input: list of outputs (generator if yield_chunks).
 
         Raises:
             ValueError: On invalid shapes or parameters.
-
-        Notes:
-            The CUDA path can allocate temporary buffers per chunk. The CPU
-            path uses a tiled distance computation to bound memory.
+            RuntimeError: For a Sample in streaming mode, or one to which this
+                field was already applied when `force` is False.
         """
+        import hashlib
+
+        is_sample = (hasattr(sample, "load_chunk_positions")
+                     and hasattr(sample, "write_chunk_positions")
+                     and hasattr(sample, "chunk_total"))
+        if is_sample and getattr(sample, "_streaming_mode", False):
+            raise RuntimeError("apply_deformation_chunked: the sample is in streaming mode; chunks are "
+                               "regenerated on demand and stored positions are never read, so a "
+                               "deformation cannot be applied.")
+
         # Backend and dtype resolution.
-        xp = cp if (use_gpu and (cp is not None)) else np
         if (use_gpu and cp is None):
             use_gpu = False
-            xp = np
+        xp = cp if use_gpu else np
         if dtype is None:
             dtype = field_F.dtype if hasattr(field_F, "dtype") else np.float32
         dtype = np.dtype(dtype)
@@ -1430,27 +1452,49 @@ class deformation(logging):
             raise ValueError("field_F must have shape (N,9) matching field_positions")
         if k <= 0 or k > max(1, P_all.shape[0]):
             raise ValueError("k must be in [1, N_field]")
+        n_field_total = int(P_all.shape[0])
+
+        # Modification record for Sample input: identifies the field by content.
+        params = None
+        if is_sample:
+            h = hashlib.sha1()
+            P_host = cp.asnumpy(P_all) if use_gpu else np.asarray(P_all)
+            F_host = cp.asnumpy(F_all) if use_gpu else np.asarray(F_all)
+            h.update(np.ascontiguousarray(P_host, dtype=np.float32).tobytes())
+            h.update(np.ascontiguousarray(F_host, dtype=np.float32).tobytes())
+            del P_host, F_host
+            params = {
+                "field_digest": h.hexdigest()[:16],
+                "n_field": n_field_total,
+                "k": int(k),
+                "power": float(power),
+                "origin": [float(v) for v in np.asarray(origin, dtype=np.float64).reshape(3)],
+            }
+            if (not force) and hasattr(sample, "has_modification") and sample.has_modification("deformation_field", params):
+                raise RuntimeError("apply_deformation_chunked: this field was already applied to the sample "
+                                   "(see sample_metadata.json); pass force=True to apply it again.")
 
         # Optional one-time field clip to sample AABB.
-        if clip_to_sample:
+        if clip_to_sample and hasattr(sample, "corners"):
             P_all, F_all = self.clip_field_to_sample(
                 P_all, F_all, sample, margin=float(clip_margin), use_gpu=use_gpu, dtype=dtype, copy=False
             )  # raises if empty
+            if k > int(P_all.shape[0]):
+                raise ValueError("k exceeds the number of field points inside the sample AABB (+margin)")
 
         origin = xp.asarray(origin, dtype=dtype).reshape(3)
         eps = dtype.type(1e-12)
 
-        # CUDA path
+        # Build the per-chunk processing function for the chosen backend.
         if use_gpu:
             kern = self._get_field_cuda_kernels(dtype=dtype, k=k)
             sizeof_T = 8 if dtype == np.float64 else 4
             block = 128
 
-            # Local helpers for GPU kNN, weighting, and apply.
             def _knn_gpu(X, P_sub):
                 M = int(X.shape[0]); N = int(P_sub.shape[0])
                 idx = cp.empty((M, k), dtype=cp.int32)
-                d2  = cp.empty((M, k), dtype=dtype)
+                d2 = cp.empty((M, k), dtype=dtype)
                 grid = (M + block - 1) // block
                 smem = 3 * block * sizeof_T  # x,y,z per candidate in shared memory
                 kern["knn_topk_sqdist"]((grid,), (block,),
@@ -1478,340 +1522,281 @@ class deformation(logging):
                     (F9.ravel(), X.ravel(), origin, out.ravel(), np.int32(M)))
                 return out
 
-            # Optional GPU cell list over field for candidate culling.
+            # Optional GPU cell list over the field for candidate culling.
             field_cells = None
-            if use_cell_list:
+            if use_cell_list and hasattr(sample, "build_cell_list_gpu"):
                 if cell_r_cut is None:
-                    bb = cp.max(P_all, axis=0) - cp.min(P_all, axis=0)
-                    vol = float((bb[0] * bb[1] * bb[2]).get())
-                    Nf = int(P_all.shape[0])
-                    mean_spacing = (vol / max(1, Nf)) ** (1.0 / 3.0)
-                    cell_r_cut = 3.0 * mean_spacing
+                    cell_r_cut = 3.0 * self._median_nn_spacing(cp.asnumpy(P_all))
                 cell_r_cut = float(cell_r_cut)
                 (sortedP, sortedIdx, cell_start, cell_end,
-                 bb_min, cell_size, nx, ny, nz) = sample.build_cell_list_gpu(P_all, cell_r_cut)
+                 bb_min, cell_size, nx, ny, nz) = sample.build_cell_list_gpu(
+                    P_all.astype(cp.float32, copy=False), cell_r_cut)
                 field_cells = {
-                    "sortedP": sortedP.astype(dtype, copy=False),
                     "sortedIdx": sortedIdx,
                     "cell_start": cell_start,
                     "cell_end": cell_end,
                     "bb_min": bb_min.astype(dtype, copy=False),
                     "cell_size": float(cell_size),
                     "nx": int(nx), "ny": int(ny), "nz": int(nz),
+                    "cand": cp.empty((max(1, int(P_all.shape[0])),), dtype=cp.int32),
+                    "count": cp.zeros((1,), dtype=cp.int32),
+                    "kernel": self._get_cell_cull_kernel(),
                 }
 
-                def _candidate_indices_from_chunk_AABB(X_chunk):
-                    # Compute integer cell ranges covering the chunk AABB plus halo.
-                    xmn = cp.min(X_chunk, axis=0)
-                    xmx = cp.max(X_chunk, axis=0)
-                    halo = float(field_cells["cell_size"] * max(0, int(cell_pad_cells)))
-                    xmn = xmn - halo
-                    xmx = xmx + halo
-                    bb_min = field_cells["bb_min"]
-                    cs = field_cells["cell_size"]
-                    nxv, nyv, nzv = field_cells["nx"], field_cells["ny"], field_cells["nz"]
+            def _candidate_indices_from_chunk_AABB(X_chunk):
+                # Gather field indices from the cells covering the chunk AABB plus halo.
+                cs = field_cells["cell_size"]
+                halo = float(cs * max(0, int(cell_pad_cells)))
+                nxv, nyv, nzv = field_cells["nx"], field_cells["ny"], field_cells["nz"]
+                lo = cp.floor((cp.min(X_chunk, axis=0) - halo - field_cells["bb_min"]) / cs)
+                hi = cp.floor((cp.max(X_chunk, axis=0) + halo - field_cells["bb_min"]) / cs)
+                cb = cp.concatenate([lo, hi]).get()
+                cx0 = max(0, min(nxv - 1, int(cb[0])))
+                cy0 = max(0, min(nyv - 1, int(cb[1])))
+                cz0 = max(0, min(nzv - 1, int(cb[2])))
+                cx1 = max(0, min(nxv - 1, int(cb[3])))
+                cy1 = max(0, min(nyv - 1, int(cb[4])))
+                cz1 = max(0, min(nzv - 1, int(cb[5])))
+                total_cells = (cx1 - cx0 + 1) * (cy1 - cy0 + 1) * (cz1 - cz0 + 1)
+                if total_cells <= 0:
+                    return cp.zeros((0,), dtype=cp.int32)
+                field_cells["count"][0] = 0
+                grid_cells = (total_cells + block - 1) // block
+                field_cells["kernel"](
+                    (grid_cells,), (block,),
+                    (field_cells["sortedIdx"], field_cells["cell_start"], field_cells["cell_end"],
+                     np.int32(cx0), np.int32(cy0), np.int32(cz0),
+                     np.int32(cx1), np.int32(cy1), np.int32(cz1),
+                     np.int32(nxv), np.int32(nyv), np.int32(nzv),
+                     np.int32(int(field_cells["cell_start"].shape[0])),
+                     field_cells["cand"], field_cells["count"])
+                )
+                count = int(field_cells["count"].get())
+                if count == 0:
+                    return cp.zeros((0,), dtype=cp.int32)
+                return field_cells["cand"][:count].copy()
 
-                    def _clamp_int(a, lo, hi):
-                        return max(lo, min(hi, int(a)))
-
-                    cx0 = _clamp_int(cp.floor((xmn[0] - bb_min[0]) / cs).get(), 0, nxv - 1)
-                    cy0 = _clamp_int(cp.floor((xmn[1] - bb_min[1]) / cs).get(), 0, nyv - 1)
-                    cz0 = _clamp_int(cp.floor((xmn[2] - bb_min[2]) / cs).get(), 0, nzv - 1)
-                    cx1 = _clamp_int(cp.floor((xmx[0] - bb_min[0]) / cs).get(), 0, nxv - 1)
-                    cy1 = _clamp_int(cp.floor((xmx[1] - bb_min[1]) / cs).get(), 0, nyv - 1)
-                    cz1 = _clamp_int(cp.floor((xmx[2] - bb_min[2]) / cs).get(), 0, nzv - 1)
-
-                    segs = []
-                    start_arr = field_cells["cell_start"]
-                    end_arr = field_cells["cell_end"]
-                    idx_all = field_cells["sortedIdx"]
-                    for cz in range(cz0, cz1 + 1):
-                        base_z = cz * (nxv * nyv)
-                        for cy in range(cy0, cy1 + 1):
-                            base_y = base_z + cy * nxv
-                            for cx in range(cx0, cx1 + 1):
-                                int_cid = base_y + cx
-                                s = int(start_arr[int_cid].get())
-                                e = int(end_arr[int_cid].get())
-                                if e > s:
-                                    segs.append(idx_all[s:e])
-                    if len(segs) == 0:
-                        return cp.zeros((0,), dtype=cp.int32)
-                    return cp.concatenate(segs, axis=0)
-
-            # Normalize sample input to chunks.
-            def _as_iter():
-                if hasattr(sample, "shape") and sample.ndim == 2 and sample.shape[1] == 3:
-                    Xall = sample
-                    total = Xall.shape[0]
-                    for s in range(0, total, int(chunk_size)):
-                        yield Xall[s:s+int(chunk_size)]
-                else:
-                    for blk in sample:
-                        yield blk
-
-            def _process_chunk_gpu(Xchunk):
-                # Core GPU processing for one chunk.
+            def _process_chunk(Xchunk):
                 X = cp.asarray(Xchunk, dtype=dtype)
                 if X.ndim != 2 or X.shape[1] != 3:
                     raise ValueError("Each sample chunk must have shape (?,3)")
-                rows = int(X.shape[0])
-                if rows == 0:
+                if int(X.shape[0]) == 0:
                     return cp.empty((0, 3), dtype=dtype)
-
                 if field_cells is not None:
                     cand_idx = _candidate_indices_from_chunk_AABB(X)
-                    if cand_idx.size >= k:
-                        P_sub = P_all[cand_idx]
-                        idx_sub, d2_sub = _knn_gpu(X, P_sub)
+                    if int(cand_idx.size) >= k:
+                        idx_sub, d2 = _knn_gpu(X, P_all[cand_idx])
                         idx = cp.take(cand_idx, idx_sub)
-                        d2 = d2_sub
                     else:
                         idx, d2 = _knn_gpu(X, P_all)
                 else:
                     idx, d2 = _knn_gpu(X, P_all)
-
                 F9 = _weight_F_gpu(idx, d2)
                 return _apply_gpu(F9, X)
 
-            iterator = _as_iter()
-            if yield_chunks:
-                def _gen():
-                    for Xc in iterator:
-                        yield _process_chunk_gpu(Xc)
-                return _gen()
+        else:
+            from scipy.spatial import cKDTree
 
-            outs = []
-            for Xc in iterator:
-                outs.append(_process_chunk_gpu(Xc))
-            if len(outs) == 0:
-                return cp.empty((0, 3), dtype=dtype)
-            if isinstance(sample, cp.ndarray):
-                return cp.concatenate(outs, axis=0)
-            return outs
-
-        # CPU fallback
-        # Heuristic tile size for distance tiles (rows * tile controls temp memory).
-        def _auto_tile(rows):
-            bytes_per = 8 if dtype == np.float64 else 4
-            if rows <= 0:
-                return min(P_all.shape[0], 65536)
-            cap_bytes = 800000000  # approx 0.8 GB
-            t = max(1, int(cap_bytes / max(1, rows * bytes_per)))
-            return int(min(P_all.shape[0], max(2048, t)))
-
-        # Optional CFFI micro-kernels for float32 speedups.
-        def _ensure_cffi():
-            if not hasattr(self, "_cffi_lib"):
-                try:
-                    ffi = FFI()
-                    csrc = r"""
-                    #include <stddef.h>
-                    void weighted_sum_F9(const int* idx,
-                                         const float* w,
-                                         const float* F9_field,
-                                         int n_rows, int k,
-                                         float* F9_out)
-                    {
-                        for (int i = 0; i < n_rows; ++i) {
-                            float sums[9] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
-                            float wsum = 0.0f;
-                            for (int j = 0; j < k; ++j) {
-                                int id = idx[i*k + j];
-                                float weight = w[i*k + j];
-                                wsum += weight;
-                                const float* f = &F9_field[(size_t)id * 9];
-                                sums[0] += weight * f[0];
-                                sums[1] += weight * f[1];
-                                sums[2] += weight * f[2];
-                                sums[3] += weight * f[3];
-                                sums[4] += weight * f[4];
-                                sums[5] += weight * f[5];
-                                sums[6] += weight * f[6];
-                                sums[7] += weight * f[7];
-                                sums[8] += weight * f[8];
-                            }
-                            float inv = (wsum > 0.0f) ? (1.0f / wsum) : 0.0f;
-                            float* out = &F9_out[(size_t)i * 9];
-                            out[0] = sums[0] * inv;
-                            out[1] = sums[1] * inv;
-                            out[2] = sums[2] * inv;
-                            out[3] = sums[3] * inv;
-                            out[4] = sums[4] * inv;
-                            out[5] = sums[5] * inv;
-                            out[6] = sums[6] * inv;
-                            out[7] = sums[7] * inv;
-                            out[8] = sums[8] * inv;
-                        }
-                    }
-                    void apply_affine_rowwise(const float* F9,
-                                              const float* pos,
-                                              const float* origin,
-                                              float* out,
-                                              size_t n)
-                    {
-                        for (size_t i = 0; i < n; ++i) {
-                            const float* f = &F9[i*9];
-                            float x = pos[i*3+0] - origin[0];
-                            float y = pos[i*3+1] - origin[1];
-                            float z = pos[i*3+2] - origin[2];
-                            out[i*3+0] = origin[0] + f[0]*x + f[1]*y + f[2]*z;
-                            out[i*3+1] = origin[1] + f[3]*x + f[4]*y + f[5]*z;
-                            out[i*3+2] = origin[2] + f[6]*x + f[7]*y + f[8]*z;
-                        }
-                    }
-                    """
-                    ffi.cdef("""
+            # Optional CFFI micro-kernels for float32 speedups.
+            def _ensure_cffi():
+                if not hasattr(self, "_cffi_lib"):
+                    try:
+                        ffi = FFI()
+                        csrc = r"""
+                        #include <stddef.h>
                         void weighted_sum_F9(const int* idx,
                                              const float* w,
                                              const float* F9_field,
                                              int n_rows, int k,
-                                             float* F9_out);
+                                             float* F9_out)
+                        {
+                            for (int i = 0; i < n_rows; ++i) {
+                                float sums[9] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+                                float wsum = 0.0f;
+                                for (int j = 0; j < k; ++j) {
+                                    int id = idx[i*k + j];
+                                    float weight = w[i*k + j];
+                                    wsum += weight;
+                                    const float* f = &F9_field[(size_t)id * 9];
+                                    sums[0] += weight * f[0];
+                                    sums[1] += weight * f[1];
+                                    sums[2] += weight * f[2];
+                                    sums[3] += weight * f[3];
+                                    sums[4] += weight * f[4];
+                                    sums[5] += weight * f[5];
+                                    sums[6] += weight * f[6];
+                                    sums[7] += weight * f[7];
+                                    sums[8] += weight * f[8];
+                                }
+                                float inv = (wsum > 0.0f) ? (1.0f / wsum) : 0.0f;
+                                float* out = &F9_out[(size_t)i * 9];
+                                out[0] = sums[0] * inv;
+                                out[1] = sums[1] * inv;
+                                out[2] = sums[2] * inv;
+                                out[3] = sums[3] * inv;
+                                out[4] = sums[4] * inv;
+                                out[5] = sums[5] * inv;
+                                out[6] = sums[6] * inv;
+                                out[7] = sums[7] * inv;
+                                out[8] = sums[8] * inv;
+                            }
+                        }
                         void apply_affine_rowwise(const float* F9,
                                                   const float* pos,
                                                   const float* origin,
                                                   float* out,
-                                                  size_t n);
-                    """)
-                    self._cffi_lib = ffi.verify(csrc, extra_compile_args=["-O3"])
-                    self._cffi = ffi
-                except Exception:
-                    self._cffi_lib = None
-                    self._cffi = None
+                                                  size_t n)
+                        {
+                            for (size_t i = 0; i < n; ++i) {
+                                const float* f = &F9[i*9];
+                                float x = pos[i*3+0] - origin[0];
+                                float y = pos[i*3+1] - origin[1];
+                                float z = pos[i*3+2] - origin[2];
+                                out[i*3+0] = origin[0] + f[0]*x + f[1]*y + f[2]*z;
+                                out[i*3+1] = origin[1] + f[3]*x + f[4]*y + f[5]*z;
+                                out[i*3+2] = origin[2] + f[6]*x + f[7]*y + f[8]*z;
+                            }
+                        }
+                        """
+                        ffi.cdef("""
+                            void weighted_sum_F9(const int* idx,
+                                                 const float* w,
+                                                 const float* F9_field,
+                                                 int n_rows, int k,
+                                                 float* F9_out);
+                            void apply_affine_rowwise(const float* F9,
+                                                      const float* pos,
+                                                      const float* origin,
+                                                      float* out,
+                                                      size_t n);
+                        """)
+                        self._cffi_lib = ffi.verify(csrc, extra_compile_args=["-O3"])
+                        self._cffi = ffi
+                    except Exception:
+                        self._cffi_lib = None
+                        self._cffi = None
 
-        def _knn_tiled(P_sub, X, k, tile):
-            # Compute kNN using distance tiles to bound memory usage.
-            M = X.shape[0]
-            best_d2 = np.full((M, k), np.inf, dtype=dtype)
-            best_idx = np.full((M, k), -1, dtype=np.int32)
-            row_idx = None
-            N = P_sub.shape[0]
-            for j in range(0, N, tile):
-                Pj = P_sub[j:j+tile]
-                diff = X[:, None, :] - Pj[None, :, :]
-                d2 = np.sum(diff * diff, axis=2)
-                part = np.argpartition(d2, kth=min(k-1, d2.shape[1]-1), axis=1)[:, :k]
-                d2k = d2[np.arange(M)[:, None], part]
-                idxk = part + j
-                if row_idx is None:
-                    row_idx = np.arange(M)[:, None]
-                all_d2 = np.concatenate([best_d2, d2k], axis=1)
-                all_idx = np.concatenate([best_idx, idxk], axis=1)
-                part2 = np.argpartition(all_d2, kth=k-1, axis=1)[:, :k]
-                best_d2 = all_d2[row_idx, part2]
-                best_idx = all_idx[row_idx, part2]
-            return best_idx, np.sqrt(best_d2)
+            def _weighted_F_cpu(idx, dists, F_field):
+                # Inverse-distance weighting of F9. Handle zero-distance rows.
+                M = idx.shape[0]
+                w = 1.0 / (np.power(dists, power, dtype=np.float64).astype(dtype, copy=False) + eps)
+                zero = dists <= eps
+                if zero.any():
+                    row_has_zero = zero.any(axis=1)
+                    zpos = zero[row_has_zero, :].argmax(axis=1)
+                    w[row_has_zero, :] = 0
+                    for r, c in enumerate(zpos):
+                        w[np.where(row_has_zero)[0][r], int(c)] = 1.0
+                if getattr(self, "_cffi_lib", None) is not None and f32:
+                    ffi = self._cffi
+                    lib = self._cffi_lib
+                    idx_i32 = np.asarray(idx, dtype=np.int32, order="C")
+                    w_f32 = np.asarray(w, dtype=np.float32, order="C")
+                    F_field_f32 = np.asarray(F_field, dtype=np.float32, order="C")
+                    out = np.empty((M, 9), dtype=np.float32, order="C")
+                    lib.weighted_sum_F9(
+                        ffi.from_buffer("int[]", idx_i32),
+                        ffi.from_buffer("float[]", w_f32),
+                        ffi.from_buffer("float[]", F_field_f32),
+                        int(M), int(idx.shape[1]),
+                        ffi.from_buffer("float[]", out),
+                    )
+                    return out.astype(dtype, copy=False)
+                else:
+                    F_neighbors = F_field[idx]
+                    wsum = w.sum(axis=1, keepdims=True)
+                    Fw = (F_neighbors * w[..., None]).sum(axis=1)
+                    Fw = Fw / np.maximum(wsum, eps)
+                    return Fw.astype(dtype, copy=False)
 
-        def _weighted_F_cpu(idx, dists, F_field):
-            # Inverse-distance weighting of F9. Handle zero-distance rows.
-            M = idx.shape[0]
-            w = 1.0 / (np.power(dists, power, dtype=np.float64).astype(dtype, copy=False) + eps)
-            zero = dists <= eps
-            if zero.any():
-                row_has_zero = zero.any(axis=1)
-                w[row_has_zero, :] = 0
-                zpos = zero[row_has_zero, :].argmax(axis=1)
-                w[row_has_zero, :] = 0
-                for r, c in enumerate(zpos):
-                    w[np.where(row_has_zero)[0][r], int(c)] = 1.0
-            if getattr(self, "_cffi_lib", None) is not None and f32:
-                # Use CFFI micro-kernel for float32.
-                ffi = self._cffi
-                lib = self._cffi_lib
-                idx_i32 = np.asarray(idx, dtype=np.int32, order="C")
-                w_f32 = np.asarray(w, dtype=np.float32, order="C")
-                F_field_f32 = np.asarray(F_field, dtype=np.float32, order="C")
-                out = np.empty((M, 9), dtype=np.float32, order="C")
-                lib.weighted_sum_F9(
-                    ffi.from_buffer("int[]", idx_i32),
-                    ffi.from_buffer("float[]", w_f32),
-                    ffi.from_buffer("float[]", F_field_f32),
-                    int(M), int(idx.shape[1]),
-                    ffi.from_buffer("float[]", out),
-                )
-                return out.astype(dtype, copy=False)
-            else:
-                F_neighbors = F_field[idx]
-                wsum = w.sum(axis=1, keepdims=True)
-                Fw = (F_neighbors * w[..., None]).sum(axis=1)
-                Fw = Fw / np.maximum(wsum, eps)
-                return Fw.astype(dtype, copy=False)
+            def _apply_F_cpu(F9, X):
+                # Apply per-row affine transforms with origin translation.
+                M = X.shape[0]
+                if getattr(self, "_cffi_lib", None) is not None and f32:
+                    ffi = self._cffi
+                    lib = self._cffi_lib
+                    F9_f32 = np.asarray(F9, dtype=np.float32, order="C")
+                    X_f32 = np.asarray(X, dtype=np.float32, order="C")
+                    out = np.empty_like(X_f32)
+                    org = np.asarray(origin, dtype=np.float32)
+                    lib.apply_affine_rowwise(
+                        ffi.from_buffer("float[]", F9_f32),
+                        ffi.from_buffer("float[]", X_f32),
+                        ffi.from_buffer("float[]", org),
+                        ffi.from_buffer("float[]", out),
+                        int(M),
+                    )
+                    return out.astype(dtype, copy=False)
+                else:
+                    dx = X[:, 0] - origin[0]
+                    dy = X[:, 1] - origin[1]
+                    dz = X[:, 2] - origin[2]
+                    x0 = origin[0] + (F9[:, 0] * dx + F9[:, 1] * dy + F9[:, 2] * dz)
+                    x1 = origin[1] + (F9[:, 3] * dx + F9[:, 4] * dy + F9[:, 5] * dz)
+                    x2 = origin[2] + (F9[:, 6] * dx + F9[:, 7] * dy + F9[:, 8] * dz)
+                    return np.stack([x0, x1, x2], axis=1).astype(dtype, copy=False)
 
-        def _apply_F_cpu(F9, X):
-            # Apply per-row affine transforms with origin translation.
-            M = X.shape[0]
-            if getattr(self, "_cffi_lib", None) is not None and f32:
-                ffi = self._cffi
-                lib = self._cffi_lib
-                F9_f32 = np.asarray(F9, dtype=np.float32, order="C")
-                X_f32 = np.asarray(X, dtype=np.float32, order="C")
-                out = np.empty_like(X_f32)
-                org = np.asarray(origin, dtype=np.float32)
-                lib.apply_affine_rowwise(
-                    ffi.from_buffer("float[]", F9_f32),
-                    ffi.from_buffer("float[]", X_f32),
-                    ffi.from_buffer("float[]", org),
-                    ffi.from_buffer("float[]", out),
-                    int(M),
-                )
-                return out.astype(dtype, copy=False)
-            else:
-                dx = X[:, 0] - origin[0]
-                dy = X[:, 1] - origin[1]
-                dz = X[:, 2] - origin[2]
-                x0 = origin[0] + (F9[:, 0] * dx + F9[:, 1] * dy + F9[:, 2] * dz)
-                x1 = origin[1] + (F9[:, 3] * dx + F9[:, 4] * dy + F9[:, 5] * dz)
-                x2 = origin[2] + (F9[:, 6] * dx + F9[:, 7] * dy + F9[:, 8] * dz)
-                return np.stack([x0, x1, x2], axis=1).astype(dtype, copy=False)
+            _ensure_cffi()
+            P_np = np.ascontiguousarray(np.asarray(P_all, dtype=dtype))
+            F_np = np.ascontiguousarray(np.asarray(F_all, dtype=dtype))
+            tree = cKDTree(P_np)
 
-        # Normalize sample input to chunks.
+            def _process_chunk(Xchunk):
+                X = np.asarray(Xchunk, dtype=dtype)
+                if X.ndim != 2 or X.shape[1] != 3:
+                    raise ValueError("Each sample chunk must have shape (?,3)")
+                if X.shape[0] == 0:
+                    return np.empty((0, 3), dtype=dtype)
+                d, idx = tree.query(X, k=k)
+                if k == 1:
+                    d = d[:, None]
+                    idx = idx[:, None]
+                F9 = _weighted_F_cpu(idx.astype(np.int32), d.astype(dtype), F_np)
+                return _apply_F_cpu(F9, X)
+
+        # Sample input: rewrite the stored chunks in place.
+        if is_sample:
+            if sample.chunk_total is None:
+                raise ValueError("Sample is not initialized. Ensure sample metadata is loaded.")
+            gmin = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
+            gmax = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
+            for chunk_i in range(1, int(sample.chunk_total) + 1):
+                X = sample.load_chunk_positions(chunk_i, use_gpu=use_gpu, raw=True)
+                if X.ndim != 2 or X.shape[1] != 3 or X.shape[0] == 0:
+                    continue
+                out = _process_chunk(X)
+                out_np = cp.asnumpy(out) if use_gpu else np.asarray(out)
+                gmin = np.minimum(gmin, out_np.min(axis=0).astype(np.float64))
+                gmax = np.maximum(gmax, out_np.max(axis=0).astype(np.float64))
+                sample.write_chunk_positions(out_np, chunk_i)
+                del X, out, out_np
+            self._finalize_sample_aabb(sample, gmin, gmax)
+            if hasattr(sample, "record_modification"):
+                sample.record_modification("deformation_field", params)
+            return None
+
+        # Array or iterable input.
         def _as_iter():
             if hasattr(sample, "shape") and sample.ndim == 2 and sample.shape[1] == 3:
-                Xall = sample
-                total = Xall.shape[0]
+                total = sample.shape[0]
                 for s in range(0, total, int(chunk_size)):
-                    yield Xall[s:s+int(chunk_size)]
+                    yield sample[s:s+int(chunk_size)]
             else:
                 for blk in sample:
                     yield blk
 
-        # CPU processing loop.
-        _ensure_cffi()
         iterator = _as_iter()
         if yield_chunks:
             def _gen():
-                for Xchunk in iterator:
-                    X = np.asarray(Xchunk, dtype=dtype)
-                    if X.ndim != 2 or X.shape[1] != 3:
-                        raise ValueError("Each sample chunk must have shape (?,3)")
-                    rows = X.shape[0]
-                    if rows == 0:
-                        yield np.empty((0, 3), dtype=dtype)
-                        continue
-                    tsize = tile_size if tile_size is not None else _auto_tile(rows)
-                    idx, d = _knn_tiled(np.asarray(P_all, dtype=dtype), X, k, int(tsize))
-                    F9 = _weighted_F_cpu(idx.astype(np.int32), d.astype(dtype), np.asarray(F_all, dtype=dtype))
-                    yield _apply_F_cpu(F9, X)
+                for Xc in iterator:
+                    yield _process_chunk(Xc)
             return _gen()
 
-        outs = []
-        for Xchunk in iterator:
-            X = np.asarray(Xchunk, dtype=dtype)
-            if X.ndim != 2 or X.shape[1] != 3:
-                raise ValueError("Each sample chunk must have shape (?,3)")
-            rows = X.shape[0]
-            if rows == 0:
-                outs.append(np.empty((0, 3), dtype=dtype))
-                continue
-            tsize = tile_size if tile_size is not None else _auto_tile(rows)
-            idx, d = _knn_tiled(np.asarray(P_all, dtype=dtype), X, k, int(tsize))
-            F9 = _weighted_F_cpu(idx.astype(np.int32), d.astype(dtype), np.asarray(F_all, dtype=dtype))
-            outs.append(_apply_F_cpu(F9, X))
-
+        outs = [_process_chunk(Xc) for Xc in iterator]
         if len(outs) == 0:
-            return np.empty((0, 3), dtype=dtype)
-        if hasattr(sample, "shape") and isinstance(sample, np.ndarray):
-            return np.concatenate(outs, axis=0)
+            return xp.empty((0, 3), dtype=dtype)
+        if hasattr(sample, "shape") and sample.ndim == 2:
+            return xp.concatenate(outs, axis=0)
         return outs
 
     def plot_field_and_sample_edges_3d(
@@ -2267,7 +2252,8 @@ class deformation(logging):
                 Xcurr = cp.asarray(Xcurr, dtype=dtype)
             self._Xref = Xref
             self._Xcurr = Xcurr
-            return Xref, Xcurr
+            self._record_fe_field_import(filepath, 1.0)
+            return self._Xref, self._Xcurr
 
         PRESETS = {
             "comsol_nodes_csv": {
@@ -2357,7 +2343,8 @@ class deformation(logging):
 
         self._Xref = Xref
         self._Xcurr = Xcurr
-        return Xref, Xcurr
+        self._record_fe_field_import(filepath, position_scale)
+        return self._Xref, self._Xcurr
 
     def import_fe_connectivity(self,
                             filepath,
@@ -2421,6 +2408,8 @@ class deformation(logging):
             if use_gpu and (cp is not None):
                 elem_nodes = cp.asarray(elem_nodes, dtype=dtype)
             self._elem_nodes = elem_nodes
+            self._fe_mesh_file = os.path.basename(filepath)
+            self._mesh_points = None
             return elem_nodes
 
         if preset == "comsol_mesh_txt":
@@ -2446,6 +2435,34 @@ class deformation(logging):
                 if "lowest mesh point index" in t:
                     lowest_index = _left_int(ln)
                     break
+
+            # 1b) Mesh point coordinates. Connectivity indexes this order, which
+            #     is not the row order of a COMSOL nodal export.
+            npts = None
+            for ln in lines:
+                if "number of mesh points" in ln.lower():
+                    npts = _left_int(ln)
+                    break
+            mp_i = -1
+            for i, ln in enumerate(lines):
+                if "# Mesh point coordinates" in ln:
+                    mp_i = i
+                    break
+            if npts is None or mp_i < 0:
+                raise ValueError("mesh point block not found in COMSOL mesh")
+            rows = []
+            j = mp_i + 1
+            while j < len(lines) and len(rows) < npts:
+                s = lines[j].strip()
+                j += 1
+                if not s or s.startswith("#"):
+                    continue
+                rows.append(s.split("#", 1)[0].split()[:3])
+            if len(rows) != npts:
+                raise ValueError("expected {} mesh points, read {}".format(npts, len(rows)))
+            mesh_points = np.asarray(rows, dtype=np.float64)
+            if mesh_points.ndim != 2 or mesh_points.shape[1] != 3:
+                raise ValueError("mesh points must have 3 coordinates")
 
             # 2) Locate an element block: prefer "tet"; else "quad".
             tet_i = -1
@@ -2535,6 +2552,11 @@ class deformation(logging):
                 elem_nodes = cp.asarray(elem_nodes, dtype=dtype)
 
             self._elem_nodes = elem_nodes
+            self._fe_mesh_file = os.path.basename(filepath)
+            self._mesh_points = mesh_points
+            self._fe_nodes_matched = False
+            if self._Xref is not None:
+                self._match_fe_nodes_to_mesh()
             return elem_nodes
 
         # ---------------- Generic whitespace/CSV fallback ----------------
@@ -2577,7 +2599,82 @@ class deformation(logging):
             elem_nodes = cp.asarray(elem_nodes, dtype=dtype)
 
         self._elem_nodes = elem_nodes
+        self._fe_mesh_file = os.path.basename(filepath)
+        self._mesh_points = None
         return elem_nodes
+
+    def _record_fe_field_import(self, filepath, position_scale):
+        """
+        Store provenance of a freshly imported nodal field and match it to the
+        mesh points when a COMSOL mesh is already loaded.
+
+        Args:
+            filepath (str): Nodal field file that was imported.
+            position_scale (float): Scale applied to the file positions.
+        """
+        X = self._Xref
+        if (cp is not None) and isinstance(X, cp.ndarray):
+            X = cp.asnumpy(X)
+        self._Xref_import = np.array(X, dtype=np.float64, copy=True)
+        self._fe_field_file = os.path.basename(filepath)
+        self._fe_position_scale = float(position_scale)
+        self._fe_nodes_matched = False
+        if getattr(self, "_mesh_points", None) is not None:
+            self._match_fe_nodes_to_mesh()
+
+    def _match_fe_nodes_to_mesh(self):
+        """
+        Reorder the nodal field rows to the mesh point order of the loaded mesh.
+
+        COMSOL nodal exports and mesh exports list the same nodes in different
+        orders, while element connectivity indexes the mesh order. Each mesh
+        point is matched to the nodal row at the same coordinate (scaled by the
+        nodal-field position scale) and `_Xref`, `_Xcurr` are permuted to mesh
+        order. Matching is skipped when no mesh points or no import-order
+        coordinates are available (binary or generic inputs, or a clipped field).
+
+        Raises:
+            ValueError: If the counts differ, a mesh point has no nodal row within
+                1e-6 of the mesh extent, or the match is not one-to-one.
+        """
+        from scipy.spatial import cKDTree
+        if getattr(self, "_fe_nodes_matched", False):
+            return
+        mesh = getattr(self, "_mesh_points", None)
+        Ximp = getattr(self, "_Xref_import", None)
+        if mesh is None or Ximp is None or self._Xref is None:
+            return
+        scale = float(getattr(self, "_fe_position_scale", 1.0))
+        mesh_s = mesh * scale
+        n_mesh = int(mesh_s.shape[0])
+        n_rows = int(Ximp.shape[0])
+        if n_mesh != n_rows or int(self._Xref.shape[0]) != n_rows:
+            raise ValueError("nodal field has {} rows but the mesh has {} points".format(n_rows, n_mesh))
+
+        extent = float(np.max(mesh_s.max(axis=0) - mesh_s.min(axis=0)))
+        tol = 1e-6 * max(extent, 1e-300)
+        d, row = cKDTree(Ximp).query(mesh_s, k=1)
+        dmax = float(d.max()) if d.size else 0.0
+        if dmax > tol:
+            raise ValueError("nodal field rows do not coincide with the mesh points: "
+                             "max distance {:.3g} exceeds tolerance {:.3g}".format(dmax, tol))
+        if np.unique(row).size != row.size:
+            raise ValueError("nodal field rows and mesh points are not in one-to-one correspondence")
+
+        perm = np.asarray(row, dtype=np.int64)
+        n_moved = int(np.count_nonzero(perm != np.arange(n_rows)))
+        if n_moved > 0:
+            def _take(arr):
+                if (cp is not None) and isinstance(arr, cp.ndarray):
+                    return arr[cp.asarray(perm)]
+                return np.asarray(arr)[perm]
+            self._Xref = _take(self._Xref)
+            if self._Xcurr is not None:
+                self._Xcurr = _take(self._Xcurr)
+            self._Xref_import = Ximp[perm]
+        self._fe_nodes_matched = True
+        self._log("normal", "matched {} nodal rows to mesh points (max distance {:.3g}, "
+                            "{} rows reordered)".format(n_rows, dmax, n_moved))
 
     # FE transforms --------------------------------------------------------------
     def zero_fe_nodal_field(self, center_mode="bbox", return_shift=False):
@@ -2664,7 +2761,8 @@ class deformation(logging):
                                  origin=(0.0, 0.0, 0.0),
                                  use_gpu=True,
                                  dtype=None,
-                                 copy=True):
+                                 copy=True,
+                                 inplace=True):
         """
         Transform FE nodal reference/current positions consistently.
 
@@ -2673,6 +2771,9 @@ class deformation(logging):
           2) optional displacement amplitude scaling: Xcur := Xref + alpha*(Xcur - Xref)
           3) optional rigid rotation about origin (both)
           4) optional translation (both)
+
+        With `inplace` the results replace the stored `_Xref` and `_Xcurr`, as
+        `zero_fe_nodal_field` and `clip_fe_mesh_to_sample` do.
 
         Args:
             Xref (ndarray): Reference nodal positions, shape (N, 3).
@@ -2688,6 +2789,8 @@ class deformation(logging):
             use_gpu (bool): Use CuPy if available.
             dtype (numpy dtype or None): Output dtype; inferred if None.
             copy (bool): If True, operate on copies.
+            inplace (bool): If True, store the outputs as the field used by
+                the apply and clip methods.
 
         Returns:
             tuple: (Xref_out, Xcur_out), both shape (N, 3).
@@ -2725,6 +2828,9 @@ class deformation(logging):
             Xr = self.translate_positions(Xr, translate, use_gpu=use_gpu, dtype=dtype, copy=False)
             Xc = self.translate_positions(Xc, translate, use_gpu=use_gpu, dtype=dtype, copy=False)
 
+        if inplace:
+            self._Xref = Xr
+            self._Xcurr = Xc
         return Xr, Xc
 
     # FE clipping ----------------------------------------------------------------
@@ -2732,7 +2838,7 @@ class deformation(logging):
                             sample,
                             Xref_nodes=None,
                             elem_nodes=None,
-                            margin=0.0,
+                            margin=None,
                             use_gpu=True):
         """
         Clip FE mesh to elements intersecting the sample AABB (+margin).
@@ -2742,11 +2848,16 @@ class deformation(logging):
             - any of its nodes lie inside the sample AABB (+margin), or
             - the element AABB intersects the sample AABB (+margin).
 
+        If a COMSOL mesh is loaded, the nodal rows are first matched to the
+        mesh point order so the connectivity indexes the right nodes.
+
         Args:
             sample (object): Exposes `corners` (8x3) in same frame as Xref.
             Xref_nodes (ndarray or None): Reference nodal coords; defaults to self.Xref.
             elem_nodes (ndarray or None): Element connectivity; defaults to self.elem_nodes.
-            margin (float): Non-negative expansion added to the sample AABB on all sides.
+            margin (float or None): Non-negative expansion added to the sample
+                AABB on all sides. None uses 3 x the median node spacing so
+                atoms near the sample faces keep a full MLS stencil.
             use_gpu (bool): If True and CuPy available, do computations on GPU.
 
         Returns:
@@ -2758,11 +2869,19 @@ class deformation(logging):
         # Select backend.
         xp = cp if (use_gpu and (cp is not None)) else np
 
+        # Match nodal rows to the mesh order before indexing with connectivity.
+        if Xref_nodes is None and elem_nodes is None:
+            self._match_fe_nodes_to_mesh()
+
         # Resolve inputs and validate.
         Xref_nodes = self.Xref if Xref_nodes is None else Xref_nodes
         elem_nodes = self.elem_nodes if elem_nodes is None else elem_nodes
         if Xref_nodes is None or elem_nodes is None:
             raise ValueError("Xref_nodes and elem_nodes must be provided or initialized in the class.")
+
+        if margin is None:
+            margin = 3.0 * self._fe_node_spacing()
+            self._log("normal", "clip_fe_mesh_to_sample: margin set to {:.4g} (3 x node spacing)".format(margin))
 
         Xn = xp.asarray(Xref_nodes)
         En = xp.asarray(elem_nodes)
@@ -2837,11 +2956,12 @@ class deformation(logging):
                 idx_cpu = cp.asnumpy(keep_nodes_unique) if ((cp is not None) and isinstance(keep_nodes_unique, cp.ndarray)) else np.asarray(keep_nodes_unique)
                 Xcurr_new = np.asarray(self._Xcurr)[idx_cpu]
 
-        # Update class properties.
+        # Update class properties. Rows no longer correspond to the mesh points.
         self._Xref = Xref_new
         if Xcurr_new is not None:
             self._Xcurr = Xcurr_new
         self._elem_nodes = En_new
+        self._Xref_import = None
 
         return self._Xref, (self._Xcurr if self._Xcurr is not None else None), self._elem_nodes
     
@@ -3009,7 +3129,87 @@ class deformation(logging):
 
         return U_pred.astype(T, copy=False)
 
-    def apply_fe_nodal_field(self, sample, use_gpu=True):
+    @staticmethod
+    def _median_nn_spacing(P, max_queries=200000):
+        """
+        Median nearest-neighbour distance of a point set.
+
+        Args:
+            P (ndarray): Host array of shape (N, 3).
+            max_queries (int): Upper bound on the number of points whose nearest
+                neighbour is evaluated; larger sets are sampled with a fixed
+                stride. The tree itself always holds every point.
+
+        Returns:
+            float: Median nearest-neighbour distance, or 1.0 for fewer than two points.
+        """
+        from scipy.spatial import cKDTree
+        P = np.asarray(P, dtype=np.float64)
+        n = int(P.shape[0])
+        if n < 2:
+            return 1.0
+        stride = max(1, n // int(max_queries))
+        d, _ = cKDTree(P).query(P[::stride], k=2)
+        nn = d[:, 1]
+        nn = nn[np.isfinite(nn)]
+        if nn.size == 0:
+            return 1.0
+        return float(np.median(nn))
+
+    def _fe_node_spacing(self):
+        """
+        Estimate the FE node spacing as the median nearest-neighbour distance
+        of the reference nodes.
+
+        Returns:
+            float: Median nearest-neighbour distance, or 1.0 for fewer than two nodes.
+        """
+        if self._Xref is None:
+            raise ValueError("FE nodal field is not initialized. Call import_fe_nodal_field(...) first.")
+        P = self._Xref
+        if (cp is not None) and isinstance(P, cp.ndarray):
+            P = cp.asnumpy(P)
+        return self._median_nn_spacing(P)
+
+    def _fe_modification_params(self, k):
+        """
+        Parameters that identify an FE nodal field application for the sample
+        modification record.
+
+        Args:
+            k (int): Neighbour count used by the MLS fit.
+
+        Returns:
+            dict: JSON-serialisable parameters.
+        """
+        return {
+            "mesh_file": getattr(self, "_fe_mesh_file", None),
+            "field_file": getattr(self, "_fe_field_file", None),
+            "n_nodes": int(self._Xref.shape[0]),
+            "k": int(k),
+            "scale": float(getattr(self, "_fe_position_scale", 1.0)),
+        }
+
+    def _finalize_sample_aabb(self, sample, gmin, gmax):
+        """
+        Set the sample box to the given atom AABB and write the metadata file.
+
+        Args:
+            sample (object): Sample whose chunk files were rewritten.
+            gmin (ndarray): Global minimum corner, shape (3,).
+            gmax (ndarray): Global maximum corner, shape (3,).
+        """
+        if np.all(np.isfinite(gmin)) and np.all(np.isfinite(gmax)):
+            new_dims = (np.asarray(gmax) - np.asarray(gmin)).astype(np.float32)
+            new_offs = ((np.asarray(gmin) + np.asarray(gmax)) * 0.5).astype(np.float32)
+            sample._dimensions = new_dims
+            sample._offset = new_offs
+            sample._matrix = np.diag(new_dims.astype(np.float32))
+            sample._corners = (sample.get_unit_corners() @ sample._matrix) - (new_dims * 0.5) + new_offs
+        if hasattr(sample, "write_sample_metadata"):
+            sample.write_sample_metadata()
+
+    def apply_fe_nodal_field(self, sample, use_gpu=True, outside_factor=2.0, force=False, reg=1e-6):
         """
         Apply FE nodal mapping to atom positions using an MLS quadratic fit.
 
@@ -3021,54 +3221,95 @@ class deformation(logging):
         of the fit, which is the predicted displacement at that atom.
 
         Strategy (high level):
-        1) Build a cell list over FE nodes (Xref) to cull candidates quickly.
-        2) For each atom chunk (and further mini-batches inside the chunk):
-            - kNN on culled nodes (GPU kernel if available).
+        1) Build a cell list over FE nodes (Xref) to cull candidates quickly
+           (GPU) or a k-d tree over all nodes (CPU).
+        2) For each atom chunk (and mini-batches inside the chunk):
+            - kNN on the nodes.
             - MLS quadratic fit per atom using weighted normal equations:
                 (P^T W P) a = P^T W U_neighbors,  with W from inverse-distance weights.
-            The predicted displacement at the query is the constant term a[0].
+              Rows whose normal matrix is not positive definite fall back to an
+              inverse-distance average of the neighbour displacements.
+            - Atoms whose nearest node is farther than `outside_factor` times
+              the median node spacing are outside the mesh: they are left
+              undisplaced and counted.
             - Add the predicted displacement to the atom positions.
-        3) Write deformed chunk and update the global AABB and sample metadata.
+        3) Write the deformed chunk, update the sample AABB, write the sample
+           metadata and record the operation so it is not applied twice.
+
+        Chunk positions are read raw (without thermal displacement).
 
         Args:
             sample (object): Provides chunked IO for positions and cell-list helpers.
             use_gpu (bool): If True and CuPy is available, prefer GPU path.
+            outside_factor (float or None): Multiple of the median node spacing
+                beyond which an atom counts as outside the mesh. None disables
+                the test.
+            force (bool): Apply even if this field was already applied to the
+                sample.
+            reg (float): Tikhonov regularization scale, A += reg * sum(w) * I.
 
         Notes:
-            The MLS fit uses k = 48 nearest FE nodes per atom and a Tikhonov
-            regularization of reg = 1e-6 (both fixed internally).
+            The MLS fit uses k = 48 nearest FE nodes per atom.
 
         Returns:
             None
 
         Raises:
             ValueError: If FE nodal field or sample metadata is not initialized.
+            RuntimeError: If the sample is in streaming mode, or the field was
+                already applied and `force` is False.
         """
+        from scipy.spatial import cKDTree
+
         # Validate inputs
         if self._Xref is None or self._Xcurr is None:
             raise ValueError("FE nodal field is not initialized. Call import_fe_nodal_field(...) first.")
         if sample is None or sample.chunk_total is None:
             raise ValueError("Sample is not initialized. Ensure sample metadata is loaded.")
+        if getattr(sample, "_streaming_mode", False):
+            raise RuntimeError("apply_fe_nodal_field: the sample is in streaming mode; chunks are "
+                               "regenerated on demand and stored positions are never read, so a "
+                               "deformation cannot be applied.")
 
         # Parameters
         k = 48
         power = 2.0
         eps = 1e-12
-        reg = 1e-6
+        reg = float(reg)
         cell_pad_cells = 2
 
         gpu_ok = (use_gpu and (cp is not None))
-        xp = cp if gpu_ok else np
         dtype = np.dtype(self._Xref.dtype if hasattr(self._Xref, "dtype") else np.float32)
 
-        # Nodes and displacements
-        Xr = xp.asarray(self._Xref, dtype=dtype)
-        Xc = xp.asarray(self._Xcurr, dtype=dtype)
-        U  = (Xc - Xr).astype(dtype, copy=False)
-        P  = Xr
+        n_nodes = int(self._Xref.shape[0])
+        if k > n_nodes:
+            k = int(max(1, n_nodes))
 
-        if k <= 0 or k > int(P.shape[0]):
-            k = int(min(max(1, P.shape[0]), 64))
+        params = self._fe_modification_params(k)
+        if (not force) and hasattr(sample, "has_modification") and sample.has_modification("fe_nodal_field", params):
+            raise RuntimeError("apply_fe_nodal_field: this FE field was already applied to the sample "
+                               "(see sample_metadata.json); pass force=True to apply it again.")
+
+        # Outside-mesh threshold from the node spacing
+        spacing = self._fe_node_spacing()
+        r_out2 = None if outside_factor is None else float(outside_factor * spacing) ** 2
+
+        counts = {"outside": 0, "fallback": 0}
+        counts_lock = threading.Lock()
+
+        def _guard_batch(xp_, Uadd, d2):
+            # Zero rows with a non-finite prediction or with the nearest node
+            # beyond the outside threshold. Returns (Uadd, n_outside).
+            bad = ~xp_.isfinite(Uadd).all(axis=1)
+            n_out = 0
+            if r_out2 is not None:
+                outside = d2[:, 0] > d2.dtype.type(r_out2)
+                n_out = int(xp_.count_nonzero(outside))
+                bad = bad | outside
+            if bool(xp_.any(bad)):
+                Uadd = Uadd.copy()
+                Uadd[bad, :] = 0
+            return Uadd, n_out
 
         # Global AABB on host
         gmin = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
@@ -3076,7 +3317,15 @@ class deformation(logging):
 
         # GPU path (Multi-GPU + Multi-Stream)
         if gpu_ok:
-            # Detect available GPUs
+            import queue
+            from concurrent.futures import as_completed
+
+            with cp.cuda.Device(0):
+                Xr = cp.asarray(self._Xref, dtype=dtype)
+                Xc = cp.asarray(self._Xcurr, dtype=dtype)
+                U = (Xc - Xr).astype(dtype, copy=False)
+                P = Xr
+
             n_gpus = cp.cuda.runtime.getDeviceCount()
             streams_per_gpu = 8
             total_workers = n_gpus * streams_per_gpu
@@ -3089,56 +3338,67 @@ class deformation(logging):
                         cp.cuda.Stream(non_blocking=True) for _ in range(streams_per_gpu)
                     ])
 
-            # Thread-safe AABB updates
             aabb_lock = threading.Lock()
+            abort = threading.Event()
 
-            # Build a cell list on nodes for culling (on GPU 0)
+            # Build a cell list on nodes for culling (on GPU 0). Cells of three
+            # node spacings with a two-cell halo cover the k = 48 stencil.
             with cp.cuda.Device(0):
-                if P.shape[0] > 0:
-                    bb = xp.max(P, axis=0) - xp.min(P, axis=0)
-                    vol = float((bb[0] * bb[1] * bb[2]).get())
-                    mean_spacing = (vol / max(1, int(P.shape[0]))) ** (1.0 / 3.0)
-                    r_cut = max(1.0, 3.0 * mean_spacing)
-                else:
-                    r_cut = 1.0
-
+                r_cut = max(1.0, 3.0 * spacing)
                 P32 = P.astype(cp.float32, copy=False)
                 (sortedP32, sortedIdx, cell_start, cell_end,
-                bb_min32, cell_size, nx, ny, nz) = sample.build_cell_list_gpu(P32, float(r_cut))
-
+                 bb_min32, cell_size, nx, ny, nz) = sample.build_cell_list_gpu(P32, float(r_cut))
                 bb_min = bb_min32.astype(dtype, copy=False)
 
-                # Get optimized kernels
                 opt_kerns = self._get_fe_nodal_cuda_kernels(dtype=dtype, k=k)
                 sizeof_T = 8 if dtype == np.float64 else 4
                 block = 256
-                max_batch_size = 65536*2  # Conservative for RTX 4090
+                max_batch_size = 65536 * 2
 
-            # Copy cell list data to all GPUs
+            # Copy node data and the cell list to every GPU
             cell_list_data = {}
             for gpu_id in range(n_gpus):
                 with cp.cuda.Device(gpu_id):
                     cell_list_data[gpu_id] = {
                         'P': cp.array(P) if gpu_id != 0 else P,
                         'U': cp.array(U) if gpu_id != 0 else U,
-                        'sortedP32': cp.array(sortedP32) if gpu_id != 0 else sortedP32,
                         'sortedIdx': cp.array(sortedIdx) if gpu_id != 0 else sortedIdx,
                         'cell_start': cp.array(cell_start) if gpu_id != 0 else cell_start,
                         'cell_end': cp.array(cell_end) if gpu_id != 0 else cell_end,
                         'bb_min': cp.array(bb_min) if gpu_id != 0 else bb_min,
                     }
 
-            def process_chunk_worker(chunk_i, gpu_id, stream_idx):
-                """Worker function to process a single chunk on a specific GPU and stream."""
+            # Scratch buffers, allocated once per (gpu, stream) slot. A slot is
+            # held by one worker at a time so the buffers are never shared.
+            slot_buffers = {}
+            slots = queue.Queue()
+            for gpu_id in range(n_gpus):
+                with cp.cuda.Device(gpu_id):
+                    n_nodes_gpu = int(cell_list_data[gpu_id]['P'].shape[0])
+                    for s in range(streams_per_gpu):
+                        slot_buffers[(gpu_id, s)] = {
+                            "idx": cp.empty((max_batch_size, k), dtype=cp.int32),
+                            "d2": cp.empty((max_batch_size, k), dtype=dtype),
+                            "A": cp.empty((max_batch_size, 100), dtype=dtype),
+                            "b": cp.empty((max_batch_size, 30), dtype=dtype),
+                            "coef": cp.empty((max_batch_size, 30), dtype=dtype),
+                            "status": cp.empty((max_batch_size,), dtype=cp.int32),
+                            "cand": cp.empty((max(1, n_nodes_gpu),), dtype=cp.int32),
+                            "count": cp.zeros((1,), dtype=cp.int32),
+                        }
+                        slots.put((gpu_id, s))
+
+            def process_chunk_worker(chunk_i):
+                """Deform one chunk on the first free (gpu, stream) slot."""
                 nonlocal gmin, gmax
-
-                # Set device and stream
-                device = cp.cuda.Device(gpu_id)
-                stream = gpu_streams[gpu_id][stream_idx]
-
-                with device:
-                    with stream:
-                        # Get cell list data for this GPU
+                if abort.is_set():
+                    return
+                gpu_id, stream_idx = slots.get()
+                try:
+                    device = cp.cuda.Device(gpu_id)
+                    stream = gpu_streams[gpu_id][stream_idx]
+                    buf = slot_buffers[(gpu_id, stream_idx)]
+                    with device, stream:
                         P_gpu = cell_list_data[gpu_id]['P']
                         U_gpu = cell_list_data[gpu_id]['U']
                         sortedIdx_gpu = cell_list_data[gpu_id]['sortedIdx']
@@ -3146,33 +3406,24 @@ class deformation(logging):
                         cell_end_gpu = cell_list_data[gpu_id]['cell_end']
                         bb_min_gpu = cell_list_data[gpu_id]['bb_min']
 
-                        # Pre-allocate buffers for this stream
-                        buf_idx = cp.empty((max_batch_size, k), dtype=cp.int32)
-                        buf_d2 = cp.empty((max_batch_size, k), dtype=dtype)
-                        buf_A = cp.empty((max_batch_size, 100), dtype=dtype)
-                        buf_b = cp.empty((max_batch_size, 30), dtype=dtype)
-                        buf_coef = cp.empty((max_batch_size, 30), dtype=dtype)
-                        buf_cand = cp.empty((int(P_gpu.shape[0]),), dtype=cp.int32)
-                        buf_count = cp.zeros((1,), dtype=cp.int32)
-
-                        def _knn_gpu_optimized(X, P_sub):
-                            """Optimized kNN using bitonic sort kernel."""
+                        def _knn_gpu(X, P_sub):
+                            """kNN over P_sub for the rows of X (sorted ascending by d2)."""
                             M = int(X.shape[0]); N = int(P_sub.shape[0])
-                            idx = buf_idx[:M] if M <= max_batch_size else cp.empty((M, k), dtype=cp.int32)
-                            d2 = buf_d2[:M] if M <= max_batch_size else cp.empty((M, k), dtype=dtype)
+                            idx = buf["idx"][:M]
+                            d2 = buf["d2"][:M]
                             grid = (M + block - 1) // block
                             smem = 3 * block * sizeof_T
-                            opt_kerns["knn_bitonic"](
+                            opt_kerns["knn"](
                                 (grid,), (block,),
                                 (P_sub.ravel(), np.int32(N),
-                                X.ravel(), np.int32(M),
-                                idx.ravel(), d2.ravel()),
+                                 X.ravel(), np.int32(M),
+                                 idx.ravel(), d2.ravel()),
                                 shared_mem=smem
                             )
                             return idx, d2
 
                         def _candidate_indices_gpu(X_chunk):
-                            """GPU-native cell culling using optimized kernel."""
+                            """Node indices of the cells covering the chunk AABB plus halo."""
                             xmn = cp.min(X_chunk, axis=0)
                             xmx = cp.max(X_chunk, axis=0)
                             halo = float(cell_size * max(0, int(cell_pad_cells)))
@@ -3181,16 +3432,9 @@ class deformation(logging):
                             cs = float(cell_size)
                             nxv, nyv, nzv = int(nx), int(ny), int(nz)
 
-                            # Compute cell bounds on GPU
-                            cx0_f = cp.floor((xmn[0] - bb_min_gpu[0]) / cs)
-                            cy0_f = cp.floor((xmn[1] - bb_min_gpu[1]) / cs)
-                            cz0_f = cp.floor((xmn[2] - bb_min_gpu[2]) / cs)
-                            cx1_f = cp.floor((xmx[0] - bb_min_gpu[0]) / cs)
-                            cy1_f = cp.floor((xmx[1] - bb_min_gpu[1]) / cs)
-                            cz1_f = cp.floor((xmx[2] - bb_min_gpu[2]) / cs)
-
-                            # Single GPU->CPU transfer
-                            cell_bounds = cp.stack([cx0_f, cy0_f, cz0_f, cx1_f, cy1_f, cz1_f]).get()
+                            lo = cp.floor((xmn - bb_min_gpu) / cs)
+                            hi = cp.floor((xmx - bb_min_gpu) / cs)
+                            cell_bounds = cp.concatenate([lo, hi]).get()
                             cx0 = max(0, min(nxv - 1, int(cell_bounds[0])))
                             cy0 = max(0, min(nyv - 1, int(cell_bounds[1])))
                             cz0 = max(0, min(nzv - 1, int(cell_bounds[2])))
@@ -3198,21 +3442,13 @@ class deformation(logging):
                             cy1 = max(0, min(nyv - 1, int(cell_bounds[4])))
                             cz1 = max(0, min(nzv - 1, int(cell_bounds[5])))
 
-                            ncx = cx1 - cx0 + 1
-                            ncy = cy1 - cy0 + 1
-                            ncz = cz1 - cz0 + 1
-                            total_cells = ncx * ncy * ncz
-
-                            if total_cells == 0:
+                            total_cells = (cx1 - cx0 + 1) * (cy1 - cy0 + 1) * (cz1 - cz0 + 1)
+                            if total_cells <= 0:
                                 return cp.zeros((0,), dtype=cp.int32)
 
-                            # Reset count
-                            buf_count[0] = 0
-
-                            # Launch GPU cell culling kernel
+                            buf["count"][0] = 0
                             grid_cells = (total_cells + block - 1) // block
                             n_cells_total = int(cell_start_gpu.shape[0])
-
                             opt_kerns["cell_cull"](
                                 (grid_cells,), (block,),
                                 (sortedIdx_gpu, cell_start_gpu, cell_end_gpu,
@@ -3220,29 +3456,23 @@ class deformation(logging):
                                  np.int32(cx1), np.int32(cy1), np.int32(cz1),
                                  np.int32(nxv), np.int32(nyv), np.int32(nzv),
                                  np.int32(n_cells_total),
-                                 buf_cand, buf_count)
+                                 buf["cand"], buf["count"])
                             )
-
-                            count = int(buf_count.get())
+                            count = int(buf["count"].get())
                             if count == 0:
                                 return cp.zeros((0,), dtype=cp.int32)
-                            return buf_cand[:count].copy()
+                            return buf["cand"][:count].copy()
 
-                        def _mls_batch_size_optimized(n_rows):
-                            """Optimized batch size for fused kernels."""
-                            return min(n_rows, max_batch_size)
-
-                        def _mls_displacement_optimized(Xe, P_all, U_all, idx_glob, d2):
-                            """Compute MLS displacement using fused kernel + custom solver."""
+                        def _mls_displacement(Xe, P_all, U_all, idx_glob, d2):
+                            """MLS displacement per row; IDW fallback where the
+                            Cholesky factorization fails. Returns (U_pred, n_fallback)."""
                             M = int(Xe.shape[0])
                             N = int(P_all.shape[0])
+                            A = buf["A"][:M]
+                            b = buf["b"][:M]
+                            coef = buf["coef"][:M]
+                            status = buf["status"][:M]
 
-                            # Use pre-allocated buffers
-                            A = buf_A[:M] if M <= max_batch_size else cp.empty((M, 100), dtype=dtype)
-                            b = buf_b[:M] if M <= max_batch_size else cp.empty((M, 30), dtype=dtype)
-                            coef = buf_coef[:M] if M <= max_batch_size else cp.empty((M, 30), dtype=dtype)
-
-                            # Fused MLS basis + weighted normal equations kernel
                             grid_mls = (M + block - 1) // block
                             opt_kerns["mls_fused"](
                                 (grid_mls,), (block,),
@@ -3252,17 +3482,26 @@ class deformation(logging):
                                  np.int32(M), np.int32(N),
                                  A.ravel(), b.ravel())
                             )
-
-                            # Custom batched 10x10 Cholesky solver
                             opt_kerns["cholesky_solve"](
                                 (grid_mls,), (block,),
-                                (A.ravel(), b.ravel(), np.int32(M), coef.ravel())
+                                (A.ravel(), b.ravel(), np.int32(M), coef.ravel(), status)
                             )
 
-                            # Extract constant term (first row of coefficient matrix)
-                            U_pred = coef.reshape(M, 10, 3)[:, 0, :]
+                            # Constant term of the fit is the displacement at the atom
+                            U_pred = coef.reshape(M, 10, 3)[:, 0, :].copy()
 
-                            # Clamp nonphysical predictions
+                            # IDW fallback for rows the solver rejected (same formula as the CPU path)
+                            bad = (status == 0) | (~cp.isfinite(U_pred).all(axis=1))
+                            n_fb = int(cp.count_nonzero(bad))
+                            if n_fb > 0:
+                                rows = cp.nonzero(bad)[0]
+                                d_b = cp.sqrt(d2[rows] + dtype.type(eps))
+                                w = dtype.type(1.0) / cp.power(d_b + dtype.type(eps), dtype.type(power))
+                                Un_b = U_all[idx_glob[rows]]
+                                wsum = cp.maximum(w.sum(axis=1, keepdims=True), dtype.type(1e-20))
+                                U_pred[rows, :] = (Un_b * w[:, :, None]).sum(axis=1) / wsum
+
+                            # Clamp nonphysical predictions to a multiple of the local envelope
                             Un = U_all[idx_glob]
                             norms = cp.linalg.norm(Un, axis=2)
                             u_cap = dtype.type(8.0) * cp.maximum(norms.max(axis=1), dtype.type(1e-9))
@@ -3270,200 +3509,155 @@ class deformation(logging):
                             mask = up_norm > u_cap
                             if bool(cp.any(mask)):
                                 scale = (u_cap[mask] / (up_norm[mask] + dtype.type(1e-20)))[:, None]
-                                U_pred = U_pred.copy()
                                 U_pred[mask, :] *= scale
 
-                            return U_pred
+                            return U_pred, n_fb
 
-                        # Load chunk on this GPU
-                        X = sample.load_chunk_positions(chunk_i, use_gpu=True).astype(dtype, copy=False)
-                        X = cp.asarray(X)
-
+                        # Load the stored chunk (no thermal displacement)
+                        X = sample.load_chunk_positions(chunk_i, use_gpu=True, raw=True)
+                        X = cp.asarray(X).astype(dtype, copy=False)
                         if X.ndim != 2 or X.shape[1] != 3 or X.shape[0] == 0:
-                            sample.write_chunk_positions(X.get(), chunk_i)
                             return
 
-                        # GPU-accelerated candidate culling
                         cand_idx = _candidate_indices_gpu(X)
-                        P_sub = P_gpu if cand_idx.size < k else P_gpu[cand_idx]
+                        P_sub = P_gpu if int(cand_idx.size) < k else P_gpu[cand_idx]
 
                         rows = int(X.shape[0])
-                        bs = int(_mls_batch_size_optimized(rows))
+                        bs = int(min(rows, max_batch_size))
                         out = cp.empty_like(X)
+                        n_out_chunk = 0
+                        n_fb_chunk = 0
 
                         for s0 in range(0, rows, bs):
                             Xe = X[s0:s0+bs]
-                            idx_loc, d2 = _knn_gpu_optimized(Xe, P_sub)
-
-                            # Map local idx to global if needed
+                            idx_loc, d2 = _knn_gpu(Xe, P_sub)
                             if P_sub is not P_gpu:
                                 idx_glob = cp.take(cand_idx, idx_loc)
                             else:
                                 idx_glob = idx_loc
-
-                            # Optimized MLS computation
-                            Uadd = _mls_displacement_optimized(Xe, P_gpu, U_gpu, idx_glob, d2)
-
-                            # Nonfinite guard
-                            bad = ~cp.isfinite(Uadd).all(axis=1)
-                            if bool(cp.any(bad)):
-                                Uadd = Uadd.copy()
-                                Uadd[bad, :] = 0
+                            Uadd, n_fb = _mls_displacement(Xe, P_gpu, U_gpu, idx_glob, d2)
+                            Uadd, n_out = _guard_batch(cp, Uadd, d2)
                             out[s0:s0+bs] = Xe + Uadd
+                            n_out_chunk += n_out
+                            n_fb_chunk += n_fb
 
-                        # Synchronize stream before AABB update and write
                         stream.synchronize()
+                        if abort.is_set():
+                            return
 
-                        # Update global AABB (thread-safe)
                         cmin = cp.min(out, axis=0).get()
                         cmax = cp.max(out, axis=0).get()
                         with aabb_lock:
                             gmin = np.minimum(gmin, cmin)
                             gmax = np.maximum(gmax, cmax)
+                        with counts_lock:
+                            counts["outside"] += n_out_chunk
+                            counts["fallback"] += n_fb_chunk
 
-                        # Save positions to disk
                         sample.write_chunk_positions(out.get(), chunk_i)
+                        del X, out
+                finally:
+                    slots.put((gpu_id, stream_idx))
 
-                        # Clean up chunk-specific buffers
-                        del X, out, buf_idx, buf_d2, buf_A, buf_b, buf_coef, buf_cand, buf_count
-
-            # Distribute chunks across GPUs and streams using ThreadPoolExecutor
+            # Run chunks on the worker pool; the first failure stops further writes.
             chunk_indices = list(range(1, int(sample.chunk_total) + 1))
+            executor = ThreadPoolExecutor(max_workers=total_workers)
+            futures = [executor.submit(process_chunk_worker, c) for c in chunk_indices]
+            try:
+                for fut in as_completed(futures):
+                    exc = fut.exception()
+                    if exc is not None:
+                        abort.set()
+                        for f in futures:
+                            f.cancel()
+                        raise exc
+            finally:
+                executor.shutdown(wait=True)
 
-            with ThreadPoolExecutor(max_workers=total_workers) as executor:
-                futures = []
-                for idx, chunk_i in enumerate(chunk_indices):
-                    # Round-robin distribution across GPUs and streams
-                    worker_id = idx % total_workers
-                    gpu_id = worker_id // streams_per_gpu
-                    stream_idx = worker_id % streams_per_gpu
-
-                    future = executor.submit(process_chunk_worker, chunk_i, gpu_id, stream_idx)
-                    futures.append(future)
-
-                # Wait for all chunks to complete
-                wait(futures, return_when=ALL_COMPLETED)
-
-                # Check for exceptions
-                for future in futures:
-                    if future.exception() is not None:
-                        raise future.exception()
-
-            # Synchronize all streams before cleanup
             for gpu_id in range(n_gpus):
                 with cp.cuda.Device(gpu_id):
                     for stream in gpu_streams[gpu_id]:
                         stream.synchronize()
 
-            # Clean up cell list data
+            # Release node data and scratch buffers
+            slot_buffers.clear()
             for gpu_id in range(n_gpus):
                 with cp.cuda.Device(gpu_id):
                     del cell_list_data[gpu_id]
                     cp.get_default_memory_pool().free_all_blocks()
 
-            # Finalize metadata
-            if np.all(np.isfinite(gmin)) and np.all(np.isfinite(gmax)):
-                new_dims = (gmax - gmin).astype(np.float32)
-                new_offs = ((gmin + gmax) * 0.5).astype(np.float32)
-                sample._dimensions = new_dims
-                sample._offset = new_offs
-                sample._matrix = np.diag(sample._dimensions.astype(np.float32))
-                sample._corners = (sample.get_unit_corners() @ sample._matrix) - (sample._dimensions * 0.5) + sample._offset
-            return
-
         # CPU path
-        P_np = np.asarray(P, dtype=dtype)
-        U_np = np.asarray(U, dtype=dtype)
+        else:
+            P_np = self._Xref
+            U_np = self._Xcurr
+            if (cp is not None) and isinstance(P_np, cp.ndarray):
+                P_np = cp.asnumpy(P_np)
+            if (cp is not None) and isinstance(U_np, cp.ndarray):
+                U_np = cp.asnumpy(U_np)
+            P_np = np.ascontiguousarray(np.asarray(P_np, dtype=dtype))
+            U_np = (np.asarray(U_np, dtype=dtype) - P_np).astype(dtype, copy=False)
+            tree = cKDTree(P_np)
 
-        def _knn_tiled(P_sub, X, k, cap_bytes=800_000_000):
-            M = X.shape[0]
-            best_d2 = np.full((M, k), np.inf, dtype=dtype)
-            best_idx = np.full((M, k), -1, dtype=np.int32)
-            row_idx = np.arange(M)[:, None]
-            N = P_sub.shape[0]
-            bytes_per = 8 if dtype == np.float64 else 4
-            tile = int(max(2048, min(N, cap_bytes // max(1, (M * bytes_per)))))
-            for j0 in range(0, N, tile):
-                Pj = P_sub[j0:j0+tile]
-                diff = X[:, None, :] - Pj[None, :, :]
-                d2 = np.sum(diff * diff, axis=2)
-                part = np.argpartition(d2, kth=min(k-1, d2.shape[1]-1), axis=1)[:, :k]
-                d2k = d2[row_idx, part]
-                idxk = part + j0
-                all_d2 = np.concatenate([best_d2, d2k], axis=1)
-                all_idx = np.concatenate([best_idx, idxk], axis=1)
-                sel = np.argpartition(all_d2, kth=k-1, axis=1)[:, :k]
-                best_d2 = all_d2[row_idx, sel]
-                best_idx = all_idx[row_idx, sel]
-            return best_idx, best_d2
+            def _mls_batch_size_cpu(n_rows):
+                # Rows per MLS mini-batch from a byte budget covering the basis,
+                # gathered neighbours, normal matrices and einsum temporaries.
+                bytes_per = 8 if dtype == np.float64 else 4
+                budget = 256 * 1024 * 1024
+                per_row = max(1, bytes_per * (k * 10 * 3 + k * 3 * 5 + 100 * 2 + 30 * 2 + k * 4))
+                return max(4096, min(n_rows, budget // per_row))
 
-        def _mls_batch_size_cpu(n_rows, dtype, k):
-            bytes_per = 8 if dtype == np.float64 else 4
-            budget = 640 * 1024 * 1024
-            per_row = max(1, bytes_per * (k * 10 + 10 * 10 + k * 3 + k))
-            return max(4096, min(n_rows, budget // per_row))
+            for chunk_i in range(1, int(sample.chunk_total) + 1):
+                X = sample.load_chunk_positions(chunk_i, use_gpu=False, raw=True)
+                X = np.asarray(X, dtype=dtype)
+                if X.ndim != 2 or X.shape[1] != 3 or X.shape[0] == 0:
+                    continue
 
-        for chunk_i in range(1, int(sample.chunk_total) + 1):
-            X = sample.load_chunk_positions(chunk_i, use_gpu=False).astype(dtype, copy=False)
-            if X.ndim != 2 or X.shape[1] != 3 or X.shape[0] == 0:
-                sample.write_chunk_positions(X, chunk_i)
-                continue
+                rows = int(X.shape[0])
+                bs = int(_mls_batch_size_cpu(rows))
+                out = np.empty_like(X)
+                n_out_chunk = 0
 
-            # AABB-based node culling similar to GPU path
-            mn = X.min(axis=0); mx = X.max(axis=0)
-            if P_np.shape[0] > 0:
-                bb = P_np.max(axis=0) - P_np.min(axis=0)
-                vol = float(bb[0] * bb[1] * bb[2])
-                mean_spacing = (vol / max(1, int(P_np.shape[0]))) ** (1.0 / 3.0)
-                halo = 3.0 * mean_spacing
-            else:
-                halo = 1.0
-            mn_h = mn - halo; mx_h = mx + halo
-            mask = ((P_np[:, 0] >= mn_h[0]) & (P_np[:, 0] <= mx_h[0]) &
-                    (P_np[:, 1] >= mn_h[1]) & (P_np[:, 1] <= mx_h[1]) &
-                    (P_np[:, 2] >= mn_h[2]) & (P_np[:, 2] <= mx_h[2]))
-            P_sub = P_np[mask] if int(np.count_nonzero(mask)) >= k else P_np
+                for s0 in range(0, rows, bs):
+                    Xe = X[s0:s0+bs]
+                    d, idx = tree.query(Xe, k=k)
+                    if k == 1:
+                        d = d[:, None]
+                        idx = idx[:, None]
+                    d2 = (d * d).astype(dtype, copy=False)
+                    idx = idx.astype(np.int64, copy=False)
+                    Uadd = self._mls_quadratic_displacement(
+                        Xe, P_np, U_np, idx, d2,
+                        power=power, eps=eps, reg=reg,
+                        use_gpu=False, dtype=dtype
+                    )
+                    Uadd, n_out = _guard_batch(np, Uadd, d2)
+                    out[s0:s0+bs] = Xe + Uadd
+                    n_out_chunk += n_out
+                    del d, idx, d2, Uadd
 
-            rows = int(X.shape[0])
-            bs = int(_mls_batch_size_cpu(rows, dtype, k))
-            out = np.empty_like(X)
+                cmin = out.min(axis=0).astype(np.float64, copy=False)
+                cmax = out.max(axis=0).astype(np.float64, copy=False)
+                gmin = np.minimum(gmin, cmin)
+                gmax = np.maximum(gmax, cmax)
+                counts["outside"] += n_out_chunk
+                sample.write_chunk_positions(out, chunk_i)
+                del X, out
 
-            for s0 in range(0, rows, bs):
-                Xe = X[s0:s0+bs]
-                idx_local, d2 = _knn_tiled(P_sub, Xe, int(min(k, max(1, P_sub.shape[0]))))
-                if P_sub is not P_np:
-                    global_ids = np.flatnonzero(mask)
-                    idx_glob = global_ids[idx_local]
-                else:
-                    idx_glob = idx_local
-                d2 = d2.astype(dtype, copy=False)
-                Uadd = self._mls_quadratic_displacement(
-                    Xe, P_np, U_np, idx_glob, d2,
-                    power=power, eps=eps, reg=reg,
-                    use_gpu=False, dtype=dtype
-                )
-                # Nonfinite guard
-                bad = ~np.isfinite(Uadd).all(axis=1)
-                if bad.any():
-                    Uadd = Uadd.copy()
-                    Uadd[bad, :] = 0
-                out[s0:s0+bs] = Xe + Uadd
+        # Finalize sample metadata and record the operation
+        self._finalize_sample_aabb(sample, gmin, gmax)
+        if hasattr(sample, "record_modification"):
+            sample.record_modification("fe_nodal_field", params)
 
-            # Update global AABB and write
-            cmin = out.min(axis=0).astype(np.float64, copy=False)
-            cmax = out.max(axis=0).astype(np.float64, copy=False)
-            gmin = np.minimum(gmin, cmin)
-            gmax = np.maximum(gmax, cmax)
-            sample.write_chunk_positions(out, chunk_i)
-
-        # Finalize metadata
-        if np.all(np.isfinite(gmin)) and np.all(np.isfinite(gmax)):
-            new_dims = (gmax - gmin).astype(np.float32)
-            new_offs = ((gmin + gmax) * 0.5).astype(np.float32)
-            sample._dimensions = new_dims
-            sample._offset = new_offs
-            sample._matrix = np.diag(sample._dimensions.astype(np.float32))
-            sample._corners = (sample.get_unit_corners() @ sample._matrix) - (sample._dimensions * 0.5) + sample._offset  # :contentReference[oaicite:6]{index=6}
+        if counts["outside"] > 0:
+            self._log("normal", "apply_fe_nodal_field: WARNING {} atoms lie outside the mesh "
+                                "(nearest node > {:.3g} x node spacing {:.4g}); left undisplaced".format(
+                                    counts["outside"], float(outside_factor), spacing))
+        else:
+            self._log("normal", "apply_fe_nodal_field: 0 atoms outside the mesh (node spacing {:.4g})".format(spacing))
+        if gpu_ok:
+            level = "normal" if counts["fallback"] > 0 else "verbose"
+            self._log(level, "apply_fe_nodal_field: {} rows used the IDW fallback "
+                             "(Cholesky factorization failed)".format(counts["fallback"]))
         return
 
     # FE plotting
