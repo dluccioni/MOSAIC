@@ -43,22 +43,32 @@ class logging:
         self._wrapped_methods = set()
 
         # Profiling state
+        self._profile_enabled = False
         self._profile_stats = {}
         self._call_depth = 0
         self._mem_threshold = 100 * 1024 * 1024  # 100 MB
 
     # ---------- public API ----------
-    def set_logging(self, level: str = "normal", auto_instrument: bool = True):
+    def set_logging(self, level: str = "normal", auto_instrument: bool = True, profile: bool = False):
         """
         Set logging verbosity and (optionally) wrap methods to emit start/stop
         messages and durations. Levels: "silent", "normal", "verbose", "debug".
+
+        At "silent" any installed wrappers are removed so calls run at native
+        cost. With profile=True the wrappers also collect timing, RSS and GPU
+        memory statistics for print_profile_report(); otherwise those
+        measurements are skipped.
         """
         lvl = str(level).strip().lower()
         if lvl not in self._LOG_LEVELS:
             raise ValueError(f"Unknown level: {level}")
         prev = self._log_level
         self._log_level = self._LOG_LEVELS[lvl]
-        if auto_instrument and not self._logging_wrapped:
+        self._profile_enabled = bool(profile)
+        if self._log_level == self._LOG_LEVELS["silent"]:
+            if self._logging_wrapped:
+                self._uninstall_logging_wrappers()
+        elif auto_instrument and not self._logging_wrapped:
             try:
                 self._install_logging_wrappers()
                 self._logging_wrapped = True
@@ -243,17 +253,28 @@ class logging:
         self._log("normal", "reset_profile_stats: profiling data cleared")
 
     # ---------- internal: wrapper installation (general-purpose) ----------
+    def _uninstall_logging_wrappers(self):
+        """Remove the per-instance wrappers so class methods are called directly."""
+        for name in list(self._wrapped_methods):
+            self.__dict__.pop(name, None)
+        self._wrapped_methods.clear()
+        self._logging_wrapped = False
+
     def _install_logging_wrappers(self):
         """
         Install logging wrappers around callable methods of this instance.
 
         Behavior by log level:
         - normal : start/end with duration for __log_top__ methods
-        - verbose: start/end for all methods + RSS memory deltas above threshold
-        - debug  : all methods with call-depth indentation, full memory/GPU deltas,
-                    detailed bound parameters and return summaries
+        - verbose: start/end for all methods (+ RSS memory deltas above
+                    threshold when profiling)
+        - debug  : all methods with call-depth indentation, detailed bound
+                    parameters and return summaries (+ memory/GPU deltas when
+                    profiling)
 
-        Cumulative profiling statistics are always collected regardless of level.
+        Cumulative profiling statistics are collected only when set_logging
+        was called with profile=True. A wrapped method whose level is not
+        enabled, with profiling off, is forwarded directly.
 
         Notes:
         - Skips __dunder__ methods, properties, and items declared in __log_exclude__.
@@ -264,7 +285,8 @@ class logging:
         # ----- configuration per-class -----
         top_names = tuple(getattr(self, "__log_top__", ()))
         exclude = set(getattr(self, "__log_exclude__", ())) | {
-            "_install_logging_wrappers", "_log", "_level_name", "set_logging",
+            "_install_logging_wrappers", "_uninstall_logging_wrappers",
+            "_log", "_level_name", "set_logging",
             "_get_rss_bytes", "_get_gpu_mem_used", "_fmt_bytes",
             "_update_profile_stats",
             "print_profile_report", "log_memory_snapshot", "reset_profile_stats",
@@ -315,19 +337,35 @@ class logging:
                 return "<unrepr>"
 
         def _make_wrapper(method_name: str, unbound_attr, min_level: str):
+            lvlmap = getattr(self, "_LOG_LEVELS",
+                             {"silent": 0, "normal": 1, "verbose": 2, "debug": 3})
+            min_lvl_num = lvlmap.get(min_level, 1)
+            verbose_num = lvlmap.get("verbose", 2)
+            debug_num = lvlmap.get("debug", 3)
+
+            # Resolve the original method once; the raw class attribute keeps
+            # staticmethod/classmethod binding correct
+            try:
+                orig_attr = inspect.getattr_static(type(self), method_name)
+                target = (orig_attr.__get__(self, type(self))
+                          if hasattr(orig_attr, "__get__") else orig_attr)
+            except Exception:
+                target = (unbound_attr.__get__(self, type(self))
+                          if hasattr(unbound_attr, "__get__") else unbound_attr)
+
             @functools.wraps(unbound_attr)
             def _wrapper(self_ref, *args, **kwargs):
-                lvlmap = getattr(self_ref, "_LOG_LEVELS",
-                                 {"silent": 0, "normal": 1, "verbose": 2, "debug": 3})
-                cur = getattr(self_ref, "_log_level", lvlmap.get("normal", 1))
-                min_lvl_num = lvlmap.get(min_level, 1)
-
+                cur = getattr(self_ref, "_log_level", 1)
+                profiling = getattr(self_ref, "_profile_enabled", False)
                 should_log = (cur >= min_lvl_num)
-                is_verbose = (cur >= lvlmap.get("verbose", 2))
-                is_debug = (cur >= lvlmap.get("debug", 3))
+                if not should_log and not profiling:
+                    return target(*args, **kwargs)
 
-                track_mem = is_verbose
-                track_gpu = is_debug
+                is_verbose = (cur >= verbose_num)
+                is_debug = (cur >= debug_num)
+
+                track_mem = profiling and is_verbose
+                track_gpu = profiling and is_debug
 
                 # Call depth
                 depth = getattr(self_ref, "_call_depth", 0)
@@ -374,15 +412,6 @@ class logging:
                 except Exception:
                     pass
 
-                # Rebind original
-                try:
-                    orig_attr = inspect.getattr_static(type(self_ref), method_name)
-                    target = (orig_attr.__get__(self_ref, type(self_ref))
-                              if hasattr(orig_attr, "__get__") else orig_attr)
-                except Exception:
-                    target = (unbound_attr.__get__(self_ref, type(self_ref))
-                              if hasattr(unbound_attr, "__get__") else unbound_attr)
-
                 # Body
                 try:
                     result = target(*args, **kwargs)
@@ -397,10 +426,11 @@ class logging:
                             self_ref._log("debug", f"{indent}{method_name}() exception: {ex}")
                     except Exception:
                         pass
-                    try:
-                        self_ref._update_profile_stats(method_name, dt, None, None)
-                    except Exception:
-                        pass
+                    if profiling:
+                        try:
+                            self_ref._update_profile_stats(method_name, dt, None, None)
+                        except Exception:
+                            pass
                     raise
 
                 # Restore depth
@@ -430,11 +460,12 @@ class logging:
                     except Exception:
                         pass
 
-                # Update cumulative stats (always)
-                try:
-                    self_ref._update_profile_stats(method_name, dt, mem_delta, gpu_delta)
-                except Exception:
-                    pass
+                # Update cumulative stats when profiling
+                if profiling:
+                    try:
+                        self_ref._update_profile_stats(method_name, dt, mem_delta, gpu_delta)
+                    except Exception:
+                        pass
 
                 # End message
                 try:
