@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import json
 import os
+import sys
 import gc
 import math
 import time
@@ -18,6 +19,37 @@ except ImportError:
     cp = None
     cupyx = None
 from cffi import FFI
+
+# Compiled helpers are built once per process: CFFI modules by name, the
+# free-space propagator kernel per device.
+_CFFI_CACHE = {}
+_PROP_KERNEL_CACHE = {}
+
+
+def polarization_from_rate(rho):
+    """
+    Degree of linear polarization and its unit vector for a beam along +x,
+    from the classical perpendicular fraction rho.
+
+    rho = 0.5 is unpolarized.  rho > 0.5 means a fraction 2 rho - 1 is
+    polarized along lab y (normal to the x-z scattering plane); rho < 0.5
+    means a fraction 1 - 2 rho is polarized along lab z.  The per-event
+    factor P = (1 - p)(1 + cos^2 2theta)/2 + p (1 - (e . r)^2) then equals
+    rho + (1 - rho) cos^2 2theta for pixels in the x-z plane.
+
+    Returns:
+        tuple[float, float, float, float]: (p, ex, ey, ez).
+    """
+    rho = float(np.clip(rho, 0.0, 1.0))
+    p = abs(2.0 * rho - 1.0)
+    return (p, 0.0, 1.0, 0.0) if rho >= 0.5 else (p, 0.0, 0.0, 1.0)
+
+
+def _cffi_compile_args():
+    """Optimisation flag for the C compiler cffi drives: MSVC takes /O2, others -O3."""
+    if sys.platform == "win32" and "GCC" not in sys.version:
+        return ["/O2"]
+    return ["-O3"]
 import databases.scattering
 import importlib.resources as pkg_resources
 
@@ -62,6 +94,8 @@ class beam(logging):
         self._energy = None
         self._wavelength = None
         self._pol_perp_rate = 0.5  # Default: unpolarized
+        self._pol_direction = None  # explicit polarization vector (lab frame), or None
+        self._pol_degree = None     # explicit degree of linear polarization, or None
         if not os.path.isdir(self.directory):
             os.makedirs(self.directory)
         # Constants (SI units)
@@ -73,6 +107,47 @@ class beam(logging):
     _DB_CACHE = {}          # parsed scattering tables, shared by all instances
     _MORTON_KERNEL = None   # compiled Morton-code kernel, built on first use
 
+    def _set_polarization(self, pol_perp_rate, pol_direction=None, pol_degree=None):
+        """Store the incident polarization (see create_beam)."""
+        self._pol_perp_rate = float(np.clip(pol_perp_rate, 0.0, 1.0))
+        self._pol_direction = (None if pol_direction is None
+                               else np.asarray(pol_direction, dtype=np.float64).reshape(3))
+        self._pol_degree = None if pol_degree is None else float(np.clip(pol_degree, 0.0, 1.0))
+
+    def _polarization_state(self):
+        """
+        Degree of linear polarization p and its unit vector e, normal to the beam.
+
+        The kernels scale each scattered amplitude by sqrt(P) with
+        P = (1 - p)(1 + cos^2 2theta)/2 + p (1 - (e . r)^2), r the unit vector
+        from the atom to the pixel.  Without an explicit vector, pol_perp_rate
+        rho maps to p = |2 rho - 1| along lab y (rho >= 0.5) or lab z
+        (rho < 0.5); see create_beam.
+
+        Returns:
+            tuple[float, float, float, float]: (p, ex, ey, ez).
+        """
+        khat = np.asarray(getattr(self, "_direction", (1.0, 0.0, 0.0)), dtype=np.float64)
+        khat = khat / np.linalg.norm(khat)
+        rho = float(getattr(self, "_pol_perp_rate", 0.5))
+        p = getattr(self, "_pol_degree", None)
+        e = getattr(self, "_pol_direction", None)
+        p_rate, ex, ey, ez = polarization_from_rate(rho)
+        if p is None:
+            p = p_rate
+        if e is None:
+            e = np.array([ex, ey, ez])
+        e = np.asarray(e, dtype=np.float64)
+        e = e - np.dot(e, khat) * khat
+        if np.linalg.norm(e) < 1e-12:
+            # Requested vector lies along the beam: fall back to a transverse axis.
+            for axis in (np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])):
+                e = axis - np.dot(axis, khat) * khat
+                if np.linalg.norm(e) >= 1e-12:
+                    break
+        e = e / np.linalg.norm(e)
+        return float(p), float(e[0]), float(e[1]), float(e[2])
+
     def create_beam(self,
                     energy,
                     eV=True,
@@ -81,13 +156,23 @@ class beam(logging):
                     beam_samples=(256, 256),
                     beam_profile="uniform",
                     gaussian_waist=None,
-                    pol_perp_rate=0.5):
+                    pol_perp_rate=0.5,
+                    pol_direction=None,
+                    pol_degree=None):
         """
         Configure a forward-propagating (+x) beam and build its transverse grid.
 
         The direction is fixed to +x because the scattering kernels assume it.
-        pol_perp_rate is the fraction of incident intensity polarized
-        perpendicular to the scattering plane (rho_perp); 0.5 is unpolarized.
+
+        Polarization enters the scattered amplitude as sqrt(P) per atom-pixel
+        pair, with P = (1 - p)(1 + cos^2 2theta)/2 + p (1 - (e . r)^2), where
+        p is the degree of linear polarization, e its unit direction and r the
+        unit vector from the atom to the pixel.  Give it either explicitly
+        (pol_direction, pol_degree) or through pol_perp_rate: rho = 0.5 is
+        unpolarized (p = 0); rho > 0.5 means p = 2 rho - 1 polarized along lab
+        y, i.e. normal to the x-z scattering plane; rho < 0.5 means
+        p = 1 - 2 rho polarized along lab z.  For pixels in the x-z plane this
+        equals the classical rho + (1 - rho) cos^2 2theta.
 
         Args:
             energy (float): Beam energy in eV, or in J when eV is False.
@@ -99,6 +184,9 @@ class beam(logging):
             gaussian_waist (tuple[float, float] or None): 1/e^2 radii (wy, wz) in
                 angstrom; None means half of beam_size per axis.
             pol_perp_rate (float): Perpendicular polarization fraction in [0, 1].
+            pol_direction (array-like or None): Lab-frame polarization vector;
+                its component along the beam is removed and it is normalised.
+            pol_degree (float or None): Degree of linear polarization in [0, 1].
         """
         # Kernels assume a +x beam
         self._direction = np.array([1.0, 0.0, 0.0], dtype=np.float32)
@@ -121,7 +209,7 @@ class beam(logging):
         self._beam_profile = str(beam_profile).lower()
         self._gauss_waist  = gaussian_waist
 
-        self._pol_perp_rate = float(np.clip(pol_perp_rate, 0.0, 1.0))
+        self._set_polarization(pol_perp_rate, pol_direction, pol_degree)
 
         # Transverse basis for +x propagation: e1 = +y, e2 = +z
         self._beam_e1 = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -287,9 +375,10 @@ class beam(logging):
                 # Malformed waist: same default
                 self._gauss_waist = (0.5 * Sy, 0.5 * Sz) if self._beam_profile == "gaussian" else None
 
-        # 0.5 = unpolarized
-        self._pol_perp_rate = float(beam_metadata.get("pol_perp_rate", 0.5))
-        self._pol_perp_rate = float(np.clip(self._pol_perp_rate, 0.0, 1.0))
+        # 0.5 = unpolarized; an explicit vector and degree override it
+        self._set_polarization(beam_metadata.get("pol_perp_rate", 0.5),
+                               beam_metadata.get("pol_direction"),
+                               beam_metadata.get("pol_degree"))
 
         e1, e2 = self.make_orthonormal_basis(self._direction)
         self._beam_e1 = e1.astype(np.float32)
@@ -338,7 +427,11 @@ class beam(logging):
             "beam_samples"    : beam_samples,    # [Ny, Nz]
             "beam_profile"    : beam_profile,    # "uniform" | "gaussian"
             "gaussian_waist"  : gauss_waist,     # [wy_angstrom, wz_angstrom] or null
-            "pol_perp_rate"   : float(pol_perp_rate)  # Polarization rate [0.0-1.0]
+            "pol_perp_rate"   : float(pol_perp_rate),  # Polarization rate [0.0-1.0]
+            "pol_direction"   : (None if getattr(self, "_pol_direction", None) is None
+                                 else [float(v) for v in self._pol_direction]),
+            "pol_degree"      : (None if getattr(self, "_pol_degree", None) is None
+                                 else float(self._pol_degree)),
         }
 
         if override_directory is not None:
@@ -527,10 +620,15 @@ class beam(logging):
     @staticmethod
     def compile_compute_scattering_cffi():
         """
-        Compile and return the CPU direct-scattering routine (CFFI):
-            void compute_scattering_cffi(
+        Compile and return the CPU direct-scattering routine (CFFI).
+
+        All geometry and phases are evaluated in double: the path length
+        atom -> pixel is ~0.1 m and a wavelength is ~1e-10 m, so single
+        precision cannot hold the phase (75 A per ulp of the distance).
+        Signature:
+            int compute_scattering_cffi(
                 int atom_count,
-                const float* positions,     // (atom_count, 3) in meters
+                const double* positions,    // (atom_count, 3) in metres
                 const float* f0_params,     // (atom_count, 11)
                 const float* f0_zero,       // (atom_count,)
                 int remove_forward,         // 0 or 1
@@ -539,251 +637,190 @@ class beam(logging):
                 const float* initial_amp_r, // (atom_count,)
                 const float* initial_amp_i, // (atom_count,)
                 int Ny, int Nz,
-                const float* coords_x,      // (Ny*Nz) in meters
-                const float* coords_y,
-                const float* coords_z,
-                float k_val,                // 2*pi/lambda in rad/m
+                const double* coords_x,     // (Ny*Nz) in metres
+                const double* coords_y,
+                const double* coords_z,
+                double k_val,               // 2*pi/lambda in rad/m
                 int apply_pol,              // 0 or 1
-                float pol_perp_rate,        // rho_perp in [0, 1]
+                double pol_deg,             // degree of linear polarization
+                double pol_ex, double pol_ey, double pol_ez,  // its unit vector
                 int apply_spherical_decay,  // 0 or 1
-                float* out_r, float* out_i  // (Ny*Nz)
+                float* out_r, float* out_i  // (Ny*Nz), accumulated into
             );
+        Returns 0, or 1 if a work buffer could not be allocated.
 
         Polarization: the amplitude is scaled by sqrt(P) with
-        P = rho_perp + (1 - rho_perp) * cos(2*theta)^2, and cos(2*theta) ~ dx/r
-        for a +x beam.
+        P = (1 - p)(1 + cos^2 2theta)/2 + p (1 - (e . r)^2), r the unit vector
+        from the atom to the pixel and cos 2theta = dx / r for a +x beam.
 
         Returns:
             tuple: (ffi_obj, C_mod) from cffi.verify; needs a working C compiler.
         """
         from cffi import FFI
+        if "scatter" in _CFFI_CACHE:
+            return _CFFI_CACHE["scatter"]
 
-        c_source = r'''
+        c_source = r"""
         #include <math.h>
         #include <stddef.h>
         #include <stdlib.h>
 
-        static inline float get_f0_value(float Q_val, const float* params)
+        /* Waasmaier-Kirfel f0 at momentum transfer Q [1/m]. */
+        static double get_f0_value(double Q_val, const float* params)
         {
-            const float PI_F = 3.14159265358979323846f;
-            const float K_SCALE_FACTOR = 0.25f * 1.0e-10f / PI_F;  // Q[m^-1] -> s[Angstrom^-1]
-            const float s   = K_SCALE_FACTOR * Q_val;
-            const float ss  = s*s;
-
-            float f0_val = params[5]; // c
-            for (int i=0;i<5;i++){
-                const float ai = params[i];
-                const float bi = params[6+i];
-                f0_val += ai * expf(-bi * ss);
+            const double s  = (0.25e-10 / 3.14159265358979323846) * Q_val;  /* sin(th)/lambda [1/A] */
+            const double ss = s * s;
+            double f0_val = params[5];
+            int i;
+            for (i = 0; i < 5; i++) {
+                f0_val += (double)params[i] * exp(-(double)params[6 + i] * ss);
             }
             return f0_val;
         }
 
-        void compute_scattering_cffi(
+        int compute_scattering_cffi(
             int atom_count,
-            const float *positions,       // (atom_count,3) [m]
-            const float *f0_params,       // (atom_count,11)
-            const float *f0_zero,         // (atom_count,)
-            int remove_forward,           // 0/1
-            const float *s_anom_real,     // (atom_count,)
-            const float *s_anom_imag,     // (atom_count,)
-            const float *initial_amp_r,   // (atom_count,)
-            const float *initial_amp_i,   // (atom_count,)
+            const double *positions,
+            const float *f0_params,
+            const float *f0_zero,
+            int remove_forward,
+            const float *s_anom_real,
+            const float *s_anom_imag,
+            const float *initial_amp_r,
+            const float *initial_amp_i,
             int Ny, int Nz,
-            const float *coords_x,        // (Ny*Nz) [m]
-            const float *coords_y,
-            const float *coords_z,
-            float k_val,                  // 2*pi/lambda [rad/m]
-            int   apply_pol,              // 0/1
-            float pol_perp_rate,          // rho_perp in [0,1]
-            int   apply_spherical_decay,  // 0/1
-            float *out_r, float *out_i    // (Ny*Nz)
+            const double *coords_x,
+            const double *coords_y,
+            const double *coords_z,
+            double k_val,
+            int   apply_pol,
+            double pol_deg, double pol_ex, double pol_ey, double pol_ez,
+            int   apply_spherical_decay,
+            float *out_r, float *out_i
         )
         {
-            const float PI_F = 3.14159265358979323846f;
-            const float rE_F = 2.81794092e-15f;  // classical electron radius [m]
-            const int pixel_count = Ny*Nz;
+            const double TWO_PI = 6.283185307179586;
+            const double rE = 2.81794092e-15;  /* classical electron radius [m] */
+            const int pixel_count = Ny * Nz;
+            int a, p;
 
-            // Per-pixel Q_cut: half a pixel's diagonal in Q-space
-            int have_qcut = 1;
-            float* Q_cut = (float*)malloc((size_t)pixel_count * sizeof(float));
-            if (!Q_cut) have_qcut = 0;
-
-            // Per-pixel R0: distance from origin to pixel
-            int have_r0 = 1;
-            float* R0_arr = (float*)malloc((size_t)pixel_count * sizeof(float));
-            if (!R0_arr) have_r0 = 0;
-
-            if (have_qcut || have_r0) {
-                for (int p = 0; p < pixel_count; ++p) {
-                    int ix = p % Ny;
-                    int iy = p / Ny;
-
-                    // Unit vector to this pixel
-                    float tx = coords_x[p];
-                    float ty = coords_y[p];
-                    float tz = coords_z[p];
-                    float R0 = sqrtf(tx*tx + ty*ty + tz*tz);
-                    float ux = 0.0f, uy = 0.0f, uz = 0.0f;
-                    if (R0 > 0.0f) {
-                        float invR0 = 1.0f / R0;
-                        ux = tx * invR0; uy = ty * invR0; uz = tz * invR0;
-                    }
-                    if (have_r0) {
-                        R0_arr[p] = R0;
-                    }
-
-                    if (have_qcut) {
-                        // Right neighbor (left on the edge, self if single column)
-                        int n_right = (ix + 1 < Ny) ? (p + 1) : ((ix > 0) ? (p - 1) : p);
-                        float rx = coords_x[n_right];
-                        float ry = coords_y[n_right];
-                        float rz = coords_z[n_right];
-                        float Rr = sqrtf(rx*rx + ry*ry + rz*rz);
-                        float urx = 0.0f, ury = 0.0f, urz = 0.0f;
-                        if (Rr > 0.0f) {
-                            float invRr = 1.0f / Rr;
-                            urx = rx*invRr; ury = ry*invRr; urz = rz*invRr;
-                        }
-                        float cos_dx = ux*urx + uy*ury + uz*urz;
-                        if (cos_dx > 1.0f) cos_dx = 1.0f;
-                        if (cos_dx < -1.0f) cos_dx = -1.0f;
-                        float Qx = k_val * sqrtf(fmaxf(0.0f, 2.0f * (1.0f - cos_dx)));
-
-                        // Up neighbor (down on the edge, self if single row)
-                        int n_up = (iy + 1 < Nz) ? (p + Ny) : ((iy > 0) ? (p - Ny) : p);
-                        float ux2 = coords_x[n_up];
-                        float uy2 = coords_y[n_up];
-                        float uz2 = coords_z[n_up];
-                        float Ru = sqrtf(ux2*ux2 + uy2*uy2 + uz2*uz2);
-                        float vux = 0.0f, vuy = 0.0f, vuz = 0.0f;
-                        if (Ru > 0.0f) {
-                            float invRu = 1.0f / Ru;
-                            vux = ux2*invRu; vuy = uy2*invRu; vuz = uz2*invRu;
-                        }
-                        float cos_dy = ux*vux + uy*vuy + uz*vuz;
-                        if (cos_dy > 1.0f) cos_dy = 1.0f;
-                        if (cos_dy < -1.0f) cos_dy = -1.0f;
-                        float Qy = k_val * sqrtf(fmaxf(0.0f, 2.0f * (1.0f - cos_dy)));
-
-                        // Half-diagonal in Q-space
-                        float Qhx = 0.5f * Qx;
-                        float Qhy = 0.5f * Qy;
-                        if (have_qcut) {
-                            Q_cut[p] = sqrtf(Qhx*Qhx + Qhy*Qhy);
-                        }
-                    }
-                }
+            double *Q_cut  = (double*)malloc((size_t)pixel_count * sizeof(double));
+            double *R0_arr = (double*)malloc((size_t)pixel_count * sizeof(double));
+            double *acc_r  = (double*)calloc((size_t)pixel_count, sizeof(double));
+            double *acc_i  = (double*)calloc((size_t)pixel_count, sizeof(double));
+            if (!Q_cut || !R0_arr || !acc_r || !acc_i) {
+                free(Q_cut); free(R0_arr); free(acc_r); free(acc_i);
+                return 1;
             }
 
-            const float wavelength_m = (2.0f * PI_F) / k_val;
+            /* Per pixel: distance from the origin, and the forward-removal
+               cut-off Q_cut = half the pixel's diagonal in Q space. */
+            for (p = 0; p < pixel_count; ++p) {
+                const int ix = p % Ny;
+                const int iy = p / Ny;
+                const double tx = coords_x[p], ty = coords_y[p], tz = coords_z[p];
+                const double R0 = sqrt(tx*tx + ty*ty + tz*tz);
+                double ux = 0.0, uy = 0.0, uz = 0.0;
+                int n_right, n_up;
+                double rx, ry, rz, Rr, cos_dx, Qx, cos_dy, Qy;
+                R0_arr[p] = R0;
+                if (R0 > 0.0) { ux = tx / R0; uy = ty / R0; uz = tz / R0; }
 
-            // Accumulate over atoms and pixels
-            for (int a=0; a<atom_count; ++a)
+                n_right = (ix + 1 < Ny) ? (p + 1) : ((ix > 0) ? (p - 1) : p);
+                rx = coords_x[n_right]; ry = coords_y[n_right]; rz = coords_z[n_right];
+                Rr = sqrt(rx*rx + ry*ry + rz*rz);
+                cos_dx = (Rr > 0.0) ? (ux*rx + uy*ry + uz*rz) / Rr : 1.0;
+                if (cos_dx > 1.0) cos_dx = 1.0;
+                if (cos_dx < -1.0) cos_dx = -1.0;
+                Qx = k_val * sqrt(fmax(0.0, 2.0 * (1.0 - cos_dx)));
+
+                n_up = (iy + 1 < Nz) ? (p + Ny) : ((iy > 0) ? (p - Ny) : p);
+                rx = coords_x[n_up]; ry = coords_y[n_up]; rz = coords_z[n_up];
+                Rr = sqrt(rx*rx + ry*ry + rz*rz);
+                cos_dy = (Rr > 0.0) ? (ux*rx + uy*ry + uz*rz) / Rr : 1.0;
+                if (cos_dy > 1.0) cos_dy = 1.0;
+                if (cos_dy < -1.0) cos_dy = -1.0;
+                Qy = k_val * sqrt(fmax(0.0, 2.0 * (1.0 - cos_dy)));
+
+                Q_cut[p] = 0.5 * sqrt(Qx*Qx + Qy*Qy);
+            }
+
+            for (a = 0; a < atom_count; ++a)
             {
-                const float ax = positions[3*a+0];
-                const float ay = positions[3*a+1];
-                const float az = positions[3*a+2];
-
+                const double ax = positions[3*a + 0];
+                const double ay = positions[3*a + 1];
+                const double az = positions[3*a + 2];
                 const float *f0p = &f0_params[a*11];
-                const float f00  = f0_zero[a];
-                const float sanr = s_anom_real[a];
-                const float sani = s_anom_imag[a];
+                const double f00  = f0_zero[a];
+                const double sanr = s_anom_real[a];
+                const double sani = s_anom_imag[a];
+                const double amp_r = initial_amp_r[a];
+                const double amp_i = initial_amp_i[a];
 
-                const float amp_r = initial_amp_r[a];
-                const float amp_i = initial_amp_i[a];
-
-                for (int p=0; p<pixel_count; ++p)
+                for (p = 0; p < pixel_count; ++p)
                 {
-                    const float dx = coords_x[p] - ax;
-                    const float dy = coords_y[p] - ay;
-                    const float dz = coords_z[p] - az;
+                    const double dx = coords_x[p] - ax;
+                    const double dy = coords_y[p] - ay;
+                    const double dz = coords_z[p] - az;
+                    const double r = sqrt(dx*dx + dy*dy + dz*dz);
+                    double dotv, Q_val, f0_val, s_re, s_im, t_re, t_im;
+                    double phase, cph, sph, val_r, val_i, scale;
+                    if (r == 0.0) continue;
 
-                    float r_det = sqrtf(dx*dx + dy*dy + dz*dz);
-                    if (r_det == 0.0f) continue;
+                    /* +x beam: cos(2 theta) = dx / r, Q = 2 k sin(theta) */
+                    dotv  = dx / r;
+                    Q_val = k_val * sqrt(fmax(0.0, 2.0 * (1.0 - dotv)));
+                    f0_val = get_f0_value(Q_val, f0p);
 
-                    // +x beam: cos(2*theta) = dx/r, Q = 2k sin(theta)
-                    float dotv = (dx / r_det);
-                    float tmp = 2.0f*(1.0f - dotv);
-                    if (tmp < 0.0f) tmp = 0.0f;
-                    float Q_val = k_val * sqrtf(tmp);
-
-                    float f0_val = get_f0_value(Q_val, f0p);
-
-                    // f = f0(Q) + f' + i f''
-                    float s_re = (f0_val + sanr);
-                    float s_im = (sani);
-
-                    // Remove the forward amplitude inside Q < Q_cut
-                    if (remove_forward) {
-                        if (have_qcut) {
-                            if (Q_val < Q_cut[p]) {
-                                s_re -= (f00 + sanr);
-                                s_im -= (sani);
-                            }
-                        } else {
-                            // No Q_cut (malloc failed): subtract everywhere
-                            s_re -= (f00 + sanr);
-                            s_im -= (sani);
-                        }
+                    s_re = f0_val + sanr;
+                    s_im = sani;
+                    if (remove_forward && Q_val < Q_cut[p]) {
+                        s_re -= (f00 + sanr);
+                        s_im -= sani;
                     }
 
-                    // Multiply by the complex entrance amplitude
-                    float t_re = amp_r * s_re - amp_i * s_im;
-                    float t_im = amp_r * s_im + amp_i * s_re;
+                    t_re = amp_r * s_re - amp_i * s_im;
+                    t_im = amp_r * s_im + amp_i * s_re;
 
-                    // Phase k*(ax + r_det), reduced mod wavelength for float precision
-                    float phase = k_val * (fmodf(ax, wavelength_m) + fmodf(r_det, wavelength_m));
-                    float cph = cosf(phase);
-                    float sph = sinf(phase);
+                    /* Incident phase k x at the atom plus the path to the pixel. */
+                    phase = fmod(k_val * (ax + r), TWO_PI);
+                    cph = cos(phase);
+                    sph = sin(phase);
+                    val_r = t_re * cph - t_im * sph;
+                    val_i = t_re * sph + t_im * cph;
 
-                    float val_r = (t_re * cph - t_im * sph);
-                    float val_i = (t_re * sph + t_im * cph);
-
-                    // Relative spherical decay R0 / r_det
-                    float scale_rel = 1.0f;
-                    if (apply_spherical_decay && r_det > 0.0f) {
-                        float R0_local;
-                        if (have_r0) {
-                            R0_local = R0_arr[p];
-                        } else {
-                            float tx = coords_x[p], ty = coords_y[p], tz = coords_z[p];
-                            R0_local = sqrtf(tx*tx + ty*ty + tz*tz);
-                        }
-                        if (R0_local > 0.0f) {
-                            scale_rel = R0_local / r_det;
-                        }
+                    scale = rE;
+                    if (apply_spherical_decay && R0_arr[p] > 0.0) {
+                        scale *= R0_arr[p] / r;
                     }
-
-                    // Polarization factor on amplitude
                     if (apply_pol) {
-                        float P = pol_perp_rate + (1.0f - pol_perp_rate) * (dotv * dotv);
-                        if (P < 0.0f) P = 0.0f;
-                        if (P > 1.0f) P = 1.0f;
-                        float scale = sqrtf(P);
-                        val_r *= scale;
-                        val_i *= scale;
+                        const double er = (pol_ex*dx + pol_ey*dy + pol_ez*dz) / r;
+                        double Pf = 0.5 * (1.0 - pol_deg) * (1.0 + dotv*dotv)
+                                  + pol_deg * (1.0 - er*er);
+                        if (Pf < 0.0) Pf = 0.0;
+                        if (Pf > 1.0) Pf = 1.0;
+                        scale *= sqrt(Pf);
                     }
 
-                    // Scale by r_e and accumulate
-                    val_r *= (rE_F * scale_rel);
-                    val_i *= (rE_F * scale_rel);
-
-                    out_r[p] += val_r;
-                    out_i[p] += val_i;
+                    acc_r[p] += val_r * scale;
+                    acc_i[p] += val_i * scale;
                 }
             }
 
-            if (Q_cut) free(Q_cut);
-            if (R0_arr) free(R0_arr);
+            for (p = 0; p < pixel_count; ++p) {
+                out_r[p] += (float)acc_r[p];
+                out_i[p] += (float)acc_i[p];
+            }
+            free(Q_cut); free(R0_arr); free(acc_r); free(acc_i);
+            return 0;
         }
-        ''';
+        """
 
         ffi_obj = FFI()
         ffi_obj.cdef(r"""
-            void compute_scattering_cffi(
+            int compute_scattering_cffi(
                 int atom_count,
-                const float *positions,
+                const double *positions,
                 const float *f0_params,
                 const float *f0_zero,
                 int remove_forward,
@@ -792,17 +829,18 @@ class beam(logging):
                 const float *initial_amp_r,
                 const float *initial_amp_i,
                 int Ny, int Nz,
-                const float *coords_x,
-                const float *coords_y,
-                const float *coords_z,
-                float k_val,
+                const double *coords_x,
+                const double *coords_y,
+                const double *coords_z,
+                double k_val,
                 int   apply_pol,
-                float pol_perp_rate,
+                double pol_deg, double pol_ex, double pol_ey, double pol_ez,
                 int   apply_spherical_decay,
                 float *out_r, float *out_i
             );
         """)
-        C_mod = ffi_obj.verify(c_source, extra_compile_args=['-O3'])
+        C_mod = ffi_obj.verify(c_source, extra_compile_args=_cffi_compile_args())
+        _CFFI_CACHE["scatter"] = (ffi_obj, C_mod)
         return ffi_obj, C_mod
     
     @staticmethod
@@ -1220,6 +1258,8 @@ class beam(logging):
         order, form-factor fit, register blocking and stream count are chosen
         from this geometry.  It declines anything it cannot represent exactly;
         nothing is written then and the caller runs the general kernel.
+        ``spc`` is a per-atom label array, or a ``(codes, labels)`` pair as
+        ``Sample.load_chunk_species(codes=True)`` returns it.
 
         Returns:
             bool: True if the chunk was scattered here.
@@ -1238,7 +1278,11 @@ class beam(logging):
         # every call.
         cache = self.__dict__.setdefault("_species_code_cache", {})
         hit = cache.get(species_key) if species_key is not None else None
-        if hit is not None and hit[0].shape[0] == int(pos_m_g.shape[0]):
+        if isinstance(spc, tuple):
+            # (codes, labels) straight from the sample: nothing to factorize
+            code = np.asarray(spc[0]).astype(np.int32, copy=False)
+            names = np.asarray(spc[1], dtype=str)
+        elif hit is not None and hit[0].shape[0] == int(pos_m_g.shape[0]):
             code, names = hit
         else:
             code, names = self._species_codes(spc)
@@ -1308,7 +1352,8 @@ class beam(logging):
                 use_series=getattr(self, "_global_use_series", True),
                 chunk=chunk, tol_rad=tol, det_extent=det_extent,
                 tol_f0=tol_f0, phasor_fp64=phasor_fp64, tol_decline=tol_user,
-                opts=kernel_opts)
+                opts=kernel_opts,
+                pol_vec=(beam._polarization_state(self) if polarization else None))
             if not handled:            # cannot happen mid-way: checked above
                 return False
         return True
@@ -1480,11 +1525,24 @@ class beam(logging):
         unroll     = int(getattr(self, "_kernel_unroll", 4))
         maxreg     = getattr(self, "_kernel_maxreg", None)
 
-        # Cache by (N, mode, M, tuning)
+        # Polarization: with an explicit vector or degree on the beam they are
+        # compiled in; otherwise the kernel derives the degree and axis from
+        # its runtime pol_perp_rate argument (see polarization_from_rate).
+        # Either way the launch signature the dynamical path shares is
+        # unchanged.
+        pol_explicit = int(getattr(self, "_pol_direction", None) is not None
+                           or getattr(self, "_pol_degree", None) is not None)
+        pol_deg, pol_ex, pol_ey, pol_ez = (float(np.float32(v))
+                                            for v in beam._polarization_state(self))
+        if not pol_explicit:
+            pol_deg, pol_ex, pol_ey, pol_ez = 0.0, 0.0, 0.0, 0.0
+
+        # Cache by (N, mode, M, tuning, polarization)
         if not hasattr(self, "_interaction_kernel_cache"):
             self._interaction_kernel_cache = {}
-        key = ("v3_dynamical", N, global_use_series, M_compile,
-               chunk_size, unroll, maxreg, n_pro, pro_mode, stage_c)
+        key = ("v4_polvec", N, global_use_series, M_compile,
+               chunk_size, unroll, maxreg, n_pro, pro_mode, stage_c,
+               pol_explicit, pol_deg, pol_ex, pol_ey, pol_ez)
         if key in self._interaction_kernel_cache:
             return self._interaction_kernel_cache[key]
 
@@ -1721,7 +1779,7 @@ class beam(logging):
             const int    remove_forward,
             const int    apply_polarization,
             const int    apply_spherical_decay,
-            const float  pol_perp_rate,
+            const float  pol_perp_rate,   // rho; ignored when POL_EXPLICIT compiles the vector in
             const int    apply_analyser,
             const int    analyser_kind,
             const float  centre_x, const float centre_y, const float centre_z,
@@ -1732,6 +1790,19 @@ class beam(logging):
             const float* __restrict__ chunk_org)  // (nChunks * 3) floats, m
         {
             const float rE_F = 2.81794092e-15f;
+
+            // Degree p and unit vector e of the linear polarization: compiled
+            // in, or from rho (>= 0.5: along y, else along z; see
+            // polarization_from_rate).
+#if POL_EXPLICIT
+            const float p_pol = POL_DEG;
+            const float e_px = POL_EX, e_py = POL_EY, e_pz = POL_EZ;
+#else
+            const float p_pol = fabsf(2.0f * pol_perp_rate - 1.0f);
+            const float e_px = 0.0f;
+            const float e_py = (pol_perp_rate >= 0.5f) ? 1.0f : 0.0f;
+            const float e_pz = (pol_perp_rate >= 0.5f) ? 0.0f : 1.0f;
+#endif
 
             int ix = blockIdx.x * blockDim.x + threadIdx.x;
             int iy = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1967,8 +2038,16 @@ class beam(logging):
                         stot_c.y -= scattering_anom[0].y;
                     }
                     if (apply_polarization) {
-                        float P = pol_perp_rate
-                                + (1.0f - pol_perp_rate) * (dotv_c * dotv_c);
+                        // P = (1-p)(1+cos^2 2th)/2 + p(1-(e.r)^2), at the chunk
+                        // origin.  1-(e.r)^2 is formed as |e x r|^2: the
+                        // difference cancels to nothing in fp32 when the
+                        // polarization is nearly extinguished (e.r -> 1).
+                        float cx_ = e_py * upz - e_pz * upy;
+                        float cy_ = e_pz * upx - e_px * upz;
+                        float cz_ = e_px * upy - e_py * upx;
+                        float s2_ = fmaf(cz_, cz_, fmaf(cy_, cy_, cx_ * cx_));
+                        float P = fmaf(0.5f * (1.0f - p_pol), 1.0f + dotv_c * dotv_c,
+                                       p_pol * s2_);
                         P = fminf(1.0f, fmaxf(0.0f, P));
                         float sc = (P > 0.0f) ? (P * rsqrtf(P)) : 0.0f;
                         stot_c.x *= sc; stot_c.y *= sc;
@@ -2102,7 +2181,16 @@ class beam(logging):
                         val.y = real_part * s_rel + imag_part * c_rel;
 
                         if (apply_polarization) {
-                            float P = pol_perp_rate + (1.0f - pol_perp_rate) * (dotv * dotv);
+                            // P = (1-p)(1+cos^2 2th)/2 + p(1-(e.r)^2), r the
+                            // unit vector from this atom to the pixel.
+                            // 1-(e.r)^2 = |e x r|^2 / r^2, which keeps full
+                            // relative precision when e.r is close to 1.
+                            float cx_ = e_py * dz - e_pz * dy;
+                            float cy_ = e_pz * dx - e_px * dz;
+                            float cz_ = e_px * dy - e_py * dx;
+                            float s2_ = fmaf(cz_, cz_, fmaf(cy_, cy_, cx_ * cx_)) * (inv_r * inv_r);
+                            float P = fmaf(0.5f * (1.0f - p_pol), 1.0f + dotv * dotv,
+                                           p_pol * s2_);
                             P = fminf(1.0f, fmaxf(0.0f, P));
                             float sc = (P > 0.0f) ? (P * rsqrtf(P)) : 0.0f;
                             val.x *= sc; val.y *= sc;
@@ -2189,6 +2277,11 @@ class beam(logging):
                 f'-DN_PRO={n_pro}',
                 f'-DPROLOGUE_MODE={pro_mode}',
                 f'-DSTAGE_C={stage_c}',
+                f'-DPOL_EXPLICIT={pol_explicit}',
+                f'-DPOL_DEG={pol_deg:.9e}f',
+                f'-DPOL_EX={pol_ex:.9e}f',
+                f'-DPOL_EY={pol_ey:.9e}f',
+                f'-DPOL_EZ={pol_ez:.9e}f',
             ) + ((f'-maxrregcount={int(maxreg)}',) if maxreg else ())
         )
         kern = kernel_module.get_function('interaction_kernal')
@@ -4481,6 +4574,9 @@ class beam(logging):
         Returns:
             cupy.RawKernel: Kernel named "prop_mul_kernel".
         """
+        dev = int(cp.cuda.Device().id)
+        if dev in _PROP_KERNEL_CACHE:
+            return _PROP_KERNEL_CACHE[dev]
         src = r'''
         #include <math.h>
 
@@ -4518,13 +4614,20 @@ class beam(logging):
             const float kt2 = kyt * kyt + kzt * kzt;
             const float kx2 = k * k - kt2;
 
+            // sqrt(k^2 - kt^2) - k is formed as -kt^2 / (sqrt(k^2 - kt^2) + k).
+            // The direct difference cancels to nothing in fp32 (ulp(k) is
+            // ~4e3 rad/m at 1 A, so k*k - kt2 == k*k for any pitch coarser
+            // than ~200 nm); this form keeps full relative precision.  The
+            // Bragg-beam offset k - k_g_axis is exactly zero for the forward
+            // beam.  The evanescent phase -z k_g_axis is ~1e10 rad, so it is
+            // reduced in double before the fp32 trig.
             float phase, amp;
             if (kx2 >= 0.0f) {
-                phase = z * (sqrtf(kx2) - k_g_axis);
+                phase = -z * kt2 / (sqrtf(kx2) + k) + z * (k - k_g_axis);
                 amp   = 1.0f;
             } else {
                 amp   = expf(-fabsf(z) * sqrtf(-kx2));
-                phase = -z * k_g_axis;
+                phase = (float)fmod(-(double)z * (double)k_g_axis, 6.283185307179586);
             }
 
             const float cph = cosf(phase);
@@ -4550,22 +4653,26 @@ class beam(logging):
             backend = 'nvcc',
             options = ('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true')
         )
-        return mod.get_function('prop_mul_kernel')
+        kern = mod.get_function('prop_mul_kernel')
+        _PROP_KERNEL_CACHE[dev] = kern
+        return kern
 
     @staticmethod
     def compile_propagation_multiplier_cffi():
         """
         CPU (CFFI) propagation multiplier for angular-spectrum steps.  Multiplies
-        a complex spectrum F (row-major Nz x Ny) in place by
-            propagating:  H = exp(+i*z*sqrt(k^2 - kt^2))
-            evanescent:   H = exp(-|z|*sqrt(kt^2 - k^2))  (real decay)
+        a complex spectrum F (row-major Nz x Ny) in place by the propagator
+        with the carrier exp(i k z) removed, as the GPU kernel does:
+            propagating:  H = exp(+i*z*(sqrt(k^2 - kt^2) - k))
+            evanescent:   H = exp(-|z|*sqrt(kt^2 - k^2) - i*z*k)
 
         Returns:
             tuple: (ffi, lib); call lib.prop_mul_cpu(Ny, Nz, ky, kz, k, z, F).
         """
+        if "prop" in _CFFI_CACHE:
+            return _CFFI_CACHE["prop"]
         source = r'''
         #include <math.h>
-        #include <complex.h>
 
         void prop_mul_cpu(
             const int      Ny,
@@ -4574,7 +4681,7 @@ class beam(logging):
             const float*   kz,    /* rad/m, length Nz */
             const float    k,     /* 2*pi/lambda */
             const float    z,     /* meters */
-            float _Complex* F)    /* spectrum (Nz*Ny), row-major */
+            float*         F)     /* spectrum (Nz*Ny) complex64, row-major, interleaved re/im */
         {
             const float az = fabsf(z);
             for (int iy = 0; iy < Nz; ++iy) {
@@ -4584,21 +4691,25 @@ class beam(logging):
                     const float kt2 = kyv*kyv + kzv*kzv;
                     const float kx2 = k*k - kt2;
 
+                    /* Envelope phase z*(sqrt(k^2-kt^2) - k) in the form
+                       -z*kt^2/(sqrt(k^2-kt^2) + k), which keeps full fp32
+                       relative precision; the direct difference does not.
+                       The evanescent carrier phase is reduced in double. */
                     float phase, amp;
                     if (kx2 >= 0.0f) {
-                        phase = z * sqrtf(kx2);
+                        phase = -z * kt2 / (sqrtf(kx2) + k);
                         amp   = 1.0f;
                     } else {
-                        phase = 0.0f;
+                        phase = (float)fmod(-(double)z * (double)k, 6.283185307179586);
                         amp   = expf(-az * sqrtf(-kx2));
                     }
 
-                    const float cph = cosf(phase);
-                    const float sph = sinf(phase);
-                    const float _Complex H = amp * (cph + I*sph);
-
-                    const int idx = iy * Ny + ix;
-                    F[idx] *= H;
+                    const float hr = amp * cosf(phase);
+                    const float hi = amp * sinf(phase);
+                    const int idx = 2 * (iy * Ny + ix);
+                    const float gr = F[idx], gi = F[idx + 1];
+                    F[idx]     = gr * hr - gi * hi;
+                    F[idx + 1] = gr * hi + gi * hr;
                 }
             }
         }
@@ -4606,8 +4717,9 @@ class beam(logging):
 
         ffi = FFI()
         ffi.cdef('void prop_mul_cpu(int,int,const float*,const float*,float,float,'
-                'float _Complex*);')
-        lib = ffi.verify(source, extra_compile_args=['-O3'])
+                'float*);')
+        lib = ffi.verify(source, extra_compile_args=_cffi_compile_args())
+        _CFFI_CACHE["prop"] = (ffi, lib)
         return ffi, lib
     
     @staticmethod
@@ -4731,21 +4843,7 @@ class beam(logging):
             A_beam_np = self._compute_beam_column_A_map_cpu(sample, stage, kernel_radius=kernel_radius)
 
         # Cache key covers beam, stage, grid, and depth window.
-        key_obj = dict(
-            E_eV=float(self._energy),
-            lam=float(self._wavelength),
-            direction=[float(x) for x in self._direction],
-            stage_R=np.asarray(stage.rotation, dtype=float).round(7).tolist(),
-            stage_T=[float(x) for x in np.asarray(stage.translation, dtype=float)],
-            beam_size=[float(x) for x in self._beam_size],
-            beam_samples=[int(self._beam_Ny), int(self._beam_Nz)],
-            beam_profile=self._beam_profile,
-            gauss_waist=[None if self._gauss_waist is None else float(self._gauss_waist[0]),
-                        None if self._gauss_waist is None else float(self._gauss_waist[1])],
-            s_min=float(s_min),
-            s_max=float(s_max)
-        )
-        key_hash = hashlib.sha1(json.dumps(key_obj, sort_keys=True).encode("utf-8")).hexdigest()
+        key_hash = self._ein_cache_key(sample, stage, s_min, s_max, kernel_radius)
         cache_dir = ein_cache_dir or os.path.join(self.directory, "ein_cache")
         os.makedirs(cache_dir, exist_ok=True)
 
@@ -5235,6 +5333,69 @@ class beam(logging):
         except Exception:
             return None
 
+    def _ein_cache_key(self, sample, stage, s_min, s_max, kernel_radius=0):
+        """
+        Hash naming one set of cached depth-dependent Ein files.
+
+        Covers everything the cached values depend on: beam energy, direction,
+        grid and profile, the stage pose, the depth window, the sample's chunk
+        files (path, size, modification time) and its thermal settings, and
+        the blur radius.  A sample regenerated in place or reloaded with other
+        thermal parameters therefore gets new entries instead of stale ones.
+        """
+        import hashlib
+        files = []
+        sdir = str(getattr(sample, "directory", ""))
+        names = getattr(sample, "_default_filenames", None)
+        base, ext = os.path.splitext(str(names[0]) if names is not None else "atomic_positions.npy")
+        for cid in range(1, int(getattr(sample, "chunk_total", 0) or 0) + 1):
+            p = os.path.join(sdir, f"{base}_{cid}{ext}")
+            try:
+                st = os.stat(p)
+                files.append([cid, int(st.st_size), int(st.st_mtime_ns)])
+            except OSError:
+                files.append([cid, None, None])
+        temp = getattr(sample, "temp_params", None)
+        key_obj = dict(
+            E_eV=float(self._energy),
+            lam=float(self._wavelength),
+            direction=[float(x) for x in self._direction],
+            stage_R=np.asarray(stage.rotation, dtype=float).round(7).tolist(),
+            stage_T=[float(x) for x in np.asarray(stage.translation, dtype=float)],
+            beam_size=[float(x) for x in self._beam_size],
+            beam_samples=[int(self._beam_Ny), int(self._beam_Nz)],
+            beam_profile=self._beam_profile,
+            gauss_waist=[None if self._gauss_waist is None else float(self._gauss_waist[0]),
+                         None if self._gauss_waist is None else float(self._gauss_waist[1])],
+            s_min=float(s_min),
+            s_max=float(s_max),
+            sample_dir=os.path.abspath(sdir) if sdir else "",
+            chunk_files=files,
+            enable_temp=bool(getattr(sample, "enable_temp", False)),
+            temp_params=None if temp is None else [str(x) for x in temp],
+            thermal_expansion=bool(getattr(sample, "_thermal_expansion_enabled", False)),
+            kernel_radius=int(kernel_radius),
+        )
+        return hashlib.sha1(json.dumps(key_obj, sort_keys=True).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _prune_ein_cache(cache_dir, key_hash):
+        """
+        Delete cached Ein files whose hash differs from the current key.
+
+        Every scan step has its own stage pose and therefore its own key, so
+        without pruning a rocking scan would leave one full copy of the sample's
+        Ein values per step on disk.
+        """
+        if not os.path.isdir(cache_dir):
+            return
+        for name in os.listdir(cache_dir):
+            if name.startswith("ein_chunk_") and name.endswith(".npz") and key_hash not in name:
+                try:
+                    os.remove(os.path.join(cache_dir, name))
+                except OSError:
+                    pass
+
     def _compute_global_depth_bounds(self, sample, stage):
         """
         Front-to-back extent of the sample along the beam direction, in Angstrom.
@@ -5279,13 +5440,15 @@ class beam(logging):
                             stage, detector=None, remove_forward_component=False,
                             initial_amp_complex=None,
                             apply_polarization=False,
-                            apply_spherical_decay=True):
+                            apply_spherical_decay=True,
+                            positions_chunk=None):
         """
         Kinematic scattering for one chunk on the CPU via the CFFI kernel.
 
         Builds the per-atom tables (f0 parameters, f0(0), anomalous f'+if'',
         entrance amplitudes), applies the stage transform, converts positions to
         metres, and calls the compiled C routine to accumulate the complex field.
+        Geometry and phases are evaluated in double inside the kernel.
 
         Args:
             complied_code: CFFI module exposing compute_scattering_cffi.
@@ -5294,7 +5457,7 @@ class beam(logging):
             sample: Provides load_chunk_species / load_chunk_positions.
             Ny, Nz (int): Detector width and height in pixels.
             coords_x_m, coords_y_m, coords_z_m: Flattened detector pixel
-                coordinates in metres, length Ny*Nz.
+                coordinates in metres (float64), length Ny*Nz.
             db_dict_f0_all (dict): element -> f0 parameters (11,).
             db_dict_f1f2_all (dict): element -> table of [E, f1, f2].
             k_val (float): Wave number 2*pi/lambda in rad/m.
@@ -5304,8 +5467,10 @@ class beam(logging):
             initial_amp_complex: Per-atom entrance amplitudes (complex64), or
                 None for ones.
             apply_polarization (bool): Apply the polarization factor in the
-                kernel using self._pol_perp_rate.
+                kernel (see _polarization_state).
             apply_spherical_decay (bool): Apply relative 1/R scaling.
+            positions_chunk: Stage-transformed positions in Angstrom, (N, 3),
+                if the caller already loaded them; None loads and transforms.
 
         Returns:
             np.ndarray: complex64 field of shape (Nz, Ny).
@@ -5337,11 +5502,18 @@ class beam(logging):
             f0_params_np[mask] = db_dict_f0_all[el]
             f0_zero_np[mask]   = float(f0_zero_dict.get(el, 0.0))
 
-        # Stage transform, then metres for the C kernel.
-        positions_chunk = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
-        positions_chunk = positions_chunk @ stage.rotation.T
-        positions_chunk += stage.translation
-        positions_chunk_m = positions_chunk / 1e10
+        # Stage transform, then double metres for the C kernel.
+        if positions_chunk is None:
+            positions_chunk = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
+            positions_chunk = positions_chunk @ stage.rotation.T
+            positions_chunk += stage.translation
+        positions_chunk_m = np.asarray(positions_chunk, dtype=np.float64) / 1e10
+        if positions_chunk_m.shape[0] != atom_count:
+            raise ValueError(f"positions/species size mismatch for chunk {chunk_id}")
+        coords_x_m = np.ascontiguousarray(coords_x_m, dtype=np.float64)
+        coords_y_m = np.ascontiguousarray(coords_y_m, dtype=np.float64)
+        coords_z_m = np.ascontiguousarray(coords_z_m, dtype=np.float64)
+        pol_deg, pol_ex, pol_ey, pol_ez = beam._polarization_state(self)
 
         if initial_amp_complex is None:
             amp_r = np.ones((atom_count,), dtype=np.float32)
@@ -5364,20 +5536,20 @@ class beam(logging):
         amp_r             = np.ascontiguousarray(amp_r)
         amp_i             = np.ascontiguousarray(amp_i)
 
-        positions_ptr = ffi_obj.cast("const float *", positions_chunk_m.ctypes.data)
+        positions_ptr = ffi_obj.cast("const double *", positions_chunk_m.ctypes.data)
         f0_params_ptr = ffi_obj.cast("const float *", f0_params_np.ctypes.data)
         f0_zero_ptr   = ffi_obj.cast("const float *", f0_zero_np.ctypes.data)
         s_anom_r_ptr  = ffi_obj.cast("const float *", s_anom_r.ctypes.data)
         s_anom_i_ptr  = ffi_obj.cast("const float *", s_anom_i.ctypes.data)
         amp_r_ptr     = ffi_obj.cast("const float *", amp_r.ctypes.data)
         amp_i_ptr     = ffi_obj.cast("const float *", amp_i.ctypes.data)
-        coords_x_ptr  = ffi_obj.cast("const float *", coords_x_m.ctypes.data)
-        coords_y_ptr  = ffi_obj.cast("const float *", coords_y_m.ctypes.data)
-        coords_z_ptr  = ffi_obj.cast("const float *", coords_z_m.ctypes.data)
+        coords_x_ptr  = ffi_obj.cast("const double *", coords_x_m.ctypes.data)
+        coords_y_ptr  = ffi_obj.cast("const double *", coords_y_m.ctypes.data)
+        coords_z_ptr  = ffi_obj.cast("const double *", coords_z_m.ctypes.data)
         out_r_ptr     = ffi_obj.cast("float *", out_r.ctypes.data)
         out_i_ptr     = ffi_obj.cast("float *", out_i.ctypes.data)
 
-        complied_code.compute_scattering_cffi(
+        status = complied_code.compute_scattering_cffi(
             atom_count,
             positions_ptr,
             f0_params_ptr,
@@ -5389,12 +5561,14 @@ class beam(logging):
             amp_i_ptr,
             Ny, Nz,
             coords_x_ptr, coords_y_ptr, coords_z_ptr,
-            k_val,
+            float(k_val),
             int(1 if apply_polarization else 0),
-            float(self._pol_perp_rate),
+            float(pol_deg), float(pol_ex), float(pol_ey), float(pol_ez),
             int(1 if apply_spherical_decay else 0),
             out_r_ptr, out_i_ptr
         )
+        if status != 0:
+            raise MemoryError("compute_scattering_cffi could not allocate its work buffers")
 
         return (out_r + 1j*out_i).reshape((Nz, Ny)).astype(np.complex64)
     
@@ -5448,41 +5622,31 @@ class beam(logging):
         db_dict_f1f2_all = self.parse_f1f2_db_all('f1f2_CromerLiberman.dat')
 
         # Wave number in rad/m.
-        k_val = np.float32(2.0 * np.pi / self._wavelength)
+        k_val = float(2.0 * np.pi / self._wavelength)
 
-        # Detector coordinates on the host, in metres.
+        # Detector coordinates on the host, in double metres.
         if cp is not None and isinstance(measurement_positions, cp.ndarray):
             measurement_positions = measurement_positions.get()
-        coords_x_m = np.ascontiguousarray(measurement_positions[0, :].astype(np.float32) / 1e10)
-        coords_y_m = np.ascontiguousarray(measurement_positions[1, :].astype(np.float32) / 1e10)
-        coords_z_m = np.ascontiguousarray(measurement_positions[2, :].astype(np.float32) / 1e10)
+        coords_x_m = np.ascontiguousarray(measurement_positions[0, :].astype(np.float64) / 1e10)
+        coords_y_m = np.ascontiguousarray(measurement_positions[1, :].astype(np.float64) / 1e10)
+        coords_z_m = np.ascontiguousarray(measurement_positions[2, :].astype(np.float64) / 1e10)
 
         chunk_total = int(sample.chunk_total or 0)
         if chunk_total == 0:
             return np.zeros((Nz, Ny), dtype=np.complex64)
 
-        # Depth window along the beam for Ein/E0 sampling.
-        s_min, s_max = self._compute_global_depth_bounds(sample, stage)
+        # The depth window only matters for depth-dependent Ein.  E0-only
+        # sampling multiplies it by zero, so the full CPU pass over the sample
+        # is skipped then.
+        s_min, s_max = (self._compute_global_depth_bounds(sample, stage)
+                        if use_depth_ein else (0.0, 1.0))
 
         # Fill in any missing Ein cache entries.
         key_hash = None
         cache_dir = None
         if use_depth_ein:
-            key_obj = dict(
-                E_eV=float(self._energy),
-                lam=float(self._wavelength),
-                direction=[float(x) for x in self._direction],
-                stage_R=np.asarray(stage.rotation, dtype=float).round(7).tolist(),
-                stage_T=[float(x) for x in np.asarray(stage.translation, dtype=float)],
-                beam_size=[float(x) for x in self._beam_size],
-                beam_samples=[int(self._beam_Ny), int(self._beam_Nz)],
-                beam_profile=self._beam_profile,
-                gauss_waist=[None if self._gauss_waist is None else float(self._gauss_waist[0]),
-                            None if self._gauss_waist is None else float(self._gauss_waist[1])],
-                s_min=float(s_min),
-                s_max=float(s_max)
-            )
-            key_hash = hashlib.sha1(json.dumps(key_obj, sort_keys=True).encode('utf-8')).hexdigest()
+            key_hash = self._ein_cache_key(sample, stage, s_min, s_max, 0)
+            self._prune_ein_cache(ein_cache_dir or os.path.join(self.directory, "ein_cache"), key_hash)
             cache_dir = ein_cache_dir or os.path.join(self.directory, "ein_cache")
             os.makedirs(cache_dir, exist_ok=True)
 
@@ -5520,37 +5684,14 @@ class beam(logging):
         vc       = float(self._beam_vc)
 
         def worker(chunk_id):
-            species_chunk_np = sample.load_chunk_species(chunk_id, use_gpu=False)
-            atom_count = int(species_chunk_np.shape[0])
+            # Stage transform once; the scatter routine reuses these positions
+            # and builds the per-atom form-factor tables itself.
+            positions_chunk = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
+            atom_count = int(positions_chunk.shape[0])
             if atom_count == 0:
                 return np.zeros((Nz, Ny), dtype=np.complex64)
-
-            # Per-atom f0 parameters, f0(0), and anomalous terms.
-            scattering_anom_np_real = np.zeros(atom_count, dtype=np.float32)
-            scattering_anom_np_imag = np.zeros(atom_count, dtype=np.float32)
-            f0_params_np            = np.zeros((atom_count, 11), dtype=np.float32)
-            f0_zero_np              = np.zeros((atom_count,), dtype=np.float32)
-
-            f0_zero_dict = self._build_f0_zero_dict(db_dict_f0_all)
-            unique_elements = pd.unique(species_chunk_np)
-            for el in unique_elements:
-                el = str(el)
-                if el not in db_dict_f0_all:
-                    continue
-                mask = (species_chunk_np == el)
-                table = db_dict_f1f2_all.get(el, None)
-                if table is not None:
-                    cplx = self.get_f1f2_from_params(self._energy, table)
-                    scattering_anom_np_real[mask] = float(cplx.real)
-                    scattering_anom_np_imag[mask] = float(cplx.imag)
-                f0_params_np[mask] = db_dict_f0_all[el]
-                f0_zero_np[mask]   = float(f0_zero_dict.get(el, 0.0))
-
-            # Stage transform, then metres for the C kernel.
-            positions_chunk = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
             positions_chunk = positions_chunk @ stage.rotation.T
             positions_chunk += stage.translation
-            positions_chunk_m = positions_chunk / 1e10
 
             # Entrance amplitudes: cached Ein or E0-only sampling.
             if use_depth_ein:
@@ -5575,7 +5716,8 @@ class beam(logging):
                 detector=None, remove_forward_component=remove_forward_component,
                 initial_amp_complex=init_amp,
                 apply_polarization=apply_polarization,
-                apply_spherical_decay=apply_spherical_decay
+                apply_spherical_decay=apply_spherical_decay,
+                positions_chunk=positions_chunk
             )
             return out
 
@@ -5777,28 +5919,18 @@ class beam(logging):
         if chunk_total == 0:
             return np.zeros((Nz, Ny), dtype=np.complex64)
 
-        # Depth window along the beam for Ein/E0 sampling.
-        s_min, s_max = self._compute_global_depth_bounds(sample, stage)
+        # The depth window only matters for depth-dependent Ein.  E0-only
+        # sampling multiplies it by zero, so the full CPU pass over the sample
+        # is skipped then.
+        s_min, s_max = (self._compute_global_depth_bounds(sample, stage)
+                        if use_depth_ein else (0.0, 1.0))
 
         # Fill in any missing Ein cache entries.
         key_hash = None
         cache_dir = None
         if use_depth_ein:
-            key_obj = dict(
-                E_eV=float(self._energy),
-                lam=float(self._wavelength),
-                direction=[float(x) for x in self._direction],
-                stage_R=np.asarray(stage.rotation, dtype=float).round(7).tolist(),
-                stage_T=[float(x) for x in np.asarray(stage.translation, dtype=float)],
-                beam_size=[float(x) for x in self._beam_size],
-                beam_samples=[int(self._beam_Ny), int(self._beam_Nz)],
-                beam_profile=self._beam_profile,
-                gauss_waist=[None if self._gauss_waist is None else float(self._gauss_waist[0]),
-                            None if self._gauss_waist is None else float(self._gauss_waist[1])],
-                s_min=float(s_min),
-                s_max=float(s_max)
-            )
-            key_hash = hashlib.sha1(json.dumps(key_obj, sort_keys=True).encode('utf-8')).hexdigest()
+            key_hash = self._ein_cache_key(sample, stage, s_min, s_max, 0)
+            self._prune_ein_cache(ein_cache_dir or os.path.join(self.directory, "ein_cache"), key_hash)
             cache_dir = ein_cache_dir or os.path.join(self.directory, "ein_cache")
             os.makedirs(cache_dir, exist_ok=True)
 
@@ -5863,8 +5995,22 @@ class beam(logging):
                 s_id = i % len(streams)
                 streams[s_id].synchronize()
 
-                spc = sample.load_chunk_species(cidx, use_gpu=False)
-                nA = int(spc.shape[0])
+                # Species as codes with a label table when the sample stores
+                # them that way (one byte per atom); the label array is only
+                # built if the general kernel has to run.
+                try:
+                    spc_codes, spc_labels = sample.load_chunk_species(
+                        cidx, use_gpu=False, codes=True)
+                    spc_codes = np.asarray(spc_codes)
+                    spc_labels = np.asarray(spc_labels, dtype=str)
+                    spc = None
+                    nA = int(spc_codes.shape[0])
+                    present = spc_labels[np.unique(spc_codes)] if nA else spc_labels[:0]
+                except TypeError:
+                    spc_codes, spc_labels = None, None
+                    spc = np.asarray(sample.load_chunk_species(cidx, use_gpu=False))
+                    nA = int(spc.shape[0])
+                    present = pd.unique(spc)
                 if nA == 0:
                     continue
                 # Species-file identity lets the fast path reuse its species
@@ -5878,7 +6024,8 @@ class beam(logging):
                     species_key = None
 
                 _anom_lu = {}                     # element -> f' + i f''
-                for el in pd.unique(spc):
+                for el in present:
+                    el = str(el)
                     tbl = db_f1f2.get(el) if el in db_f0 else None
                     if tbl is not None:
                         _anom_lu[str(el)] = complex(
@@ -5886,7 +6033,7 @@ class beam(logging):
 
                 with streams[s_id]:
                     # Positions to device, then the stage transform.
-                    pos = cp.array(sample.load_chunk_positions(cidx, use_gpu=True), dtype=cp.float32)
+                    pos = cp.asarray(sample.load_chunk_positions(cidx, use_gpu=True), dtype=cp.float32)
                     pos = pos @ Rg.T
                     pos += Tg
 
@@ -5917,7 +6064,8 @@ class beam(logging):
                     # meanwhile: pos_m plus the incident field, 20 B/atom.
                     sub_n = self._scatter_subchunk_size(1, resident_bytes=20 * nA)
                     if self._fast_scatter(
-                            pos_m, initial_amp, spc,
+                            pos_m, initial_amp,
+                            spc if spc is not None else (spc_codes, spc_labels),
                             db_f0, f0_zero, _anom_lu, xg, yg, zg,
                             dfields[s_id], Ny, Nz,
                             float(abs(self._kx_scalar)), 1,
@@ -5930,7 +6078,7 @@ class beam(logging):
 
                     # General kernel, staged per sub-chunk, with a single
                     # global origin (use_origins=False).
-                    spc_np = np.asarray(spc)
+                    spc_np = np.asarray(spc) if spc is not None else spc_labels[spc_codes]
                     for c0 in range(0, nA, sub_n):
                         c1 = min(c0 + sub_n, nA)
                         sub = self._stage_general_subchunk(
@@ -7437,7 +7585,7 @@ class beam(logging):
     # Wavefield propagation
     def _angular_spectrum_propagate_gpu(
             self, field, dy, dz, z, kernel,
-            step_max=0.02, pad_factor=1.0,
+            step_max=None, pad_factor=1.0,
             padding_mode: str = "edge",
             pad_constant: float = 0.0,
             cos_theta: float = 1.0,
@@ -7448,18 +7596,21 @@ class beam(logging):
         """
         Band-limited angular-spectrum propagation on the GPU.
 
-        Distances longer than step_max are split into equal sub-steps to bound
-        phase error and wrap-around. Each step pads the field symmetrically to
-        the size from _choose_optimal_pad (power of two, at least pad_factor
-        times larger), applies FFT -> transfer function (CUDA kernel) -> IFFT,
-        and centre-crops back to (Nz, Ny).
+        The field is padded symmetrically to the size from _choose_optimal_pad
+        (power of two, at least pad_factor times larger, sized for the full
+        distance), then FFT -> transfer function (CUDA kernel) -> IFFT, and
+        centre-cropped back to (Nz, Ny).  The whole distance is one step: the
+        transfer function is exact at any z, and every extra step would crop
+        the field again, acting as a repeated hard aperture.  A finite
+        step_max still splits the distance for callers that want it.
 
         Args:
             field: Complex (Nz, Ny) array, NumPy or CuPy.
             dy, dz: Pixel size along Y (width) and Z (height) in metres.
             z (float): Propagation distance in metres, may be negative.
             kernel: "prop_mul_kernel" from build_propagation_multiplier_kernel.
-            step_max (float): Maximum sub-step distance in metres.
+            step_max (float or None): Maximum sub-step distance in metres;
+                None (default) propagates in a single step.
             pad_factor (float): Minimum padding factor (>= 1).
             padding_mode (str): "edge" replicates edges, "constant" uses pad_constant.
             cos_theta, k_g_axis, k_g_perp_y, k_g_perp_z: Carrier wavevector of
@@ -7474,9 +7625,9 @@ class beam(logging):
         if cp is None:
             raise RuntimeError('CuPy required for GPU propagation')
 
-        # Split long distances into sub-steps
+        # Optional sub-stepping, only when a caller asks for it
         z = float(z)
-        if abs(z) > step_max:
+        if step_max is not None and abs(z) > step_max:
             n = int(np.ceil(abs(z) / step_max))
             dz_step = z / n
             out = cp.asarray(field) if isinstance(field, cp.ndarray) else cp.asarray(field, dtype=cp.complex64)
@@ -7540,14 +7691,15 @@ class beam(logging):
     
     def _angular_spectrum_propagate_cpu(
             self, field, dy, dz, z, lib, ffi,
-            step_max=0.02, pad_factor=1.0,
+            step_max=None, pad_factor=1.0,
             padding_mode: str = "edge",
             pad_constant: float = 0.0
         ):
         """
         CPU counterpart of _angular_spectrum_propagate_gpu, using
         lib.prop_mul_cpu from compile_propagation_multiplier_cffi. Same
-        sub-stepping, padding and cropping; no carrier-tilt arguments.
+        single-step propagation, padding and cropping; no carrier-tilt
+        arguments.
 
         Args:
             field: Complex (Nz, Ny) array.
@@ -7560,7 +7712,7 @@ class beam(logging):
             np.ndarray: complex64 field after propagation, shape (Nz, Ny).
         """
         z = float(z)
-        if abs(z) > step_max:
+        if step_max is not None and abs(z) > step_max:
             n = int(np.ceil(abs(z) / step_max))
             dz_step = z / n
             out = field
@@ -7604,7 +7756,7 @@ class beam(logging):
             ffi.cast('const float*', ky.ctypes.data),
             ffi.cast('const float*', kz.ctypes.data),
             k, np.float32(z),
-            ffi.cast('float _Complex*', Fp.ctypes.data)
+            ffi.cast('float*', Fp.ctypes.data)
         )
 
         # Inverse FFT and center crop
@@ -7612,7 +7764,7 @@ class beam(logging):
         return out[z0:z0+Nz, y0:y0+Ny]
 
     def wavefield_propagation(self, detector, optics,
-                              use_gpu=True, step_max=0.02, pad_factor=1.0,
+                              use_gpu=True, step_max=None, pad_factor=1.0,
                               padding_mode: str = "edge",
                               pad_constant: float = 0.0, save_field=True):
         """
@@ -7652,12 +7804,14 @@ class beam(logging):
         # Build free-space propagator as a closure so optics need not import beam.
         if use_gpu and cp is not None:
             kernel = self.build_propagation_multiplier_kernel()
+            # Returns a device array: apply_stack keeps the field on the GPU
+            # between components and downloads once at the end.
             def _propagate_free_space(F, dym, dzm, z):
                 return self._angular_spectrum_propagate_gpu(
                     F, dym, dzm, z, kernel,
                     step_max=step_max, pad_factor=pad_factor,
                     padding_mode=padding_mode, pad_constant=pad_constant
-                ).get()
+                )
         else:
             ffi, lib = self.compile_propagation_multiplier_cffi()
             def _propagate_free_space(F, dym, dzm, z):
@@ -7759,9 +7913,8 @@ __device__ __forceinline__ void sincos_k_dd(float k, float sh, float sl,
 //
 // sqrt(P) is folded into a polynomial because the SFU is the limiting unit
 // here: the phase already spends two of its ops, and a per-atom-pixel sqrtf
-// on top costs about 1.3x.  This is valid only where P stays away from zero.
-// At pol_perp_rate = 0 the factor is |dotv|, with a kink at 90 deg, so
-// POL_ZERO keeps its own exact path.
+// on top costs about 1.3x.  Only the unpolarized factor (1 + dotv^2)/2 is a
+// function of dotv alone; a polarized beam takes the POL_VEC path.
 __device__ __forceinline__ void poly_pair(float dotv,
                                           const float* __restrict__ fp,
                                           float& f0v, float& polv)
@@ -7853,7 +8006,9 @@ extern "C" __global__ void mosaic_fast(
     const int    Ny,
     const int    Nz,
     const float* __restrict__ chunk_org,
-    const int    chunks_per_slice)       // blockIdx.z selects an atom slice
+    const int    chunks_per_slice,       // blockIdx.z selects an atom slice
+    const float  pol_deg,                // degree of linear polarization (POL_VEC)
+    const float  pol_ex, const float pol_ey, const float pol_ez)  // its unit vector
 {
     __shared__ float4 s_pos[CHUNK];
     __shared__ float2 s_amp[CHUNK];
@@ -7951,6 +8106,9 @@ extern "C" __global__ void mosaic_fast(
         float R0p[PIX], iR0p[PIX], upx[PIX], upy[PIX], upz[PIX];
         float s0[PIX], c0[PIX];
         float2 csum[PIX];
+#if POL_VEC
+        float cux[PIX], cuy[PIX], cuz[PIX];   // e x (pixel - chunk origin) / R0p
+#endif
 #if PANEL_CHUNK
         int   pc0[PIX], pc1[PIX];       // coefficient offsets of the panel
         float pa[PIX], pb[PIX];         // x = fma(dotv, pa, pb) inside it
@@ -8002,6 +8160,11 @@ extern "C" __global__ void mosaic_fast(
             upx[p] = tx[p]*iR0h; upy[p] = ty[p]*iR0h; upz[p] = tz[p]*iR0h;
             s0[p] = 0.0f; c0[p] = 1.0f;
 #endif
+#if POL_VEC
+            cux[p] = pol_ey*upz[p] - pol_ez*upy[p];
+            cuy[p] = pol_ez*upx[p] - pol_ex*upz[p];
+            cuz[p] = pol_ex*upy[p] - pol_ey*upx[p];
+#endif
 #if PANEL_CHUNK
             {   // Every atom of this chunk lands in the panel of the chunk
                 // origin's direction cosine upx: the host enables this only
@@ -8036,10 +8199,12 @@ extern "C" __global__ void mosaic_fast(
                 if (upx[p] > dvcut[p]) { sx0[p] -= (f0_zero + anom_x); sy0[p] -= anom_y; }
     #endif
     #if POLARIZE
-      #if POL_ZERO
-                sc0[p] = fabsf(upx[p]);
-      #elif POL_POLY
+      #if POL_POLY
                 sc0[p] = polv0;
+      #elif POL_VEC
+                sc0[p] = sqrtf(fminf(1.0f, fmaxf(0.0f,
+                          fmaf(0.5f*(1.0f - pol_deg), 1.0f + upx[p]*upx[p],
+                               pol_deg*fmaf(cuz[p],cuz[p], fmaf(cuy[p],cuy[p], cux[p]*cux[p]))))));
       #else
                 sc0[p] = sqrtf(fminf(1.0f, fmaxf(0.0f,
                           fmaf(1.0f - pol_rate, upx[p]*upx[p], pol_rate))));
@@ -8056,6 +8221,12 @@ extern "C" __global__ void mosaic_fast(
         for (int j = 0; j < CHUNK; ++j) {
             const float4 P  = s_pos[j];     // one LDS.128 shared by all PIX
             const float2 Eg = s_amp[j];     // one LDS.64  shared by all PIX
+#if POL_VEC
+            // e x d for this atom, shared by all PIX
+            const float cdx = pol_ey*P.z - pol_ez*P.y;
+            const float cdy = pol_ez*P.x - pol_ex*P.z;
+            const float cdz = pol_ex*P.y - pol_ey*P.x;
+#endif
             #pragma unroll
             for (int p = 0; p < PIX; ++p) {
                 const float sp   = fmaf(upz[p],P.z, fmaf(upy[p],P.y, upx[p]*P.x));
@@ -8102,13 +8273,23 @@ extern "C" __global__ void mosaic_fast(
   #if FUSED
                 const float sc = 1.0f;
   #elif POLARIZE
-                // sqrt(P) analytically.  With pol_rate = 0 this is |dotv|,
-                // which has a kink at 90 deg and must not be folded into the
-                // f0 polynomial.
-    #if POL_ZERO
-                const float sc = fabsf(dotv);
-    #elif POL_POLY
+                // sqrt(P): from the fitted polynomial, or per atom-pixel for
+                // a polarized beam (POL_VEC)
+    #if POL_POLY
                 const float sc = polv;
+    #elif POL_VEC
+                // P = (1-p)(1+dotv^2)/2 + p(1-(e.r)^2), with 1-(e.r)^2 as
+                // |e x r|^2 so nothing cancels when e.r is close to 1:
+                // e x (T-o-d)/r_det = (e x (T-o)/R0p - (e x d)/R0p) / (1+poly)
+                const float vx = fmaf(-cdx, iR0p[p], cux[p]);
+                const float vy = fmaf(-cdy, iR0p[p], cuy[p]);
+                const float vz = fmaf(-cdz, iR0p[p], cuz[p]);
+                const float g1 = 1.0f + ip_;
+                const float s2 = fmaf(vz, vz, fmaf(vy, vy, vx*vx)) * (g1*g1);
+                const float Pf = fminf(1.0f, fmaxf(0.0f,
+                                   fmaf(0.5f*(1.0f - pol_deg), 1.0f + dotv*dotv,
+                                        pol_deg*s2)));
+                const float sc = sqrtf(Pf);
     #else
                 const float Pf = fminf(1.0f, fmaxf(0.0f,
                                    fmaf(1.0f - pol_rate, dotv*dotv, pol_rate)));
@@ -8341,12 +8522,13 @@ def build(cfg):
         ("NSER", cfg["nser"]), ("DOTV_ORDER", cfg["dotv_order"]), ("FDEG", cfg["fdeg"]), ("NPANEL", cfg["npanel"]),
         ("POL_POLY", int(cfg["pol_poly"])), ("PDEG", cfg["pdeg"]),
         ("USE_ORIGIN", int(cfg["origin"])), ("POLARIZE", int(cfg["polarize"])),
-        ("POL_ZERO", int(cfg["pol_zero"])), ("DECAY", int(cfg["decay"])),
+        ("DECAY", int(cfg["decay"])),
         ("REMOVE_FWD", int(cfg["remove_fwd"])),
         ("PHASOR_FP64", int(cfg.get("phasor_fp64", True))),
         ("PANEL_CHUNK", int(cfg.get("panel_chunk", False))),
         ("FUSED", int(cfg.get("fused", False))),
         ("FACTOR", int(cfg.get("factor", False))),
+        ("POL_VEC", int(cfg.get("pol_vec", False))),
     ))
     mod = cp.RawModule(code=defs + "\n" + _HELPERS + _KERNEL, backend="nvrtc")
     k = mod.get_function("mosaic_fast")
@@ -8389,11 +8571,11 @@ def autotune(cfg_base, launch_fn, npix, force=False):
     dev = cp.cuda.Device().id
     key = (dev, npix, cfg_base["chunk"], cfg_base["nser"], cfg_base["npanel"],
            cfg_base["dotv_order"], cfg_base["origin"], cfg_base["polarize"],
-           cfg_base["pol_zero"], cfg_base["pol_poly"], cfg_base["decay"],
+           cfg_base["pol_poly"], cfg_base["decay"],
            cfg_base["remove_fwd"], cfg_base.get("phasor_fp64", True),
            cfg_base.get("fdeg"), cfg_base.get("pdeg"),
            cfg_base.get("panel_chunk"), cfg_base.get("fused"),
-           cfg_base.get("factor"))
+           cfg_base.get("factor"), cfg_base.get("pol_vec"))
     if not force and key in _TUNE_CACHE:
         return _TUNE_CACHE[key]
 
@@ -8518,7 +8700,7 @@ def _f0_fn(p, k):
 def plan(wk_params, dotv_lo, dotv_hi, k, R0_min, sample_half_m,
          polarize=True, pol_rate=0.0, decay=True, remove_fwd=False,
          chunk=128, tol_rad=1e-6, tol_f0=1e-7, chunk_radius_m=None,
-         phasor_fp64=True, anom=0.0j, opts=None):
+         phasor_fp64=True, anom=0.0j, opts=None, pol_vec=None):
     """Derive the compile-time constants from the problem and a phase budget.
 
     Every cost-against-accuracy tradeoff is decided here, from the geometry
@@ -8537,6 +8719,15 @@ def plan(wk_params, dotv_lo, dotv_hi, k, R0_min, sample_half_m,
             which understates it for a sparse or elongated sample.
         tol_rad (float): phase error budget for the series truncation.
         tol_f0 (float): relative error budget for the f0 fit.
+        pol_rate (float): classical perpendicular fraction rho; used only
+            when ``pol_vec`` is None, through :func:`polarization_from_rate`.
+        pol_vec (tuple or None): (p, ex, ey, ez), the degree of linear
+            polarization and its unit vector.  With p > 0 the factor
+            P = (1-p)(1+cos^2 2th)/2 + p(1-(e.r)^2) depends on the transverse
+            direction as well as on dotv, so it is evaluated per atom-pixel in
+            the kernel and none of the dotv-only shortcuts (fused, pol
+            polynomial, factorisation) apply.  With p = 0 the factor is
+            (1+dotv^2)/2, a polynomial in dotv.
         phasor_fp64 (bool): evaluate the per-pixel base phasor exp(i k R0)
             in double.  The general kernel forms it from an fp32 R0, whose
             rounding is worth up to k * ulp/2 = 190 rad at 0.1 m, so the
@@ -8561,6 +8752,14 @@ def plan(wk_params, dotv_lo, dotv_hi, k, R0_min, sample_half_m,
     opts = dict(DEFAULT_OPTS, **(opts or {}))
     anom = complex(anom)
     f0fn = _f0_fn(wk_params, k)
+    # The polarization is always the vector form.  A bare pol_rate is the
+    # classical perpendicular fraction and maps to (p, e) the way the beam
+    # maps it; p = 0 (rho = 0.5) is the unpolarized factor (1 + dotv^2)/2,
+    # which is what the pol_rate = 0.5 polynomial paths below evaluate.
+    if pol_vec is None:
+        pol_vec = polarization_from_rate(pol_rate)
+    pol_vec_on = bool(polarize and float(pol_vec[0]) > 0.0)
+    pol_rate = 0.5
     lo_, hi_ = ((dotv_lo, dotv_hi) if dotv_hi - dotv_lo >= 1e-12
                 else (dotv_lo - 1e-6, dotv_hi + 1e-6))
     f0_degs = [2, 3, 4, 5, 6, 8] if opts["adaptive_degree"] else [8]
@@ -8592,7 +8791,7 @@ def plan(wk_params, dotv_lo, dotv_hi, k, R0_min, sample_half_m,
     # sqrt(P) has a kink at 90 deg when pol_rate = 0, so that case is excluded
     # here, as it is for the separate sqrt(P) fit.
     fused_on, fdeg, pdeg, pol_poly, pol_err = False, 8, 6, False, 0.0
-    if opts["fused"] and polarize and pol_rate != 0.0:
+    if opts["fused"] and polarize and pol_rate != 0.0 and not pol_vec_on:
         sP = lambda d: np.sqrt(np.clip(pol_rate + (1.0 - pol_rate) * d * d, 0.0, 1.0))
         re_fn = lambda d: (f0fn(d) + anom.real) * sP(d)
         im_fn = lambda d: anom.imag * sP(d)
@@ -8643,7 +8842,7 @@ def plan(wk_params, dotv_lo, dotv_hi, k, R0_min, sample_half_m,
         # sqrt(P) rides along on the same panel grid when a polynomial can
         # carry it to tolerance, which removes one SFU op per atom-pixel.
         pdeg = 6
-        if polarize and pol_rate != 0.0:
+        if polarize and pol_rate != 0.0 and not pol_vec_on:
             pc = None
             for pdeg in pol_degs:
                 pc, pol_err = fit_pol(pol_rate, dotv_lo, dotv_hi, npanel,
@@ -8667,7 +8866,7 @@ def plan(wk_params, dotv_lo, dotv_hi, k, R0_min, sample_half_m,
     # below the fit tolerance, so it adds no more error than the fit residual
     # already accepted.
     factor_on, factor_est = False, 0.0
-    if opts["factor"]:
+    if opts["factor"] and not pol_vec_on:
         g = np.linspace(lo_, hi_, 4001)
         y = f0fn(g) + anom.real
         if polarize and pol_rate != 0.0:
@@ -8689,15 +8888,15 @@ def plan(wk_params, dotv_lo, dotv_hi, k, R0_min, sample_half_m,
                dotv_order=int(dotv_order), fdeg=int(fdeg), npanel=int(npanel),
                pol_poly=bool(pol_poly), pdeg=int(pdeg),
                origin=bool(origin), polarize=bool(polarize),
-               pol_zero=bool(polarize and pol_rate == 0.0),
                decay=bool(decay), remove_fwd=bool(remove_fwd),
                phasor_fp64=bool(phasor_fp64), panel_chunk=panel_chunk,
-               fused=bool(fused_on), factor=bool(factor_on))
+               fused=bool(fused_on), factor=bool(factor_on),
+               pol_vec=bool(pol_vec_on))
     diag = dict(series_err_rad=ser_err, f0_rel_err=f0_err, npanel=npanel,
                 fdeg=fdeg, pdeg=pdeg, fused_on=fused_on, panel_chunk=panel_chunk,
                 factor_on=factor_on, factor_est=factor_est,
                 excursion=excursion, panel_w=panel_w,
-                pol_abs_err=pol_err, pol_poly=pol_poly,
+                pol_abs_err=pol_err, pol_poly=pol_poly, pol_vec=pol_vec_on,
                 poly_max=poly_max, origin=origin, chunk_radius_m=radius)
     return cfg, fpoly, diag
 
@@ -8820,11 +9019,14 @@ def _launch(cfg, st, bx, by, out, n_slices=1, chunks_per_slice=None):
     bx, by = fit_block(kern, bx, by)
     if chunks_per_slice is None:
         chunks_per_slice = (int(st["n"]) + cfg["chunk"] - 1) // cfg["chunk"]
+    pv = st.get("pol_vec") or (0.0, 0.0, 0.0, 0.0)
     args = (np.int32(st["n"]), st["k"], st["px"], st["py"], st["pz"],
             st["amp"], st["fpoly"], st["anom_x"], st["anom_y"], st["f0z"],
             np.float32(R_E), st["pol_rate"], st["xc"], st["yc"], st["zc"],
             st["phasor"], out, np.int32(Ny), np.int32(Nz), st["org"],
-            np.int32(max(1, chunks_per_slice)))
+            np.int32(max(1, chunks_per_slice)),
+            np.float32(pv[0]), np.float32(pv[1]), np.float32(pv[2]),
+            np.float32(pv[3]))
     grid = ((Ny + bx - 1) // bx,
             max(1, ((Nz + by - 1) // by + cfg["pix"] - 1) // cfg["pix"]),
             int(max(1, n_slices)))
@@ -8867,7 +9069,8 @@ def dispatch(pos_m_g, amp_g, species_code, wk_rows, f0z_rows, anom_rows,
              polarization=True, pol_rate=0.0, decay=True, remove_forward=False,
              m_beams=1, analyser_kind=0, use_series=True,
              chunk=128, tol_rad=1e-6, tune=True, det_extent=None,
-             tol_f0=1e-7, phasor_fp64=True, tol_decline=None, opts=None):
+             tol_f0=1e-7, phasor_fp64=True, tol_decline=None, opts=None,
+             pol_vec=None):
     """Run one interaction pass on the fast path, or decline.
 
     ``tol_rad`` is the budget the series order is chosen against.
@@ -8889,6 +9092,8 @@ def dispatch(pos_m_g, amp_g, species_code, wk_rows, f0z_rows, anom_rows,
         anom_rows (numpy.ndarray): (S,) complex anomalous term, per species.
         out (cupy.ndarray): (Ny * Nz,) complex64, accumulated into.
         det_extent (tuple): optional cached (R0_min, dotv_lo, dotv_hi).
+        pol_vec (tuple or None): (p, ex, ey, ez) polarization state; see
+            :func:`plan`.  None derives it from ``pol_rate``.
 
     Returns:
         bool: True if the pass ran here.  False means nothing was written and
@@ -8930,17 +9135,20 @@ def dispatch(pos_m_g, amp_g, species_code, wk_rows, f0z_rows, anom_rows,
             polarize=polarization, pol_rate=pol_rate, decay=decay,
             remove_fwd=remove_forward, chunk=chunk, tol_rad=tol_rad,
             chunk_radius_m=rad, tol_f0=tol_f0, phasor_fp64=phasor_fp64,
-            anom=complex(anom_rows[sid]), opts=opts)
+            anom=complex(anom_rows[sid]), opts=opts, pol_vec=pol_vec)
         limit = tol_rad if tol_decline is None else max(tol_rad, tol_decline)
         if diag["f0_rel_err"] > tol_f0 or diag["series_err_rad"] > limit:
             return False
+        pv = (tuple(float(v) for v in (pol_vec if pol_vec is not None
+                                       else polarization_from_rate(pol_rate)))
+              if cfg["pol_vec"] else None)
         st = dict(n=ntot, k=np.float32(k_global), px=px, py=py, pz=pz,
                   amp=gamp, org=org, fpoly=cp.asarray(fpoly),
                   anom_x=np.float32(anom_rows[sid].real),
                   anom_y=np.float32(anom_rows[sid].imag),
                   f0z=np.float32(f0z_rows[sid]),
                   xc=xg, yc=yg, zc=zg, phasor=phz, npix=(Ny, Nz),
-                  pol_rate=np.float32(pol_rate))
+                  pol_rate=np.float32(0.5), pol_vec=pv)
         runs.append((cfg, st))
 
     tuned = None
