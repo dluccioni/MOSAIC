@@ -2,3 +2,4 @@ scripts/testing/
 temp/
 **/__pycache__/
 __pycache__/
+*.bak
