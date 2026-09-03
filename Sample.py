@@ -3,7 +3,6 @@
 # -----------------------------------------------------------------------------
 import numpy as np
 import os
-import gc
 import json
 from Logging import logging
 try:
@@ -12,12 +11,19 @@ except ImportError:
     cp = None
 from cffi import FFI
 import threading
+import warnings
+from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED, FIRST_COMPLETED
 
 # -----------------------------------------------------------------------------
 # Multi-GPU Configuration (environment variables)
 # -----------------------------------------------------------------------------
 SAMPLE_STREAMS_PER_GPU = int(os.environ.get("SAMPLE_STREAMS_PER_GPU", "4"))
 SAMPLE_WRITER_THREADS = int(os.environ.get("SAMPLE_WRITER_THREADS", "3"))
+
+# Tolerance of the in-box test, in position units (angstrom). The box is
+# half-open, [-tol, L - tol) per axis, so a lattice-commensurate box holds
+# exactly L/a planes whichever side of the face rounding puts them on.
+SAMPLE_BOX_TOL = 1.0e-3
 
 
 def _get_gpu_count():
@@ -26,6 +32,115 @@ def _get_gpu_count():
         return cp.cuda.runtime.getDeviceCount() if cp is not None else 0
     except Exception:
         return 0
+
+
+class _ChunkWriter:
+    """
+    Thread pool for chunk files with a bounded number of in-flight writes.
+
+    `submit` blocks while `max_workers + 1` writes are pending, so at most that
+    many buffer copies are held in host memory. A failed write is raised by the
+    next `submit` or by `finish`, so a missing chunk file cannot go unnoticed.
+    """
+
+    def __init__(self, write_fn, max_workers):
+        self._write_fn = write_fn
+        self._workers = max(1, int(max_workers))
+        self._limit = self._workers + 1
+        self._pool = ThreadPoolExecutor(max_workers=self._workers, thread_name_prefix="writer")
+        self._pending = []
+        self._error = None
+
+    def _reap(self, done):
+        """Drop finished futures from the pending list and re-raise their errors."""
+        self._pending = [f for f in self._pending if f not in done]
+        for f in done:
+            exc = f.exception()
+            if exc is not None:
+                if self._error is None:
+                    self._error = exc
+                raise exc
+
+    def submit(self, idx, pos_arr, spc_arr):
+        """Queue one chunk write, waiting first if the queue is full."""
+        while len(self._pending) >= self._limit:
+            done, _ = wait(self._pending, return_when=FIRST_COMPLETED)
+            self._reap(done)
+        self._pending.append(self._pool.submit(self._write_fn, idx, pos_arr, spc_arr))
+
+    def finish(self):
+        """Wait for every pending write, shut the pool down, and raise the first failure."""
+        try:
+            if self._pending:
+                done, _ = wait(self._pending, return_when=ALL_COMPLETED)
+                self._reap(done)
+            if self._error is not None:
+                raise self._error
+        finally:
+            self._pool.shutdown(wait=True)
+
+    def close(self):
+        """Shut the pool down without raising; for cleanup after an error."""
+        self._pool.shutdown(wait=True)
+
+
+class _OrderedResults:
+    """
+    Hand results produced by several worker threads to one consumer in index order.
+
+    Workers call `put(idx, item)`; the consumer calls `take(idx)` for idx = 0, 1,
+    ... and receives the items in that order whatever order the workers finished
+    in. A worker that cannot produce its remaining indices calls `fail(indices)`,
+    after which `take` returns None at the first failed index and any blocked
+    workers are released. `window` bounds how far ahead of the consumer a worker
+    may run, which bounds the host memory held by parked results.
+    """
+
+    def __init__(self, window):
+        self._cond = threading.Condition()
+        self._results = {}
+        self._failed = set()
+        self._next = 0
+        self._window = max(1, int(window))
+        self._stopped = False
+
+    def put(self, idx, item):
+        with self._cond:
+            while (not self._stopped) and (idx - self._next >= self._window):
+                self._cond.wait()
+            if self._stopped:
+                return
+            self._results[idx] = item
+            self._cond.notify_all()
+
+    def fail(self, indices):
+        with self._cond:
+            self._failed.update(int(i) for i in indices)
+            self._cond.notify_all()
+
+    def take(self, idx):
+        with self._cond:
+            while (idx not in self._results) and (idx not in self._failed):
+                self._cond.wait()
+            if idx not in self._results:
+                self._stopped = True
+                self._cond.notify_all()
+                return None
+            item = self._results.pop(idx)
+            self._next = idx + 1
+            self._cond.notify_all()
+            return item
+
+    def stop(self):
+        with self._cond:
+            self._stopped = True
+            self._results.clear()
+            self._cond.notify_all()
+
+    @property
+    def stopped(self):
+        """True once the consumer has given up; workers should stop producing."""
+        return self._stopped
 
 # -----------------------------------------------------------------------------
 # Class
@@ -92,6 +207,13 @@ class sample(logging):
 
         # Temperature/displacement configuration (disabled by default)
         self.enable_temp = False
+        # Record of operations that rewrote the chunk files (defects,
+        # deformation), so the same operation is not applied twice.
+        self._modifications = []
+        # Species are stored on disk as small integer codes; this table maps a
+        # code to its label and is part of the sample metadata.
+        self._species_labels = []
+        self._species_lock = threading.Lock()
         self.temp_params = ['gaussian', 0.25, 1, 40]
 
         # Thermal expansion configuration (disabled by default)
@@ -108,11 +230,16 @@ class sample(logging):
         self._streaming_geom_atom_counts = None  # atom counts per geometric chunk
         self._streaming_file_chunk_ranges = None  # mapping from file chunks to geometric chunks
         self._streaming_use_gpu = False  # GPU preference from generate_sample_* call
+        # Last generated file chunk, (chunk_number, positions, species), so a
+        # positions load followed by a species load generates once
+        self._streaming_cache = None
+        self._streaming_cache_lock = threading.Lock()
 
         # Alloy mode configuration (disabled by default)
         # When enabled, atom species are randomly assigned from a user-provided list
         self._alloy_species = None          # list of element symbols, e.g. ["Fe", "Co"]
         self._alloy_concentrations = None   # list of probabilities, e.g. [0.5, 0.5]
+        self._alloy_seed = None             # root seed; streaming draws per chunk from it
         self._alloy_rng = None              # np.random.Generator for reproducibility
         self._alloy_lock = None             # threading.Lock for multi-GPU safety
 
@@ -196,6 +323,7 @@ class sample(logging):
 
         # Streaming mode configuration
         self._streaming_mode = bool(streaming)
+        self._streaming_cache = None
         if streaming:
             self._streaming_material = None  # Will be set during generate_*
             
@@ -239,6 +367,50 @@ class sample(logging):
             self._alloy_concentrations = sample_metadata["alloy_concentrations"]
         if sample_metadata.get("sample_shape") is not None:
             self._sample_shape = sample_metadata["sample_shape"]
+        self._modifications = list(sample_metadata.get("modifications", []))
+        self._species_labels = [str(x) for x in sample_metadata.get("species_labels", [])]
+
+    ## Modification record
+    # -------------------------------------
+    @staticmethod
+    def _modification_key(kind, params):
+        """Canonical JSON string for a (kind, params) pair, used for equality."""
+        def conv(v):
+            if isinstance(v, np.ndarray):
+                return v.tolist()
+            if isinstance(v, (np.floating, np.integer)):
+                return v.item()
+            if isinstance(v, dict):
+                return {str(k): conv(x) for k, x in v.items()}
+            if isinstance(v, (list, tuple)):
+                return [conv(x) for x in v]
+            return v
+        return json.dumps({"kind": str(kind), "params": conv(params)}, sort_keys=True)
+
+    def has_modification(self, kind, params):
+        """
+        True if an operation with this kind and parameters was already applied
+        to the stored chunk files (see `record_modification`).
+        """
+        key = self._modification_key(kind, params)
+        return any(self._modification_key(m.get("kind"), m.get("params")) == key
+                   for m in getattr(self, "_modifications", []))
+
+    def record_modification(self, kind, params):
+        """
+        Append an applied operation to the sample metadata and write it to disk.
+
+        Args:
+            kind (str): Operation name, e.g. "stacking_fault", "fe_nodal_field".
+            params (dict): JSON-serialisable parameters that identify the
+                operation. Two calls with equal kind and params are treated as
+                the same operation by `has_modification`.
+        """
+        entry = json.loads(self._modification_key(kind, params))
+        if not hasattr(self, "_modifications") or self._modifications is None:
+            self._modifications = []
+        self._modifications.append(entry)
+        self.write_sample_metadata()
 
     ## Alloy helpers
     # -------------------------------------
@@ -271,11 +443,18 @@ class sample(logging):
                     )
             self._alloy_species = alloy_species
             self._alloy_concentrations = alloy_concentrations
-            self._alloy_rng = np.random.default_rng(alloy_seed)
+            # A None seed still gets a fixed root, so streaming chunks are
+            # reproducible within one session
+            if alloy_seed is None:
+                self._alloy_seed = int(np.random.SeedSequence().entropy)
+            else:
+                self._alloy_seed = int(alloy_seed)
+            self._alloy_rng = np.random.default_rng(self._alloy_seed)
             self._alloy_lock = threading.Lock()
         else:
             self._alloy_species = None
             self._alloy_concentrations = None
+            self._alloy_seed = None
             self._alloy_rng = None
             self._alloy_lock = None
 
@@ -284,7 +463,24 @@ class sample(logging):
         self._alloy_rng = None
         self._alloy_lock = None
 
-    def _build_species(self, base_species, n_tiles, mask=None):
+    def _alloy_chunk_rng(self, geom_idx):
+        """
+        Generator for the alloy species of one geometric unit in streaming mode.
+
+        Seeded from the root alloy seed and the unit index, so the same chunk
+        gets the same species every time it is generated.
+
+        Args:
+            geom_idx (int): 0-based geometric chunk or region index.
+
+        Returns:
+            np.random.Generator | None: None when alloy mode is off.
+        """
+        if self._alloy_species is None or self._alloy_seed is None:
+            return None
+        return np.random.default_rng([int(self._alloy_seed), int(geom_idx)])
+
+    def _build_species(self, base_species, n_tiles, mask=None, rng=None):
         """
         Build a species array, optionally randomizing for alloy mode.
 
@@ -296,6 +492,8 @@ class sample(logging):
             base_species (array-like): Per-unit-cell species labels.
             n_tiles (int): Number of unit-cell repeats.
             mask (np.ndarray | None): Boolean mask to select valid atoms.
+            rng (np.random.Generator | None): Generator for the alloy draw. If
+                None, the shared generator from `_setup_alloy` is used.
 
         Returns:
             np.ndarray: 1-D array of species strings.
@@ -303,6 +501,10 @@ class sample(logging):
         spc = np.tile(base_species, n_tiles)
         if mask is not None:
             spc = spc[mask]
+        if self._alloy_species is None:
+            return spc
+        if rng is not None:
+            return np.array(rng.choice(self._alloy_species, size=len(spc), p=self._alloy_concentrations))
         if self._alloy_rng is not None:
             with self._alloy_lock:
                 spc = np.array(
@@ -343,15 +545,50 @@ class sample(logging):
         else:
             np.save(os.path.join(self.directory, chunk_filename), data)
     
+    def _encode_species(self, data):
+        """
+        Map a label array to integer codes, extending the label table as needed.
+
+        Args:
+            data (array-like): 1-D labels (strings) or codes (integers already
+                indexing the label table).
+
+        Returns:
+            tuple: (codes uint8 or uint16, new_labels (bool)).
+        """
+        data = np.asarray(data)
+        with self._species_lock:
+            if data.dtype.kind in "iu":
+                if data.size and int(data.max()) >= len(self._species_labels):
+                    raise ValueError("species codes exceed the sample's label table")
+                new = False
+                codes = data
+            else:
+                labels, inv = np.unique(data.astype(str), return_inverse=True)
+                lut = np.empty(labels.size, dtype=np.int64)
+                new = False
+                for i, lab in enumerate(labels):
+                    lab = str(lab)
+                    if lab not in self._species_labels:
+                        self._species_labels.append(lab)
+                        new = True
+                    lut[i] = self._species_labels.index(lab)
+                codes = lut[inv.reshape(-1)]
+            dtype = np.uint8 if len(self._species_labels) <= 256 else np.uint16
+            return codes.astype(dtype, copy=False), new
+
     def write_chunk_species(self, data, chunk_num, override_directory=None):
         """
         Write a species array for a specific chunk to disk.
 
-        Saves a 1-D species array as `atomic_species_<chunk_num>.npy` either
-        under `self.directory` or `override_directory` if provided.
+        In the sample's own directory the labels are stored as integer codes
+        (`atomic_species_<chunk_num>.npy`, one byte per atom) with the label
+        table in the sample metadata, which is rewritten whenever a new label
+        appears. In another directory, which has no label table, the labels
+        themselves are stored; `load_chunk_species` reads both forms.
 
         Args:
-            data (array-like): 1-D array of species labels or ids with length N.
+            data (array-like): 1-D array of species labels or codes with length N.
             chunk_num (int): 1-based chunk index used in the output filename.
             override_directory (str, optional): Alternate directory root for
                 output. If None, uses `self.directory`.
@@ -359,15 +596,17 @@ class sample(logging):
         Returns:
             None
         """
-        # Compose the chunked filename based on the default basename
         base, ext = os.path.splitext(self._default_filenames[1])
         chunk_filename = f"{base}_{chunk_num}{ext}"
-
-        # Persist the array in the appropriate directory
-        if override_directory is not None:
-            np.save(os.path.join(override_directory, chunk_filename), data)
-        else:
-            np.save(os.path.join(self.directory, chunk_filename), data)
+        same_dir = (override_directory is None
+                    or os.path.abspath(override_directory) == os.path.abspath(self.directory))
+        if not same_dir:
+            np.save(os.path.join(override_directory, chunk_filename), np.asarray(data))
+            return
+        codes, new_labels = self._encode_species(data)
+        np.save(os.path.join(self.directory, chunk_filename), codes)
+        if new_labels:
+            self.write_sample_metadata()
             
     def write_sample_metadata(self, override_directory=None):
         """
@@ -393,6 +632,8 @@ class sample(logging):
             "alloy_species": self._alloy_species if self._alloy_species is not None else None,
             "alloy_concentrations": self._alloy_concentrations if self._alloy_concentrations is not None else None,
             "sample_shape": getattr(self, '_sample_shape', 'box'),
+            "modifications": list(getattr(self, "_modifications", [])),
+            "species_labels": list(getattr(self, "_species_labels", [])),
         }
 
         # Choose the output directory and filename
@@ -404,9 +645,9 @@ class sample(logging):
         # Write a nicely formatted JSON file for human inspection and versioning
         with open(metadata_filename, "w") as f:
             json.dump(sample_metadata, f, indent=4)
-        print(f"Metadata written to {metadata_filename} in JSON format.")
+        self._log("verbose", f"Metadata written to {metadata_filename} in JSON format.")
     
-    def load_chunk_positions(self, chunk_number, use_gpu=True):
+    def load_chunk_positions(self, chunk_number, use_gpu=True, raw=False):
         """
         Load a chunk's positions from disk, optionally on GPU.
 
@@ -421,6 +662,11 @@ class sample(logging):
             chunk_number (int): 1-based chunk index to load.
             use_gpu (bool, optional): If True and CuPy is available, load using
                 `cp.load` and return a GPU array. Defaults to True.
+            raw (bool, optional): If True, return the stored positions without
+                thermal expansion or thermal displacements even when
+                `enable_temp` is set. Code that rewrites chunk files (defects,
+                deformation) must use this so a thermal realisation is never
+                baked into the stored sample.
 
         Returns:
             np.ndarray or cp.ndarray: Array of shape (N, 3) containing positions.
@@ -447,8 +693,8 @@ class sample(logging):
         else:
             positions = np.load(full_path)
 
-        # Optionally apply thermal effects according to configured model
-        if self.enable_temp is True:
+        # Thermal effects are applied on load only; raw=True skips them.
+        if self.enable_temp is True and not raw:
             # Determine temperature from temp_params (index 1 is sigma/T_K)
             # For gaussian mode, use reference temperature for expansion calculation
             distribution = self.temp_params[0]
@@ -473,88 +719,134 @@ class sample(logging):
             )
         return positions
 
-    def load_chunk_species(self, chunk_number, use_gpu=True):
+    def load_chunk_species(self, chunk_number, use_gpu=True, codes=False):
         """
-        Load a chunk's species array from disk, optionally on GPU.
+        Load a chunk's species, as labels or as codes with a label table.
 
-        If `use_gpu` is True and CuPy is available, returns a `cp.ndarray`.
-        Otherwise, returns an `np.ndarray`.
-
-        In streaming mode, species are generated on-demand instead of being
-        loaded from disk.
+        Chunk files hold integer codes (see `write_chunk_species`); files
+        written by older versions hold the labels themselves and are read the
+        same way. In streaming mode, species are generated on demand.
 
         Args:
             chunk_number (int): 1-based chunk index to load.
-            use_gpu (bool, optional): If True and CuPy is available, load using
-                `cp.load` and return a GPU array. Defaults to True.
+            use_gpu (bool, optional): With `codes=True` and CuPy available,
+                return the codes on the device. Label arrays are always host
+                arrays (CuPy has no string dtype).
+            codes (bool, optional): If True return `(codes, labels)`, where
+                `labels[codes]` are the per-atom labels; this avoids building
+                the label array at all. Defaults to False.
 
         Returns:
-            np.ndarray or cp.ndarray: 1-D species array corresponding to the
-            positions in the same chunk.
+            np.ndarray of labels, shape (N,), or the tuple `(codes, labels)`.
 
         Raises:
-            FileNotFoundError: If the chunk file does not exist (raised by the
-                underlying loader).
+            FileNotFoundError: If the chunk file does not exist.
+            ValueError: If a code exceeds the label table (metadata missing).
             RuntimeError: In streaming mode, if material reference is not set.
         """
-        # STREAMING MODE: generate on-demand instead of loading from disk
         if getattr(self, "_streaming_mode", False):
-            return self._generate_chunk_on_demand(chunk_number, use_gpu, return_positions=False)
-
-        # Compose the on-disk filename for this chunk
-        base, ext = os.path.splitext(self._default_filenames[1])
-        species_filename = f"{base}_{chunk_number}{ext}"
-        full_path = os.path.join(self.directory, species_filename)
-
-        # Load on GPU if requested and available; else load on CPU
-        if use_gpu and (cp is not None):
-            return cp.load(full_path)
+            arr = self._generate_chunk_on_demand(chunk_number, use_gpu, return_positions=False)
         else:
-            return np.load(full_path)
+            base, ext = os.path.splitext(self._default_filenames[1])
+            arr = np.load(os.path.join(self.directory, f"{base}_{chunk_number}{ext}"))
+        arr = np.asarray(arr)
+
+        if arr.dtype.kind in "iu":
+            labels = np.asarray(getattr(self, "_species_labels", []), dtype=str)
+            if arr.size and int(arr.max()) >= labels.size:
+                raise ValueError(
+                    f"species codes in chunk {chunk_number} exceed the label table "
+                    f"({labels.size} labels); read_sample_metadata() may be missing")
+            if codes:
+                return (cp.asarray(arr) if (use_gpu and cp is not None) else arr), labels
+            return labels[arr]
+
+        # Labels stored directly
+        if codes:
+            labels, inv = np.unique(arr.astype(str), return_inverse=True)
+            inv = inv.reshape(-1).astype(np.uint8 if labels.size <= 256 else np.uint16)
+            return (cp.asarray(inv) if (use_gpu and cp is not None) else inv), labels
+        return arr
 
     # -------------------------------------
     # Streaming mode helpers
     # -------------------------------------
-    def _get_chunk_atom_count(self, material, chunk_position, chunk_dimensions):
+    @staticmethod
+    def _in_box_mask(positions, dims, xp):
+        """
+        Half-open in-box test in the [0, dimensions) sample frame.
+
+        Each axis accepts [-SAMPLE_BOX_TOL, L - SAMPLE_BOX_TOL), so a site that
+        rounds onto the lower face is kept and one on the upper face is dropped
+        regardless of which side of the face float32 puts it.
+
+        Args:
+            positions (np.ndarray | cp.ndarray): (N, 3) float32 positions.
+            dims (array-like): Length-3 box lengths.
+            xp: Array module of `positions` (np or cp).
+
+        Returns:
+            (N,) boolean array on the same backend.
+        """
+        tol = np.float32(SAMPLE_BOX_TOL)
+        hi = xp.asarray(dims, dtype=xp.float32) - tol
+        return xp.all((positions >= -tol) & (positions < hi), axis=1)
+
+    def _shape_mask(self, positions, xp):
+        """
+        Box test plus, for ellipsoid samples, the inscribed-ellipsoid test.
+
+        Args:
+            positions (np.ndarray | cp.ndarray): (N, 3) float32 positions in
+                the [0, dimensions) frame.
+            xp: Array module of `positions` (np or cp).
+
+        Returns:
+            (N,) boolean array on the same backend.
+        """
+        dims = xp.asarray(self.dimensions, dtype=xp.float32)
+        mask = self._in_box_mask(positions, dims, xp)
+        if getattr(self, '_sample_shape', 'box') == 'ellipsoid':
+            semi = dims * 0.5
+            norm_sq = ((positions[:, 0] - semi[0]) / semi[0]) ** 2 + \
+                      ((positions[:, 1] - semi[1]) / semi[1]) ** 2 + \
+                      ((positions[:, 2] - semi[2]) / semi[2]) ** 2
+            mask = mask & (norm_sq <= 1.0)
+        return mask
+
+    def _get_chunk_atom_count(self, material, chunk_position, chunk_dimensions, use_gpu=False):
         """
         Count atoms in a geometric chunk without storing positions.
 
-        Uses the same logic as get_atomic_data but only returns the count,
-        which is faster for computing chunk mappings.
+        Applies the same box and shape masks as get_atomic_data, on the same
+        backend, so the count matches what a later generation of the chunk
+        produces.
 
         Args:
             material: Crystal material object.
             chunk_position: (3,) array of chunk origin.
             chunk_dimensions: (3,) array of chunk size in lattice units.
+            use_gpu (bool, optional): Count on the GPU if CuPy is available.
+                Defaults to False.
 
         Returns:
             int: Number of atoms in this geometric chunk.
         """
-        # Get lattice positions
-        lattice_positions_np = self.get_lattice_positions(
-            material, chunk_position, chunk_dimensions, use_gpu=False
+        use_gpu = bool(use_gpu and (cp is not None))
+        xp = cp if use_gpu else np
+
+        lattice_positions = self.get_lattice_positions(
+            material, chunk_position, chunk_dimensions, use_gpu=use_gpu
         )
-        n_lattice = lattice_positions_np.shape[0]
-        if n_lattice == 0:
+        if lattice_positions.shape[0] == 0:
             return 0
 
-        n_atoms_per_cell = len(material.species)
-        lattice_atom_cartesian_np = material.lattice_atom_cartesian.astype(np.float32)
-
-        # Expand to atom sites
+        basis = xp.asarray(material.lattice_atom_cartesian, dtype=xp.float32)
         atomic_positions_S = (
-            lattice_positions_np[:, np.newaxis, :].astype(np.float32) +
-            lattice_atom_cartesian_np[np.newaxis, :, :]
+            lattice_positions[:, xp.newaxis, :].astype(xp.float32) + basis[xp.newaxis, :, :]
         ).reshape(-1, 3)
 
-        # In-box mask
-        mask = (
-            (atomic_positions_S[:, 0] >= 0) & (atomic_positions_S[:, 0] <= self.dimensions[0]) &
-            (atomic_positions_S[:, 1] >= 0) & (atomic_positions_S[:, 1] <= self.dimensions[1]) &
-            (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= self.dimensions[2])
-        )
-
-        return int(np.sum(mask))
+        return int(self._shape_mask(atomic_positions_S, xp).sum())
 
     def _compute_streaming_chunk_mapping(self, material, flush_size):
         """
@@ -570,17 +862,17 @@ class sample(logging):
         poly = (self._sample_type == "poly")
         num_geom = self._grain_regions.shape[0] if poly else self._chunk_positions.shape[0]
         flush_size = int(flush_size)
+        self._streaming_cache = None
 
-        # Count atoms in each geometric chunk
+        # Count atoms in each geometric chunk on the backend that will serve them
+        use_gpu = getattr(self, '_streaming_use_gpu', True)
         geom_counts = []
         for i in range(num_geom):
             if poly:
-                count = self._get_region_atom_count(
-                    material, i, use_gpu=getattr(self, '_streaming_use_gpu', True)
-                )
+                count = self._get_region_atom_count(material, i, use_gpu=use_gpu)
             else:
                 count = self._get_chunk_atom_count(
-                    material, self._chunk_positions[i], self._chunk_dimensions
+                    material, self._chunk_positions[i], self._chunk_dimensions, use_gpu=use_gpu
                 )
             geom_counts.append(count)
 
@@ -651,10 +943,10 @@ class sample(logging):
         if self._sample_type == "poly":
             return self._generate_poly_geometric_chunk(geom_idx, use_gpu=use_gpu)
         else:
-            # Single crystal: pass use_gpu to get_atomic_data
-            # Note: get_atomic_data returns numpy arrays when use_gpu=True but return_on_gpu=False (default)
+            # get_atomic_data returns host arrays when return_on_gpu is False
             return self.get_atomic_data(material, self._chunk_positions[geom_idx],
-                                        self._chunk_dimensions, use_gpu=use_gpu)
+                                        self._chunk_dimensions, use_gpu=use_gpu,
+                                        species_rng=self._alloy_chunk_rng(geom_idx))
 
     def _generate_poly_geometric_chunk(self, geom_idx, use_gpu=True):
         """
@@ -684,10 +976,13 @@ class sample(logging):
                 self._log("debug", f"[sample] GPU detection failed: {type(e).__name__}: {e}")
                 gpu_available = False
 
+        species_rng = self._alloy_chunk_rng(geom_idx)
+
         # Try GPU path first
         if gpu_available:
             try:
-                return self._generate_grain_region(material, geom_idx, use_gpu=True)
+                return self._generate_grain_region(material, geom_idx, use_gpu=True,
+                                                   species_rng=species_rng)
             except (cp.cuda.memory.OutOfMemoryError, cp.cuda.runtime.CUDARuntimeError) as e:
                 # GPU memory or runtime error -> fall through to CPU path
                 self._log("normal", f"[sample] GPU streaming chunk generation failed (OOM/runtime), falling back to CPU: {e}")
@@ -701,15 +996,18 @@ class sample(logging):
                 raise
 
         # CPU fallback path
-        return self._generate_grain_region(material, geom_idx, use_gpu=False)
+        return self._generate_grain_region(material, geom_idx, use_gpu=False,
+                                           species_rng=species_rng)
 
     def _clear_streaming_gpu_cache(self):
         """
         Clear GPU cache for streaming mode invariants.
 
-        Frees GPU memory used by cached seeds, rotations, and other invariants.
-        Safe to call even if cache was never initialized.
+        Frees GPU memory used by cached seeds, rotations, and other invariants,
+        and drops the cached file chunk. Safe to call even if the cache was
+        never initialized.
         """
+        self._streaming_cache = None
         self._streaming_gpu_seeds_cp = None
         self._streaming_gpu_rotations_cp = None
         self._streaming_gpu_lattice_cp = None
@@ -751,51 +1049,21 @@ class sample(logging):
         if file_chunk_idx < 0 or file_chunk_idx >= len(self._streaming_file_chunk_ranges):
             raise ValueError(f"chunk_number {chunk_number} out of range [1, {len(self._streaming_file_chunk_ranges)}]")
 
-        # Get the mapping for this file chunk
-        start_geom, end_geom, start_offset, end_offset = self._streaming_file_chunk_ranges[file_chunk_idx]
+        # The last generated file chunk is kept, so a positions load followed
+        # by a species load (or a repeated load) does not regenerate it. The
+        # lock also makes two threads asking for the same chunk generate once.
+        with self._streaming_cache_lock:
+            cached = self._streaming_cache
+            if cached is not None and cached[0] == chunk_number:
+                positions, species = cached[1], cached[2]
+            else:
+                positions, species = self._generate_file_chunk(file_chunk_idx)
+                self._streaming_cache = (chunk_number, positions, species)
 
-        # In streaming mode, use the GPU setting from sample generation, not from caller
-        effective_use_gpu = getattr(self, '_streaming_use_gpu', use_gpu)
-
-        # Generate atoms from all contributing geometric chunks
-        all_pos = []
-        all_spc = []
-
-        for geom_idx in range(start_geom, end_geom + 1):
-            pos, spc = self._generate_geometric_chunk(geom_idx, use_gpu=effective_use_gpu)
-
-            if pos.shape[0] == 0:
-                continue
-
-            # Apply slicing for boundary geometric chunks
-            if geom_idx == start_geom and geom_idx == end_geom:
-                # This file chunk is entirely within one geometric chunk
-                pos = pos[start_offset:end_offset]
-                spc = spc[start_offset:end_offset]
-            elif geom_idx == start_geom:
-                # First geometric chunk: take from start_offset to end
-                pos = pos[start_offset:]
-                spc = spc[start_offset:]
-            elif geom_idx == end_geom:
-                # Last geometric chunk: take from beginning to end_offset
-                pos = pos[:end_offset]
-                spc = spc[:end_offset]
-            # Middle geometric chunks: take all atoms (no slicing needed)
-
-            if pos.shape[0] > 0:
-                all_pos.append(pos)
-                all_spc.append(spc)
-
-        # Concatenate results
-        if all_pos:
-            positions = np.concatenate(all_pos, axis=0)
-            species = np.concatenate(all_spc, axis=0)
-        else:
-            positions = np.zeros((0, 3), dtype=np.float32)
-            species = np.array([], dtype=object)
-
-        # Apply temperature effects if enabled (same logic as load_chunk_positions)
-        if return_positions and self.enable_temp and positions.shape[0] > 0:
+        if not return_positions:
+            result = species
+        elif self.enable_temp and positions.shape[0] > 0:
+            # Thermal effects produce a fresh array; the cached one stays raw
             distribution = self.temp_params[0]
             if distribution.lower() in ('gaussian', 'normal'):
                 T_K = getattr(self, '_thermal_expansion_T_ref', 300.0)
@@ -805,7 +1073,7 @@ class sample(logging):
             if getattr(self, '_thermal_expansion_enabled', False):
                 positions = self.apply_thermal_expansion(positions, T_K)
 
-            positions = self.apply_temperature(
+            result = self.apply_temperature(
                 positions,
                 distribution=distribution,
                 sigma=self.temp_params[1],
@@ -813,13 +1081,56 @@ class sample(logging):
                 seed=self.temp_params[3],
                 chunk_number=chunk_number
             )
-
-        result = positions if return_positions else species
+        else:
+            # Hand out a copy so a caller writing in place cannot alter the cache
+            result = positions.copy()
 
         # Convert to GPU if requested
         if use_gpu and (cp is not None):
             return cp.asarray(result)
         return result
+
+    def _generate_file_chunk(self, file_chunk_idx):
+        """
+        Generate the atoms of one streaming file chunk from its geometric units.
+
+        Args:
+            file_chunk_idx (int): 0-based index into `_streaming_file_chunk_ranges`.
+
+        Returns:
+            tuple: (positions, species) NumPy arrays, positions float32 (N, 3).
+        """
+        start_geom, end_geom, start_offset, end_offset = self._streaming_file_chunk_ranges[file_chunk_idx]
+
+        # In streaming mode, use the GPU setting from sample generation, not from caller
+        effective_use_gpu = getattr(self, '_streaming_use_gpu', True)
+
+        all_pos = []
+        all_spc = []
+        for geom_idx in range(start_geom, end_geom + 1):
+            pos, spc = self._generate_geometric_chunk(geom_idx, use_gpu=effective_use_gpu)
+
+            if pos.shape[0] == 0:
+                continue
+
+            # Boundary geometric chunks are shared with the neighbouring file chunk
+            if geom_idx == start_geom and geom_idx == end_geom:
+                pos = pos[start_offset:end_offset]
+                spc = spc[start_offset:end_offset]
+            elif geom_idx == start_geom:
+                pos = pos[start_offset:]
+                spc = spc[start_offset:]
+            elif geom_idx == end_geom:
+                pos = pos[:end_offset]
+                spc = spc[:end_offset]
+
+            if pos.shape[0] > 0:
+                all_pos.append(pos)
+                all_spc.append(spc)
+
+        if all_pos:
+            return np.concatenate(all_pos, axis=0), np.concatenate(all_spc, axis=0)
+        return np.zeros((0, 3), dtype=np.float32), np.array([], dtype=object)
 
     # -------------------------------------
 
@@ -1256,25 +1567,19 @@ class sample(logging):
               and ``_rotation`` are updated.
             - This function streams lines to bound memory usage on very large files.
         """
-        from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
-
         chunk_num = 0  # running chunk counter
 
         # Track bounding box while streaming the file
         x_min = y_min = z_min = float('inf')
         x_max = y_max = z_max = float('-inf')
 
-        # Thread pool for async disk writes (mirrors generate_sample_single pattern)
+        # Bounded writer pool for async disk writes
         def _write_chunk(idx, pos_arr, spc_arr):
             self.write_chunk_positions(pos_arr, idx, override_directory=override_directory)
             self.write_chunk_species(spc_arr, idx, override_directory=override_directory)
             return idx
 
-        writer_pool = ThreadPoolExecutor(
-            max_workers=max(1, SAMPLE_WRITER_THREADS),
-            thread_name_prefix="import_writer"
-        )
-        pending_writes = []
+        writer = _ChunkWriter(_write_chunk, SAMPLE_WRITER_THREADS)
 
         # Determine which columns to read and their order in the output array
         scale_factor = float(scale / 1e-10)
@@ -1290,25 +1595,38 @@ class sample(logging):
             with open(import_file, "r") as f:
                 # Skip header lines at the top of the file
                 for _ in range(header_lines):
-                    next(f)
-
-                while True:
-                    # Read up to flush_size rows with C-optimized parsing
-                    try:
-                        raw_data = np.loadtxt(
-                            f,
-                            max_rows=flush_size,
-                            usecols=cols_to_read,
-                            dtype=np.float64,
-                            ndmin=2
+                    if f.readline() == "":
+                        raise ValueError(
+                            f"import_atomic_data: {import_file} has fewer than "
+                            f"{header_lines} header lines"
                         )
-                    except (StopIteration, ValueError):
-                        break
+
+                rows_read = 0
+                while True:
+                    # Read up to flush_size rows with C-optimized parsing. At end
+                    # of file loadtxt returns an empty array (and warns); a line
+                    # it cannot parse raises ValueError, which is an error here.
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings("ignore", message=".*input contained no data.*")
+                            raw_data = np.loadtxt(
+                                f,
+                                max_rows=flush_size,
+                                usecols=cols_to_read,
+                                dtype=np.float64,
+                                ndmin=2
+                            )
+                    except ValueError as e:
+                        raise ValueError(
+                            f"import_atomic_data: malformed line in {import_file} "
+                            f"after {rows_read} atoms: {e}"
+                        ) from e
 
                     if raw_data.size == 0:
                         break
 
                     n_atoms = raw_data.shape[0]
+                    rows_read += n_atoms
 
                     # Extract and scale positions (first 3 columns correspond to position_columns)
                     data_arr = (raw_data[:, :3] * scale_factor).astype(np.float32)
@@ -1330,19 +1648,20 @@ class sample(logging):
                     else:
                         species_arr = np.full(n_atoms, element_list[0])
 
-                    # Submit async write (copy to isolate from next iteration)
+                    # Queue the write; the arrays are fresh per iteration
                     chunk_num += 1
-                    pending_writes.append(
-                        writer_pool.submit(_write_chunk, chunk_num, data_arr.copy(), species_arr.copy())
-                    )
+                    writer.submit(chunk_num, data_arr, species_arr)
 
-            # Wait for all writes to complete before setting metadata
-            wait(pending_writes, return_when=ALL_COMPLETED)
+            # Every write must have completed before the chunk count is recorded
+            writer.finish()
         finally:
-            writer_pool.shutdown(wait=True)
+            writer.close()
 
         # Record how many chunks were written to disk
         self._chunk_total = chunk_num
+        # Persist the chunk count with the rest of the metadata so a reloaded
+        # sample knows how many chunk files it has.
+        self.write_sample_metadata()
 
         # Infer sample box dimensions from the bounding box
         self._dimensions = np.array([x_max - x_min,
@@ -1702,35 +2021,37 @@ class sample(logging):
                 Defaults to 0.25.
             max_displacement (float | None, optional): Optional per-axis clip on
                 the displacement magnitude. Defaults to 1.
-            seed (int | None, optional): Random seed for reproducibility. Set to
-                None to avoid reseeding. Defaults to 40.
-            chunk_number (int | None, optional): Chunk index used to fetch
-                per-atom species on CPU for per-species Einstein parameters.
+            seed (int | None, optional): Root seed of the displacement field.
+                Each chunk draws from its own stream keyed on (seed,
+                chunk_number), so the same chunk always gets the same
+                displacements and different chunks get different ones. None
+                draws a fresh root on every call. Defaults to 40.
+            chunk_number (int | None, optional): Chunk index; keys the random
+                stream and, when per-species Einstein parameters are
+                configured, selects the species array to read.
 
         Returns:
-            np.ndarray or cp.ndarray: Displaced positions of the same shape and backend.
+            np.ndarray or cp.ndarray: Displaced positions of the same shape,
+            dtype and backend.
 
         Raises:
             ValueError: If an unknown ``distribution`` is provided.
 
         Notes:
             - Backend (NumPy vs CuPy) is inferred from ``positions`` type.
+            - The global NumPy/CuPy random state is not touched.
             - If ``T_K <= 0`` in Einstein/Debye mode, only zero-point motion is applied.
         """
         # Select backend based on input array type
         use_cp = (cp is not None) and isinstance(positions, cp.ndarray)
         xp = cp if use_cp else np
 
-        # Seed the RNG for deterministic noise if a seed is provided
-        if seed is not None:
-            if use_cp:
-                cp.random.seed(int(seed))
-            else:
-                np.random.seed(int(seed))
+        rng = self._thermal_rng(seed, chunk_number, use_cp)
 
         # Mode 1: plain Gaussian displacements with a single sigma
         if isinstance(distribution, str) and distribution.lower() in ('gaussian', 'normal'):
-            displacements = xp.random.normal(loc=0.0, scale=float(sigma), size=positions.shape)
+            displacements = rng.standard_normal(size=positions.shape, dtype=positions.dtype)
+            displacements *= float(sigma)
             if (max_displacement is not None) and (max_displacement > 0.0):
                 xp.clip(displacements, -max_displacement, max_displacement, out=displacements)
             return positions + displacements
@@ -1763,19 +2084,25 @@ class sample(logging):
             )
 
             if have_per_species:
-                # Load species on CPU for this chunk and map to arrays of m and theta_E
-                species = self.load_chunk_species(chunk_number, use_gpu=False)
-                masses_amu = np.empty(N, dtype=np.float64)
-                thetaE_K = np.empty(N, dtype=np.float64)
-
-                # Fallbacks if a species key is missing
+                # Resolve the species labels once and gather per-atom values
+                # through the inverse index instead of looping over atoms
+                species = np.asarray(self.load_chunk_species(chunk_number, use_gpu=False))
+                if species.shape[0] != N:
+                    raise ValueError(
+                        f"chunk {chunk_number}: {species.shape[0]} species for {N} positions"
+                    )
                 m_default = getattr(self, '_temp_mass_amu', 28.0)
                 th_default = getattr(self, '_temp_theta_E_K', 300.0)
 
-                for i, sp in enumerate(species):
-                    key = str(sp)
-                    masses_amu[i] = self._temp_species_mass_amu.get(key, m_default)
-                    thetaE_K[i] = self._temp_species_theta_E_K.get(key, th_default)
+                labels, inverse = np.unique(species.astype(str), return_inverse=True)
+                mass_table = np.array(
+                    [self._temp_species_mass_amu.get(str(k), m_default) for k in labels],
+                    dtype=np.float64)
+                theta_table = np.array(
+                    [self._temp_species_theta_E_K.get(str(k), th_default) for k in labels],
+                    dtype=np.float64)
+                masses_amu = mass_table[inverse.reshape(-1)]
+                thetaE_K = theta_table[inverse.reshape(-1)]
             else:
                 # Use global values (with safe fallbacks) for all atoms
                 m_default = getattr(self, '_temp_mass_amu', 28.0)
@@ -1803,7 +2130,7 @@ class sample(logging):
             sigma_units = xp.sqrt(msd_m2) / pos_unit_m  # per-atom sigma in position units
 
             # Draw per-atom Gaussian noise and cast to match input dtype
-            rand = xp.random.standard_normal(size=positions.shape)
+            rand = rng.standard_normal(size=positions.shape)
             displacements = rand * sigma_units.reshape(-1, 1)
             displacements = displacements.astype(positions.dtype, copy=False)
 
@@ -1878,7 +2205,7 @@ class sample(logging):
             sigma_units = np.sqrt(msd_m2) / pos_unit_m
 
             # Draw Gaussian noise and scale by sigma
-            rand = xp.random.standard_normal(size=positions.shape)
+            rand = rng.standard_normal(size=positions.shape)
             displacements = rand * sigma_units
             displacements = displacements.astype(positions.dtype, copy=False)
 
@@ -1890,6 +2217,26 @@ class sample(logging):
 
         # Anything else is unsupported
         raise ValueError("Unknown distribution: {}".format(distribution))
+
+    @staticmethod
+    def _thermal_rng(seed, chunk_number, use_cp):
+        """
+        Local random generator for the thermal displacements of one chunk.
+
+        Args:
+            seed (int | None): Root seed; None draws fresh entropy.
+            chunk_number (int | None): Chunk index mixed into the stream key.
+            use_cp (bool): Return a CuPy generator instead of a NumPy one.
+
+        Returns:
+            np.random.Generator or cp.random.Generator.
+        """
+        root = np.random.SeedSequence().entropy if seed is None else int(seed)
+        key = [root] if chunk_number is None else [root, int(chunk_number)]
+        seq = np.random.SeedSequence(key)
+        if use_cp:
+            return cp.random.default_rng(seq)
+        return np.random.default_rng(seq)
     # -------------------------------------
         
     # -------------------------------------
@@ -2272,9 +2619,9 @@ class sample(logging):
         offset_np = self.offset.astype(np.float32)
 
         for i in range(self.chunk_total):
-            # Load the i-th chunk (1-based chunk files)
-            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
-            
+            # Load the stored positions (1-based chunk files), without thermal effects
+            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu, raw=True)
+
             if cp is not None and isinstance(positions_chunk, cp.ndarray):
                 # GPU path: subtract offset on device, then bring to host for writing
                 positions_chunk -= cp.array(offset_np)
@@ -2293,9 +2640,10 @@ class sample(logging):
         """
         Remove the current global rotation from all atom positions.
 
-        Reloads each chunk, right-multiplies all positions by ``self._rotation.T``
-        (the inverse for an orthonormal rotation), writes them back, and then
-        resets ``self._rotation`` to identity.
+        Reloads each chunk and applies the inverse of ``self._rotation``. The
+        stored rotation R is active on row-vector positions, p' = p @ R.T, so
+        the inverse is p = p' @ R. Writes the chunks back and resets
+        ``self._rotation`` to identity.
 
         Args:
             use_gpu (bool, optional): If True and CuPy is available, perform the
@@ -2310,25 +2658,24 @@ class sample(logging):
         # Must have a rotation to undo
         if self._rotation is None:
             raise ValueError("No sample rotation matrix is set. Please initialize or load it first.")
-        
-        # Inverse of rotation is its transpose for orthonormal matrices
-        R_inv = self._rotation.T.astype(np.float32)
-        
+
+        # rotate_sample_relative applies p @ R.T, so p @ R undoes it
+        R_undo = np.asarray(self._rotation, dtype=np.float32)
+
         if self._chunk_total is None:
             raise ValueError("Chunk total is not initialized. Please generate or import sample data first.")
-        
+
         for i in range(self.chunk_total):
-            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
-            
+            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu, raw=True)
+
             if cp is not None and isinstance(positions_chunk, cp.ndarray):
                 # GPU path: do matrix multiply on device
-                R_inv_cp = cp.asarray(R_inv)
-                positions_chunk = positions_chunk @ R_inv_cp
+                positions_chunk = positions_chunk @ cp.asarray(R_undo)
                 positions_chunk_cpu = positions_chunk.get()
                 self.write_chunk_positions(positions_chunk_cpu, i + 1)
             else:
                 # CPU path
-                positions_chunk = positions_chunk @ R_inv
+                positions_chunk = positions_chunk @ R_undo
                 self.write_chunk_positions(positions_chunk, i + 1)
         
         # Reset rotation to identity
@@ -2356,9 +2703,12 @@ class sample(logging):
         """
         Apply an additional rotation to all atoms and update state.
 
-        Computes a rotation matrix for the given axis and angle, applies it to
-        every chunk, writes the results, and left-multiplies the stored
-        ``_rotation`` by the new rotation.
+        Computes an active rotation matrix R for the given axis and angle,
+        applies it to every chunk as p @ R.T (the same convention as
+        ``Crystal.rotate_crystal``, so (1, 0, 0) rotated +90 degrees about z
+        becomes (0, 1, 0)), writes the results, and left-multiplies the stored
+        ``_rotation`` by R. ``zero_sample_rotation`` undoes the accumulated
+        rotation exactly.
 
         Args:
             axis (array-like): 3-vector for the rotation axis.
@@ -2381,21 +2731,22 @@ class sample(logging):
         
         # Build the rotation matrix and ensure float32 for consistency
         R = self.get_rotation(axis, dangle).astype(np.float32)
-        
+        # Positions are row vectors, so the active rotation is p @ R.T
+        R_T = np.ascontiguousarray(R.T)
+
         if self._chunk_total is None:
             raise ValueError("Chunk total is not initialized. Please generate or import sample data first.")
-        
+
         for i in range(self.chunk_total):
-            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
+            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu, raw=True)
             if cp is not None and isinstance(positions_chunk, cp.ndarray):
                 # GPU path
-                R_cp = cp.asarray(R)
-                positions_chunk = positions_chunk @ R_cp
+                positions_chunk = positions_chunk @ cp.asarray(R_T)
                 positions_chunk_cpu = positions_chunk.get()
                 self.write_chunk_positions(positions_chunk_cpu, i + 1)
             else:
                 # CPU path
-                positions_chunk = positions_chunk @ R
+                positions_chunk = positions_chunk @ R_T
                 self.write_chunk_positions(positions_chunk, i + 1)
         
         # Update the stored global rotation
@@ -2428,7 +2779,7 @@ class sample(logging):
         offset_np = np.array(offset_vector, dtype=np.float32)
         
         for i in range(self.chunk_total):
-            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu)
+            positions_chunk = self.load_chunk_positions(i + 1, use_gpu=use_gpu, raw=True)
             if cp is not None and isinstance(positions_chunk, cp.ndarray):
                 # GPU path
                 positions_chunk += cp.asarray(offset_np)
@@ -2457,7 +2808,7 @@ class sample(logging):
         Builds atomic positions for a single geometric chunk entirely on GPU:
         1) Computes lattice positions in the sample frame.
         2) Broadcasts unit-cell atom offsets and flattens to sites.
-        3) Applies an in-box mask against [0, dimensions].
+        3) Applies the half-open in-box mask on [0, dimensions).
         4) Shifts to centered coordinates using offset - 0.5 * dimensions.
 
         Args:
@@ -2496,11 +2847,9 @@ class sample(logging):
             atomic_positions = (lattice_positions_S[:, cp.newaxis, :] +
                                 atom_uc[cp.newaxis, :, :]).reshape(-1, 3)
 
-            # In-box mask using [0, dimensions]
+            # Half-open in-box mask on [0, dimensions)
             dims = cp.asarray(self.dimensions, dtype=cp.float32)
-            mask = ((atomic_positions[:, 0] >= 0) & (atomic_positions[:, 0] <= dims[0]) &
-                    (atomic_positions[:, 1] >= 0) & (atomic_positions[:, 1] <= dims[1]) &
-                    (atomic_positions[:, 2] >= 0) & (atomic_positions[:, 2] <= dims[2]))
+            mask = self._in_box_mask(atomic_positions, dims, cp)
 
             # Compact on GPU
             pos_sel_cp = atomic_positions[mask, :]
@@ -2807,15 +3156,17 @@ class sample(logging):
         return_on_gpu=False,
         lattice_atom_cartesian_cp=None,
         offset_gpu=None,
-        dim_half_gpu=None
+        dim_half_gpu=None,
+        species_rng=None
     ):
         """
         Build atom positions and species for a single geometric chunk.
 
         On GPU:
             - Expands lattice points by the unit-cell atom offsets,
-              masks to [0, dimensions], applies centering shift (offset - 0.5*dimensions),
-              and optionally returns GPU arrays without host copies.
+              masks to [0, dimensions) (half-open, see `_in_box_mask`), applies
+              the centering shift (offset - 0.5*dimensions), and optionally
+              returns GPU arrays without host copies.
         On CPU:
             - Performs the equivalent operations using NumPy and returns host arrays.
 
@@ -2836,6 +3187,9 @@ class sample(logging):
                 ``self.offset``.
             dim_half_gpu (cp.ndarray | None, optional): Preloaded device copy of
                 ``self.dimensions * 0.5``.
+            species_rng (np.random.Generator | None, optional): Generator for
+                the alloy species draw of this chunk (streaming mode). None
+                uses the shared alloy generator.
 
         Returns:
             tuple:
@@ -2875,21 +3229,8 @@ class sample(logging):
                     lattice_positions_cp[:, cp.newaxis, :] + lattice_atom_cartesian_cp[cp.newaxis, :, :]
                 ).reshape(-1, 3)
 
-                # In-box mask against [0, dimensions]
-                dims_gpu = cp.asarray(self.dimensions, dtype=cp.float32)
-                mask = (
-                    (atomic_positions_S[:, 0] >= 0) & (atomic_positions_S[:, 0] <= dims_gpu[0]) &
-                    (atomic_positions_S[:, 1] >= 0) & (atomic_positions_S[:, 1] <= dims_gpu[1]) &
-                    (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= dims_gpu[2])
-                )
-
-                # Ellipsoid mask: discard atoms outside inscribed ellipsoid
-                if getattr(self, '_sample_shape', 'box') == 'ellipsoid':
-                    semi = dims_gpu * 0.5
-                    norm_sq = ((atomic_positions_S[:, 0] - semi[0]) / semi[0])**2 + \
-                              ((atomic_positions_S[:, 1] - semi[1]) / semi[1])**2 + \
-                              ((atomic_positions_S[:, 2] - semi[2]) / semi[2])**2
-                    mask = mask & (norm_sq <= 1.0)
+                # Box and (for ellipsoid samples) ellipsoid mask
+                mask = self._shape_mask(atomic_positions_S, cp)
 
                 # Filter and apply center/offset
                 atomic_positions_S = atomic_positions_S[mask, :]
@@ -2904,11 +3245,9 @@ class sample(logging):
                 mask_np = mask.get()
                 positions_np = atomic_positions_S.get()
 
-                atomic_species = self._build_species(material.species, int(lattice_positions_cp.shape[0]), mask_np)
-
-                # Free temporary device allocations
-                cp.get_default_memory_pool().free_all_blocks()
-                gc.collect()
+                atomic_species = self._build_species(
+                    material.species, int(lattice_positions_cp.shape[0]), mask_np, rng=species_rng
+                )
                 return positions_np.astype(np.float32, copy=False), atomic_species
 
         # CPU branch (unchanged semantics)
@@ -2922,29 +3261,18 @@ class sample(logging):
             lattice_atom_cartesian_np[np.newaxis, :, :]
         ).reshape(-1, 3)
 
-        # In-box mask on CPU
-        mask = (
-            (atomic_positions_S[:, 0] >= 0) & (atomic_positions_S[:, 0] <= self.dimensions[0]) &
-            (atomic_positions_S[:, 1] >= 0) & (atomic_positions_S[:, 1] <= self.dimensions[1]) &
-            (atomic_positions_S[:, 2] >= 0) & (atomic_positions_S[:, 2] <= self.dimensions[2])
-        )
-
-        # Ellipsoid mask: discard atoms outside inscribed ellipsoid
-        if getattr(self, '_sample_shape', 'box') == 'ellipsoid':
-            semi = self.dimensions * 0.5
-            norm_sq = ((atomic_positions_S[:, 0] - semi[0]) / semi[0])**2 + \
-                      ((atomic_positions_S[:, 1] - semi[1]) / semi[1])**2 + \
-                      ((atomic_positions_S[:, 2] - semi[2]) / semi[2])**2
-            mask = mask & (norm_sq <= 1.0)
+        # Box and (for ellipsoid samples) ellipsoid mask
+        mask = self._shape_mask(atomic_positions_S, np)
 
         # Apply mask and center/offset shift
         atomic_positions_S = atomic_positions_S[mask, :].astype(np.float32)
-        atomic_species = self._build_species(material.species, lattice_positions_np.shape[0], mask)
+        atomic_species = self._build_species(
+            material.species, lattice_positions_np.shape[0], mask, rng=species_rng
+        )
 
         offset_np = self.offset.astype(np.float32)
         dim_half_np = (self.dimensions * 0.5).astype(np.float32)
         atomic_positions_S += (offset_np - dim_half_np)
-        gc.collect()
         return atomic_positions_S, atomic_species
 
     def generate_sample_single(
@@ -3019,23 +3347,19 @@ class sample(logging):
             self._streaming_use_gpu = use_gpu  # Remember GPU preference for streaming
             self._streaming_material = material
             self._compute_streaming_chunk_mapping(material, flush_size)
+            # Streaming draws alloy species per chunk from the root seed
+            self._teardown_alloy()
             return
 
         flush_size = int(flush_size)
 
-        from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
-
-        # Thread pool for disk writes
+        # Bounded writer pool for chunk files
         def _write_chunk(idx, pos_arr, spc_arr):
             self.write_chunk_positions(pos_arr, idx)
             self.write_chunk_species(spc_arr, idx)
             return idx
 
-        writer_pool = ThreadPoolExecutor(
-            max_workers=max(1, int(writer_threads)),
-            thread_name_prefix="writer"
-        )
-        pending_writes = []
+        writer = _ChunkWriter(_write_chunk, writer_threads)
 
         # CPU-side streaming buffers shared by both GPU and CPU paths
         buf_pos = None
@@ -3044,7 +3368,7 @@ class sample(logging):
         file_chunk_index = 0
 
         def _accumulate_to_buffers(pos_np, spc_np):
-            nonlocal buf_pos, buf_spc, fill, file_chunk_index, pending_writes
+            nonlocal buf_pos, buf_spc, fill, file_chunk_index
             n = int(pos_np.shape[0])
             if n == 0:
                 return
@@ -3066,268 +3390,272 @@ class sample(logging):
                 if fill == flush_size:
                     file_chunk_index += 1
                     # Copy slices to isolate from subsequent overwrites
-                    pending_writes.append(
-                        writer_pool.submit(_write_chunk, file_chunk_index, buf_pos.copy(), buf_spc.copy())
-                    )
+                    writer.submit(file_chunk_index, buf_pos.copy(), buf_spc.copy())
                     fill = 0  # reset
 
         def _flush_tail():
-            nonlocal fill, file_chunk_index, pending_writes
+            nonlocal fill, file_chunk_index
             if fill > 0:
                 file_chunk_index += 1
-                pending_writes.append(
-                    writer_pool.submit(_write_chunk, file_chunk_index, buf_pos[:fill].copy(), buf_spc[:fill].copy())
-                )
+                writer.submit(file_chunk_index, buf_pos[:fill].copy(), buf_spc[:fill].copy())
                 fill = 0
 
-        # 3) Decide if we can and should use GPU, and how many
-        gpu_ok = False
-        available_gpus = 0
-        if use_gpu and (cp is not None):
-            try:
-                available_gpus = int(cp.cuda.runtime.getDeviceCount())
-                gpu_ok = (available_gpus > 0)
-            except Exception:
-                gpu_ok = False
+        # Geometric chunks already drained into the buffers; a GPU failure
+        # resumes with exactly the ones still missing
+        done = set()
 
-        # Determine number of GPUs to use
-        if n_gpus is None:
-            use_n_gpus = max(1, available_gpus)
-        else:
-            use_n_gpus = min(int(n_gpus), available_gpus) if available_gpus > 0 else 0
-
-        # GPU path
-        drained_count = 0  # number of geom-chunks fully drained into CPU buffers
-
-        # Multi-GPU path: distribute chunks across multiple GPUs
-        if gpu_ok and use_n_gpus > 1:
-            try:
-                n_streams = max(1, int(gpu_streams))
-                buf_lock = threading.Lock()
-
-                # Round-robin distribute chunks to GPUs
-                shards = [[] for _ in range(use_n_gpus)]
-                for i in range(num_geom):
-                    shards[i % use_n_gpus].append(i)
-
-                # Shared state for multi-GPU accumulation
-                gpu_errors = [None] * use_n_gpus
-
-                def gpu_worker(dev_id, my_chunks):
-                    """Process assigned chunks on a specific GPU."""
-                    nonlocal drained_count
-                    try:
-                        cp.cuda.Device(dev_id).use()
-
-                        # Per-GPU stream ring
-                        streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
-
-                        # Preload GPU invariants once per device
-                        lattice_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
-                        offset_cp = cp.asarray(self.offset, dtype=cp.float32)
-                        dim_half_cp = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
-
-                        inflight = []
-                        enq_idx = 0
-
-                        def _enqueue_local(chunk_i, s):
-                            with s:
-                                pos_cp, mask_cp, site_count = self.get_atomic_data(
-                                    material,
-                                    self.chunk_positions[chunk_i, :],
-                                    self._chunk_dimensions,
-                                    use_gpu=True,
-                                    stream=s,
-                                    return_on_gpu=True,
-                                    lattice_atom_cartesian_cp=lattice_cp,
-                                    offset_gpu=offset_cp,
-                                    dim_half_gpu=dim_half_cp
-                                )
-                            ev = cp.cuda.Event()
-                            ev.record(s)
-                            inflight.append({
-                                "event": ev,
-                                "pos_cp": pos_cp,
-                                "mask_cp": mask_cp,
-                                "site_count": site_count
-                            })
-
-                        def _drain_local():
-                            nonlocal drained_count
-                            task = inflight.pop(0)
-                            task["event"].synchronize()
-
-                            pos_np = task["pos_cp"].get()
-                            mask_np = task["mask_cp"].get()
-
-                            spc_np = self._build_species(material.species, task["site_count"], mask_np)
-
-                            # Thread-safe accumulation
-                            with buf_lock:
-                                _accumulate_to_buffers(pos_np, spc_np)
-                                drained_count += 1
-
-                            del pos_np, mask_np, spc_np, task
-
-                        # Fill-drain loop for this GPU's chunks
-                        while (enq_idx < len(my_chunks)) or inflight:
-                            while (enq_idx < len(my_chunks)) and (len(inflight) < n_streams):
-                                s = streams[enq_idx % n_streams]
-                                _enqueue_local(my_chunks[enq_idx], s)
-                                enq_idx += 1
-
-                            if inflight:
-                                _drain_local()
-
-                        # Cleanup this GPU's memory
-                        try:
-                            cp.get_default_memory_pool().free_all_blocks()
-                        except Exception:
-                            pass
-
-                    except Exception as e:
-                        gpu_errors[dev_id] = e
-
-                # Launch one thread per GPU
-                threads = []
-                for dev_id in range(use_n_gpus):
-                    if shards[dev_id]:
-                        t = threading.Thread(
-                            target=gpu_worker,
-                            args=(dev_id, shards[dev_id]),
-                            name=f"GPU-{dev_id}"
-                        )
-                        t.start()
-                        threads.append(t)
-
-                # Wait for all GPUs to complete
-                for t in threads:
-                    t.join()
-
-                # Check for errors (if any GPU failed, fall back to CPU for remaining)
-                if any(e is not None for e in gpu_errors):
+        try:
+            # Decide if we can and should use GPU, and how many
+            gpu_ok = False
+            available_gpus = 0
+            if use_gpu and (cp is not None):
+                try:
+                    available_gpus = int(cp.cuda.runtime.getDeviceCount())
+                    gpu_ok = (available_gpus > 0)
+                except Exception:
                     gpu_ok = False
 
-            except Exception:
+            # Determine number of GPUs to use
+            if n_gpus is None:
+                use_n_gpus = max(1, available_gpus)
+            else:
+                use_n_gpus = min(int(n_gpus), available_gpus) if available_gpus > 0 else 0
+
+            # Multi-GPU path: chunks are sharded round-robin over the GPUs and
+            # handed back to this thread in geometric order, so the file chunks
+            # do not depend on which GPU finished first
+            if gpu_ok and use_n_gpus > 1:
                 try:
+                    n_streams = max(1, int(gpu_streams))
+
+                    shards = [[] for _ in range(use_n_gpus)]
+                    for i in range(num_geom):
+                        shards[i % use_n_gpus].append(i)
+
+                    gpu_errors = [None] * use_n_gpus
+                    results = _OrderedResults(window=use_n_gpus * (n_streams + 1))
+
+                    def gpu_worker(dev_id, my_chunks):
+                        """Generate this GPU's chunks and hand them over in order."""
+                        produced = 0
+                        try:
+                            cp.cuda.Device(dev_id).use()
+
+                            # Per-GPU stream ring
+                            streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
+
+                            # Preload GPU invariants once per device
+                            lattice_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
+                            offset_cp = cp.asarray(self.offset, dtype=cp.float32)
+                            dim_half_cp = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
+
+                            inflight = []
+                            enq_idx = 0
+
+                            def _enqueue_local(chunk_i, s):
+                                with s:
+                                    pos_cp, mask_cp, site_count = self.get_atomic_data(
+                                        material,
+                                        self.chunk_positions[chunk_i, :],
+                                        self._chunk_dimensions,
+                                        use_gpu=True,
+                                        stream=s,
+                                        return_on_gpu=True,
+                                        lattice_atom_cartesian_cp=lattice_cp,
+                                        offset_gpu=offset_cp,
+                                        dim_half_gpu=dim_half_cp
+                                    )
+                                ev = cp.cuda.Event()
+                                ev.record(s)
+                                inflight.append({
+                                    "index": chunk_i,
+                                    "event": ev,
+                                    "pos_cp": pos_cp,
+                                    "mask_cp": mask_cp,
+                                    "site_count": site_count
+                                })
+
+                            def _drain_local():
+                                nonlocal produced
+                                task = inflight.pop(0)
+                                task["event"].synchronize()
+                                pos_np = task["pos_cp"].get()
+                                mask_np = task["mask_cp"].get()
+                                results.put(task["index"], (pos_np, mask_np, task["site_count"]))
+                                produced += 1
+                                del task
+
+                            # Fill-drain loop for this GPU's chunks
+                            while ((enq_idx < len(my_chunks)) or inflight) and not results.stopped:
+                                while (enq_idx < len(my_chunks)) and (len(inflight) < n_streams):
+                                    s = streams[enq_idx % n_streams]
+                                    _enqueue_local(my_chunks[enq_idx], s)
+                                    enq_idx += 1
+
+                                if inflight:
+                                    _drain_local()
+
+                            try:
+                                cp.get_default_memory_pool().free_all_blocks()
+                            except Exception:
+                                pass
+
+                        except Exception as e:
+                            gpu_errors[dev_id] = e
+                            self._log("normal", f"[sample] GPU {dev_id} failed after {produced} of "
+                                                f"{len(my_chunks)} chunks: {type(e).__name__}: {e}")
+                            results.fail(my_chunks[produced:])
+
+                    threads = []
                     for dev_id in range(use_n_gpus):
-                        cp.cuda.Device(dev_id).use()
+                        if shards[dev_id]:
+                            t = threading.Thread(
+                                target=gpu_worker,
+                                args=(dev_id, shards[dev_id]),
+                                name=f"GPU-{dev_id}"
+                            )
+                            t.start()
+                            threads.append(t)
+
+                    # Consume in geometric order; species are built here so the
+                    # alloy draw order is fixed as well
+                    for i in range(num_geom):
+                        item = results.take(i)
+                        if item is None:
+                            break
+                        pos_np, mask_np, site_count = item
+                        spc_np = self._build_species(material.species, site_count, mask_np)
+                        _accumulate_to_buffers(pos_np, spc_np)
+                        done.add(i)
+                        del pos_np, mask_np, spc_np, item
+
+                    results.stop()
+                    for t in threads:
+                        t.join()
+
+                    if any(e is not None for e in gpu_errors):
+                        gpu_ok = False
+
+                except Exception as e:
+                    self._log("normal", f"[sample] multi-GPU generation failed, continuing on CPU: "
+                                        f"{type(e).__name__}: {e}")
+                    try:
+                        for dev_id in range(use_n_gpus):
+                            cp.cuda.Device(dev_id).use()
+                            cp.get_default_memory_pool().free_all_blocks()
+                    except Exception:
+                        pass
+                    gpu_ok = False
+
+            # Single-GPU path
+            elif gpu_ok:
+                try:
+                    n_streams = max(1, int(gpu_streams))
+                    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
+
+                    # Preload invariants once
+                    lattice_atom_cartesian_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
+                    offset_gpu = cp.asarray(self.offset, dtype=cp.float32)
+                    dim_half_gpu = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
+
+                    inflight = []  # list of dicts: {index, event, pos_cp, mask_cp, site_count}
+                    enqueue_idx = 0  # next geom-chunk index to enqueue
+
+                    def _enqueue(i, s):
+                        with s:
+                            pos_cp, mask_cp, site_count = self.get_atomic_data(
+                                material,
+                                self.chunk_positions[i, :],
+                                self._chunk_dimensions,
+                                use_gpu=True,
+                                stream=s,
+                                return_on_gpu=True,
+                                lattice_atom_cartesian_cp=lattice_atom_cartesian_cp,
+                                offset_gpu=offset_gpu,
+                                dim_half_gpu=dim_half_gpu
+                            )
+                        ev = cp.cuda.Event()
+                        ev.record(s)
+                        inflight.append({
+                            "index": i,
+                            "event": ev,
+                            "pos_cp": pos_cp,
+                            "mask_cp": mask_cp,
+                            "site_count": site_count
+                        })
+
+                    def _drain_one():
+                        task = inflight.pop(0)
+                        task["event"].synchronize()
+
+                        # Bring results to host
+                        pos_np = task["pos_cp"].get()
+                        mask_np = task["mask_cp"].get()
+
+                        # Build species vector on host
+                        spc_np = self._build_species(material.species, task["site_count"], mask_np)
+
+                        _accumulate_to_buffers(pos_np, spc_np)
+                        done.add(task["index"])
+
+                        # Cleanup local references
+                        del pos_np, mask_np, spc_np, task
+
+                    # Fill-drain loop
+                    while (enqueue_idx < num_geom) or inflight:
+                        # Enqueue up to ring capacity
+                        while (enqueue_idx < num_geom) and (len(inflight) < n_streams):
+                            s = streams[enqueue_idx % n_streams]
+                            _enqueue(enqueue_idx, s)
+                            enqueue_idx += 1
+
+                        # Drain at least one task if any are inflight
+                        if inflight:
+                            _drain_one()
+
+                    # Free GPU memory pool
+                    try:
                         cp.get_default_memory_pool().free_all_blocks()
-                except Exception:
-                    pass
-                gpu_ok = False
+                    except Exception:
+                        pass
 
-        # Single-GPU path
-        elif gpu_ok:
-            try:
-                n_streams = max(1, int(gpu_streams))
-                streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
+                except Exception as e:
+                    # GPU failure -> fall back to CPU for the chunks not yet drained
+                    self._log("normal", f"[sample] GPU generation failed after {len(done)} of "
+                                        f"{num_geom} chunks, continuing on CPU: {type(e).__name__}: {e}")
+                    try:
+                        cp.get_default_memory_pool().free_all_blocks()
+                    except Exception:
+                        pass
+                    gpu_ok = False
 
-                # Preload invariants once
-                lattice_atom_cartesian_cp = cp.asarray(material.lattice_atom_cartesian, dtype=cp.float32)
-                offset_gpu = cp.asarray(self.offset, dtype=cp.float32)
-                dim_half_gpu = cp.asarray(self.dimensions * 0.5, dtype=cp.float32)
-
-                inflight = []  # list of dicts: {event, pos_cp, mask_cp, site_count}
-                enqueue_idx = 0  # next geom-chunk index to enqueue
-
-                def _enqueue(i, s):
-                    with s:
-                        pos_cp, mask_cp, site_count = self.get_atomic_data(
-                            material,
-                            self.chunk_positions[i, :],
-                            self._chunk_dimensions,
-                            use_gpu=True,
-                            stream=s,
-                            return_on_gpu=True,
-                            lattice_atom_cartesian_cp=lattice_atom_cartesian_cp,
-                            offset_gpu=offset_gpu,
-                            dim_half_gpu=dim_half_gpu
-                        )
-                    ev = cp.cuda.Event()
-                    ev.record(s)
-                    inflight.append({
-                        "event": ev,
-                        "pos_cp": pos_cp,
-                        "mask_cp": mask_cp,
-                        "site_count": site_count
-                    })
-
-                def _drain_one():
-                    nonlocal drained_count
-                    task = inflight.pop(0)
-                    task["event"].synchronize()
-
-                    # Bring results to host
-                    pos_np = task["pos_cp"].get()
-                    mask_np = task["mask_cp"].get()
-
-                    # Build species vector on host
-                    spc_np = self._build_species(material.species, task["site_count"], mask_np)
-
+            # CPU path (or GPU fallback remainder): only the chunks not yet drained
+            if not gpu_ok:
+                for i in sorted(set(range(num_geom)) - done):
+                    pos_np, spc_np = self.get_atomic_data(
+                        material,
+                        self.chunk_positions[i, :],
+                        self._chunk_dimensions,
+                        use_gpu=False
+                    )
                     _accumulate_to_buffers(pos_np, spc_np)
-                    drained_count += 1
+                    done.add(i)
+                    del pos_np, spc_np
 
-                    # Cleanup local references
-                    del pos_np, mask_np, spc_np, task
-
-                # Fill-drain loop
-                while (enqueue_idx < num_geom) or inflight:
-                    # Enqueue up to ring capacity
-                    while (enqueue_idx < num_geom) and (len(inflight) < n_streams):
-                        s = streams[enqueue_idx % n_streams]
-                        _enqueue(enqueue_idx, s)
-                        enqueue_idx += 1
-
-                    # Drain at least one task if any are inflight
-                    if inflight:
-                        _drain_one()
-
-                # Free GPU memory pool
-                try:
-                    cp.get_default_memory_pool().free_all_blocks()
-                except Exception:
-                    pass
-
-            except (cp.cuda.memory.OutOfMemoryError, cp.cuda.runtime.CUDARuntimeError, RuntimeError, ValueError) as _gpu_err:
-                # GPU failure -> fall back to CPU for remaining work
-                try:
-                    cp.get_default_memory_pool().free_all_blocks()
-                except Exception:
-                    pass
-                gpu_ok = False  # signal CPU fallback
-
-            except Exception:
-                # Any other unexpected GPU-side error -> CPU fallback
-                try:
-                    cp.get_default_memory_pool().free_all_blocks()
-                except Exception:
-                    pass
-                gpu_ok = False
-
-        # CPU path (or GPU fallback remainder)
-        if not gpu_ok:
-            start_i = drained_count  # redo from first not-drained chunk
-            for i in range(start_i, num_geom):
-                pos_np, spc_np = self.get_atomic_data(
-                    material,
-                    self.chunk_positions[i, :],
-                    self._chunk_dimensions,
-                    use_gpu=False
-                )
-                _accumulate_to_buffers(pos_np, spc_np)
-                del pos_np, spc_np
-
-        # Flush trailing partial buffer and finish
-        _flush_tail()
-        wait(pending_writes, return_when=ALL_COMPLETED)
-        writer_pool.shutdown(wait=True)
+            # Flush trailing partial buffer; every write must succeed before
+            # the chunk count is recorded
+            _flush_tail()
+            writer.finish()
+        finally:
+            writer.close()
 
         # Update metadata
         self._chunk_total = int(file_chunk_index)
+        # Persist the chunk count with the rest of the metadata so a reloaded
+        # sample knows how many chunk files it has.
+        self.write_sample_metadata()
         self._teardown_alloy()
         return
-
     def input_voronoi_seed(self, seeds):
         """
         Set user-provided Voronoi seed map.
@@ -3380,7 +3708,8 @@ class sample(logging):
         Args:
             n_grains (int): number of grains (seeds).
             method (str): 'uniform' (default) or 'random'.
-            random_seed (int|None): RNG seed for reproducibility.
+            random_seed (int | np.random.SeedSequence | None): RNG seed for
+                reproducibility.
 
         Returns:
             np.ndarray: seeds (G, 3) in world coordinates, dtype float32.
@@ -3388,7 +3717,7 @@ class sample(logging):
         if n_grains is None or int(n_grains) <= 0:
             raise ValueError("generate_voronoi_seeds: n_grains must be positive")
 
-        rng = np.random.RandomState(None if random_seed is None else int(random_seed))
+        rng = self._legacy_rng(random_seed)
 
         dims = np.asarray(self.dimensions, dtype=np.float32)
         box_min = (self.offset - 0.5 * dims).astype(np.float32)
@@ -3439,6 +3768,21 @@ class sample(logging):
         self._grain_seeds = seeds
         self._grain_count = int(seeds.shape[0])
         return self._grain_seeds
+
+    @staticmethod
+    def _legacy_rng(seed):
+        """
+        RandomState from an int, a SeedSequence, or None (fresh entropy).
+
+        Args:
+            seed (int | np.random.SeedSequence | None): Seed source.
+
+        Returns:
+            np.random.RandomState
+        """
+        if isinstance(seed, np.random.SeedSequence):
+            return np.random.RandomState(np.random.MT19937(seed))
+        return np.random.RandomState(None if seed is None else int(seed))
 
     @staticmethod
     def _random_rotation_matrix(rng):
@@ -3501,8 +3845,9 @@ class sample(logging):
         Modes: 'random' (uniform SO(3)), 'textured' (half-Gaussian tilt about
         texture_axis), 'march-dollase' (tilt drawn from the March-Dollase
         distribution with parameter march_r; r=1 reduces to isotropic).
+        `random_seed` may be an int, a SeedSequence, or None.
         """
-        rng = np.random.RandomState(None if random_seed is None else int(random_seed))
+        rng = self._legacy_rng(random_seed)
         R = np.zeros((int(n_grains), 3, 3), dtype=np.float32)
         if mode not in ("random", "textured", "march-dollase"):
             raise ValueError(
@@ -3581,21 +3926,41 @@ class sample(logging):
         return mat
 
     @staticmethod
-    def _voronoi_min_index_cpu(positions_np, seeds_np):
+    def _voronoi_min_index_cpu(positions_np, seeds_np, pos_tile=2048, seed_tile=1024):
         """
-        Return argmin seed index for each position (CPU; streaming over seeds).
+        Return argmin seed index for each position (CPU, tiled).
+
+        Works on blocks of `pos_tile` positions by `seed_tile` seeds, one
+        coordinate at a time: squared differences are formed in float32 and
+        accumulated in float64, the same arithmetic as a per-seed pass, with
+        bounded memory and no Python loop per seed. Ties go to the lowest
+        seed index.
         """
+        positions_np = np.asarray(positions_np, dtype=np.float32)
+        seeds_np = np.asarray(seeds_np, dtype=np.float32)
         N = positions_np.shape[0]
         G = seeds_np.shape[0]
         min_d2 = np.full((N,), np.inf, dtype=np.float64)
         min_idx = np.full((N,), -1, dtype=np.int32)
-        # loop seeds to keep memory O(N)
-        for g in range(G):
-            d = positions_np - seeds_np[g, :][None, :]
-            d2 = np.sum(d * d, axis=1, dtype=np.float64)
-            mask = d2 < min_d2
-            min_idx[mask] = g
-            min_d2[mask] = d2[mask]
+        for p0 in range(0, N, pos_tile):
+            p1 = min(N, p0 + pos_tile)
+            P = positions_np[p0:p1]
+            rows = np.arange(p1 - p0)
+            for s0 in range(0, G, seed_tile):
+                s1 = min(G, s0 + seed_tile)
+                S = seeds_np[s0:s1]
+                d = P[:, 0:1] - S[None, :, 0]
+                d *= d
+                d2 = d.astype(np.float64)
+                for k in (1, 2):
+                    d = P[:, k:k + 1] - S[None, :, k]
+                    d *= d
+                    d2 += d
+                j = np.argmin(d2, axis=1)
+                best = d2[rows, j]
+                better = best < min_d2[p0:p1]
+                min_idx[p0:p1][better] = (s0 + j[better]).astype(np.int32)
+                min_d2[p0:p1][better] = best[better]
         return min_idx
 
     @staticmethod
@@ -3845,19 +4210,13 @@ class sample(logging):
             labels = self._voronoi_min_index_cpu(probe, seeds_np)
 
         pad = 1.5 * dims / float(n_probe)
-        lo = np.empty((G, 3), dtype=np.float64)
-        hi = np.empty((G, 3), dtype=np.float64)
-        n_missed = 0
-        for g in range(G):
-            pts = probe[labels == g]
-            if pts.shape[0] == 0:
-                # Cell smaller than the probe spacing; fall back to the seed
-                n_missed += 1
-                lo[g] = seeds_np[g] - pad
-                hi[g] = seeds_np[g] + pad
-            else:
-                lo[g] = pts.min(axis=0) - pad
-                hi[g] = pts.max(axis=0) + pad
+
+        # Cells smaller than the probe spacing catch no probe point and fall
+        # back to the seed; every other cell gets the extent of its points
+        mins, maxs, hit = self._label_extents(probe, labels, G)
+        lo = np.where(hit[:, None], mins - pad, seeds_np.astype(np.float64) - pad)
+        hi = np.where(hit[:, None], maxs + pad, seeds_np.astype(np.float64) + pad)
+        n_missed = G - int(hit.sum())
 
         if n_missed > 0:
             self._log("normal", f"[sample] {n_missed} of {G} Voronoi cells were smaller than the "
@@ -3866,6 +4225,38 @@ class sample(logging):
         lo = np.maximum(lo, box_min)
         hi = np.minimum(hi, box_min + dims)
         return lo, hi
+
+    @staticmethod
+    def _label_extents(points, labels, n_labels):
+        """
+        Per-label coordinate minimum and maximum of a labelled point set.
+
+        Sorts the labels once and reduces over each run, so the cost is one
+        sort of the points rather than one pass over them per label.
+
+        Args:
+            points (np.ndarray): (N, 3) points.
+            labels (np.ndarray): (N,) integer label of each point, in [0, n_labels).
+            n_labels (int): Number of labels.
+
+        Returns:
+            tuple: (mins, maxs, hit); mins and maxs are (n_labels, 3) float64
+            and are only meaningful where the (n_labels,) boolean hit is True.
+        """
+        labels = np.asarray(labels)
+        points = np.asarray(points, dtype=np.float64)
+        mins = np.zeros((int(n_labels), 3), dtype=np.float64)
+        maxs = np.zeros((int(n_labels), 3), dtype=np.float64)
+        hit = np.zeros(int(n_labels), dtype=bool)
+        if labels.size == 0:
+            return mins, maxs, hit
+        order = np.argsort(labels, kind="stable")
+        sorted_points = points[order]
+        present, starts = np.unique(labels[order], return_index=True)
+        mins[present] = np.minimum.reduceat(sorted_points, starts, axis=0)
+        maxs[present] = np.maximum.reduceat(sorted_points, starts, axis=0)
+        hit[present] = True
+        return mins, maxs, hit
 
     @staticmethod
     def _grain_candidate_seeds(seeds_np, lo, hi):
@@ -3885,15 +4276,21 @@ class sample(logging):
         Returns:
             list[np.ndarray]: Per grain, a sorted array of candidate seed indices.
         """
+        from scipy.spatial import cKDTree
+
         seeds_np = np.asarray(seeds_np, dtype=np.float64)
+        lo = np.asarray(lo, dtype=np.float64)
+        hi = np.asarray(hi, dtype=np.float64)
         corners = sample.get_unit_corners().astype(np.float64)
-        out = []
-        for g in range(seeds_np.shape[0]):
-            box_corners = lo[g] + corners * (hi[g] - lo[g])
-            radius = float(np.linalg.norm(box_corners - seeds_np[g], axis=1).max())
-            d = np.linalg.norm(seeds_np - seeds_np[g], axis=1)
-            out.append(np.flatnonzero(d < 2.0 * radius + 1.0e-9))
-        return out
+
+        # Farthest box corner from each seed, for all grains at once
+        box_corners = lo[:, None, :] + corners[None, :, :] * (hi - lo)[:, None, :]
+        radius = np.linalg.norm(box_corners - seeds_np[:, None, :], axis=2).max(axis=1)
+
+        # Seeds within 2 R_g of seed g, through a tree instead of an all-pairs scan
+        tree = cKDTree(seeds_np)
+        near = tree.query_ball_point(seeds_np, r=2.0 * radius + 1.0e-9)
+        return [np.sort(np.asarray(idx, dtype=np.int64)) for idx in near]
 
     def _build_grain_regions(self, use_gpu=True):
         """
@@ -4006,7 +4403,7 @@ class sample(logging):
 
         return positions, mask, int(cells.shape[0])
 
-    def _generate_grain_region(self, material, region_idx, use_gpu=True):
+    def _generate_grain_region(self, material, region_idx, use_gpu=True, species_rng=None):
         """
         Generate the atoms of one grain that fall inside one generation region.
 
@@ -4019,6 +4416,9 @@ class sample(logging):
             material: Material object with lattice data.
             region_idx (int): 0-based index into `_grain_regions`.
             use_gpu (bool, optional): Use the CuPy path if available. Defaults to True.
+            species_rng (np.random.Generator | None, optional): Generator for
+                the alloy species draw of this region (streaming mode). None
+                uses the shared alloy generator.
 
         Returns:
             tuple: (positions, species) NumPy arrays for this region.
@@ -4061,15 +4461,8 @@ class sample(logging):
             inside = inside[keep, :]
 
         mask_np = mask.get() if gpu_available else mask
-        species = self._build_species(material.species, site_count, mask_np)
+        species = self._build_species(material.species, site_count, mask_np, rng=species_rng)
         positions_np = inside.get() if gpu_available else inside
-
-        if gpu_available:
-            del positions, mask, inside, seeds_sub
-            try:
-                cp.get_default_memory_pool().free_all_blocks()
-            except Exception:
-                pass
 
         return np.asarray(positions_np, dtype=np.float32), species
 
@@ -4197,10 +4590,16 @@ class sample(logging):
 
         self._sample_type = "poly"
 
+        # Seeds and orientations draw from two independent streams of the same
+        # root seed, so a grain's orientation is not a function of its position
+        seed_streams = np.random.SeedSequence(
+            None if randomness_seed is None else int(randomness_seed)
+        ).spawn(2)
+
         # Seeds
         if self._grain_seeds is None:
             G = int(8 if (n_grains is None) else n_grains)
-            self.generate_voronoi_seeds(G, method=voronoi_method, random_seed=randomness_seed)
+            self.generate_voronoi_seeds(G, method=voronoi_method, random_seed=seed_streams[0])
         else:
             G = int(self._grain_seeds.shape[0])
             if n_grains is not None and int(n_grains) != G:
@@ -4213,7 +4612,7 @@ class sample(logging):
                 mode=orientation_mode,
                 texture_axis=texture_axis,
                 spread_deg=texture_spread_deg,
-                random_seed=randomness_seed,
+                random_seed=seed_streams[1],
                 march_r=march_r
             )
             self._grain_orientations = R
@@ -4234,24 +4633,18 @@ class sample(logging):
             self._streaming_use_gpu = use_gpu  # Remember GPU preference for streaming
             self._streaming_material = material
             self._compute_streaming_chunk_mapping(material, flush_size)
+            self._teardown_alloy()
             return
-
-        # Writer and global accumulation buffers (same pattern as generate_sample_single)
-        from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
-        import threading
 
         flush_size = int(flush_size)
 
+        # Bounded writer pool for chunk files
         def _write_chunk(idx, pos_arr, spc_arr):
             self.write_chunk_positions(pos_arr, idx)
             self.write_chunk_species(spc_arr, idx)
             return idx
 
-        writer_pool = ThreadPoolExecutor(
-            max_workers=max(1, int(writer_threads)),
-            thread_name_prefix="writer"
-        )
-        pending_writes = []
+        writer = _ChunkWriter(_write_chunk, writer_threads)
 
         buf_pos = None
         buf_spc = None
@@ -4259,12 +4652,16 @@ class sample(logging):
         file_chunk_index = 0
         lock = threading.Lock()
 
-        def _accumulate_to_buffers(pos_np, spc_np):
-            nonlocal buf_pos, buf_spc, fill, file_chunk_index, pending_writes
+        # Regions already accumulated; a GPU failure resumes with the rest
+        done = set()
+
+        def _accumulate_to_buffers(pos_np, spc_np, region_idx):
+            nonlocal buf_pos, buf_spc, fill, file_chunk_index
             n = int(pos_np.shape[0])
-            if n == 0:
-                return
             with lock:
+                done.add(int(region_idx))
+                if n == 0:
+                    return
                 if buf_pos is None:
                     buf_pos = np.empty((flush_size, 3), dtype=pos_np.dtype)
                     buf_spc = np.empty((flush_size,), dtype=np.asarray(spc_np).dtype)
@@ -4282,161 +4679,174 @@ class sample(logging):
 
                     if fill == flush_size:
                         file_chunk_index += 1
-                        pending_writes.append(
-                            writer_pool.submit(_write_chunk, file_chunk_index, buf_pos.copy(), buf_spc.copy())
-                        )
+                        writer.submit(file_chunk_index, buf_pos.copy(), buf_spc.copy())
                         fill = 0  # reset
 
         def _flush_tail():
-            nonlocal fill, file_chunk_index, pending_writes
+            nonlocal fill, file_chunk_index
             with lock:
                 if fill > 0:
                     file_chunk_index += 1
-                    pending_writes.append(
-                        writer_pool.submit(_write_chunk, file_chunk_index, buf_pos[:fill].copy(), buf_spc[:fill].copy())
-                    )
+                    writer.submit(file_chunk_index, buf_pos[:fill].copy(), buf_spc[:fill].copy())
                     fill = 0
 
-        # 4) Decide if GPU is available, and how many
-        gpu_ok = False
-        available_gpus = 0
-        if use_gpu and (cp is not None):
-            try:
-                available_gpus = int(cp.cuda.runtime.getDeviceCount())
-                gpu_ok = (available_gpus > 0)
-            except Exception:
-                gpu_ok = False
-
-        # Determine number of GPUs to use
-        if n_gpus is None:
-            use_n_gpus = max(1, available_gpus)
-        else:
-            use_n_gpus = min(int(n_gpus), available_gpus) if available_gpus > 0 else 0
-
-        # Per-region generation: each region carries one grain's own rotated
-        # lattice, cut to the Voronoi cell it actually falls in
-
-        # Multi-GPU path: distribute regions across multiple GPUs
-        if gpu_ok and use_n_gpus > 1:
-            try:
-                # Round-robin distribute regions to GPUs
-                shards = [[] for _ in range(use_n_gpus)]
-                for i in range(num_regions):
-                    shards[i % use_n_gpus].append(i)
-
-                # Shared state for multi-GPU accumulation
-                gpu_errors = [None] * use_n_gpus
-
-                def gpu_worker_poly(dev_id, my_regions):
-                    """Process assigned regions on a specific GPU."""
-                    try:
-                        cp.cuda.Device(dev_id).use()
-
-                        for region_idx in my_regions:
-                            pos_np, spc_np = self._generate_grain_region(
-                                material, region_idx, use_gpu=True
-                            )
-                            if pos_np.shape[0] == 0:
-                                continue
-
-                            # Thread-safe accumulation (lock is inside _accumulate_to_buffers)
-                            _accumulate_to_buffers(pos_np, spc_np)
-
-                        try:
-                            cp.get_default_memory_pool().free_all_blocks()
-                        except Exception:
-                            pass
-
-                    except Exception as e:
-                        gpu_errors[dev_id] = e
-
-                # Launch one thread per GPU
-                threads = []
-                for dev_id in range(use_n_gpus):
-                    if shards[dev_id]:
-                        t = threading.Thread(
-                            target=gpu_worker_poly,
-                            args=(dev_id, shards[dev_id]),
-                            name=f"GPU-{dev_id}"
-                        )
-                        t.start()
-                        threads.append(t)
-
-                # Wait for all GPUs to complete
-                for t in threads:
-                    t.join()
-
-                # Check for errors
-                if any(e is not None for e in gpu_errors):
+        try:
+            # Decide if GPU is available, and how many
+            gpu_ok = False
+            available_gpus = 0
+            if use_gpu and (cp is not None):
+                try:
+                    available_gpus = int(cp.cuda.runtime.getDeviceCount())
+                    gpu_ok = (available_gpus > 0)
+                except Exception:
                     gpu_ok = False
 
-            except Exception:
-                try:
-                    for dev_id in range(use_n_gpus):
-                        cp.cuda.Device(dev_id).use()
-                        cp.get_default_memory_pool().free_all_blocks()
-                except Exception:
-                    pass
-                gpu_ok = False
-
-        # Single-GPU path
-        elif gpu_ok:
-            try:
-                for region_idx in range(num_regions):
-                    pos_np, spc_np = self._generate_grain_region(
-                        material, region_idx, use_gpu=True
-                    )
-                    if pos_np.shape[0] == 0:
-                        continue
-
-                    _accumulate_to_buffers(pos_np, spc_np)
-
-                try:
-                    cp.get_default_memory_pool().free_all_blocks()
-                except Exception:
-                    pass
-
-            except (cp.cuda.memory.OutOfMemoryError, cp.cuda.runtime.CUDARuntimeError, RuntimeError, ValueError):
-                # GPU error -> fallback to CPU path
-                try:
-                    cp.get_default_memory_pool().free_all_blocks()
-                except Exception:
-                    pass
-                gpu_ok = False  # Fall through to CPU path
-
-        if not gpu_ok:
-            # CPU path: region-level parallelism
-            def _process_region_cpu(region_idx):
-                pos_np, spc_np = self._generate_grain_region(
-                    material, region_idx, use_gpu=False
-                )
-                if pos_np.shape[0] == 0:
-                    return
-
-                _accumulate_to_buffers(pos_np, spc_np)
-
-            # Process regions (can be parallelized with threads if needed)
-            if grain_workers is None or int(grain_workers) <= 0:
-                try:
-                    grain_workers = min(num_regions, os.cpu_count() or 1)
-                except Exception:
-                    grain_workers = min(num_regions, 4)
-
-            if num_regions > 1 and grain_workers > 1:
-                with ThreadPoolExecutor(max_workers=int(grain_workers), thread_name_prefix="grain") as pool:
-                    futs = [pool.submit(_process_region_cpu, i) for i in range(num_regions)]
-                    wait(futs, return_when=ALL_COMPLETED)
+            # Determine number of GPUs to use
+            if n_gpus is None:
+                use_n_gpus = max(1, available_gpus)
             else:
-                for i in range(num_regions):
-                    _process_region_cpu(i)
+                use_n_gpus = min(int(n_gpus), available_gpus) if available_gpus > 0 else 0
 
-        # Flush and finalize
-        _flush_tail()
-        wait(pending_writes, return_when=ALL_COMPLETED)
-        writer_pool.shutdown(wait=True)
+            # Per-region generation: each region carries one grain's own rotated
+            # lattice, cut to the Voronoi cell it actually falls in
+
+            # Multi-GPU path: regions are sharded round-robin over the GPUs and
+            # handed back to this thread in region order, so the file chunks do
+            # not depend on which GPU finished first
+            if gpu_ok and use_n_gpus > 1:
+                try:
+                    shards = [[] for _ in range(use_n_gpus)]
+                    for i in range(num_regions):
+                        shards[i % use_n_gpus].append(i)
+
+                    gpu_errors = [None] * use_n_gpus
+                    results = _OrderedResults(window=2 * use_n_gpus)
+
+                    def gpu_worker_poly(dev_id, my_regions):
+                        """Generate this GPU's regions and hand them over in order."""
+                        produced = 0
+                        try:
+                            cp.cuda.Device(dev_id).use()
+
+                            for region_idx in my_regions:
+                                if results.stopped:
+                                    break
+                                pos_np, spc_np = self._generate_grain_region(
+                                    material, region_idx, use_gpu=True
+                                )
+                                results.put(region_idx, (pos_np, spc_np))
+                                produced += 1
+
+                            try:
+                                cp.get_default_memory_pool().free_all_blocks()
+                            except Exception:
+                                pass
+
+                        except Exception as e:
+                            gpu_errors[dev_id] = e
+                            self._log("normal", f"[sample] GPU {dev_id} failed after {produced} of "
+                                                f"{len(my_regions)} regions: {type(e).__name__}: {e}")
+                            results.fail(my_regions[produced:])
+
+                    threads = []
+                    for dev_id in range(use_n_gpus):
+                        if shards[dev_id]:
+                            t = threading.Thread(
+                                target=gpu_worker_poly,
+                                args=(dev_id, shards[dev_id]),
+                                name=f"GPU-{dev_id}"
+                            )
+                            t.start()
+                            threads.append(t)
+
+                    # Consume in region order
+                    for i in range(num_regions):
+                        item = results.take(i)
+                        if item is None:
+                            break
+                        _accumulate_to_buffers(item[0], item[1], i)
+                        del item
+
+                    results.stop()
+                    for t in threads:
+                        t.join()
+
+                    if any(e is not None for e in gpu_errors):
+                        gpu_ok = False
+
+                except Exception as e:
+                    self._log("normal", f"[sample] multi-GPU generation failed, continuing on CPU: "
+                                        f"{type(e).__name__}: {e}")
+                    try:
+                        for dev_id in range(use_n_gpus):
+                            cp.cuda.Device(dev_id).use()
+                            cp.get_default_memory_pool().free_all_blocks()
+                    except Exception:
+                        pass
+                    gpu_ok = False
+
+            # Single-GPU path
+            elif gpu_ok:
+                try:
+                    for region_idx in range(num_regions):
+                        pos_np, spc_np = self._generate_grain_region(
+                            material, region_idx, use_gpu=True
+                        )
+                        _accumulate_to_buffers(pos_np, spc_np, region_idx)
+
+                    try:
+                        cp.get_default_memory_pool().free_all_blocks()
+                    except Exception:
+                        pass
+
+                except Exception as e:
+                    # GPU error -> the regions not yet accumulated go to the CPU path
+                    self._log("normal", f"[sample] GPU generation failed after {len(done)} of "
+                                        f"{num_regions} regions, continuing on CPU: {type(e).__name__}: {e}")
+                    try:
+                        cp.get_default_memory_pool().free_all_blocks()
+                    except Exception:
+                        pass
+                    gpu_ok = False
+
+            if not gpu_ok:
+                # CPU path: region-level parallelism over the regions still missing
+                def _process_region_cpu(region_idx):
+                    pos_np, spc_np = self._generate_grain_region(
+                        material, region_idx, use_gpu=False
+                    )
+                    _accumulate_to_buffers(pos_np, spc_np, region_idx)
+
+                remaining = sorted(set(range(num_regions)) - done)
+
+                if grain_workers is None or int(grain_workers) <= 0:
+                    try:
+                        grain_workers = min(max(1, len(remaining)), os.cpu_count() or 1)
+                    except Exception:
+                        grain_workers = min(max(1, len(remaining)), 4)
+
+                if len(remaining) > 1 and grain_workers > 1:
+                    with ThreadPoolExecutor(max_workers=int(grain_workers), thread_name_prefix="grain") as pool:
+                        futs = [pool.submit(_process_region_cpu, i) for i in remaining]
+                        wait(futs, return_when=ALL_COMPLETED)
+                        for f in futs:
+                            f.result()
+                else:
+                    for i in remaining:
+                        _process_region_cpu(i)
+
+            # Flush and finalize; every write must succeed before the chunk
+            # count is recorded
+            _flush_tail()
+            writer.finish()
+        finally:
+            writer.close()
 
         # update metadata
         self._chunk_total = int(file_chunk_index)
+        # Persist the chunk count with the rest of the metadata so a reloaded
+        # sample knows how many chunk files it has.
+        self.write_sample_metadata()
         self._teardown_alloy()
         return
     # -------------------------------------
