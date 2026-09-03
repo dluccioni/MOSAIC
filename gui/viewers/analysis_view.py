@@ -553,8 +553,9 @@ class AnalysisView(QWidget):
             params = self._get_integration_params()
             self.status_label.setText("Integrating...")
 
-            # Perform integration with external plot
-            bin_centers, integrated_values = self.state.analysis.integrate_detector_along_axis(
+            # Perform integration with external plot; the returned figure is
+            # shown below and owned by this caller
+            bin_centers, integrated_values, fig, ax = self.state.analysis.integrate_detector_along_axis(
                 detector=self.state.detector,
                 data_type=params['data_type'],
                 axis=params['axis'],
@@ -567,7 +568,8 @@ class AnalysisView(QWidget):
                 title=params['title'],
                 xlabel=params['xlabel'],
                 ylabel=params['ylabel'],
-                figsize=params['figsize']
+                figsize=params['figsize'],
+                return_figure=True
             )
 
             # Store results

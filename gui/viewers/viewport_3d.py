@@ -519,9 +519,11 @@ class Viewport3D(QWidget):
                     rotation = np.array(stage.rotation)
                     transform = MatrixTransform()
 
-                    # Build 4x4 matrix from 3x3 rotation
+                    # Build 4x4 matrix from 3x3 rotation. VisPy applies
+                    # row vectors (v @ M), so the column-convention stage
+                    # rotation enters transposed.
                     mat4 = np.eye(4)
-                    mat4[:3, :3] = rotation
+                    mat4[:3, :3] = rotation.T
                     transform.matrix = mat4
                     box.transform = transform
 

@@ -202,9 +202,9 @@ class DiffractionCalculator:
         by _cumulative_rotation, so Q_crystal computed from it is already
         in the sample frame. We only need to apply the stage rotation.
 
-        Convention note: Stage.get_rotation() returns R designed for row-vector
-        convention (pos_lab = pos_sample @ R, used in Beam.py). For column-vector
-        Q-vectors, we need: Q_lab = R.T @ Q_sample.
+        Convention note: Stage.get_rotation() returns the sample-to-lab matrix
+        in the column-vector convention (pos_lab = R @ pos_sample, applied by
+        Beam.py as pos @ R.T on row-stacked positions), so Q_lab = R @ Q_sample.
 
         Args:
             hkl: Tuple of Miller indices (h, k, l).
@@ -218,13 +218,11 @@ class DiffractionCalculator:
         Q_sample = self.get_q_vector_crystal(hkl)
 
         # Apply stage rotation to transform from sample frame to lab frame
-        # Stage.get_rotation() is designed for row-vectors: pos_lab = pos_sample @ R
-        # For column-vector Q: Q_lab = R.T @ Q_sample
         R_stage = np.eye(3)
         if self.stage is not None:
             R_stage = self.stage.get_rotation()
 
-        return R_stage.T @ Q_sample
+        return R_stage @ Q_sample
 
     def get_detector_angles(self, hkl: Tuple[int, int, int]) -> Optional[Tuple[float, float]]:
         """Calculate detector angles to capture a specific reflection.
@@ -581,10 +579,10 @@ class DiffractionCalculator:
         _motor_coupling attributes (as created by Stage.create_stage).
 
         Returns:
-            'busing-levy' if the rotation motors are (omega, chi, phi),
-            uncoupled, about axes [0,0,-1], [-1,0,0], [0,0,-1] (the negated
-            lab z/x/z axes, matching get_rotation()'s row-vector convention,
-            as created by Stage.create_stage(convention='busing-levy')).
+            'busing-levy' if the rotation motors are (omega, chi, phi) about
+            the lab z, x and z axes with chi carried by omega and phi carried
+            by omega and chi, as created by
+            Stage.create_stage(convention='busing-levy').
             'default' otherwise (including when no stage is set), which
             preserves the original solver for the shipped default goniometer.
         """
@@ -604,16 +602,23 @@ class DiffractionCalculator:
                 return 'default'
 
             expected_axes = {
-                'omega': np.array([0.0, 0.0, -1.0]),
-                'chi': np.array([-1.0, 0.0, 0.0]),
-                'phi': np.array([0.0, 0.0, -1.0]),
+                'omega': np.array([0.0, 0.0, 1.0]),
+                'chi': np.array([1.0, 0.0, 0.0]),
+                'phi': np.array([0.0, 0.0, 1.0]),
+            }
+            # Physical chain: omega at the base, chi on omega, phi on chi
+            i_omega, i_chi, i_phi = rot_idx
+            expected_couplings = {
+                'omega': [],
+                'chi': [i_omega],
+                'phi': [i_omega, i_chi],
             }
             for i, motor in zip(rot_idx, rot_names):
                 if not np.allclose(np.asarray(axes[i], dtype=float),
                                    expected_axes[motor], atol=1e-9):
                     return 'default'
-                # Rotation motors must be uncoupled (fixed lab axes)
-                if any(c is not None for c in couplings[i]):
+                carried_by = [int(c) for c in couplings[i] if c is not None]
+                if carried_by != expected_couplings[motor]:
                     return 'default'
         except Exception:
             return 'default'
@@ -626,14 +631,9 @@ class DiffractionCalculator:
         """Build the Busing-Levy stage rotation matrix from motor angles.
 
         Matches Stage.get_rotation() for a stage created with
-        Stage.create_stage(convention='busing-levy'): the rotation motors
-        (omega, chi, phi) are uncoupled with fixed axes [0,0,-1], [-1,0,0],
-        [0,0,-1], and get_rotation() composes them in motor order as
-        R = R_phi @ R_chi @ R_omega (row-vector convention).
-
-        Its transpose is the column-vector sample-to-lab rotation
-        R.T = R_z(omega) @ R_x(chi) @ R_z(phi), i.e. the Busing & Levy
-        (1967) four-circle composition with phi innermost.
+        Stage.create_stage(convention='busing-levy'): the column-vector
+        sample-to-lab rotation R = R_z(omega) @ R_x(chi) @ R_z(phi), i.e.
+        the Busing & Levy (1967) four-circle composition with phi innermost.
 
         Args:
             omega: Omega angle in radians
@@ -643,17 +643,15 @@ class DiffractionCalculator:
         Returns:
             3x3 rotation matrix matching Stage.get_rotation()
         """
-        omega_axis = np.array([0.0, 0.0, -1.0])
-        chi_axis = np.array([-1.0, 0.0, 0.0])
-        phi_axis = np.array([0.0, 0.0, -1.0])
+        omega_axis = np.array([0.0, 0.0, 1.0])
+        chi_axis = np.array([1.0, 0.0, 0.0])
+        phi_axis = np.array([0.0, 0.0, 1.0])
 
         R_omega = self._axis_angle_rotation(omega_axis, omega)
         R_chi = self._axis_angle_rotation(chi_axis, chi)
         R_phi = self._axis_angle_rotation(phi_axis, phi)
 
-        # Stage.get_rotation() iterates motors in list order (omega, chi,
-        # phi), left-multiplying each: R = R_phi @ R_chi @ R_omega
-        return R_phi @ R_chi @ R_omega
+        return R_omega @ R_chi @ R_phi
 
     def _compute_busing_levy_angles_for_alignment(
         self,
@@ -695,10 +693,9 @@ class DiffractionCalculator:
         # chi about x within the y-z plane: (rho_s, Qs[2]) -> (rho_t, Qt[2])
         chi = np.arctan2(Qt[2], rho_t) - np.arctan2(Qs[2], rho_s)
 
-        # Sanity check against the stage composition (row-vector matrix, so
-        # the column-vector sample-to-lab rotation is its transpose)
+        # Sanity check against the stage composition
         R = self._build_stage_rotation_busing_levy(omega, chi, phi)
-        Q_lab = R.T @ Qs
+        Q_lab = R @ Qs
         if 1.0 - np.dot(Q_lab / np.linalg.norm(Q_lab), Qt) > 1e-8:
             return None
 
@@ -763,9 +760,8 @@ class DiffractionCalculator:
             """Cost = 1 - cos(angle between rotated Q and target)."""
             phi, chi, omega = angles
             R = self._build_stage_rotation(phi, chi, omega)
-            # Use R.T because _build_stage_rotation returns row-vector convention matrix
-            # (matching Stage.get_rotation()), but we use column-vector Q
-            Q_lab = R.T @ Qs
+            # Column-vector convention, matching Stage.get_rotation()
+            Q_lab = R @ Qs
             Q_lab_norm = Q_lab / np.linalg.norm(Q_lab)
             # Return 1 - dot product (0 when aligned, 2 when opposite)
             return 1.0 - np.dot(Q_lab_norm, Qt)
@@ -789,10 +785,9 @@ class DiffractionCalculator:
         if abs(Qs[0]) < 0.01 and abs(Qs[1]) < 0.01 and abs(Qs[2]) > 0.99:
             # Q is along Z, compute phi directly
             # Q_target = [-sin(θ), cos(θ)*sin(η), cos(θ)*cos(η)]
-            # For phi rotation around [0,-1,0]: R.T @ [0,0,1] = [sin(phi), 0, cos(phi)]
-            # To match Q_target[0] = -sin(θ): sin(phi) = -sin(θ) => phi = -θ
-            # Since Qt[0] = -sin(θ), we have phi = arcsin(Qt[0])
-            analytical_phi = np.arcsin(Qt[0])  # Qt[0] = -sin(θ) => phi = -θ
+            # For phi rotation around [0,-1,0]: R @ [0,0,1] = [-sin(phi), 0, cos(phi)]
+            # To match Q_target[0] = -sin(θ): phi = θ, i.e. phi = -arcsin(Qt[0])
+            analytical_phi = -np.arcsin(Qt[0])
             test_angles = np.array([analytical_phi, 0.0, 0.0])
             test_cost = cost_function(test_angles)
             if test_cost < 1e-8:

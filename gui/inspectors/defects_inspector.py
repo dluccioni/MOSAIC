@@ -629,10 +629,13 @@ class DefectsInspector(InspectorPanel):
             if hasattr(pd, '_applied_vacancies') and pd._applied_vacancies:
                 count = sum(len(v) for v in pd._applied_vacancies)
                 applied_items.append(f"{count} vacancies")
+            # applied lists hold one (M, 3) array per chunk; count the rows
             if hasattr(pd, '_applied_substitutions') and pd._applied_substitutions:
-                applied_items.append(f"{len(pd._applied_substitutions)} substitutions")
+                count = sum(len(v) for v in pd._applied_substitutions)
+                applied_items.append(f"{count} substitutions")
             if hasattr(pd, '_applied_interstitials') and pd._applied_interstitials:
-                applied_items.append(f"{len(pd._applied_interstitials)} interstitials")
+                count = sum(len(v) for v in pd._applied_interstitials)
+                applied_items.append(f"{count} interstitials")
 
             if applied_items:
                 self.pd_list.addItem(f"[Applied: {', '.join(applied_items)}]")

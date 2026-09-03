@@ -1129,34 +1129,65 @@ class SimulationState:
                 print(f"Warning: Could not load pixel intensity: {e}")
 
     def _deserialize_stage(self, data: Dict) -> None:
-        """Deserialize stage from dictionary."""
+        """Deserialize stage from dictionary.
+
+        The stage_metadata.json written by Stage.write_stage_metadata is
+        preferred, so a custom stage (e.g. Busing-Levy) is restored exactly.
+        Otherwise the stage is rebuilt from the serialized motor lists when
+        they are complete, else the default stage is created and the saved
+        motor values applied.
+
+        Raises:
+            ValueError: If the saved motor values do not match the rebuilt
+                stage's motor count.
+        """
         directory = data.get('directory') or self._global_working_directory or os.getcwd()
 
-        try:
-            self._stage = StageType(directory)
+        stage = StageType(directory)
 
-            # Try to load from metadata file first
-            metadata_loaded = False
-            if directory and Path(directory).exists():
-                metadata_path = Path(directory) / "stage_metadata.npy"
-                if metadata_path.exists() and hasattr(self._stage, 'read_stage_metadata'):
-                    try:
-                        self._stage.read_stage_metadata()
-                        metadata_loaded = True
-                    except Exception:
-                        pass
+        # Try to load from metadata file first
+        metadata_loaded = False
+        metadata_path = Path(directory) / "stage_metadata.json" if directory else None
+        if metadata_path is not None and metadata_path.exists() and hasattr(stage, 'read_stage_metadata'):
+            try:
+                stage.read_stage_metadata()
+                metadata_loaded = True
+            except Exception as e:
+                print(f"Warning: Could not read {metadata_path}: {e}")
 
-            # Fall back to creating default stage and setting motor values
-            if not metadata_loaded:
-                self._stage.create_stage()
+        if not metadata_loaded:
+            motor_value = data.get('motor_value')
+            motor_lists = [data.get(k) for k in ('motor_name', 'motor_type', 'motor_coupling', 'motor_axis')]
+            if all(lst for lst in motor_lists):
+                # Rebuild the saved stage geometry (any convention)
+                motor_name, motor_type, motor_coupling, motor_axis = motor_lists
+                n = len(motor_name)
+                stage.create_stage(
+                    name=data.get('name') or ['goniometer'],
+                    motor_name=motor_name,
+                    motor_type=motor_type,
+                    motor_coupling=motor_coupling,
+                    motor_axis=motor_axis,
+                    motor_value=[0.0] * n,
+                    motor_resolution=[0.0] * n,
+                )
+            else:
+                stage.create_stage()
 
-                # Restore motor values if available
-                motor_value = data.get('motor_value')
-                if motor_value and hasattr(self._stage, 'set_motor_value_absolute'):
-                    self._stage.set_motor_value_absolute(motor_value_abs=motor_value, degrees=False)
-        except Exception as e:
-            print(f"Error loading stage: {e}")
-            self._stage = None
+            if motor_value:
+                n_motors = len(stage.motor_names)
+                if len(motor_value) != n_motors:
+                    raise ValueError(
+                        f"Saved stage state has {len(motor_value)} motor values but the "
+                        f"restored stage has {n_motors} motors {stage.motor_names}. "
+                        f"Save the stage metadata (stage_metadata.json) to restore a custom stage."
+                    )
+                stage.set_motor_value_absolute(motor_value_abs=motor_value, degrees=False)
+            else:
+                stage.get_rotation()
+                stage.get_translation()
+
+        self._stage = stage
 
     def _deserialize_optics(self, data: Dict) -> None:
         """Deserialize optics from dictionary."""

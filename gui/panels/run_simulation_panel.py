@@ -33,6 +33,7 @@ class SimulationWorker(QObject):
     progress = Signal(int, str)  # progress %, message
     finished = Signal(object)    # result dict
     error = Signal(str)          # error message
+    scan_image = Signal(object)  # {"title": str, "png": bytes} rendered off the GUI thread
 
     def __init__(self, state, adi_kwargs, propagation_enabled, prop_kwargs, mode="single", scan_config=None):
         """
@@ -228,7 +229,19 @@ class SimulationWorker(QObject):
         # Use kwargs gathered in main thread (thread-safe)
         prop_kwargs = self.prop_kwargs if self.propagation_enabled else None
 
-        # Run scan
+        def on_step(info):
+            # Runs in this worker thread: report progress and hand rendered
+            # images to the main thread; never open a window here
+            pct = 10 + int(85 * info["step"] / max(1, info["total"]))
+            self.progress.emit(pct, f"Step {info['step']}/{info['total']}: {info['position']}")
+            if show_plots:
+                for name, fig in info["figures"].items():
+                    png = self._figure_to_png(fig)
+                    if png is not None:
+                        self.scan_image.emit({"title": f"Step {info['step']}/{info['total']} {name}", "png": png})
+
+        # Plots are shown on the main thread from the emitted images, so the
+        # scan itself never calls plt.show()
         result = exp.scan_nD(
             sample=sample,
             beam=beam,
@@ -242,15 +255,74 @@ class SimulationWorker(QObject):
             optics=optics if self.propagation_enabled else None,
             couplings=couplings,
             per_step_outputs=per_step_outputs,
-            show_plots=show_plots,
+            show_plots=False,
             save_dir=save_dir,
             adi_kwargs=self.adi_kwargs,
             prop_kwargs=prop_kwargs,
+            step_callback=on_step,
         )
+
+        summary_png = self._render_scan_summary(result) if show_plots else None
 
         self.progress.emit(100, "Scan complete")
         print("[GUI|INFO] Scan complete")
-        self.finished.emit({"success": True, "mode": "scan", "result": result})
+        self.finished.emit({"success": True, "mode": "scan", "result": result, "summary_png": summary_png})
+
+    @staticmethod
+    def _figure_to_png(fig, dpi=100):
+        """Rasterize a matplotlib figure to PNG bytes (Agg path, no window)."""
+        import io
+        try:
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=dpi)
+            return buf.getvalue()
+        except Exception as e:
+            print(f"[GUI|WARN] Could not rasterize scan figure: {e}")
+            return None
+
+    @staticmethod
+    def _render_scan_summary(result):
+        """Render the summed-intensity summary of a scan_nD result to PNG bytes.
+
+        Uses a standalone Agg figure so it is safe to call from the worker thread.
+        """
+        import io
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+            axes = result["axes"]
+            motors = result["motor_names"]
+            sumI = np.asarray(result["sum_intensity"])
+            fig = Figure(figsize=(6, 4.5))
+            FigureCanvasAgg(fig)
+            if len(axes) == 1:
+                ax = fig.add_subplot(111)
+                ax.plot(axes[0], sumI)
+                ax.set_xlabel(motors[0])
+                ax.set_ylabel("sum(Intensity)")
+                ax.set_title(f"Summed intensity vs {motors[0]}")
+            elif len(axes) == 2:
+                ax = fig.add_subplot(111)
+                X, Y = np.meshgrid(axes[0], axes[1], indexing="xy")
+                pcm = ax.pcolormesh(X, Y, sumI.T, shading="auto")
+                fig.colorbar(pcm, ax=ax, label="sum(Intensity)")
+                ax.set_xlabel(motors[0])
+                ax.set_ylabel(motors[1])
+                ax.set_title(f"Summed intensity vs {motors[0]} and {motors[1]}")
+            else:
+                from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+                ax = fig.add_subplot(111, projection="3d")
+                A0, A1, A2 = np.meshgrid(axes[0], axes[1], axes[2], indexing="ij")
+                sc = ax.scatter(A0.ravel(), A1.ravel(), A2.ravel(), c=sumI.ravel(), s=10)
+                fig.colorbar(sc, ax=ax, label="sum(Intensity)")
+                ax.set_xlabel(motors[0]); ax.set_ylabel(motors[1]); ax.set_zlabel(motors[2])
+                ax.set_title(f"Summed intensity vs {motors[0]}, {motors[1]}, {motors[2]}")
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=100)
+            return buf.getvalue()
+        except Exception as e:
+            print(f"[GUI|WARN] Could not render scan summary: {e}")
+            return None
 
 
 class RunSimulationPanel(QWidget):
@@ -266,6 +338,7 @@ class RunSimulationPanel(QWidget):
         self.method_panel = method_panel
         self._worker = None
         self._thread = None
+        self._scan_image_window = None
         self._setup_ui()
         self._register_observers()
 
@@ -1015,6 +1088,7 @@ class RunSimulationPanel(QWidget):
         # Connect signals
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_progress)
+        self._worker.scan_image.connect(self._on_scan_image)
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._thread.quit)
@@ -1029,6 +1103,33 @@ class RunSimulationPanel(QWidget):
         self.progress_bar.setValue(value)
         self.progress_label.setText(message)
 
+    def _on_scan_image(self, payload):
+        """Show a per-step scan image rendered by the worker (main thread)."""
+        self._show_scan_image(payload.get("title", "Scan"), payload.get("png"))
+
+    def _show_scan_image(self, title, png_bytes):
+        """Display PNG bytes in a persistent non-modal window."""
+        if not png_bytes:
+            return
+        from PySide6.QtWidgets import QDialog
+        from PySide6.QtGui import QPixmap
+        if getattr(self, "_scan_image_window", None) is None:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Scan")
+            layout = QVBoxLayout(dlg)
+            label = QLabel()
+            label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(label)
+            dlg._image_label = label
+            self._scan_image_window = dlg
+        dlg = self._scan_image_window
+        pixmap = QPixmap()
+        if pixmap.loadFromData(png_bytes, "PNG"):
+            dlg._image_label.setPixmap(pixmap)
+            dlg.setWindowTitle(title)
+            dlg.adjustSize()
+            dlg.show()
+
     def _on_finished(self, result):
         """Handle simulation finished."""
         self.run_single_btn.setEnabled(True)
@@ -1037,6 +1138,9 @@ class RunSimulationPanel(QWidget):
         self.cancel_btn.setEnabled(False)
         self.progress_label.setText("Complete")
         self.progress_label.setStyleSheet("color: #4ec94e;")
+
+        if isinstance(result, dict) and result.get("summary_png"):
+            self._show_scan_image("Scan summary", result["summary_png"])
 
         self.simulation_finished.emit(result)
 

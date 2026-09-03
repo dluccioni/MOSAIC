@@ -753,7 +753,9 @@ class DeformationInspector(InspectorPanel):
                     chunk_size = self.chunk_size.value()
                     use_gpu = self.use_gpu.isChecked()
 
-                    # apply_deformation_chunked takes field_positions, field_F, sample
+                    # With a Sample argument the stored chunks are rewritten in
+                    # place and the metadata updated; chunk_size only applies
+                    # to array input.
                     deformation.apply_deformation_chunked(
                         field_positions=self._positions,
                         field_F=self._F,
