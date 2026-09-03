@@ -71,7 +71,8 @@ class detector(logging):
             os.makedirs(self.directory)
         
     def create_detector(self, shape, pixel_size, geometry='rectangular',
-                        construction_mode='plane', input_mode='spatial'):
+                        construction_mode='plane', input_mode='spatial',
+                        n_pixels=None):
         """
         Create the pixel layout in plane or shell construction mode.
 
@@ -109,6 +110,10 @@ class detector(logging):
             - spatial: shape is pixel counts, pixel_size is spacing
             - angular: shape is angular range, pixel_size is angular resolution
               Actual pixel counts computed and stored in self.shape.
+          n_pixels (tuple[int, int], optional): Angular mode only. Pixel
+            counts to use instead of deriving them from pixel_size; the
+            resolution is then recomputed as range / count. Used when the
+            grid is rebuilt from stored state so the shape stays fixed.
 
         Raises:
           ValueError: If an unsupported geometry, construction_mode, or input_mode is provided.
@@ -160,15 +165,20 @@ class detector(logging):
                 if theta_y_min >= theta_y_max or theta_z_min >= theta_z_max:
                     raise ValueError("Angular range min must be less than max")
 
-                # Calculate pixel counts
-                Ny = int(np.ceil((theta_y_max - theta_y_min) / d_theta_y))
-                Nz = int(np.ceil((theta_z_max - theta_z_min) / d_theta_z))
+                # Pixel counts: an explicit n_pixels wins over the requested
+                # resolution, so a rebuild from the stored resolution keeps
+                # the existing grid.
+                if n_pixels is not None:
+                    Ny, Nz = int(n_pixels[0]), int(n_pixels[1])
+                else:
+                    Ny = int(np.ceil((theta_y_max - theta_y_min) / d_theta_y))
+                    Nz = int(np.ceil((theta_z_max - theta_z_min) / d_theta_z))
 
-                # Store actual shape and recalculate actual resolution
+                # Store actual shape and recalculate actual resolution (float64)
                 self._shape = (Ny, Nz)
                 d_theta_y_actual = (theta_y_max - theta_y_min) / Ny
                 d_theta_z_actual = (theta_z_max - theta_z_min) / Nz
-                self._pixel_size = np.array([d_theta_y_actual, d_theta_z_actual], dtype=np.float32)
+                self._pixel_size = np.array([d_theta_y_actual, d_theta_z_actual], dtype=np.float64)
 
                 # Store angular range for reference
                 self._angular_range = (theta_y_min, theta_y_max, theta_z_min, theta_z_max)
@@ -209,15 +219,12 @@ class detector(logging):
 
                 self._pixel_coordinates = np.vstack((X.ravel(), Y.ravel(), Z.ravel()))
 
-            else:  # spatial mode (existing behavior)
-                # Create 1D axes centered on 0 for y and z. The endpoints are chosen
-                # so that there are exactly shape[0] and shape[1] samples.
-                y_lin = np.linspace(-(self.shape[0]/2)*self.pixel_size[0],
-                                    +(self.shape[0]/2)*self.pixel_size[0],
-                                    self.shape[0], dtype=np.float32)
-                z_lin = np.linspace(-(self.shape[1]/2)*self.pixel_size[1],
-                                    +(self.shape[1]/2)*self.pixel_size[1],
-                                    self.shape[1], dtype=np.float32)
+            else:  # spatial mode
+                # Pixel centres at pitch exactly pixel_size, array centred on 0
+                # for both odd and even counts.
+                Ny0, Nz0 = int(self.shape[0]), int(self.shape[1])
+                y_lin = ((np.arange(Ny0) - (Ny0 - 1) / 2.0) * float(self.pixel_size[0])).astype(np.float32)
+                z_lin = ((np.arange(Nz0) - (Nz0 - 1) / 2.0) * float(self.pixel_size[1])).astype(np.float32)
                 # Mesh in y-z; X is identically 0 in this initial plane.
                 Y, Z = np.meshgrid(y_lin, z_lin)
                 X = np.full_like(Y, 0)
@@ -244,17 +251,21 @@ class detector(logging):
                     raise ValueError(f"two_theta_outer must be <= {max_two_theta}° for "
                                    f"{self._construction_mode} mode")
 
-                # Calculate pixel counts
-                N_two_theta = int(np.ceil((two_theta_outer_deg - two_theta_inner_deg) / d_two_theta_deg))
-                N_eta = int(np.floor(360.0 / d_eta_deg))
+                # Bin counts: an explicit n_pixels wins over the requested
+                # resolution (see rectangular branch).
+                if n_pixels is not None:
+                    N_two_theta, N_eta = int(n_pixels[0]), int(n_pixels[1])
+                else:
+                    N_two_theta = int(np.ceil((two_theta_outer_deg - two_theta_inner_deg) / d_two_theta_deg))
+                    N_eta = int(np.floor(360.0 / d_eta_deg))
                 if N_eta < 1:
                     N_eta = 1
 
-                # Store actual shape and resolution
+                # Store actual shape and resolution (float64)
                 self._shape = (N_two_theta, N_eta)
                 d_two_theta_actual = (two_theta_outer_deg - two_theta_inner_deg) / N_two_theta
                 d_eta_actual = 360.0 / N_eta
-                self._pixel_size = np.array([d_two_theta_actual, d_eta_actual], dtype=np.float32)
+                self._pixel_size = np.array([d_two_theta_actual, d_eta_actual], dtype=np.float64)
 
                 # Store angular range
                 self._angular_range = (two_theta_inner_deg, two_theta_outer_deg)
@@ -271,10 +282,11 @@ class detector(logging):
                 TWO_THETA, ETA = np.meshgrid(two_theta_lin, eta_lin, indexing='xy')
 
                 if self._construction_mode == 'plane':
-                    # Build at unit distance (r = tan(2theta))
+                    # Build at unit distance (r = tan(2theta)); eta measured
+                    # from +Z towards +Y, the same convention as shell mode.
                     R = np.tan(TWO_THETA)
-                    Y = R * np.cos(ETA)
-                    Z = R * np.sin(ETA)
+                    Y = (R * np.sin(ETA)).astype(np.float32)
+                    Z = (R * np.cos(ETA)).astype(np.float32)
                     X = np.zeros_like(Y, dtype=np.float32)
                 else:  # shell
                     # Direct spherical coordinates on unit sphere
@@ -284,19 +296,18 @@ class detector(logging):
 
                 self._pixel_coordinates = np.vstack((X.ravel(), Y.ravel(), Z.ravel()))
 
-            else:  # spatial mode (existing behavior)
+            else:  # spatial mode
                 # Compute inner radius so that its circumference equals N_eta * d_eta.
                 r_in = (self.shape[1] * self.pixel_size[1]) / (2 * np.pi)
-                # Outer radius adds N_two_theta radial bins of size d_two_theta.
-                r_out = r_in + self.shape[0] * self.pixel_size[0]
-                # Note: r_out is currently not used directly; radii are sampled with 0.5-bin offset.
+                # Radii are sampled with a 0.5-bin offset over N_two_theta bins.
                 i_lin = np.arange(self.shape[0], dtype=np.float32)
                 j_lin = np.arange(self.shape[1], dtype=np.float32)
                 r_lin = r_in + (i_lin + 0.5) * self.pixel_size[0]
                 phi_lin = 2.0 * np.pi * (j_lin + 0.5) / self.shape[1]
                 R, PHI = np.meshgrid(r_lin, phi_lin, indexing='xy')
-                Y = R * np.cos(PHI)
-                Z = R * np.sin(PHI)
+                # eta measured from +Z towards +Y, matching shell mode
+                Y = R * np.sin(PHI)
+                Z = R * np.cos(PHI)
                 X = np.zeros_like(Y)
                 self._pixel_coordinates = np.vstack((X.ravel(), Y.ravel(), Z.ravel()))
         else:
@@ -376,18 +387,22 @@ class detector(logging):
             saved_center = self._center.copy() if self._center is not None else None
             saved_direction = self._direction.copy() if self._direction is not None else None
 
-            # For angular mode, use the angular_range as shape
+            # For angular mode, use the angular_range as shape and keep the
+            # stored pixel counts so the grid does not drift on reload
             if self._input_mode == 'angular' and self._angular_range is not None:
                 shape_to_use = self._angular_range
+                n_pixels = self._shape
             else:
                 shape_to_use = self._shape
+                n_pixels = None
 
             self.create_detector(
                 shape=shape_to_use,
                 pixel_size=self._pixel_size,
                 geometry=self._geometry,
                 construction_mode=self._construction_mode,
-                input_mode=self._input_mode
+                input_mode=self._input_mode,
+                n_pixels=n_pixels
             )
 
             # Restore loaded position values
@@ -498,7 +513,7 @@ class detector(logging):
             outfile = os.path.join(override_directory, filename)
         else:
             outfile = os.path.join(self.directory, filename)
-        if field == None:
+        if field is None:
             if self._pixel_values is None:
                 raise ValueError("Pixel values are not initialized; cannot save them.")
             pxvals = self._pixel_values
@@ -647,14 +662,18 @@ class detector(logging):
         construction_mode = self._construction_mode if hasattr(self, '_construction_mode') and self._construction_mode is not None else "plane"
         input_mode = self._input_mode if hasattr(self, '_input_mode') and self._input_mode is not None else "spatial"
 
-        # For angular mode, use the saved angular_range as shape
+        # For angular mode, use the saved angular_range as shape and keep the
+        # current pixel counts so repeated positioning does not change the grid
         if input_mode == 'angular' and hasattr(self, '_angular_range') and self._angular_range is not None:
             shape_to_use = self._angular_range
+            n_pixels = self.shape
         else:
             shape_to_use = self.shape
+            n_pixels = None
 
         self.create_detector(shape_to_use, self.pixel_size, geometry=geometry,
-                           construction_mode=construction_mode, input_mode=input_mode)
+                           construction_mode=construction_mode, input_mode=input_mode,
+                           n_pixels=n_pixels)
 
         # Record absolute state
         self._two_theta = float(two_theta)
@@ -699,24 +718,26 @@ class detector(logging):
         else:  # shell + angular
             # Shell mode (angular): only rotate (already at distance from origin)
             self._pixel_coordinates = R @ self._pixel_coordinates
-        self.display_detector_values(degrees=True)
-        
+        self.display_detector_values(degrees=True, level="verbose")
+
     def get_rotation_detector(self, two_theta, eta):
         """
         Composite rotation used by this detector.
 
-        Returns a matrix that applies +two_theta about +y and then +eta about
-        +x. The order matches the convention used throughout this class.
+        Returns R_eta(-x) @ R_2theta(-y): first two_theta about -y, taking the
+        +x normal to (cos 2theta, 0, sin 2theta), then eta about -x. The
+        result sends +x to the centre direction used by position_detector_*
+        (cos 2theta, sin 2theta sin eta, sin 2theta cos eta).
 
         Args:
-          two_theta (float): Rotation about +y in radians.
-          eta (float): Rotation about +x in radians.
+          two_theta (float): Rotation about -y in radians.
+          eta (float): Rotation about -x in radians.
 
         Returns:
           np.ndarray: Rotation matrix of shape (3, 3).
         """
         eta_matrix = self.get_rotation(np.array([-1.0, 0.0, 0.0]), eta)
-        two_theta_matrix = self.get_rotation(eta_matrix@np.array([0.0, -1.0, 0.0]), two_theta)
+        two_theta_matrix = self.get_rotation(np.array([0.0, -1.0, 0.0]), two_theta)
         return eta_matrix @ two_theta_matrix
         
     def get_detector_position_cartesian(self):
@@ -731,7 +752,10 @@ class detector(logging):
     
     def input_pixel_values(self,pixel_values):
         """
-        Assign complex pixel values and update derived fields.
+        Assign complex pixel values and reset the derived fields.
+
+        Phase, amplitude and intensity are computed on first access through
+        the pixel_phase, pixel_amplitude and pixel_intensity properties.
 
         Args:
           pixel_values (np.ndarray): Complex array matching the detector pixel
@@ -741,9 +765,9 @@ class detector(logging):
           None
         """
         self._pixel_values = pixel_values
-        self._pixel_phase = np.angle(self.pixel_values)
-        self._pixel_amplitude = np.abs(self.pixel_values)
-        self._pixel_intensity = self.pixel_amplitude**2
+        self._pixel_phase = None
+        self._pixel_amplitude = None
+        self._pixel_intensity = None
 
     def add_noise(self, noise_type, photon_flux=None, sigma=None, seed=None):
         """
@@ -1146,7 +1170,7 @@ class detector(logging):
           ValueError: If an unknown 'system' is requested.
         """
         # 1) Get raw pixel coordinates (move from GPU to host if needed) -------
-        if isinstance(self.pixel_coordinates, cp.ndarray):
+        if cp is not None and isinstance(self.pixel_coordinates, cp.ndarray):
             coords = self.pixel_coordinates.get()
         else:
             coords = self.pixel_coordinates
@@ -1163,12 +1187,15 @@ class detector(logging):
         else:
             return coords_reshaped
         
-    def display_detector_values(self, degrees=True):
+    def display_detector_values(self, degrees=True, level="normal"):
         """
-        Print a table of key detector values (distance, angles, center, normal).
+        Log a table of key detector values (distance, angles).
 
         Args:
             degrees (bool): If True, angles are shown in degrees; otherwise radians.
+            level (str): Log level the table is emitted at ("normal",
+                "verbose" or "debug"). Nothing is printed when the detector
+                log level is below it.
 
         Returns:
             None
@@ -1186,7 +1213,10 @@ class detector(logging):
             tt_label = "two_theta_rad"
             et_label = "eta_rad"
 
-        print("Detector State:")
+        # Skip building the table when it would not be printed
+        if getattr(self, "_log_level", 1) < self._LOG_LEVELS.get(level, 1):
+            return
+
         cols = [
             "distance", tt_label, et_label
         ]
@@ -1196,12 +1226,12 @@ class detector(logging):
         if pd is not None:
             df = pd.DataFrame(vals, columns=cols)
             df.index = ["Values"]
-            print(df)
+            table = str(df)
         else:
             # Fallback plain-text table if pandas is unavailable
             row = vals[0]
-            for c, v in zip(cols, row):
-                print(f"  {c:>12s}: {v:.6g}")
+            table = "\n".join(f"  {c:>12s}: {v:.6g}" for c, v in zip(cols, row))
+        self._log(level, "Detector State:\n" + table)
         
     def plot_detector(
         self,
