@@ -6,16 +6,6 @@ try:
     import cupy as cp
 except ImportError:
     cp = None
-try:
-    from scipy.special import k0 as _scipy_k0, k1 as _scipy_k1
-except ImportError:
-    _scipy_k0 = None
-    _scipy_k1 = None
-try:
-    from cupyx.scipy.special import k0 as _cupy_k0, k1 as _cupy_k1
-except ImportError:
-    _cupy_k0 = None
-    _cupy_k1 = None
 import json
 import re
 import os
@@ -23,276 +13,235 @@ from Logging import logging
 
 
 # -----------------------------------------------------------------------------
-# Helpers for the Bertin (2018) spectral dislocation framework
+# Module helpers
 # -----------------------------------------------------------------------------
-def _cai_kernel_fourier(K, a, xp=np):
+def _same_directory(a, b):
+    """True if two directory paths point at the same location."""
+    if a is None or b is None:
+        return a is None and b is None
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _writes_in_place(sample, directory):
     """
-    3D Fourier transform of the Cai et al. (2006) non-singular spreading kernel
-    omega(r, a) = (15 / (8 pi a^3)) * ((r/a)^2 + 1)^(-7/2).
-
-    Closed form (Bertin 2018, derived in the paper appendix from
-    Gradshteyn-Ryzhik 3.771):
-
-        omega_hat(k, a) = ((a k)^2 / 2) * K_2(a k)
-
-    where K_2 is the modified Bessel function of the second kind, order 2.
-    K_2 is reconstructed from K_0 and K_1 via the standard recurrence
-    K_2(x) = K_0(x) + (2/x) K_1(x). For very small arguments x = ak < 1e-3
-    the routine switches to the series 1 - x^2/4 + O(x^4 log x), which avoids
-    the catastrophic 2/x^2 - 2/x^2 cancellation in the Bessel form.
-
-    Args:
-        K:  array of |k| values (sqrt(kx^2 + ky^2 + kz^2)) on the spectral grid.
-        a:  scalar spreading radius (a_grid).
-        xp: numpy or cupy module. Determines which Bessel implementation
-            (scipy.special or cupyx.scipy.special) is used.
-
-    Returns:
-        Phi: array of shape `K.shape` with values in [0, 1] giving the
-        Fourier-domain spreading kernel. Phi at K=0 is set to 1.
+    True if writing chunk files to `directory` overwrites the files the sample
+    object reads back (None or the sample's own directory). Only then does an
+    applied-modification record on the sample make sense.
     """
-    if xp is np:
-        if _scipy_k0 is None or _scipy_k1 is None:
-            raise ImportError(
-                "scipy.special.k0/k1 are required for the Cai kernel; "
-                "install scipy."
-            )
-        k0_fn = _scipy_k0
-        k1_fn = _scipy_k1
-    else:
-        if _cupy_k0 is None or _cupy_k1 is None:
-            raise ImportError(
-                "cupyx.scipy.special.k0/k1 are required for the Cai kernel "
-                "on the GPU; please use CuPy 12.0 or newer."
-            )
-        k0_fn = _cupy_k0
-        k1_fn = _cupy_k1
-
-    x = a * K
-    Phi = xp.empty_like(x)
-
-    # Threshold below which we use the small-argument series.
-    # Series:  ((ax)^2/2) K_2(ax) = 1 - (ax)^2/4 + O((ax)^4 log(ax))
-    eps_series = 1.0e-3
-
-    small_mask = x < eps_series
-    big_mask = ~small_mask
-
-    # Series branch: (1 - x^2/4)  -- accurate to ~6e-8 at x = 1e-3
-    Phi_small = 1.0 - 0.25 * (x * x)
-
-    # Bessel branch: ((ax)^2/2) * (K_0(ax) + (2/(ax)) K_1(ax))
-    #              = ((ax)^2/2) K_0(ax) + ax K_1(ax)
-    x_big = xp.where(big_mask, x, xp.ones_like(x))  # avoid log(0) inside k0
-    Phi_big = 0.5 * (x_big * x_big) * k0_fn(x_big) + x_big * k1_fn(x_big)
-
-    Phi = xp.where(small_mask, Phi_small, Phi_big)
-
-    # K = 0 (DC bin) is the indeterminate form 0 * inf; the limit is 1.
-    Phi = xp.where(K > 0, Phi, xp.ones_like(Phi))
-    return Phi
+    return directory is None or _same_directory(directory, getattr(sample, "directory", None))
 
 
-def _isotropic_stiffness_tensor(mu, nu):
+def _jsonable(v):
+    """Convert NumPy scalars and arrays inside a params dict to plain Python."""
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if isinstance(v, (np.floating, np.integer, np.bool_)):
+        return v.item()
+    if isinstance(v, dict):
+        return {str(k): _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    return v
+
+
+def _check_modification(sample, directory, kind, params, force):
     """
-    Build the (3,3,3,3) elastic stiffness tensor for isotropic Hooke's law
-    from shear modulus mu and Poisson ratio nu.
-
-        C_ijkl = lambda * delta_ij delta_kl + mu * (delta_ik delta_jl + delta_il delta_jk)
-
-    where lambda = 2 mu nu / (1 - 2 nu).
+    Raise RuntimeError if the sample already carries an in-place record of
+    `kind` with the same `params` and `force` is False.
     """
-    mu_ = float(mu)
-    nu_ = float(nu)
-    if not (0.0 < nu_ < 0.5):
-        raise ValueError("nu must be in (0, 0.5)")
-    lam = 2.0 * mu_ * nu_ / (1.0 - 2.0 * nu_)
-    I3 = np.eye(3, dtype=np.float64)
-    C = (
-        lam * np.einsum("ij,kl->ijkl", I3, I3)
-        + mu_ * np.einsum("ik,jl->ijkl", I3, I3)
-        + mu_ * np.einsum("il,jk->ijkl", I3, I3)
-    )
-    return C.astype(np.float64)
+    if force or not _writes_in_place(sample, directory):
+        return
+    if sample.has_modification(kind, _jsonable(params)):
+        raise RuntimeError(
+            f"{kind} with these parameters was already applied to the sample in "
+            f"'{sample.directory}'. Pass force=True to apply it again.")
 
 
-def _voigt_to_tensor(C_voigt):
+def _record_modification(sample, directory, kind, params):
+    """Record an in-place modification on the sample; no-op for other directories."""
+    if _writes_in_place(sample, directory):
+        sample.record_modification(kind, _jsonable(params))
+
+
+def _convex_hull_inside_mask(positions, equations, tol=1e-12):
     """
-    Expand a (6,6) Voigt stiffness matrix to a full (3,3,3,3) tensor using
-    the standard mapping (1<->11, 2<->22, 3<->33, 4<->23, 5<->13, 6<->12).
+    Mask of positions inside a convex hull from its facet equations
+    [a, b, c, d] (a*x + b*y + c*z + d <= tol inside). Facets are tested one
+    at a time in float32, so no (facets x N) matrix is formed. Accepts NumPy
+    or CuPy positions and returns the mask on the same device.
     """
-    Cv = np.asarray(C_voigt, dtype=np.float64)
-    if Cv.shape != (6, 6):
-        raise ValueError("Voigt stiffness must be (6, 6)")
-    # Voigt index <-> tensor index pairs
-    voigt_pairs = [(0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1)]
-    C = np.zeros((3, 3, 3, 3), dtype=np.float64)
-    for I in range(6):
-        i, j = voigt_pairs[I]
-        for J in range(6):
-            k, l = voigt_pairs[J]
-            v = Cv[I, J]
-            C[i, j, k, l] = v
-            C[j, i, k, l] = v
-            C[i, j, l, k] = v
-            C[j, i, l, k] = v
-    return C
+    xp = cp if (cp is not None and isinstance(positions, cp.ndarray)) else np
+    pos = positions if positions.dtype == xp.float32 else positions.astype(xp.float32)
+    eq = xp.asarray(equations, dtype=xp.float32)
+    inside = xp.ones(pos.shape[0], dtype=bool)
+    for k in range(int(eq.shape[0])):
+        inside &= (pos @ eq[k, :3] + eq[k, 3]) <= tol
+    return inside
 
 
-def _cubic_stiffness_tensor(c11, c12, c44):
+# Per-thread evaluation of the isotropic Volterra displacement of straight
+# dislocation segments. Segment records are 12 doubles: S0, S1, C, b. Each
+# segment contributes the solid angle of the triangle (S0, S1, C) times
+# b/(4 pi) and the Burgers formula elastic terms integrated along S0->S1 with
+# |r| -> sqrt(r^2 + a^2). The solid angle is evaluated in double because its
+# atan2 arguments cancel for points near the plane of a large triangle; the
+# elastic terms use float32 on vertex differences formed in double.
+_DISLOCATION_DISPLACEMENT_KERNEL = r'''
+#define SEG_TILE 128
+extern "C" __global__
+void dislocation_displacement(const double* __restrict__ P, const int Np,
+                              const double* __restrict__ seg, const int Ns,
+                              const float a2, const float c1, const float c2,
+                              float* __restrict__ U)
+{
+    __shared__ double sh[SEG_TILE * 12];
+    const float inv4pi = 0.07957747154594767f;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    double px = 0.0, py = 0.0, pz = 0.0;
+    if (i < Np) { px = P[3*i]; py = P[3*i+1]; pz = P[3*i+2]; }
+    float ux = 0.f, uy = 0.f, uz = 0.f;
+
+    for (int base = 0; base < Ns; base += SEG_TILE) {
+        int n = Ns - base; if (n > SEG_TILE) n = SEG_TILE;
+        for (int k = threadIdx.x; k < n * 12; k += blockDim.x) sh[k] = seg[base * 12 + k];
+        __syncthreads();
+        if (i < Np) {
+            for (int s = 0; s < n; ++s) {
+                const double* q = sh + 12 * s;
+                double R1x = q[0] - px, R1y = q[1] - py, R1z = q[2] - pz;
+                double R2x = q[3] - px, R2y = q[4] - py, R2z = q[5] - pz;
+                double R3x = q[6] - px, R3y = q[7] - py, R3z = q[8] - pz;
+                float bx = (float)q[9], by = (float)q[10], bz = (float)q[11];
+
+                // Solid angle of the triangle (Van Oosterom and Strackee), in double.
+                double n1 = sqrt(R1x*R1x + R1y*R1y + R1z*R1z);
+                double n2 = sqrt(R2x*R2x + R2y*R2y + R2z*R2z);
+                double n3 = sqrt(R3x*R3x + R3y*R3y + R3z*R3z);
+                double cx = R2y*R3z - R2z*R3y;
+                double cy = R2z*R3x - R2x*R3z;
+                double cz = R2x*R3y - R2y*R3x;
+                double num = R1x*cx + R1y*cy + R1z*cz;
+                double den = n1*n2*n3
+                           + (R1x*R2x + R1y*R2y + R1z*R2z) * n3
+                           + (R1x*R3x + R1y*R3y + R1z*R3z) * n2
+                           + (R2x*R3x + R2y*R3y + R2z*R3z) * n1;
+                float w = (float)(2.0 * atan2(num, den)) * inv4pi;
+                ux += w * bx; uy += w * by; uz += w * bz;
+                float r1x = (float)R1x, r1y = (float)R1y, r1z = (float)R1z;
+
+                // Elastic terms along the real segment.
+                float tx = (float)(q[3] - q[0]), ty = (float)(q[4] - q[1]), tz = (float)(q[5] - q[2]);
+                float L2 = tx*tx + ty*ty + tz*tz;
+                if (L2 > 1.0e-20f) {
+                    float L = sqrtf(L2);
+                    float invL = 1.0f / L;
+                    tx *= invL; ty *= invL; tz *= invL;
+                    float lam = -(r1x*tx + r1y*ty + r1z*tz);
+                    float dx = -r1x - lam*tx, dy = -r1y - lam*ty, dz = -r1z - lam*tz;
+                    float rho2 = dx*dx + dy*dy + dz*dz + a2;
+                    float s1 = -lam, s2 = L - lam;
+                    float Ra1 = sqrtf(s1*s1 + rho2);
+                    float Ra2 = sqrtf(s2*s2 + rho2);
+                    float I1, I3;
+                    if (s1 >= 0.0f)      I1 = logf((s2 + Ra2) / (s1 + Ra1));
+                    else if (s2 <= 0.0f) I1 = logf((Ra1 - s1) / (Ra2 - s2));
+                    else                 I1 = logf((s2 + Ra2) * (Ra1 - s1) / rho2);
+                    float ssum = s1 + s2;
+                    if (s1 * s2 > 0.0f) I3 = L * ssum / (Ra1 * Ra2 * (s2*Ra1 + s1*Ra2));
+                    else                I3 = (s2 / Ra2 - s1 / Ra1) / rho2;
+                    float J3 = L * ssum / (Ra1 * Ra2 * (Ra1 + Ra2));
+                    float qx = by*tz - bz*ty, qy = bz*tx - bx*tz, qz = bx*ty - by*tx;
+                    float bd = qx*dx + qy*dy + qz*dz;
+                    float g = (c1 + c2) * I1;
+                    float h = c2 * bd;
+                    ux += g*qx - h*(dx*I3 - tx*J3);
+                    uy += g*qy - h*(dy*I3 - ty*J3);
+                    uz += g*qz - h*(dz*I3 - tz*J3);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (i < Np) { U[3*i] = ux; U[3*i+1] = uy; U[3*i+2] = uz; }
+}
+'''
+
+
+def _dislocation_displacement_numpy(P, seg, a, nu, tile_points=2048, tile_segments=256):
     """
-    Build the (3,3,3,3) stiffness tensor for a cubic crystal from the three
-    independent moduli (c11, c12, c44) using the Voigt expansion.
+    NumPy evaluation of the segment displacement (see the CUDA kernel for the
+    formula). `P` is (N, 3), `seg` is (M, 12) [S0, S1, C, b]; float64 tiles of
+    points x segments are formed and summed. Returns (N, 3) float64.
     """
-    Cv = np.zeros((6, 6), dtype=np.float64)
-    Cv[0, 0] = Cv[1, 1] = Cv[2, 2] = float(c11)
-    Cv[0, 1] = Cv[0, 2] = Cv[1, 0] = Cv[1, 2] = Cv[2, 0] = Cv[2, 1] = float(c12)
-    Cv[3, 3] = Cv[4, 4] = Cv[5, 5] = float(c44)
-    return _voigt_to_tensor(Cv)
+    P = np.asarray(P, dtype=np.float64)
+    seg = np.asarray(seg, dtype=np.float64)
+    N = P.shape[0]
+    U = np.zeros((N, 3), dtype=np.float64)
+    a2 = float(a) * float(a)
+    c1 = -1.0 / (4.0 * np.pi)
+    c2 = 1.0 / (8.0 * np.pi * (1.0 - float(nu)))
+    inv4pi = 1.0 / (4.0 * np.pi)
 
+    S0 = seg[:, 0:3]; S1 = seg[:, 3:6]; C = seg[:, 6:9]; B = seg[:, 9:12]
+    Lvec = S1 - S0
+    L = np.linalg.norm(Lvec, axis=1)
+    ok = L > 1.0e-10
+    T = np.zeros_like(Lvec)
+    T[ok] = Lvec[ok] / L[ok, None]
+    BxT = np.cross(B, T)
 
-def _resolve_stiffness(stiffness, mu, nu):
-    """
-    Normalise the user-supplied `stiffness` argument of generate_nodal_field
-    into a (3,3,3,3) numpy array C_ijkl.
+    for p0 in range(0, N, int(tile_points)):
+        p1 = min(N, p0 + int(tile_points))
+        Pt = P[p0:p1]
+        acc = np.zeros((p1 - p0, 3), dtype=np.float64)
+        for s0 in range(0, seg.shape[0], int(tile_segments)):
+            s1 = min(seg.shape[0], s0 + int(tile_segments))
+            r1 = S0[None, s0:s1] - Pt[:, None]
+            r2 = S1[None, s0:s1] - Pt[:, None]
+            r3 = C[None, s0:s1] - Pt[:, None]
+            n1 = np.sqrt(np.einsum("psk,psk->ps", r1, r1))
+            n2 = np.sqrt(np.einsum("psk,psk->ps", r2, r2))
+            n3 = np.sqrt(np.einsum("psk,psk->ps", r3, r3))
+            num = np.einsum("psk,psk->ps", r1, np.cross(r2, r3))
+            den = (n1 * n2 * n3
+                   + np.einsum("psk,psk->ps", r1, r2) * n3
+                   + np.einsum("psk,psk->ps", r1, r3) * n2
+                   + np.einsum("psk,psk->ps", r2, r3) * n1)
+            omega = 2.0 * np.arctan2(num, den)
+            acc += inv4pi * (omega @ B[s0:s1])
+            del r2, r3, n1, n2, n3, num, den
 
-    Accepted forms:
-      - None                                 -> isotropic from (mu, nu)
-      - dict {"isotropic": (mu, nu)}         -> isotropic
-      - dict {"cubic": (c11, c12, c44)}      -> cubic via Voigt expansion
-      - (6, 6) array                         -> Voigt expansion
-      - (3, 3, 3, 3) array                   -> validated and returned
-    """
-    if stiffness is None:
-        return _isotropic_stiffness_tensor(mu, nu)
-    if isinstance(stiffness, dict):
-        if "isotropic" in stiffness:
-            mu_iso, nu_iso = stiffness["isotropic"]
-            return _isotropic_stiffness_tensor(mu_iso, nu_iso)
-        if "cubic" in stiffness:
-            c11, c12, c44 = stiffness["cubic"]
-            return _cubic_stiffness_tensor(c11, c12, c44)
-        raise ValueError(
-            "stiffness dict must have key 'isotropic' or 'cubic'"
-        )
-    arr = np.asarray(stiffness, dtype=np.float64)
-    if arr.shape == (6, 6):
-        return _voigt_to_tensor(arr)
-    if arr.shape == (3, 3, 3, 3):
-        # Validate symmetries
-        if not np.allclose(arr, arr.transpose(1, 0, 2, 3), atol=1e-6):
-            raise ValueError("stiffness violates minor symmetry C_ijkl = C_jikl")
-        if not np.allclose(arr, arr.transpose(0, 1, 3, 2), atol=1e-6):
-            raise ValueError("stiffness violates minor symmetry C_ijkl = C_ijlk")
-        if not np.allclose(arr, arr.transpose(2, 3, 0, 1), atol=1e-6):
-            raise ValueError("stiffness violates major symmetry C_ijkl = C_klij")
-        return arr.copy()
-    raise ValueError(
-        "stiffness must be None, a dict, a (6,6) Voigt matrix, "
-        "or a (3,3,3,3) tensor"
-    )
+            t = T[s0:s1]
+            Ls = L[s0:s1]
+            rel = -r1
+            lam = np.einsum("psk,sk->ps", rel, t)
+            d = rel - lam[:, :, None] * t[None]
+            rho2 = np.einsum("psk,psk->ps", d, d) + a2
+            sa = -lam
+            sb = Ls[None, :] - lam
+            Ra1 = np.sqrt(sa * sa + rho2)
+            Ra2 = np.sqrt(sb * sb + rho2)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                I1 = np.where(sa >= 0.0, np.log((sb + Ra2) / (sa + Ra1)),
+                              np.where(sb <= 0.0, np.log((Ra1 - sa) / (Ra2 - sb)),
+                                       np.log((sb + Ra2) * (Ra1 - sa) / rho2)))
+                ssum = sa + sb
+                I3 = np.where(sa * sb > 0.0,
+                              Ls[None, :] * ssum / (Ra1 * Ra2 * (sb * Ra1 + sa * Ra2)),
+                              (sb / Ra2 - sa / Ra1) / rho2)
+            J3 = Ls[None, :] * ssum / (Ra1 * Ra2 * (Ra1 + Ra2))
+            bad = ~ok[s0:s1]
+            if np.any(bad):
+                I1[:, bad] = 0.0; I3[:, bad] = 0.0; J3[:, bad] = 0.0
+            bxt = BxT[s0:s1]
+            bd = np.einsum("psk,sk->ps", d, bxt)
+            acc += (c1 + c2) * (I1 @ bxt)
+            acc -= c2 * np.einsum("ps,psk->pk", bd * I3, d)
+            acc += c2 * ((bd * J3) @ t)
+            del r1, rel, lam, d, rho2, sa, sb, Ra1, Ra2, I1, I3, J3, bd
+        U[p0:p1] = acc
+    return U
 
-
-def _cic_line_segment_integral(d_tilde, t_hat, H, sa, sb):
-    """
-    Closed-form line integral of the trilinear cloud-in-cell (CIC) kernel over
-    a sub-interval [sa, sb] of a straight dislocation segment, following Bertin
-    (2018) Appendix A.
-
-    Computes
-        I = integral_{sa..sb}  prod_i max(0, 1 - |d_tilde_i - s * t_hat_i| / H_i)  ds
-    where d_tilde = x_voxel - x_segment_start (vector from segment start to the
-    voxel centre), t_hat is the unit segment tangent, H is the (per-axis) voxel
-    spacing (=CIC support half-width), and [sa, sb] is the sub-interval where
-    the segment lies inside the voxel's [-H, +H] CIC weighting box (caller is
-    responsible for that clipping).
-
-    Each axis-i factor (1 - |d_i - s t_i|/H_i) is piecewise linear in s with a
-    sign-flip at s_i* = d_i / t_i. We split [sa, sb] at the (up to three) flips
-    so that on each sub-interval the absolute values can be removed by attaching
-    a sign sigma_i in {+1, -1}. The integrand is then a cubic polynomial in s
-    that we expand in coefficients (c0..c3) of the basis (1, s, s^2, s^3) and
-    integrate analytically.
-
-    Returns 0.0 when [sa, sb] is empty.
-    """
-    if not (sb > sa):
-        return 0.0
-
-    # Find sign-flip points along this sub-interval
-    flips = []
-    for i in range(3):
-        ti = t_hat[i]
-        if abs(ti) > 1.0e-30:
-            sf = d_tilde[i] / ti
-            if sa < sf < sb:
-                flips.append(sf)
-    flips.sort()
-    breaks = [sa] + flips + [sb]
-
-    total = 0.0
-    for ki in range(len(breaks) - 1):
-        s0 = breaks[ki]
-        s1 = breaks[ki + 1]
-        if not (s1 > s0):
-            continue
-        s_mid = 0.5 * (s0 + s1)
-
-        # Per-axis (alpha_i + beta_i s) form of the (1 - sigma_i (d_i - s t_i)/H_i) factor
-        alpha = [0.0, 0.0, 0.0]
-        beta  = [0.0, 0.0, 0.0]
-        for i in range(3):
-            sgn = 1.0 if (d_tilde[i] - s_mid * t_hat[i]) >= 0.0 else -1.0
-            alpha[i] = 1.0 - sgn * d_tilde[i] / H[i]
-            beta[i]  =       sgn * t_hat[i]  / H[i]
-
-        # Polynomial coefficients of  prod_i (alpha_i + beta_i s)  =  c0 + c1 s + c2 s^2 + c3 s^3
-        a0, a1, a2 = alpha
-        b0, b1, b2 = beta
-        c0 = a0 * a1 * a2
-        c1 = a0 * a1 * b2 + a0 * b1 * a2 + b0 * a1 * a2
-        c2 = a0 * b1 * b2 + b0 * a1 * b2 + b0 * b1 * a2
-        c3 = b0 * b1 * b2
-
-        ds  = s1 - s0
-        ds2 = s1 * s1 - s0 * s0
-        ds3 = s1 * s1 * s1 - s0 * s0 * s0
-        ds4 = s1 * s1 * s1 * s1 - s0 * s0 * s0 * s0
-
-        total += c0 * ds + 0.5 * c1 * ds2 + (c2 / 3.0) * ds3 + 0.25 * c3 * ds4
-
-    return total
-
-
-def _cic_segment_voxel_clip(d_tilde, t_hat, H, L):
-    """
-    Slab-clip a straight dislocation segment of length L (parameter s in [0, L])
-    against a single CIC voxel's [-H, +H] weighting box (centred at the voxel,
-    expressed in the segment-local frame via d_tilde = x_voxel - x_segment_start).
-
-    Returns (sa, sb) such that the segment is inside the voxel's CIC support
-    for s in [sa, sb], or (None, None) if the slab is empty.
-    """
-    sa = 0.0
-    sb = L
-    for i in range(3):
-        ti = t_hat[i]
-        if abs(ti) > 1.0e-30:
-            inv_ti = 1.0 / ti
-            s_lo = (d_tilde[i] - H[i]) * inv_ti
-            s_hi = (d_tilde[i] + H[i]) * inv_ti
-            if s_lo > s_hi:
-                s_lo, s_hi = s_hi, s_lo
-            if s_lo > sa:
-                sa = s_lo
-            if s_hi < sb:
-                sb = s_hi
-        else:
-            if not (-H[i] <= d_tilde[i] <= H[i]):
-                return (None, None)
-        if sa >= sb:
-            return (None, None)
-    return (sa, sb)
 
 # -----------------------------------------------------------------------------
 # Class
@@ -311,6 +260,9 @@ class defects(logging):
         "add_point_defects",
         "import_dislocation_network",
         "generate_nodal_field",
+        "dislocation_displacement",
+        "apply_dislocation_displacement",
+        "finalize_dislocation_sample",
     )
     
     # -----------------------------------------------------------------------------
@@ -341,8 +293,9 @@ class defects(logging):
         Read defect metadata from a JSON file and restore object state.
 
         Reads the defect metadata JSON file from disk and restores this defect
-        object's state, including stacking faults, cracks, and point defects
-        if present.
+        object's state: stacking faults, cracks, amorphous bands, point
+        defects (with their applied-position arrays) and the dislocation
+        network stored in the `.npz` sidecar next to the JSON.
 
         Args:
             override_directory: Optional directory path to read from instead
@@ -415,23 +368,65 @@ class defects(logging):
                 interstitial_species=spec.get("interstitial_species", None),
                 interstitial_min_separation=spec.get("interstitial_min_separation", None),
             )
-            # Restore applied logs if present
-            applied = pd_data.get("applied", {})
-            if applied:
-                self._point_defects._applied_vacancies = [np.asarray(v, dtype=np.float32) for v in applied.get("vacancies", [])]
-                self._point_defects._applied_substitutions = applied.get("substitutions", [])
-                self._point_defects._applied_interstitials = applied.get("interstitials", [])
-                
-        print(f"Defect metadata read from {metadata_filename}.")
+            # Restore applied positions from the per-chunk .npy files
+            applied = pd_data.get("applied", {}) or {}
+            if applied.get("chunks"):
+                self._point_defects._load_applied_arrays(
+                    applied.get("directory") or os.path.dirname(metadata_filename),
+                    int(applied["chunks"]))
+
+        # Restore amorphous band if present
+        ab_data = defect_metadata.get("amorphous_bands", None)
+        if ab_data is not None:
+            self._amorphous_bands = self.amorphous_band(
+                ab_data.get("directory", None),
+                band_points=ab_data.get("band_points", None),
+                center=ab_data.get("center", None),
+                length=ab_data.get("length", None),
+                width=ab_data.get("width", None),
+                thickness=ab_data.get("thickness", None),
+                orientation=ab_data.get("orientation", None),
+                period=ab_data.get("period", None),
+                n_stripes=ab_data.get("n_stripes", None),
+                density_ratio=ab_data.get("density_ratio", 1.0),
+                number_density=ab_data.get("number_density", None),
+                seed=ab_data.get("seed", None),
+            )
+
+        # Restore the dislocation network from its .npz sidecar
+        net = defect_metadata.get("dislocation_network", None)
+        if net is not None:
+            net_path = net.get("path", None)
+            if net_path is None or not os.path.isfile(net_path):
+                net_path = os.path.join(os.path.dirname(metadata_filename), net.get("filename", ""))
+            if os.path.isfile(net_path):
+                with np.load(net_path) as z:
+                    self._opendis_nodes_xyz = z["nodes_xyz"]
+                    self._opendis_segments = z["segments"]
+                    self._opendis_S0 = z["S0"]
+                    self._opendis_S1 = z["S1"]
+                    self._opendis_bvec = z["bvec"]
+                    self._opendis_tvec = z["tvec"]
+                    self._opendis_mids = z["mids"]
+                    self._opendis_halfL = z["halfL"]
+                    self._opendis_bounds = {"min": z["bounds_min"], "max": z["bounds_max"]}
+                self._opendis_source = net.get("source", None)
+            else:
+                self._log("normal", f"dislocation network sidecar not found: {net_path}")
+
+        self._log("normal", f"Defect metadata read from {metadata_filename}.")
         
     ## Data Handling Functions
     def write_defect_metadata(self, override_directory=None):
         """
         Serialize the defect object's state to a JSON file on disk.
 
-        Writes critical internal fields (defect history, stacking faults,
-        cracks, point defects) to a human-readable JSON file so that the
-        state can be restored later.
+        Writes the defect history, stacking faults, cracks, amorphous bands
+        and point defects to a human-readable JSON file so that the state can
+        be restored later. The dislocation network arrays go to a
+        `defects_dislocation_network.npz` sidecar next to the JSON (its path
+        is recorded in the JSON), and applied point-defect positions are kept
+        in per-chunk `.npy` files with only their counts in the JSON.
 
         Args:
             override_directory: Optional directory path to write to instead
@@ -441,6 +436,7 @@ class defects(logging):
             metadata_filename = os.path.join(override_directory, "defects_metadata.json")
         else:
             metadata_filename = os.path.join(self.directory, "defects_metadata.json")
+        meta_dir = os.path.dirname(os.path.abspath(metadata_filename))
 
         # Prepare top-level defect data
         defect_metadata = {
@@ -503,18 +499,62 @@ class defects(logging):
                     "interstitial_min_separation": pd.interstitial_min_separation,
                 },
                 "applied": {
-                    "vacancies": [x.tolist() for x in pd._applied_vacancies],
-                    "substitutions": [{"pos": s["pos"].tolist(), "from": s["from"], "to": s["to"]} for s in pd._applied_substitutions],
-                    "interstitials": [{"pos": t["pos"].tolist(), "species": t["species"]} for t in pd._applied_interstitials],
+                    "directory": pd._applied_directory,
+                    "chunks": len(pd._applied_vacancies),
+                    "vacancies": int(sum(int(v.shape[0]) for v in pd._applied_vacancies)),
+                    "substitutions": int(sum(int(v.shape[0]) for v in pd._applied_substitutions)),
+                    "interstitials": int(sum(int(v.shape[0]) for v in pd._applied_interstitials)),
                 }
             }
         else:
             defect_metadata["point_defects"] = None
 
+        # Amorphous band spec
+        if self._amorphous_bands is not None:
+            ab = self._amorphous_bands
+            defect_metadata["amorphous_bands"] = {
+                "directory": ab.directory,
+                "band_points": ab.band_points.tolist() if ab.band_points is not None else None,
+                "center": ab.center.tolist() if ab.center is not None else None,
+                "length": ab.length,
+                "width": ab.width,
+                "thickness": ab.thickness,
+                "orientation": ab.orientation.tolist() if ab.orientation is not None else None,
+                "period": ab.period,
+                "n_stripes": ab.n_stripes if ab.period is not None else None,
+                "density_ratio": ab.density_ratio,
+                "number_density": ab.number_density,
+                "seed": ab.seed,
+            }
+        else:
+            defect_metadata["amorphous_bands"] = None
+
+        # Dislocation network arrays as an .npz sidecar
+        if getattr(self, "_opendis_S0", None) is not None:
+            net_name = "defects_dislocation_network.npz"
+            net_path = os.path.join(meta_dir, net_name)
+            np.savez(net_path,
+                     nodes_xyz=np.asarray(self._opendis_nodes_xyz),
+                     segments=np.asarray(self._opendis_segments),
+                     S0=np.asarray(self._opendis_S0), S1=np.asarray(self._opendis_S1),
+                     bvec=np.asarray(self._opendis_bvec), tvec=np.asarray(self._opendis_tvec),
+                     mids=np.asarray(self._opendis_mids), halfL=np.asarray(self._opendis_halfL),
+                     bounds_min=np.asarray(self._opendis_bounds["min"]),
+                     bounds_max=np.asarray(self._opendis_bounds["max"]))
+            defect_metadata["dislocation_network"] = {
+                "path": net_path,
+                "filename": net_name,
+                "source": getattr(self, "_opendis_source", None),
+                "node_count": int(np.asarray(self._opendis_nodes_xyz).shape[0]),
+                "segment_count": int(np.asarray(self._opendis_S0).shape[0]),
+            }
+        else:
+            defect_metadata["dislocation_network"] = None
+
         # Write as nicely formatted JSON
         with open(metadata_filename, "w") as f:
             json.dump(defect_metadata, f, indent=4)
-        print(f"Defect metadata written to {metadata_filename} in JSON format.")
+        self._log("normal", f"Defect metadata written to {metadata_filename} in JSON format.")
 
     def add_stacking_faults(self, fault_number, fault_offset, fault_normal,
                             interfault_spacing, burgers_vector, fault_orientation, fault_gap):
@@ -633,6 +673,12 @@ class defects(logging):
         Parses an OpenDiS config.*.data file, reconstructs the dislocation
         network, and caches arrays for GPU/CPU evaluation.
 
+        Node tags (domain, id) are mapped to contiguous indices, so files
+        with several domains or non-contiguous ids parse correctly. Burgers
+        vectors are stored in the file as multiples of `burgers_magnitude`
+        and are converted without renormalisation, so junction arms keep
+        their larger magnitude and Frank's rule holds at every node.
+
         Args:
             filepath: Path to the OpenDiS config.*.data file.
             crystal: Crystal object providing lattice information.
@@ -663,8 +709,8 @@ class defects(logging):
                 - _opendis_mids: (M, 3) segment midpoints.
                 - _opendis_halfL: (M,) half lengths.
                 - _opendis_bounds: dict with "min" and "max" bounds.
+                - _opendis_source: absolute path of the parsed file.
         """
-        import re, os
 
         if not os.path.isfile(filepath):
             raise FileNotFoundError("File not found: {}".format(filepath))
@@ -717,21 +763,25 @@ class defects(logging):
                 i += 1
                 continue
             dom, node_id, x, y, z, n_arms, _flag = m.groups()
-            node_id = int(node_id)
-            nodes_xyz[node_id] = (float(x), float(y), float(z))
+            node_key = (int(dom), int(node_id))
+            nodes_xyz[node_key] = (float(x), float(y), float(z))
             i += 1
             arms = []
             for _ in range(int(n_arms)):
                 m1 = arm_l1.match(lines[i]); m2 = arm_l2.match(lines[i+1]) if (i+1) < len(lines) else None
                 if not (m1 and m2):
-                    raise ValueError("Malformed arm block after node {}".format(node_id))
-                _dom2, nbr_id, bx, by, bz = m1.groups()
+                    raise ValueError("Malformed arm block after node {}".format(node_key))
+                dom2, nbr_id, bx, by, bz = m1.groups()
                 nx, ny, nz = m2.groups()
-                arms.append((int(nbr_id),
+                arms.append(((int(dom2), int(nbr_id)),
                             float(bx), float(by), float(bz),
                             float(nx), float(ny), float(nz)))
                 i += 2
-            arms_by_node[node_id] = arms
+            arms_by_node[node_key] = arms
+
+        # Contiguous node indices in sorted (domain, id) order
+        node_keys = sorted(nodes_xyz.keys())
+        node_index = {key: idx for idx, key in enumerate(node_keys)}
 
         # Deduplicate segments by sorted node-pair
         seg_keys = []
@@ -743,7 +793,7 @@ class defects(logging):
         for ni, arm_list in arms_by_node.items():
             pi = np.asarray(nodes_xyz[ni], dtype=np.float64)
             for nbr, bx, by, bz, nx, ny, nz in arm_list:
-                if ni == nbr:
+                if ni == nbr or nbr not in nodes_xyz:
                     continue
                 key = (ni, nbr) if ni < nbr else (nbr, ni)
                 if key in seen:
@@ -751,18 +801,13 @@ class defects(logging):
                 seen.add(key)
                 pj = np.asarray(nodes_xyz[nbr], dtype=np.float64)
 
-                b_dir_crys = np.array([bx, by, bz], dtype=np.float64)
-                nrm = np.linalg.norm(b_dir_crys)
-                if nrm == 0:
+                # File components are multiples of |b|; keep their magnitude.
+                b_crys = np.array([bx, by, bz], dtype=np.float64)
+                if not np.any(b_crys):
                     continue
-                b_dir_crys /= nrm
-                b_dir_real = (Bmap.T @ b_dir_crys.reshape(3,1)).reshape(3)
-                bn = np.linalg.norm(b_dir_real)
-                if bn == 0:
-                    continue
-                b_vec = (b_dir_real / bn) * bmag
+                b_vec = (Bmap.T @ b_crys) * bmag
 
-                seg_keys.append(key)
+                seg_keys.append((node_index[ni], node_index[nbr]))
                 seg_S0.append(pi)
                 seg_S1.append(pj)
                 seg_b.append(b_vec.astype(np.float64))
@@ -808,9 +853,10 @@ class defects(logging):
                          where=(Llen[:, None] > 0)).astype(dtype)
 
         self._opendis_nodes_xyz = np.asarray(
-            [nodes_xyz[k] for k in sorted(nodes_xyz.keys())], dtype=dtype
+            [nodes_xyz[k] for k in node_keys], dtype=dtype
         )
         self._opendis_segments = segs
+        self._opendis_source = os.path.abspath(filepath)
         self._opendis_S0 = S0
         self._opendis_S1 = S1
         self._opendis_bvec = Bv
@@ -836,8 +882,9 @@ class defects(logging):
         Clip dislocation network to the sample bounding box.
 
         Keeps only dislocation segments that intersect the sample axis-aligned
-        bounding box (AABB) plus an optional margin. Rebuilds a compact node
-        set and recomputes per-segment derived arrays.
+        bounding box (AABB) plus an optional margin. The per-segment arrays
+        are filtered directly, so minimum-image unwrapped endpoints are kept,
+        and a compact node list is rebuilt from the kept endpoints.
 
         Args:
             sample: Sample object exposing a 'corners' attribute with shape
@@ -920,21 +967,21 @@ class defects(logging):
             return
             # raise ValueError("Clipping removed all segments. Increase margin or verify inputs.")
 
-        # Filter segments and associated per-segment data
+        # Filter the per-segment arrays directly (keeps the unwrapped endpoints)
         seg_keep = seg_idx[keep, :]
         Bv_keep = Bv[keep, :]
+        S0_new = S0[keep, :]
+        S1_new = S1[keep, :]
 
-        # Build compact node set and reindex segments
+        # Compact node list from the kept endpoints; S0 (the stored node
+        # position) wins over an unwrapped S1 image at the same node.
         used_nodes = np.unique(seg_keep.ravel())
-        remap = -np.ones((nodes.shape[0],), dtype=np.int64)
+        remap = -np.ones((max(int(nodes.shape[0]), int(used_nodes.max()) + 1),), dtype=np.int64)
         remap[used_nodes] = np.arange(used_nodes.size, dtype=np.int64)
         seg_new = remap[seg_keep]
-
-        nodes_new = nodes[used_nodes, :]
-
-        # Recompute S0/S1 from the compact node set
-        S0_new = nodes_new[seg_new[:, 0], :]
-        S1_new = nodes_new[seg_new[:, 1], :]
+        nodes_new = np.zeros((used_nodes.size, 3), dtype=np.float64)
+        nodes_new[seg_new[:, 1]] = S1_new
+        nodes_new[seg_new[:, 0]] = S0_new
 
         # Recompute derived per-segment quantities
         Lvec = S1_new - S0_new
@@ -1037,8 +1084,8 @@ class defects(logging):
                 Requires rotate_angle to be set. Ignored if rotate_matrix is provided.
             rotate_angle: Rotation angle around rotate_axis. Interpreted in degrees
                 unless degrees=False. Ignored if rotate_matrix is provided.
-            rotate_matrix: Explicit 3x3 rotation matrix. If provided, rotate_axis
-                and rotate_angle are ignored.
+            rotate_matrix: Explicit 3x3 rotation matrix applied as v -> R v.
+                If provided, rotate_axis and rotate_angle are ignored.
             degrees: If True, interpret rotate_angle in degrees. Defaults to True.
 
         Raises:
@@ -1098,11 +1145,11 @@ class defects(logging):
         Bv = np.asarray(self._opendis_bvec, dtype=np.float64)
         seg_idx = np.asarray(self._opendis_segments, dtype=np.int64)
 
-        # Transform positions: scale, rotate, then translate
+        # Transform positions: scale, rotate (v -> R v), then translate
         def _xform_pos(P):
             out = P * s
             if R is not None:
-                out = out @ R
+                out = out @ R.T
             if t is not None:
                 out = out + t
             return out
@@ -1111,7 +1158,7 @@ class defects(logging):
         def _xform_vec(V):
             out = V * s
             if R is not None:
-                out = out @ R
+                out = out @ R.T
             return out
 
         nodes_new = _xform_pos(nodes)
@@ -1165,1250 +1212,98 @@ class defects(logging):
                              float_fmt="%.9e",
                              chunk_rows=2000000,
                              dtype=np.float32,
-                             mode="LR+SR"):
+                             mode=None):
         """
-        Compute a nodal displacement field from the dislocation network.
+        Evaluate the dislocation displacement field on a regular grid and
+        write it as an FE-style nodal field.
 
-        Implements the spectral / analytic hybrid framework of Bertin (2018,
-        *Int. J. Plasticity* **122**, 268-284) specialised to the displacement
-        output that the X-ray Simulator needs to drive its atomic positions.
-        The Nye tensor is deposited on a periodic grid by the closed-form
-        cloud-in-cell line integral of Bertin Appendix A, smoothed in Fourier
-        space by the Cai et al. (2006) non-singular kernel
-        omega(r, a) = (15 / (8 pi a^3)) * ((r/a)^2 + 1)^(-7/2) whose 3D Fourier
-        transform admits the closed form omega_hat(k, a) = ((a k)^2 / 2) K_2(a k),
-        and converted to displacement by inverting the anisotropic
-        Christoffel matrix A_im(k) = C_ijml k_j k_l per Fourier mode. A
-        short-range correction (LR+SR mode) sums the difference of the Cai 2006
-        non-singular displacement gradient evaluated at the physical core
-        radius and the spectral spreading radius over neighbour segments
-        within `r_cut`, then integrates the result back to a displacement
-        correction in Fourier space.
+        Each cell-centred grid node receives the isotropic Volterra
+        displacement of the imported network from `dislocation_displacement`,
+        so the slip discontinuity of every loop is present in the nodal
+        values. A structured Tet4 connectivity is written alongside so
+        `Deformation.apply_fe_nodal_field` can interpolate the field onto the
+        atoms. Interpolation smears the discontinuity over one cell; use
+        `apply_dislocation_displacement` to evaluate the field at the atoms
+        directly.
 
         Args:
-            crystal: Crystal object (deprecated, may be removed in future).
-            mu: Shear modulus, used by the **isotropic short-range correction**
-                (Cai 2006 closed form) regardless of whether `stiffness` is
-                supplied for the long-range solver. Required.
-            nu: Poisson's ratio in (0, 0.5), used by the short-range correction
-                and to build the default isotropic stiffness for the
-                long-range solver if `stiffness=None`.
-            grid_shape: (nx, ny, nz) shape of the spectral grid. 64-256 per
-                axis is typical.
+            mu: Shear modulus. Accepted for API compatibility; the
+                displacement of a dislocation depends on `nu` only.
+            nu: Poisson's ratio in (0, 0.5).
+            grid_shape: (nx, ny, nz) number of cells per axis.
             bounds: Explicit ((xmin, xmax), (ymin, ymax), (zmin, zmax)). If
                 None, uses the imported network bounds plus `padding`.
             padding: Padding around the network bounds when `bounds` is None.
-            core_radius: Physical dislocation core radius a_0 used in the
-                short-range Cai 2006 correction. Defaults to 5.0 angstrom.
-            r_cut: Short-range neighbour cutoff for LR+SR mode. If None,
-                set to 4 * a_grid where a_grid = 2 * min(dx, dy, dz) is the
-                spectral spreading radius. This corresponds to the ~5%
-                splitting-error rule of thumb of Bertin (2018) Fig. 10 for
-                a_phys ~ b. Pass a custom value to tighten/loosen.
-            stiffness: Elastic stiffness used by the **anisotropic** spectral
-                long-range solver. Accepts:
-
-                * None: build the isotropic Hooke's law from `(mu, nu)`
-                  (default; preserves backwards compatibility).
-                * dict ``{"isotropic": (mu, nu)}``: same as None but lets the
-                  caller decouple SR/LR moduli.
-                * dict ``{"cubic": (c11, c12, c44)}``: cubic crystal expanded
-                  via the Voigt mapping.
-                * (6, 6) ndarray: arbitrary anisotropic stiffness in Voigt
-                  notation.
-                * (3, 3, 3, 3) ndarray: full 4th-order tensor with the
-                  standard symmetries.
-
-                Note: the short-range Cai 2006 routine is intrinsically
-                isotropic, so even when an anisotropic `stiffness` is
-                supplied, the SR correction uses (mu, nu). Strict-anisotropic
-                short-range corrections via the spherical-harmonic expansion
-                of Aubry & Arsenlis (2013) or the closed-form non-singular
-                theory of Po et al. (2018) are out of scope here.
-            scale: Scale factor for the displacement field. Defaults to 1.0.
+            core_radius: Core radius a (Angstrom) that regularises the
+                elastic terms, |r| -> sqrt(r^2 + a^2). Defaults to 5.0.
+            r_cut: Ignored; kept for API compatibility.
+            stiffness: Ignored; only isotropic elasticity is available.
+            scale: Multiplier applied to the displacement field.
             write_directory: Directory for output files. If None, uses
                 self.directory.
             nodes_filename: Output filename for the nodal positions.
             conn_filename: Output filename for the Tet4 connectivity.
-            use_gpu: If True and CuPy is available, run the spectral solve
-                and SR accumulation on the GPU.
-            one_based_connectivity: If True, Tet4 indices start at 1
-                (FE-style); else 0-based.
+            use_gpu: If True and CuPy is available, evaluate on the GPU.
+            one_based_connectivity: If True, Tet4 indices in the returned
+                `conn` start at 1; the written file is always 0-based.
             file_format: "txt", "npy", or "npz".
             float_fmt: Float format string for text output.
             chunk_rows: Number of rows per text-write chunk.
             dtype: NumPy dtype for output arrays.
-            mode: Computation mode:
-                - "LR":   spectral long-range only.
-                - "SR":   continuum non-singular line-integral only
-                          (ExaDiS-style; sums over all segments).
-                - "LR+SR": hybrid spectral long-range plus analytic
-                          near-core delta correction (default; faithful to
-                          Bertin 2018 splitting Eq. 14 / 31).
+            mode: Ignored; kept for API compatibility with earlier callers.
 
         Returns:
             dict: ``Xref`` (N, 3) reference positions, ``U`` (N, 3)
-            displacement field, ``conn`` Tet4 connectivity, plus output
-            file paths.
+            displacements, ``conn`` Tet4 connectivity, ``nodes_path`` and
+            ``conn_path``.
 
         Raises:
             RuntimeError: If the dislocation network has not been imported.
-            ValueError: If `mode` is invalid, `nu` is out of range, or
-                `stiffness` violates the major/minor symmetries.
-
-        Notes:
-            For large segment counts (Ns > ~10**4) combined with the new
-            r_cut = 4 * a_grid default, the brute-force segment-midpoint
-            culling in the short-range loop becomes the bottleneck. A
-            uniform-grid spatial hash is a planned optimisation; for now,
-            consider lowering r_cut at the cost of a larger splitting error.
-
-        References:
-            Bertin, N. *Int. J. Plasticity* **122**, 268-284 (2019).
-            Cai, W. et al. *J. Mech. Phys. Solids* **54**, 561-587 (2006).
+            ValueError: If `nu` is out of range or `grid_shape` is too small.
         """
-        # --------------------------
-        # Preconditions and inputs
-        # --------------------------
-        if not hasattr(self, "_opendis_S0"):
+        if not hasattr(self, "_opendis_S0") or self._opendis_S0 is None:
             raise RuntimeError("Call import_dislocation_network(...) first.")
-        if mode not in ("LR", "SR", "LR+SR"):
-            raise ValueError('mode must be one of "LR", "SR", or "LR+SR"')
         if not (0.0 < float(nu) < 0.5):
             raise ValueError("nu must be in (0, 0.5)")
-
-        nu = float(nu)
-        mu_ = float(mu)
-        lam = 2.0 * mu_ * nu / max(1.0 - 2.0*nu, 1e-12)
-        a_phys = float(core_radius)
-
-        # Resolve the user-supplied stiffness into a (3,3,3,3) tensor used by
-        # the spectral long-range solver. The short-range correction always
-        # uses the isotropic Cai 2006 closed forms with (mu, nu); see the
-        # docstring for the rationale.
-        C_stiff = _resolve_stiffness(stiffness, mu_, nu)
+        if mode is not None:
+            self._log("normal", f"generate_nodal_field: mode='{mode}' is ignored; "
+                                "the field is evaluated directly per node.")
+        if stiffness is not None:
+            self._log("normal", "generate_nodal_field: stiffness is ignored; "
+                                "only isotropic elasticity is available.")
 
         out_dir = write_directory if write_directory is not None else (self.directory if self.directory else ".")
         os.makedirs(out_dir, exist_ok=True)
 
-        # --------------------------
-        # Bounds and grid (cell-centered)
-        # --------------------------
+        # Bounds and cell-centred grid
         if bounds is None:
             bmin = np.asarray(self._opendis_bounds["min"], dtype=np.float64)
             bmax = np.asarray(self._opendis_bounds["max"], dtype=np.float64)
             if float(padding) != 0.0:
-                pad = float(padding)
-                bmin = bmin - pad
-                bmax = bmax + pad
+                bmin = bmin - float(padding)
+                bmax = bmax + float(padding)
             bounds = ((float(bmin[0]), float(bmax[0])),
-                    (float(bmin[1]), float(bmax[1])),
-                    (float(bmin[2]), float(bmax[2])))
+                      (float(bmin[1]), float(bmax[1])),
+                      (float(bmin[2]), float(bmax[2])))
         (xmin, xmax), (ymin, ymax), (zmin, zmax) = bounds
         nx, ny, nz = [int(v) for v in grid_shape]
         if min(nx, ny, nz) < 2:
             raise ValueError("grid_shape must be >= 2")
-
-        Lx = float(xmax - xmin); Ly = float(ymax - ymin); Lz = float(zmax - zmin)
-        dx = Lx / nx; dy = Ly / ny; dz = Lz / nz
-
-        # a_grid for LR spreading; SR-only does not use it
-        a_grid = 2.0 * min(dx, dy, dz)
-
-        # default SR neighbor radius for LR+SR; for SR-only we include all segments.
-        # Bertin (2018) Fig. 10 / Eq. 53: r_c = sqrt((a_grid^2 - a_phys^2) / eps_max),
-        # which gives r_c ~= 4 a_grid for a_phys ~= b and eps_max ~= 5%. Tied to
-        # a_grid (not the mean grid spacing) so the splitting error stays bounded.
-        if r_cut is None:
-            r_cut = 4.0 * a_grid
-        R_c = float(r_cut)
-
-        # Cell-centered nodes (reference positions)
+        dx = float(xmax - xmin) / nx
+        dy = float(ymax - ymin) / ny
+        dz = float(zmax - zmin) / nz
         xs = np.linspace(xmin + 0.5*dx, xmax - 0.5*dx, nx, dtype=dtype)
         ys = np.linspace(ymin + 0.5*dy, ymax - 0.5*dy, ny, dtype=dtype)
         zs = np.linspace(zmin + 0.5*dz, zmax - 0.5*dz, nz, dtype=dtype)
         Xg, Yg, Zg = np.meshgrid(xs, ys, zs, indexing="ij")
         Xref = np.stack([Xg.ravel(), Yg.ravel(), Zg.ravel()], axis=1).astype(dtype, copy=False)
 
-        # Simple structured Tet4 connectivity (unchanged)
-        def _grid_tet4(nx, ny, nz, one_based=True):
-            ex, ey, ez = nx-1, ny-1, nz-1
-            elems = []
-            def nid(i,j,k, ii,jj,kk):
-                return (ii+i)*ny*nz + (jj+j)*nz + (kk+k)
-            for ii in range(ex):
-                for jj in range(ey):
-                    for kk in range(ez):
-                        v000 = nid(0,0,0, ii,jj,kk)
-                        v100 = nid(1,0,0, ii,jj,kk)
-                        v010 = nid(0,1,0, ii,jj,kk)
-                        v110 = nid(1,1,0, ii,jj,kk)
-                        v001 = nid(0,0,1, ii,jj,kk)
-                        v101 = nid(1,0,1, ii,jj,kk)
-                        v011 = nid(0,1,1, ii,jj,kk)
-                        v111 = nid(1,1,1, ii,jj,kk)
-                        elems.extend([
-                            [v000, v100, v110, v111],
-                            [v000, v110, v010, v111],
-                            [v000, v010, v011, v111],
-                            [v000, v011, v001, v111],
-                            [v000, v001, v101, v111],
-                            [v000, v101, v100, v111],
-                        ])
-            conn = np.asarray(elems, dtype=np.int64)
-            if one_based:
-                conn = conn + 1
-            return conn
-
-        conn = _grid_tet4(nx, ny, nz, one_based=bool(one_based_connectivity))
-
-        # --------------------------
-        # Dislocation arrays (NumPy on host)
-        # --------------------------
-        S0  = np.asarray(self._opendis_S0, dtype=np.float64)
-        S1  = np.asarray(self._opendis_S1, dtype=np.float64)
-        Bv  = np.asarray(self._opendis_bvec, dtype=np.float64)
-        MID = np.asarray(self._opendis_mids, dtype=np.float64)
-        HL  = np.asarray(self._opendis_halfL, dtype=np.float64)
-        Ns = int(S0.shape[0])
-        if Ns == 0:
-            raise ValueError("No dislocation segments loaded.")
-
-        # --------------------------
-        # GPU availability
-        # --------------------------
-        gpu_ok = bool(use_gpu and (cp is not None))
-        if gpu_ok:
-            try:
-                _ = cp.cuda.runtime.getDeviceCount()
-            except Exception:
-                gpu_ok = False
-
-        # --------------------------
-        # Helper: spectral LR solver
-        #
-        # Implements the Bertin (2018) spectral framework for the displacement
-        # field of a dislocation network on a periodic grid:
-        #   1. FFT(alpha) -> alpha_hat                                (Nye tensor in Fourier space)
-        #   2. alpha_hat_ns = omega_hat(k, a_grid) * alpha_hat        (Cai 2006 spreading)
-        #   3. chi_hat_ij = i eps_jkl k_l alpha_hat_ns_ik / |k|^2     (Stokes-Helmholtz incompatible distortion, Bertin Eq. 29)
-        #   4. eps_hat = sym(chi_hat)
-        #   5. sigma_hat_ij = C_ijkl eps_hat_kl                       (anisotropic Hooke's law)
-        #   6. RHS_i = i k_j sigma_hat_ij                             (force density driving Navier)
-        #   7. A_im(k) = C_ijml k_j k_l                               (acoustic / Christoffel matrix)
-        #   8. Uhat_i = A^{-1}_ij(k) RHS_j   (per-k 3x3 inverse)
-        #   9. u_long(r) = IFFT(Uhat)
-        # The k=0 mode is set to zero (rigid-body translation gauge).
-        # --------------------------
-        def _fft_lr(alpha_arr, use_gpu_fft=True):
-            xp = cp if use_gpu_fft else np
-            C_xp = xp.asarray(C_stiff, dtype=xp.float32)
-
-            kx = 2.0*np.pi*xp.fft.fftfreq(nx, d=dx)
-            ky = 2.0*np.pi*xp.fft.fftfreq(ny, d=dy)
-            kz = 2.0*np.pi*xp.fft.fftfreq(nz, d=dz)
-            KX, KY, KZ = xp.meshgrid(kx, ky, kz, indexing="ij")
-            K2 = KX*KX + KY*KY + KZ*KZ
-            K = xp.sqrt(K2)
-            K2_safe = K2.copy()
-            K2_safe[0,0,0] = 1.0
-
-            # Cai 2006 non-singular spreading kernel in Fourier space.
-            # See _cai_kernel_fourier docstring for the closed form
-            # omega_hat(k, a) = ((a k)^2 / 2) K_2(a k).
-            Phi = _cai_kernel_fourier(K, a_grid, xp=xp).astype(xp.float32)
-
-            Ak = xp.fft.fftn(alpha_arr, axes=(0,1,2))
-            Ak_ns = Phi[...,None,None] * Ak
-
-            # chi_hat from Bertin Eq. 29:  chi_hat_ij = i eps_jkl k_l alpha_hat_ns_ik / |k|^2
-            beta_p = xp.zeros_like(Ak_ns, dtype=xp.complex64)
-            for i in range(3):
-                arow = Ak_ns[..., i, :]
-                cx = xp.stack([
-                    KY*arow[...,2] - KZ*arow[...,1],
-                    KZ*arow[...,0] - KX*arow[...,2],
-                    KX*arow[...,1] - KY*arow[...,0],
-                ], axis=-1)
-                beta_p[..., i, :] = 1j * cx / K2_safe[...,None]
-            beta_p[0,0,0,...] = 0.0
-
-            ep = 0.5*(beta_p + xp.transpose(beta_p, (0,1,2,4,3)))
-            kvec = xp.stack([KX, KY, KZ], axis=-1)
-
-            # sigma_hat_ij = C_ijkl eps_hat_kl  (full anisotropic Hooke's law)
-            sigma = xp.einsum('ijkl,xyzkl->xyzij', C_xp, ep)
-
-            # Force density RHS_i = i k_j sigma_hat_ij
-            RHS = 1j * xp.einsum('xyzj,xyzij->xyzi', kvec.astype(xp.complex64), sigma)
-
-            # Christoffel matrix A_im(k) = C_ijml k_j k_l, shape (nx,ny,nz,3,3)
-            A_christ = xp.einsum('ijml,xyzj,xyzl->xyzim', C_xp, kvec, kvec)
-
-            # Avoid singular k=0 inversion; we explicitly zero Uhat[0,0,0] below.
-            A_safe = A_christ.copy()
-            A_safe[0,0,0] = xp.eye(3, dtype=A_safe.dtype)
-
-            # Per-k 3x3 solve.  cupy.linalg.solve and numpy.linalg.solve both
-            # treat leading dimensions as a batch.
-            Uhat = xp.linalg.solve(A_safe.astype(xp.complex64), RHS[..., None]).squeeze(-1)
-            Uhat[0,0,0,:] = 0.0
-
-            u_long = xp.real(xp.fft.ifftn(Uhat, axes=(0,1,2))).astype(xp.float32)
-            return u_long
-
-        # --------------------------
-        # LR branch (alpha deposition + spectral solve), used when mode has LR
-        # --------------------------
-        lr_needed = (mode in ("LR", "LR+SR"))
-        if lr_needed:
-            # Deposit Nye tensor alpha on the grid using the trilinear cloud-in-cell
-            # weighting function with the closed-form line integral of Bertin (2018)
-            # Appendix A. For each segment, slab-clip against each candidate voxel's
-            # [-H, +H] CIC support box, split the resulting parameter interval at the
-            # sign-flip points s_i* = (x_voxel_i - x_a_i) / t_hat_i, and accumulate
-            # the per-sub-interval cubic-polynomial integral analytically. This is
-            # exact for straight segments and replaces the previous oversampled
-            # numerical subdivision scheme.
-            if gpu_ok:
-                alpha = cp.zeros((nx, ny, nz, 3, 3), dtype=cp.float32)
-
-                cic_kernel_src = r'''
-                extern "C" __global__
-                void deposit_alpha_cic_analytical(
-                    const int Ns,
-                    const float *s0x, const float *s0y, const float *s0z,
-                    const float *s1x, const float *s1y, const float *s1z,
-                    const float *bx,  const float *by,  const float *bz,
-                    const int nx, const int ny, const int nz,
-                    const float xmin, const float ymin, const float zmin,
-                    const float dx, const float dy, const float dz,
-                    float *alpha)   // flattened [nx,ny,nz,3,3]
-                {
-                    int sid = blockDim.x * blockIdx.x + threadIdx.x;
-                    if (sid >= Ns) return;
-
-                    float x0 = s0x[sid], y0 = s0y[sid], z0 = s0z[sid];
-                    float x1 = s1x[sid], y1 = s1y[sid], z1 = s1z[sid];
-                    float tx = x1 - x0, ty = y1 - y0, tz = z1 - z0;
-                    float L2 = tx*tx + ty*ty + tz*tz;
-                    if (!(L2 > 1.0e-20f)) return;
-                    float Linv = rsqrtf(L2);
-                    float L = 1.0f / Linv;
-                    tx *= Linv; ty *= Linv; tz *= Linv;
-
-                    float bxv = bx[sid], byv = by[sid], bzv = bz[sid];
-                    float btx00 = bxv*tx, btx01 = bxv*ty, btx02 = bxv*tz;
-                    float btx10 = byv*tx, btx11 = byv*ty, btx12 = byv*tz;
-                    float btx20 = bzv*tx, btx21 = bzv*ty, btx22 = bzv*tz;
-
-                    const float Hx = dx, Hy = dy, Hz = dz;
-                    const float vol_inv = 1.0f / (dx * dy * dz);
-                    const float TINY = 1.0e-30f;
-
-                    // AABB of touched voxel indices: a voxel with center c sees
-                    // a point x iff |c - x| < H, i.e. x - H < c < x + H, so
-                    // (x - xmin)/dx - 1.5 < i < (x - xmin)/dx + 0.5.
-                    float xa = fminf(x0, x1), xb = fmaxf(x0, x1);
-                    float ya = fminf(y0, y1), yb = fmaxf(y0, y1);
-                    float za = fminf(z0, z1), zb = fmaxf(z0, z1);
-                    int n_xmin = (int)ceilf((xa - xmin)/dx - 1.5f);
-                    int n_xmax = (int)floorf((xb - xmin)/dx + 0.5f);
-                    int n_ymin = (int)ceilf((ya - ymin)/dy - 1.5f);
-                    int n_ymax = (int)floorf((yb - ymin)/dy + 0.5f);
-                    int n_zmin = (int)ceilf((za - zmin)/dz - 1.5f);
-                    int n_zmax = (int)floorf((zb - zmin)/dz + 0.5f);
-
-                    for (int ii = n_xmin; ii <= n_xmax; ++ii) {
-                        float xc = xmin + ((float)ii + 0.5f) * dx;
-                        float dtx = xc - x0;
-                        for (int jj = n_ymin; jj <= n_ymax; ++jj) {
-                            float yc = ymin + ((float)jj + 0.5f) * dy;
-                            float dty = yc - y0;
-                            for (int kk = n_zmin; kk <= n_zmax; ++kk) {
-                                float zc = zmin + ((float)kk + 0.5f) * dz;
-                                float dtz = zc - z0;
-
-                                // Slab-clip the segment against the voxel's [-H, +H] box
-                                float sa = 0.0f, sb = L;
-                                bool ok = true;
-
-                                if (fabsf(tx) > TINY) {
-                                    float inv = 1.0f / tx;
-                                    float lo = (dtx - Hx) * inv;
-                                    float hi = (dtx + Hx) * inv;
-                                    if (lo > hi) { float t = lo; lo = hi; hi = t; }
-                                    if (lo > sa) sa = lo;
-                                    if (hi < sb) sb = hi;
-                                } else if (fabsf(dtx) >= Hx) {
-                                    ok = false;
-                                }
-                                if (ok && fabsf(ty) > TINY) {
-                                    float inv = 1.0f / ty;
-                                    float lo = (dty - Hy) * inv;
-                                    float hi = (dty + Hy) * inv;
-                                    if (lo > hi) { float t = lo; lo = hi; hi = t; }
-                                    if (lo > sa) sa = lo;
-                                    if (hi < sb) sb = hi;
-                                } else if (ok && fabsf(dty) >= Hy) {
-                                    ok = false;
-                                }
-                                if (ok && fabsf(tz) > TINY) {
-                                    float inv = 1.0f / tz;
-                                    float lo = (dtz - Hz) * inv;
-                                    float hi = (dtz + Hz) * inv;
-                                    if (lo > hi) { float t = lo; lo = hi; hi = t; }
-                                    if (lo > sa) sa = lo;
-                                    if (hi < sb) sb = hi;
-                                } else if (ok && fabsf(dtz) >= Hz) {
-                                    ok = false;
-                                }
-
-                                if (!ok || !(sb > sa)) continue;
-
-                                // Sign-flip parameters s_i* = d_tilde_i / t_i, sorted
-                                float flips[3];
-                                int n_flips = 0;
-                                if (fabsf(tx) > TINY) {
-                                    float sf = dtx / tx;
-                                    if (sa < sf && sf < sb) {
-                                        flips[n_flips++] = sf;
-                                    }
-                                }
-                                if (fabsf(ty) > TINY) {
-                                    float sf = dty / ty;
-                                    if (sa < sf && sf < sb) {
-                                        int p = n_flips;
-                                        while (p > 0 && flips[p-1] > sf) { flips[p] = flips[p-1]; --p; }
-                                        flips[p] = sf;
-                                        ++n_flips;
-                                    }
-                                }
-                                if (fabsf(tz) > TINY) {
-                                    float sf = dtz / tz;
-                                    if (sa < sf && sf < sb) {
-                                        int p = n_flips;
-                                        while (p > 0 && flips[p-1] > sf) { flips[p] = flips[p-1]; --p; }
-                                        flips[p] = sf;
-                                        ++n_flips;
-                                    }
-                                }
-
-                                // Walk through sub-intervals; on each, the integrand
-                                // is the cubic polynomial prod_i (alpha_i + beta_i s).
-                                float total = 0.0f;
-                                float prev = sa;
-                                for (int q = 0; q <= n_flips; ++q) {
-                                    float curr = (q < n_flips) ? flips[q] : sb;
-                                    if (!(curr > prev)) continue;
-                                    float s_mid = 0.5f * (prev + curr);
-
-                                    float sgx = ((dtx - s_mid * tx) >= 0.0f) ? 1.0f : -1.0f;
-                                    float sgy = ((dty - s_mid * ty) >= 0.0f) ? 1.0f : -1.0f;
-                                    float sgz = ((dtz - s_mid * tz) >= 0.0f) ? 1.0f : -1.0f;
-
-                                    float ax = 1.0f - sgx * dtx / Hx;
-                                    float ay = 1.0f - sgy * dty / Hy;
-                                    float az = 1.0f - sgz * dtz / Hz;
-                                    float bxc = sgx * tx / Hx;
-                                    float byc = sgy * ty / Hy;
-                                    float bzc = sgz * tz / Hz;
-
-                                    float c0 = ax * ay * az;
-                                    float c1 = ax*ay*bzc + ax*byc*az + bxc*ay*az;
-                                    float c2 = ax*byc*bzc + bxc*ay*bzc + bxc*byc*az;
-                                    float c3 = bxc * byc * bzc;
-
-                                    float ds  = curr - prev;
-                                    float ds2 = curr*curr - prev*prev;
-                                    float ds3 = curr*curr*curr - prev*prev*prev;
-                                    float ds4 = curr*curr*curr*curr - prev*prev*prev*prev;
-
-                                    total += c0 * ds + 0.5f * c1 * ds2
-                                           + (c2 / 3.0f) * ds3 + 0.25f * c3 * ds4;
-                                    prev = curr;
-                                }
-
-                                if (total != 0.0f) {
-                                    int iw = ((ii % nx) + nx) % nx;
-                                    int jw = ((jj % ny) + ny) % ny;
-                                    int kw = ((kk % nz) + nz) % nz;
-                                    float w = total * vol_inv;
-                                    size_t base = (((size_t)iw*ny + (size_t)jw)*nz + (size_t)kw)*9;
-                                    atomicAdd(&alpha[base + 0], w * btx00);
-                                    atomicAdd(&alpha[base + 1], w * btx01);
-                                    atomicAdd(&alpha[base + 2], w * btx02);
-                                    atomicAdd(&alpha[base + 3], w * btx10);
-                                    atomicAdd(&alpha[base + 4], w * btx11);
-                                    atomicAdd(&alpha[base + 5], w * btx12);
-                                    atomicAdd(&alpha[base + 6], w * btx20);
-                                    atomicAdd(&alpha[base + 7], w * btx21);
-                                    atomicAdd(&alpha[base + 8], w * btx22);
-                                }
-                            }
-                        }
-                    }
-                }'''.strip("\n")
-                mod_alpha = cp.RawModule(code=cic_kernel_src, backend='nvcc',
-                                        options=('--gpu-architecture=native','-O3','--use_fast_math'))
-                deposit_alpha = mod_alpha.get_function('deposit_alpha_cic_analytical')
-
-                s0x = cp.asarray(S0[:,0], dtype=cp.float32); s0y = cp.asarray(S0[:,1], dtype=cp.float32); s0z = cp.asarray(S0[:,2], dtype=cp.float32)
-                s1x = cp.asarray(S1[:,0], dtype=cp.float32); s1y = cp.asarray(S1[:,1], dtype=cp.float32); s1z = cp.asarray(S1[:,2], dtype=cp.float32)
-                bx  = cp.asarray(Bv[:,0], dtype=cp.float32); by  = cp.asarray(Bv[:,1], dtype=cp.float32); bz  = cp.asarray(Bv[:,2], dtype=cp.float32)
-
-                threads = 256
-                blocks  = (Ns + threads - 1) // threads
-                deposit_alpha((blocks,), (threads,),
-                            (np.int32(Ns),
-                            s0x, s0y, s0z, s1x, s1y, s1z, bx, by, bz,
-                            np.int32(nx), np.int32(ny), np.int32(nz),
-                            np.float32(xmin), np.float32(ymin), np.float32(zmin),
-                            np.float32(dx), np.float32(dy), np.float32(dz),
-                            alpha))
-            else:
-                alpha = np.zeros((nx, ny, nz, 3, 3), dtype=np.float32)
-                vol_inv = 1.0 / (dx * dy * dz)
-                H_arr = (dx, dy, dz)
-                for s in range(Ns):
-                    p0 = S0[s]
-                    t_vec = S1[s] - p0
-                    L2 = float(np.dot(t_vec, t_vec))
-                    if L2 < 1e-20:
-                        continue
-                    L = float(np.sqrt(L2))
-                    t_hat = (t_vec / L).astype(np.float64)
-                    btx = np.outer(Bv[s].astype(np.float64), t_hat)
-
-                    # AABB of touched voxel indices (per axis: i in (xrel - 1.5, xrel + 0.5))
-                    xa, xb = float(min(p0[0], p0[0] + L*t_hat[0])), float(max(p0[0], p0[0] + L*t_hat[0]))
-                    ya, yb = float(min(p0[1], p0[1] + L*t_hat[1])), float(max(p0[1], p0[1] + L*t_hat[1]))
-                    za, zb = float(min(p0[2], p0[2] + L*t_hat[2])), float(max(p0[2], p0[2] + L*t_hat[2]))
-                    n_xmin = int(np.ceil((xa - xmin)/dx - 1.5))
-                    n_xmax = int(np.floor((xb - xmin)/dx + 0.5))
-                    n_ymin = int(np.ceil((ya - ymin)/dy - 1.5))
-                    n_ymax = int(np.floor((yb - ymin)/dy + 0.5))
-                    n_zmin = int(np.ceil((za - zmin)/dz - 1.5))
-                    n_zmax = int(np.floor((zb - zmin)/dz + 0.5))
-
-                    for ii in range(n_xmin, n_xmax + 1):
-                        xc = xmin + (ii + 0.5) * dx
-                        for jj in range(n_ymin, n_ymax + 1):
-                            yc = ymin + (jj + 0.5) * dy
-                            for kk in range(n_zmin, n_zmax + 1):
-                                zc = zmin + (kk + 0.5) * dz
-                                d_tilde = (xc - p0[0], yc - p0[1], zc - p0[2])
-
-                                sa, sb = _cic_segment_voxel_clip(d_tilde, t_hat, H_arr, L)
-                                if sa is None:
-                                    continue
-
-                                I_voxel = _cic_line_segment_integral(d_tilde, t_hat, H_arr, sa, sb)
-                                if I_voxel == 0.0:
-                                    continue
-
-                                iw = ii % nx
-                                jw = jj % ny
-                                kw = kk % nz
-                                alpha[iw, jw, kw, ...] += (I_voxel * vol_inv) * btx
-
-            # Spectral LR solve
-            u_long = _fft_lr(alpha, use_gpu_fft=gpu_ok)
-
-        # --------------------------
-        # SR branch
-        # --------------------------
-        sr_needed = (mode in ("SR", "LR+SR"))
-        U = None  # will be set in next branches
-
-        if sr_needed and mode == "LR+SR":
-            # Existing LR+SR: analytic delta dudx [a_phys - a_grid] near segments, then integrate to Ucorr, add to LR.
-            if gpu_ok:
-                sr_kernel_src = r'''
-                extern "C" __global__
-                void sr_accumulate_diff(
-                    const int Npts,
-                    const float *px, const float *py, const float *pz,
-                    const int Ns,
-                    const float *s0x, const float *s0y, const float *s0z,
-                    const float *s1x, const float *s1y, const float *s1z,
-                    const float *bx,  const float *by,  const float *bz,
-                    const float *mid_x, const float *mid_y, const float *mid_z,
-                    const float *halfL, const float Rc,
-                    const float a_phys, const float a_grid, const float nu,
-                    float *G00, float *G01, float *G02,
-                    float *G10, float *G11, float *G12,
-                    float *G20, float *G21, float *G22)
-                {
-                    int i = blockDim.x * blockIdx.x + threadIdx.x;
-                    if (i >= Npts) return;
-
-                    float x = px[i], y = py[i], z = pz[i];
-
-                    float g00=0.f,g01=0.f,g02=0.f;
-                    float g10=0.f,g11=0.f,g12=0.f;
-                    float g20=0.f,g21=0.f,g22=0.f;
-
-                    const float m8pi = -0.125f / 3.14159265358979323846f;
-                    const float m8pinu = m8pi / (1.0f - nu);
-
-                    for (int s=0; s<Ns; ++s) {
-                        float dxm = x - mid_x[s];
-                        float dym = y - mid_y[s];
-                        float dzm = z - mid_z[s];
-                        float rad = Rc + halfL[s];
-                        if (dxm*dxm + dym*dym + dzm*dzm > rad*rad) continue;
-
-                        float sx = s0x[s], sy = s0y[s], sz = s0z[s];
-                        float ex = s1x[s], ey = s1y[s], ez = s1z[s];
-                        float tx = ex - sx, ty = ey - sy, tz = ez - sz;
-                        float L2 = tx*tx + ty*ty + tz*tz;
-                        if (!(L2 > 1.0e-20f)) continue;
-                        float Linv = rsqrtf(L2);
-                        float L = 1.0f / Linv;
-                        tx*=Linv; ty*=Linv; tz*=Linv;
-
-                        float Rx = x - sx, Ry = y - sy, Rz = z - sz;
-                        float Rdt = Rx*tx + Ry*ty + Rz*tz;
-
-                        float p0x = sx + Rdt*tx;
-                        float p0y = sy + Rdt*ty;
-                        float p0z = sz + Rdt*tz;
-
-                        float dx = Rx - (p0x - sx);
-                        float dy = Ry - (p0y - sy);
-                        float dz = Rz - (p0z - sz);
-                        float s1p = -Rdt;
-                        float s2p =  L - Rdt;
-
-                        float bxv = bx[s]; float byv = by[s]; float bzv = bz[s];
-
-                        auto compute_d = [&] (float a2,
-                                            float &d00,float &d01,float &d02,
-                                            float &d10,float &d11,float &d12,
-                                            float &d20,float &d21,float &d22) {
-                            float d2   = dx*dx + dy*dy + dz*dz;
-                            float da2  = d2 + a2;
-                            float da2inv = 1.0f / da2;
-
-                            float Ra1 = sqrtf(s1p*s1p + da2);
-                            float Ra2 = sqrtf(s2p*s2p + da2);
-                            float Ra1inv = 1.0f / fmaxf(Ra1, 1.0e-38f);
-                            float Ra2inv = 1.0f / fmaxf(Ra2, 1.0e-38f);
-                            float Ra1inv3 = Ra1inv*Ra1inv*Ra1inv;
-                            float Ra2inv3 = Ra2inv*Ra2inv*Ra2inv;
-
-                            float J03 = da2inv*(s2p*Ra2inv - s1p*Ra1inv);
-                            float J13 = -Ra2inv + Ra1inv;
-                            float J15 = -(1.0f/3.0f)*(Ra2inv3 - Ra1inv3);
-                            float J25 = (1.0f/3.0f)*da2inv*(s2p*s2p*s2p*Ra2inv3 - s1p*s1p*s1p*Ra1inv3);
-                            float J05 = da2inv*(2.0f*J25 + s2p*Ra2inv3 - s1p*Ra1inv3);
-                            float J35 = 2.0f*da2*J15 - s2p*s2p*Ra2inv3 + s1p*s1p*Ra1inv3;
-
-                            float A0 = 3.0f*a2*(dx*J05 - tx*J15) + 2.0f*(dx*J03 - tx*J13);
-                            float A1 = 3.0f*a2*(dy*J05 - ty*J15) + 2.0f*(dy*J03 - ty*J13);
-                            float A2 = 3.0f*a2*(dz*J05 - tz*J15) + 2.0f*(dz*J03 - tz*J13);
-
-                            float U1_00 = (-A2*ty*bxv) - (-A1*tz*bxv);
-                            float U1_01 = (-A0*tz*byv) - (-A2*tx*byv);
-                            float U1_02 = (-A1*tx*bzv) - (-A0*ty*bzv);
-
-                            float U2_00 = (-A0*tz*byv) - (-A0*ty*bzv);
-                            float U2_11 = (-A1*tx*bzv) - (-A1*tz*bxv);
-                            float U2_22 = (-A2*ty*bxv) - (-A2*tx*byv);
-
-                            float t0=tx, t1=ty, t2=tz;
-                            float d0=dx, d1=dy, d2c=dz;
-
-                            float B111 = -3.f*d0*J03 + 3.f*t0*J13 + 3.f*d0*d0*d0*J05 - 9.f*(d0*d0*t0)*J15 + 9.f*(d0*t0*t0)*J25 - 3.f*t0*t0*t0*J35;
-                            float B222 = -3.f*d1*J03 + 3.f*t1*J13 + 3.f*d1*d1*d1*J05 - 9.f*(d1*d1*t1)*J15 + 9.f*(d1*t1*t1)*J25 - 3.f*t1*t1*t1*J35;
-                            float B333 = -3.f*d2c*J03 + 3.f*t2*J13 + 3.f*d2c*d2c*d2c*J05 - 9.f*(d2c*d2c*t2)*J15 + 9.f*(d2c*t2*t2)*J25 - 3.f*t2*t2*t2*J35;
-
-                            float B112 = -d1*J03 + t1*J13 + 3.f*d0*d0*d1*J05
-                                    -3.f*(d0*d0*t1 + d0*t0*d1 + t0*d0*d1)*J15
-                                    +3.f*(t0*t0*d1 + t0*d0*t1 + d0*t0*t1)*J25
-                                    -3.f*t0*t0*t1*J35;
-
-                            float B113 = -d2c*J03 + t2*J13 + 3.f*d0*d0*d2c*J05
-                                    -3.f*(d0*d0*t2 + d0*t0*d2c + t0*d0*d2c)*J15
-                                    +3.f*(t0*t0*d2c + t0*d0*t2 + d0*t0*t2)*J25
-                                    -3.f*t0*t0*t2*J35;
-
-                            float B221 = -d0*J03 + t0*J13 + 3.f*d1*d1*d0*J05
-                                    -3.f*(d1*d1*t0 + d1*t1*d0 + t1*d1*d0)*J15
-                                    +3.f*(t1*t1*d0 + t1*d1*t0 + d1*t1*t0)*J25
-                                    -3.f*t1*t1*t0*J35;
-
-                            float B223 = -d2c*J03 + t2*J13 + 3.f*d1*d1*d2c*J05
-                                    -3.f*(d1*d1*t2 + d1*t1*d2c + t1*d1*d2c)*J15
-                                    +3.f*(t1*t1*d2c + t1*d1*t2 + d1*t1*t2)*J25
-                                    -3.f*t1*t1*t2*J35;
-
-                            float B331 = -d0*J03 + t0*J13 + 3.f*d2c*d2c*d0*J05
-                                    -3.f*(d2c*d2c*t0 + d2c*t2*d0 + t2*d2c*d0)*J15
-                                    +3.f*(t2*t2*d0 + t2*d2c*t0 + d2c*t2*t0)*J25
-                                    -3.f*t2*t2*t0*J35;
-
-                            float B332 = -d1*J03 + t1*J13 + 3.f*d2c*d2c*d1*J05
-                                    -3.f*(d2c*d2c*t1 + d2c*t2*d1 + t2*d2c*d1)*J15
-                                    +3.f*(t2*t2*d1 + t2*d2c*t1 + d2c*t2*t1)*J25
-                                    -3.f*t2*t2*t1*J35;
-
-                            float B123 =  3.f*d0*d1*d2c*J05
-                                    -3.f*(d0*d1*t2 + d0*t1*d2c + t0*d1*d2c)*J15
-                                    +3.f*(t0*t1*d2c + t0*d1*t2 + d0*t1*t2)*J25
-                                    -3.f*t0*t1*t2*J35;
-
-                            float U3_00 = (B112*t2 - B113*t1)*bxv + (B113*t0 - B111*t2)*byv + (B111*t1 - B112*t0)*bzv;
-                            float U3_11 = (B222*t2 - B223*t1)*bxv + (B223*t0 - B221*t2)*byv + (B221*t1 - B222*t0)*bzv;
-                            float U3_22 = (B332*t2 - B333*t1)*bxv + (B333*t0 - B331*t2)*byv + (B331*t1 - B332*t0)*bzv;
-                            float U3_01 = (B221*t2 - B123*t1)*bxv + (B123*t0 - B112*t2)*byv + (B112*t1 - B221*t0)*bzv;
-                            float U3_02 = (B123*t2 - B331*t1)*bxv + (B331*t0 - B113*t2)*byv + (B113*t1 - B123*t0)*bzv;
-                            float U3_12 = (B223*t2 - B332*t1)*bxv + (B332*t0 - B123*t2)*byv + (B123*t1 - B223*t0)*bzv;
-
-                            d00 = m8pi*(U1_00 + U2_00) + m8pinu*U3_00;
-                            d01 = m8pi*(U1_01 + 0.0f)  + m8pinu*U3_01;
-                            d02 = m8pi*(U1_02 + 0.0f)  + m8pinu*U3_02;
-
-                            d10 = m8pinu*U3_01;
-                            d11 = m8pi*(0.0f + U2_11) + m8pinu*U3_11;
-                            d12 = m8pinu*U3_12;
-
-                            d20 = m8pinu*U3_02;
-                            d21 = m8pinu*U3_12;
-                            d22 = m8pi*(0.0f + U2_22) + m8pinu*U3_22;
-                        };
-
-                        float d00p,d01p,d02p,d10p,d11p,d12p,d20p,d21p,d22p;
-                        float d00g,d01g,d02g,d10g,d11g,d12g,d20g,d21g,d22g;
-
-                        compute_d(a_phys*a_phys, d00p,d01p,d02p,d10p,d11p,d12p,d20p,d21p,d22p);
-                        compute_d(a_grid*a_grid, d00g,d01g,d02g,d10g,d11g,d12g,d20g,d21g,d22g);
-
-                        g00 += (d00p - d00g); g01 += (d01p - d01g); g02 += (d02p - d02g);
-                        g10 += (d10p - d10g); g11 += (d11p - d11g); g12 += (d12p - d12g);
-                        g20 += (d20p - d20g); g21 += (d21p - d21g); g22 += (d22p - d22g);
-                    }
-
-                    G00[i]=g00; G01[i]=g01; G02[i]=g02;
-                    G10[i]=g10; G11[i]=g11; G12[i]=g12;
-                    G20[i]=g20; G21[i]=g21; G22[i]=g22;
-                }'''.strip("\n")
-                mod_sr = cp.RawModule(code=sr_kernel_src, backend='nvcc',
-                                    options=('--gpu-architecture=native','-O3','--use_fast_math'))
-                sr_accum = mod_sr.get_function('sr_accumulate_diff')
-
-                px = cp.asarray(Xref[:,0], dtype=cp.float32)
-                py = cp.asarray(Xref[:,1], dtype=cp.float32)
-                pz = cp.asarray(Xref[:,2], dtype=cp.float32)
-
-                s0x = cp.asarray(S0[:,0], dtype=cp.float32); s0y = cp.asarray(S0[:,1], dtype=cp.float32); s0z = cp.asarray(S0[:,2], dtype=cp.float32)
-                s1x = cp.asarray(S1[:,0], dtype=cp.float32); s1y = cp.asarray(S1[:,1], dtype=cp.float32); s1z = cp.asarray(S1[:,2], dtype=cp.float32)
-                bx  = cp.asarray(Bv[:,0], dtype=cp.float32); by  = cp.asarray(Bv[:,1], dtype=cp.float32); bz  = cp.asarray(Bv[:,2], dtype=cp.float32)
-                mx  = cp.asarray(MID[:,0], dtype=cp.float32); my  = cp.asarray(MID[:,1], dtype=cp.float32); mz  = cp.asarray(MID[:,2], dtype=cp.float32)
-                hl  = cp.asarray(HL,        dtype=cp.float32)
-
-                G00 = cp.zeros(px.size, dtype=cp.float32); G01 = cp.zeros_like(G00); G02 = cp.zeros_like(G00)
-                G10 = cp.zeros_like(G00); G11 = cp.zeros_like(G00); G12 = cp.zeros_like(G00)
-                G20 = cp.zeros_like(G00); G21 = cp.zeros_like(G00); G22 = cp.zeros_like(G00)
-
-                threads = 256
-                blocks  = (px.size + threads - 1) // threads
-                sr_accum((blocks,), (threads,),
-                        (np.int32(px.size),
-                        px, py, pz,
-                        np.int32(Ns),
-                        s0x, s0y, s0z, s1x, s1y, s1z,
-                        bx,  by,  bz,
-                        mx,  my,  mz,
-                        hl,  cp.float32(R_c),
-                        cp.float32(a_phys), cp.float32(a_grid), cp.float32(nu),
-                        G00, G01, G02, G10, G11, G12, G20, G21, G22))
-
-                deltaG = cp.stack([
-                            cp.stack([G00,G01,G02], axis=1),
-                            cp.stack([G10,G11,G12], axis=1),
-                            cp.stack([G20,G21,G22], axis=1)
-                        ], axis=1).transpose(0,2,1)  # (N,3,3)
-                deltaG = deltaG.reshape(nx,ny,nz,3,3)
-
-                # Integrate deltaG to Ucorr in Fourier domain
-                kx = 2.0*np.pi*cp.fft.fftfreq(nx, d=dx)
-                ky = 2.0*np.pi*cp.fft.fftfreq(ny, d=dy)
-                kz = 2.0*np.pi*cp.fft.fftfreq(nz, d=dz)
-                KX, KY, KZ = cp.meshgrid(kx, ky, kz, indexing="ij")
-                K2 = KX*KX + KY*KY + KZ*KZ
-                K2[0,0,0] = 1.0
-
-                Ucorr = cp.zeros((nx,ny,nz,3), dtype=cp.float32)
-                for i in range(3):
-                    Gk0 = cp.fft.fftn(deltaG[..., i, 0]); Gk1 = cp.fft.fftn(deltaG[..., i, 1]); Gk2 = cp.fft.fftn(deltaG[..., i, 2])
-                    Uk  = (1j*(KX*Gk0 + KY*Gk1 + KZ*Gk2)) / K2
-                    Uk[0,0,0] = 0.0
-                    Ucorr[..., i] = cp.real(cp.fft.ifftn(Uk)).astype(cp.float32)
-
-                U = (u_long + Ucorr).reshape(nx*ny*nz, 3).get().astype(dtype, copy=False)
-            else:
-                # CPU LR+SR delta dudx
-                px = Xref[:,0].astype(np.float64); py = Xref[:,1].astype(np.float64); pz = Xref[:,2].astype(np.float64)
-                Gsum = np.zeros((px.size,3,3), dtype=np.float64)
-
-                def _dudx_seg(px, py, pz, p1, p2, b, a, nu):
-                    t = p2 - p1
-                    L2 = float(np.dot(t,t))
-                    if L2 < 1e-20:
-                        z = np.zeros_like(px)
-                        return (z,z,z,z,z,z,z,z,z)
-                    Linv = 1.0/np.sqrt(L2); L = 1.0/Linv; t = t*Linv
-                    Rx = px - p1[0]; Ry = py - p1[1]; Rz = pz - p1[2]
-                    Rdt = Rx*t[0] + Ry*t[1] + Rz*t[2]
-                    p0x = p1[0] + Rdt*t[0]; p0y = p1[1] + Rdt*t[1]; p0z = p1[2] + Rdt*t[2]
-                    dx = Rx - (p0x - p1[0]); dy = Ry - (p0y - p1[1]); dz = Rz - (p0z - p1[2])
-                    s1 = -Rdt; s2 = L - Rdt
-
-                    a2  = a*a
-                    d2  = dx*dx + dy*dy + dz*dz
-                    da2 = d2 + a2
-                    da2inv = 1.0/da2
-                    Ra1 = np.sqrt(s1*s1 + da2); Ra2 = np.sqrt(s2*s2 + da2)
-                    Ra1inv = 1.0/np.maximum(Ra1,1e-38); Ra2inv = 1.0/np.maximum(Ra2,1e-38)
-                    Ra1inv3 = Ra1inv*Ra1inv*Ra1inv; Ra2inv3 = Ra2inv*Ra2inv*Ra2inv
-
-                    J03 = da2inv*(s2*Ra2inv - s1*Ra1inv)
-                    J13 = -Ra2inv + Ra1inv
-                    J15 = -(1.0/3.0)*(Ra2inv3 - Ra1inv3)
-                    J25 = (1.0/3.0)*da2inv*(s2*s2*s2*Ra2inv3 - s1*s1*s1*Ra1inv3)
-                    J05 = da2inv*(2.0*J25 + s2*Ra2inv3 - s1*Ra1inv3)
-                    J35 = 2.0*da2*J15 - s2*s2*Ra2inv3 + s1*s1*Ra1inv3
-
-                    A0 = 3.0*a2*(dx*J05 - t[0]*J15) + 2.0*(dx*J03 - t[0]*J13)
-                    A1 = 3.0*a2*(dy*J05 - t[1]*J15) + 2.0*(dy*J03 - t[1]*J13)
-                    A2 = 3.0*a2*(dz*J05 - t[2]*J15) + 2.0*(dz*J03 - t[2]*J13)
-
-                    U1_00 = (-A2*t[1]*b[0]) - (-A1*t[2]*b[0])
-                    U1_01 = (-A0*t[2]*b[1]) - (-A2*t[0]*b[1])
-                    U1_02 = (-A1*t[0]*b[2]) - (-A0*t[1]*b[2])
-
-                    U2_00 = (-A0*t[2]*b[1]) - (-A0*t[1]*b[2])
-                    U2_11 = (-A1*t[0]*b[2]) - (-A1*t[2]*b[0])
-                    U2_22 = (-A2*t[1]*b[0]) - (-A2*t[0]*b[1])
-
-                    t0,t1,t2 = t[0],t[1],t[2]; d0,d1,d2c = dx,dy,dz
-                    B111 = -3.0*d0*J03 + 3.0*t0*J13 + 3.0*d0*d0*d0*J05 - 9.0*(d0*d0*t0)*J15 + 9.0*(d0*t0*t0)*J25 - 3.0*t0*t0*t0*J35
-                    B222 = -3.0*d1*J03 + 3.0*t1*J13 + 3.0*d1*d1*d1*J05 - 9.0*(d1*d1*t1)*J15 + 9.0*(d1*t1*t1)*J25 - 3.0*t1*t1*t1*J35
-                    B333 = -3.0*d2c*J03 + 3.0*t2*J13 + 3.0*d2c*d2c*d2c*J05 - 9.0*(d2c*d2c*t2)*J15 + 9.0*(d2c*t2*t2)*J25 - 3.0*t2*t2*t2*J35
-                    B112 = -d1*J03 + t1*J13 + 3.0*d0*d0*d1*J05 -3.0*(d0*d0*t1 + d0*t0*d1 + t0*d0*d1)*J15 +3.0*(t0*t0*d1 + t0*d0*t1 + d0*t0*t1)*J25 -3.0*t0*t0*t1*J35
-                    B113 = -d2c*J03 + t2*J13 + 3.0*d0*d0*d2c*J05 -3.0*(d0*d0*t2 + d0*t0*d2c + t0*d0*d2c)*J15 +3.0*(t0*t0*d2c + t0*d0*t2 + d0*t0*t2)*J25 -3.0*t0*t0*t2*J35
-                    B221 = -d0*J03 + t0*J13 + 3.0*d1*d1*d0*J05 -3.0*(d1*d1*t0 + d1*t1*d0 + t1*d1*d0)*J15 +3.0*(t1*t1*d0 + t1*d1*t0 + d1*t1*t0)*J25 -3.0*t1*t1*t0*J35
-                    B223 = -d2c*J03 + t2*J13 + 3.0*d1*d1*d2c*J05 -3.0*(d1*d1*t2 + d1*t1*d2c + t1*d1*d2c)*J15 +3.0*(t1*t1*d2c + t1*d1*t2 + d1*t1*t2)*J25 -3.0*t1*t1*t2*J35
-                    B331 = -d0*J03 + t0*J13 + 3.0*d2c*d2c*d0*J05 -3.0*(d2c*d2c*t0 + d2c*t2*d0 + t2*d2c*d0)*J15 +3.0*(t2*t2*d0 + t2*d2c*t0 + d2c*t2*t0)*J25 -3.0*t2*t2*t0*J35
-                    B332 = -d1*J03 + t1*J13 + 3.0*d2c*d2c*d1*J05 -3.0*(d2c*d2c*t1 + d2c*t2*d1 + t2*d2c*d1)*J15 +3.0*(t2*t2*d1 + t2*d2c*t1 + d2c*t2*t1)*J25 -3.0*t2*t2*t1*J35
-                    B123 =  3.0*d0*d1*d2c*J05 -3.0*(d0*d1*t2 + d0*t1*d2c + t0*d1*d2c)*J15 +3.0*(t0*t1*d2c + t0*d1*t2 + d0*t1*t2)*J25 -3.0*t0*t1*t2*J35
-
-                    U3_00 = (B112*t2 - B113*t1)*b[0] + (B113*t0 - B111*t2)*b[1] + (B111*t1 - B112*t0)*b[2]
-                    U3_11 = (B222*t2 - B223*t1)*b[0] + (B223*t0 - B221*t2)*b[1] + (B221*t1 - B222*t0)*b[2]
-                    U3_22 = (B332*t2 - B333*t1)*b[0] + (B333*t0 - B331*t2)*b[1] + (B331*t1 - B332*t0)*b[2]
-                    U3_01 = (B221*t2 - B123*t1)*b[0] + (B123*t0 - B112*t2)*b[1] + (B112*t1 - B221*t0)*b[2]
-                    U3_02 = (B123*t2 - B331*t1)*b[0] + (B331*t0 - B113*t2)*b[1] + (B113*t1 - B123*t0)*b[2]
-                    U3_12 = (B223*t2 - B332*t1)*b[0] + (B332*t0 - B123*t2)*b[1] + (B123*t1 - B223*t0)*b[2]
-
-                    m8pi   = -0.125/np.pi
-                    m8pinu = m8pi/(1.0 - nu)
-                    d00 = m8pi*(U1_00 + U2_00) + m8pinu*U3_00
-                    d01 = m8pi*(U1_01 + 0.0)   + m8pinu*U3_01
-                    d02 = m8pi*(U1_02 + 0.0)   + m8pinu*U3_02
-                    d10 = m8pinu*U3_01
-                    d11 = m8pi*(0.0 + U2_11) + m8pinu*U3_11
-                    d12 = m8pinu*U3_12
-                    d20 = m8pinu*U3_02
-                    d21 = m8pinu*U3_12
-                    d22 = m8pi*(0.0 + U2_22) + m8pinu*U3_22
-                    return (d00,d01,d02,d10,d11,d12,d20,d21,d22)
-
-                for s in range(Ns):
-                    p0 = S0[s]; p1 = S1[s]; b = Bv[s]
-                    dxm = px - MID[s,0]; dym = py - MID[s,1]; dzm = pz - MID[s,2]
-                    rad = R_c + HL[s]
-                    msk = (dxm*dxm + dym*dym + dzm*dzm) <= (rad*rad)
-                    if not np.any(msk):
-                        continue
-                    d00p,d01p,d02p,d10p,d11p,d12p,d20p,d21p,d22p = _dudx_seg(px[msk], py[msk], pz[msk], p0, p1, b, a_phys, nu)
-                    d00g,d01g,d02g,d10g,d11g,d12g,d20g,d21g,d22g = _dudx_seg(px[msk], py[msk], pz[msk], p0, p1, b, a_grid, nu)
-                    Gsum[msk,0,0] += (d00p-d00g); Gsum[msk,0,1] += (d01p-d01g); Gsum[msk,0,2] += (d02p-d02g)
-                    Gsum[msk,1,0] += (d10p-d10g); Gsum[msk,1,1] += (d11p-d11g); Gsum[msk,1,2] += (d12p-d12g)
-                    Gsum[msk,2,0] += (d20p-d20g); Gsum[msk,2,1] += (d21p-d21g); Gsum[msk,2,2] += (d22p-d22g)
-
-                deltaG = Gsum.reshape(nx,ny,nz,3,3)
-
-                # Integrate deltaG to Ucorr
-                kx = 2.0*np.pi*np.fft.fftfreq(nx, d=dx)
-                ky = 2.0*np.pi*np.fft.fftfreq(ny, d=dy)
-                kz = 2.0*np.pi*np.fft.fftfreq(nz, d=dz)
-                KX, KY, KZ = np.meshgrid(kx, ky, kz, indexing="ij")
-                K2 = KX*KX + KY*KY + KZ*KZ
-                K2[0,0,0] = 1.0
-
-                Ucorr = np.zeros((nx,ny,nz,3), dtype=np.float32)
-                for i in range(3):
-                    Gk0 = np.fft.fftn(deltaG[..., i, 0]); Gk1 = np.fft.fftn(deltaG[..., i, 1]); Gk2 = np.fft.fftn(deltaG[..., i, 2])
-                    Uk  = (1j*(KX*Gk0 + KY*Gk1 + KZ*Gk2)) / K2
-                    Uk[0,0,0] = 0.0
-                    Ucorr[..., i] = np.real(np.fft.ifftn(Uk)).astype(np.float32)
-
-                U = (u_long + Ucorr).reshape(nx*ny*nz, 3).astype(dtype, copy=False)
-
-        elif sr_needed and mode == "SR":
-            # New SR-only (ExaDiS-style dudx): compute full non-singular dudx(a_phys), integrate to U
-            if gpu_ok:
-                sr_full_src = r'''
-                extern "C" __global__
-                void sr_accumulate_full(
-                    const int Npts,
-                    const float *px, const float *py, const float *pz,
-                    const int Ns,
-                    const float *s0x, const float *s0y, const float *s0z,
-                    const float *s1x, const float *s1y, const float *s1z,
-                    const float *bx,  const float *by,  const float *bz,
-                    const float *mid_x, const float *mid_y, const float *mid_z,
-                    const float *halfL,
-                    const float Rc_effective,   // if very large, effectively includes all segments
-                    const float a_phys, const float nu,
-                    float *G00, float *G01, float *G02,
-                    float *G10, float *G11, float *G12,
-                    float *G20, float *G21, float *G22)
-                {
-                    int i = blockDim.x * blockIdx.x + threadIdx.x;
-                    if (i >= Npts) return;
-
-                    float x = px[i], y = py[i], z = pz[i];
-
-                    float g00=0.f,g01=0.f,g02=0.f;
-                    float g10=0.f,g11=0.f,g12=0.f;
-                    float g20=0.f,g21=0.f,g22=0.f;
-
-                    const float m8pi   = -0.125f / 3.14159265358979323846f;
-                    const float m8pinu = m8pi / (1.0f - nu);
-                    const float a2 = a_phys * a_phys;
-
-                    for (int s=0; s<Ns; ++s) {
-                        // optional midpoint culling; if Rc_effective is very large, this test passes for all
-                        float dxm = x - mid_x[s];
-                        float dym = y - mid_y[s];
-                        float dzm = z - mid_z[s];
-                        float rad = Rc_effective + halfL[s];
-                        if (dxm*dxm + dym*dym + dzm*dzm > rad*rad) continue;
-
-                        float sx = s0x[s], sy = s0y[s], sz = s0z[s];
-                        float ex = s1x[s], ey = s1y[s], ez = s1z[s];
-                        float tx = ex - sx, ty = ey - sy, tz = ez - sz;
-                        float L2 = tx*tx + ty*ty + tz*tz;
-                        if (!(L2 > 1.0e-20f)) continue;
-                        float Linv = rsqrtf(L2);
-                        float L = 1.0f / Linv;
-                        tx*=Linv; ty*=Linv; tz*=Linv;
-
-                        float Rx = x - sx, Ry = y - sy, Rz = z - sz;
-                        float Rdt = Rx*tx + Ry*ty + Rz*tz;
-
-                        float p0x = sx + Rdt*tx;
-                        float p0y = sy + Rdt*ty;
-                        float p0z = sz + Rdt*tz;
-
-                        float dx = Rx - (p0x - sx);
-                        float dy = Ry - (p0y - sy);
-                        float dz = Rz - (p0z - sz);
-                        float s1p = -Rdt;
-                        float s2p =  L - Rdt;
-
-                        float bxv = bx[s]; float byv = by[s]; float bzv = bz[s];
-
-                        float d2   = dx*dx + dy*dy + dz*dz;
-                        float da2  = d2 + a2;
-                        float da2inv = 1.0f / da2;
-
-                        float Ra1 = sqrtf(s1p*s1p + da2);
-                        float Ra2 = sqrtf(s2p*s2p + da2);
-                        float Ra1inv = 1.0f / fmaxf(Ra1, 1.0e-38f);
-                        float Ra2inv = 1.0f / fmaxf(Ra2, 1.0e-38f);
-                        float Ra1inv3 = Ra1inv*Ra1inv*Ra1inv;
-                        float Ra2inv3 = Ra2inv*Ra2inv*Ra2inv;
-
-                        float J03 = da2inv*(s2p*Ra2inv - s1p*Ra1inv);
-                        float J13 = -Ra2inv + Ra1inv;
-                        float J15 = -(1.0f/3.0f)*(Ra2inv3 - Ra1inv3);
-                        float J25 = (1.0f/3.0f)*da2inv*(s2p*s2p*s2p*Ra2inv3 - s1p*s1p*s1p*Ra1inv3);
-                        float J05 = da2inv*(2.0f*J25 + s2p*Ra2inv3 - s1p*Ra1inv3);
-                        float J35 = 2.0f*da2*J15 - s2p*s2p*Ra2inv3 + s1p*s1p*Ra1inv3;
-
-                        float A0 = 3.0f*a2*(dx*J05 - tx*J15) + 2.0f*(dx*J03 - tx*J13);
-                        float A1 = 3.0f*a2*(dy*J05 - ty*J15) + 2.0f*(dy*J03 - ty*J13);
-                        float A2 = 3.0f*a2*(dz*J05 - tz*J15) + 2.0f*(dz*J03 - tz*J13);
-
-                        float U1_00 = (-A2*ty*bxv) - (-A1*tz*bxv);
-                        float U1_01 = (-A0*tz*byv) - (-A2*tx*byv);
-                        float U1_02 = (-A1*tx*bzv) - (-A0*ty*bzv);
-
-                        float U2_00 = (-A0*tz*byv) - (-A0*ty*bzv);
-                        float U2_11 = (-A1*tx*bzv) - (-A1*tz*bxv);
-                        float U2_22 = (-A2*ty*bxv) - (-A2*tx*byv);
-
-                        float t0=tx, t1=ty, t2=tz;
-                        float d0=dx, d1=dy, d2c=dz;
-
-                        float B111 = -3.f*d0*J03 + 3.f*t0*J13 + 3.f*d0*d0*d0*J05 - 9.f*(d0*d0*t0)*J15 + 9.f*(d0*t0*t0)*J25 - 3.f*t0*t0*t0*J35;
-                        float B222 = -3.f*d1*J03 + 3.f*t1*J13 + 3.f*d1*d1*d1*J05 - 9.f*(d1*d1*t1)*J15 + 9.f*(d1*t1*t1)*J25 - 3.f*t1*t1*t1*J35;
-                        float B333 = -3.f*d2c*J03 + 3.f*t2*J13 + 3.f*d2c*d2c*d2c*J05 - 9.f*(d2c*d2c*t2)*J15 + 9.f*(d2c*t2*t2)*J25 - 3.f*t2*t2*t2*J35;
-
-                        float B112 = -d1*J03 + t1*J13 + 3.f*d0*d0*d1*J05
-                                -3.f*(d0*d0*t1 + d0*t0*d1 + t0*d0*d1)*J15
-                                +3.f*(t0*t0*d1 + t0*d0*t1 + d0*t0*t1)*J25
-                                -3.f*t0*t0*t1*J35;
-
-                        float B113 = -d2c*J03 + t2*J13 + 3.f*d0*d0*d2c*J05
-                                -3.f*(d0*d0*t2 + d0*t0*d2c + t0*d0*d2c)*J15
-                                +3.f*(t0*t0*d2c + t0*d0*t2 + d0*t0*t2)*J25
-                                -3.f*t0*t0*t2*J35;
-
-                        float B221 = -d0*J03 + t0*J13 + 3.f*d1*d1*d0*J05
-                                -3.f*(d1*d1*t0 + d1*t1*d0 + t1*d1*d0)*J15
-                                +3.f*(t1*t1*d0 + t1*d1*t0 + d1*t1*t0)*J25
-                                -3.f*t1*t1*t0*J35;
-
-                        float B223 = -d2c*J03 + t2*J13 + 3.f*d1*d1*d2c*J05
-                                -3.f*(d1*d1*t2 + d1*t1*d2c + t1*d1*d2c)*J15
-                                +3.f*(t1*t1*d2c + t1*d1*t2 + d1*t1*t2)*J25
-                                -3.f*t1*t1*t2*J35;
-
-                        float B331 = -d0*J03 + t0*J13 + 3.f*d2c*d2c*d0*J05
-                                -3.f*(d2c*d2c*t0 + d2c*t2*d0 + t2*d2c*d0)*J15
-                                +3.f*(t2*t2*d0 + t2*d2c*t0 + d2c*t2*t0)*J25
-                                -3.f*t2*t2*t0*J35;
-
-                        float B332 = -d1*J03 + t1*J13 + 3.f*d2c*d2c*d1*J05
-                                -3.f*(d2c*d2c*t1 + d2c*t2*d1 + t2*d2c*d1)*J15
-                                +3.f*(t2*t2*d1 + t2*d2c*t1 + d2c*t2*t1)*J25
-                                -3.f*t2*t2*t1*J35;
-
-                        float B123 =  3.f*d0*d1*d2c*J05
-                                -3.f*(d0*d1*t2 + d0*t1*d2c + t0*d1*d2c)*J15
-                                +3.f*(t0*t1*d2c + t0*d1*t2 + d0*t1*t2)*J25
-                                -3.f*t0*t1*t2*J35;
-
-                        float U3_00 = (B112*t2 - B113*t1)*bxv + (B113*t0 - B111*t2)*byv + (B111*t1 - B112*t0)*bzv;
-                        float U3_11 = (B222*t2 - B223*t1)*bxv + (B223*t0 - B221*t2)*byv + (B221*t1 - B222*t0)*bzv;
-                        float U3_22 = (B332*t2 - B333*t1)*bxv + (B333*t0 - B331*t2)*byv + (B331*t1 - B332*t0)*bzv;
-                        float U3_01 = (B221*t2 - B123*t1)*bxv + (B123*t0 - B112*t2)*byv + (B112*t1 - B221*t0)*bzv;
-                        float U3_02 = (B123*t2 - B331*t1)*bxv + (B331*t0 - B113*t2)*byv + (B113*t1 - B123*t0)*bzv;
-                        float U3_12 = (B223*t2 - B332*t1)*bxv + (B332*t0 - B123*t2)*byv + (B123*t1 - B223*t0)*bzv;
-
-                        float d00 = m8pi*(U1_00 + U2_00) + m8pinu*U3_00;
-                        float d01 = m8pi*(U1_01 + 0.0f)  + m8pinu*U3_01;
-                        float d02 = m8pi*(U1_02 + 0.0f)  + m8pinu*U3_02;
-
-                        float d10 = m8pinu*U3_01;
-                        float d11 = m8pi*(0.0f + U2_11) + m8pinu*U3_11;
-                        float d12 = m8pinu*U3_12;
-
-                        float d20 = m8pinu*U3_02;
-                        float d21 = m8pinu*U3_12;
-                        float d22 = m8pi*(0.0f + U2_22) + m8pinu*U3_22;
-
-                        g00 += d00; g01 += d01; g02 += d02;
-                        g10 += d10; g11 += d11; g12 += d12;
-                        g20 += d20; g21 += d21; g22 += d22;
-                    }
-
-                    G00[i]=g00; G01[i]=g01; G02[i]=g02;
-                    G10[i]=g10; G11[i]=g11; G12[i]=g12;
-                    G20[i]=g20; G21[i]=g21; G22[i]=g22;
-                }'''.strip("\n")
-
-                mod_full = cp.RawModule(code=sr_full_src, backend='nvcc',
-                                        options=('--gpu-architecture=native','-O3','--use_fast_math'))
-                sr_full = mod_full.get_function('sr_accumulate_full')
-
-                # Inputs to GPU
-                px = cp.asarray(Xref[:,0], dtype=cp.float32)
-                py = cp.asarray(Xref[:,1], dtype=cp.float32)
-                pz = cp.asarray(Xref[:,2], dtype=cp.float32)
-
-                s0x = cp.asarray(S0[:,0], dtype=cp.float32); s0y = cp.asarray(S0[:,1], dtype=cp.float32); s0z = cp.asarray(S0[:,2], dtype=cp.float32)
-                s1x = cp.asarray(S1[:,0], dtype=cp.float32); s1y = cp.asarray(S1[:,1], dtype=cp.float32); s1z = cp.asarray(S1[:,2], dtype=cp.float32)
-                bx  = cp.asarray(Bv[:,0], dtype=cp.float32); by  = cp.asarray(Bv[:,1], dtype=cp.float32); bz  = cp.asarray(Bv[:,2], dtype=cp.float32)
-                mx  = cp.asarray(MID[:,0], dtype=cp.float32); my  = cp.asarray(MID[:,1], dtype=cp.float32); mz  = cp.asarray(MID[:,2], dtype=cp.float32)
-                hl  = cp.asarray(HL,        dtype=cp.float32)
-
-                G00 = cp.zeros(px.size, dtype=cp.float32); G01 = cp.zeros_like(G00); G02 = cp.zeros_like(G00)
-                G10 = cp.zeros_like(G00); G11 = cp.zeros_like(G00); G12 = cp.zeros_like(G00)
-                G20 = cp.zeros_like(G00); G21 = cp.zeros_like(G00); G22 = cp.zeros_like(G00)
-
-                threads = 256
-                blocks  = (px.size + threads - 1) // threads
-
-                # Choose an effective Rc that surely includes every segment relative to any grid node:
-                # use the grid AABB diagonal plus max half-length.
-                diag = float(np.sqrt(Lx*Lx + Ly*Ly + Lz*Lz))
-                Rc_all = np.float32(diag + (float(np.max(HL)) if HL.size else 0.0) + 1.0)
-
-                sr_full((blocks,), (threads,),
-                        (np.int32(px.size),
-                        px, py, pz,
-                        np.int32(Ns),
-                        s0x, s0y, s0z, s1x, s1y, s1z,
-                        bx,  by,  bz,
-                        mx,  my,  mz,
-                        hl,
-                        cp.float32(Rc_all),
-                        cp.float32(a_phys), cp.float32(nu),
-                        G00, G01, G02, G10, G11, G12, G20, G21, G22))
-
-                Gfull = cp.stack([
-                            cp.stack([G00,G01,G02], axis=1),
-                            cp.stack([G10,G11,G12], axis=1),
-                            cp.stack([G20,G21,G22], axis=1)
-                        ], axis=1).transpose(0,2,1)  # (N,3,3)
-                Gfull = Gfull.reshape(nx,ny,nz,3,3)
-
-                # Integrate dudx -> U (FFT LSQ, U(k=0)=0)
-                kx = 2.0*np.pi*cp.fft.fftfreq(nx, d=dx)
-                ky = 2.0*np.pi*cp.fft.fftfreq(ny, d=dy)
-                kz = 2.0*np.pi*cp.fft.fftfreq(nz, d=dz)
-                KX, KY, KZ = cp.meshgrid(kx, ky, kz, indexing="ij")
-                K2 = KX*KX + KY*KY + KZ*KZ
-                K2[0,0,0] = 1.0
-
-                Ugrid = cp.zeros((nx,ny,nz,3), dtype=cp.float32)
-                for i in range(3):
-                    Gk0 = cp.fft.fftn(Gfull[..., i, 0]); Gk1 = cp.fft.fftn(Gfull[..., i, 1]); Gk2 = cp.fft.fftn(Gfull[..., i, 2])
-                    Uk  = (1j*(KX*Gk0 + KY*Gk1 + KZ*Gk2)) / K2
-                    Uk[0,0,0] = 0.0
-                    Ugrid[..., i] = cp.real(cp.fft.ifftn(Uk)).astype(cp.float32)
-
-                U = Ugrid.reshape(nx*ny*nz, 3).get().astype(dtype, copy=False)
-            else:
-                # CPU SR-only: compute full dudx(a_phys) for all segments/nodes; integrate to U
-                px = Xref[:,0].astype(np.float64); py = Xref[:,1].astype(np.float64); pz = Xref[:,2].astype(np.float64)
-                Gsum = np.zeros((px.size,3,3), dtype=np.float64)
-
-                def _dudx_seg_full(px, py, pz, p1, p2, b, a, nu):
-                    t = p2 - p1
-                    L2 = float(np.dot(t,t))
-                    if L2 < 1e-20:
-                        z = np.zeros_like(px)
-                        return (z,z,z,z,z,z,z,z,z)
-                    Linv = 1.0/np.sqrt(L2); L = 1.0/Linv; t = t*Linv
-                    Rx = px - p1[0]; Ry = py - p1[1]; Rz = pz - p1[2]
-                    Rdt = Rx*t[0] + Ry*t[1] + Rz*t[2]
-                    p0x = p1[0] + Rdt*t[0]; p0y = p1[1] + Rdt*t[1]; p0z = p1[2] + Rdt*t[2]
-                    dx = Rx - (p0x - p1[0]); dy = Ry - (p0y - p1[1]); dz = Rz - (p0z - p1[2])
-                    s1 = -Rdt; s2 = L - Rdt
-
-                    a2  = a*a
-                    d2  = dx*dx + dy*dy + dz*dz
-                    da2 = d2 + a2
-                    da2inv = 1.0/da2
-                    Ra1 = np.sqrt(s1*s1 + da2); Ra2 = np.sqrt(s2*s2 + da2)
-                    Ra1inv = 1.0/np.maximum(Ra1,1e-38); Ra2inv = 1.0/np.maximum(Ra2,1e-38)
-                    Ra1inv3 = Ra1inv*Ra1inv*Ra1inv; Ra2inv3 = Ra2inv*Ra2inv*Ra2inv
-
-                    J03 = da2inv*(s2*Ra2inv - s1*Ra1inv)
-                    J13 = -Ra2inv + Ra1inv
-                    J15 = -(1.0/3.0)*(Ra2inv3 - Ra1inv3)
-                    J25 = (1.0/3.0)*da2inv*(s2*s2*s2*Ra2inv3 - s1*s1*s1*Ra1inv3)
-                    J05 = da2inv*(2.0*J25 + s2*Ra2inv3 - s1*Ra1inv3)
-                    J35 = 2.0*da2*J15 - s2*s2*Ra2inv3 + s1*s1*Ra1inv3
-
-                    A0 = 3.0*a2*(dx*J05 - t[0]*J15) + 2.0*(dx*J03 - t[0]*J13)
-                    A1 = 3.0*a2*(dy*J05 - t[1]*J15) + 2.0*(dy*J03 - t[1]*J13)
-                    A2 = 3.0*a2*(dz*J05 - t[2]*J15) + 2.0*(dz*J03 - t[2]*J13)
-
-                    U1_00 = (-A2*t[1]*b[0]) - (-A1*t[2]*b[0])
-                    U1_01 = (-A0*t[2]*b[1]) - (-A2*t[0]*b[1])
-                    U1_02 = (-A1*t[0]*b[2]) - (-A0*t[1]*b[2])
-
-                    U2_00 = (-A0*t[2]*b[1]) - (-A0*t[1]*b[2])
-                    U2_11 = (-A1*t[0]*b[2]) - (-A1*t[2]*b[0])
-                    U2_22 = (-A2*t[1]*b[0]) - (-A2*t[0]*b[1])
-
-                    t0,t1,t2 = t[0],t[1],t[2]; d0,d1,d2c = dx,dy,dz
-                    B111 = -3.0*d0*J03 + 3.0*t0*J13 + 3.0*d0*d0*d0*J05 - 9.0*(d0*d0*t0)*J15 + 9.0*(d0*t0*t0)*J25 - 3.0*t0*t0*t0*J35
-                    B222 = -3.0*d1*J03 + 3.0*t1*J13 + 3.0*d1*d1*d1*J05 - 9.0*(d1*d1*t1)*J15 + 9.0*(d1*t1*t1)*J25 - 3.0*t1*t1*t1*J35
-                    B333 = -3.0*d2c*J03 + 3.0*t2*J13 + 3.0*d2c*d2c*d2c*J05 - 9.0*(d2c*d2c*t2)*J15 + 9.0*(d2c*t2*t2)*J25 - 3.0*t2*t2*t2*J35
-                    B112 = -d1*J03 + t1*J13 + 3.0*d0*d0*d1*J05 -3.0*(d0*d0*t1 + d0*t0*d1 + t0*d0*d1)*J15 +3.0*(t0*t0*d1 + t0*d0*t1 + d0*t0*t1)*J25 -3.0*t0*t0*t1*J35
-                    B113 = -d2c*J03 + t2*J13 + 3.0*d0*d0*d2c*J05 -3.0*(d0*d0*t2 + d0*t0*d2c + t0*d0*d2c)*J15 +3.0*(t0*t0*d2c + t0*d0*t2 + d0*t0*t2)*J25 -3.0*t0*t0*t2*J35
-                    B221 = -d0*J03 + t0*J13 + 3.0*d1*d1*d0*J05 -3.0*(d1*d1*t0 + d1*t1*d0 + t1*d1*d0)*J15 +3.0*(t1*t1*d0 + t1*d1*t0 + d1*t1*t0)*J25 -3.0*t1*t1*t0*J35
-                    B223 = -d2c*J03 + t2*J13 + 3.0*d1*d1*d2c*J05 -3.0*(d1*d1*t2 + d1*t1*d2c + t1*d1*d2c)*J15 +3.0*(t1*t1*d2c + t1*d1*t2 + d1*t1*t2)*J25 -3.0*t1*t1*t2*J35
-                    B331 = -d0*J03 + t0*J13 + 3.0*d2c*d2c*d0*J05 -3.0*(d2c*d2c*t0 + d2c*t2*d0 + t2*d2c*d0)*J15 +3.0*(t2*t2*d0 + t2*d2c*t0 + d2c*t2*t0)*J25 -3.0*t2*t2*t0*J35
-                    B332 = -d1*J03 + t1*J13 + 3.0*d2c*d2c*d1*J05 -3.0*(d2c*d2c*t1 + d2c*t2*d1 + t2*d2c*d1)*J15 +3.0*(t2*t2*d1 + t2*d2c*t1 + d2c*t2*t1)*J25 -3.0*t2*t2*t1*J35
-                    B123 =  3.0*d0*d1*d2c*J05 -3.0*(d0*d1*t2 + d0*t1*d2c + t0*d1*d2c)*J15 +3.0*(t0*t1*d2c + t0*d1*t2 + d0*t1*t2)*J25 -3.0*t0*t1*t2*J35
-
-                    U3_00 = (B112*t2 - B113*t1)*b[0] + (B113*t0 - B111*t2)*b[1] + (B111*t1 - B112*t0)*b[2]
-                    U3_11 = (B222*t2 - B223*t1)*b[0] + (B223*t0 - B221*t2)*b[1] + (B221*t1 - B222*t0)*b[2]
-                    U3_22 = (B332*t2 - B333*t1)*b[0] + (B333*t0 - B331*t2)*b[1] + (B331*t1 - B332*t0)*b[2]
-                    U3_01 = (B221*t2 - B123*t1)*b[0] + (B123*t0 - B112*t2)*b[1] + (B112*t1 - B221*t0)*b[2]
-                    U3_02 = (B123*t2 - B331*t1)*b[0] + (B331*t0 - B113*t2)*b[1] + (B113*t1 - B123*t0)*b[2]
-                    U3_12 = (B223*t2 - B332*t1)*b[0] + (B332*t0 - B123*t2)*b[1] + (B123*t1 - B223*t0)*b[2]
-
-                    m8pi   = -0.125/np.pi
-                    m8pinu = m8pi/(1.0 - nu)
-                    d00 = m8pi*(U1_00 + U2_00) + m8pinu*U3_00
-                    d01 = m8pi*(U1_01 + 0.0)   + m8pinu*U3_01
-                    d02 = m8pi*(U1_02 + 0.0)   + m8pinu*U3_02
-                    d10 = m8pinu*U3_01
-                    d11 = m8pi*(0.0 + U2_11) + m8pinu*U3_11
-                    d12 = m8pinu*U3_12
-                    d20 = m8pinu*U3_02
-                    d21 = m8pinu*U3_12
-                    d22 = m8pi*(0.0 + U2_22) + m8pinu*U3_22
-                    return (d00,d01,d02,d10,d11,d12,d20,d21,d22)
-
-                # Include all segments by using an effective large radius like the diagonal size of the box
-                diag = float(np.sqrt(Lx*Lx + Ly*Ly + Lz*Lz))
-                Rc_all = diag + (float(np.max(HL)) if HL.size else 0.0) + 1.0
-
-                for s in range(Ns):
-                    p0 = S0[s]; p1 = S1[s]; b = Bv[s]
-                    dxm = px - MID[s,0]; dym = py - MID[s,1]; dzm = pz - MID[s,2]
-                    rad = Rc_all + HL[s]
-                    msk = (dxm*dxm + dym*dym + dzm*dzm) <= (rad*rad)
-                    if not np.any(msk):
-                        continue
-                    d00,d01,d02,d10,d11,d12,d20,d21,d22 = _dudx_seg_full(px[msk], py[msk], pz[msk], p0, p1, b, a_phys, nu)
-                    Gsum[msk,0,0] += d00; Gsum[msk,0,1] += d01; Gsum[msk,0,2] += d02
-                    Gsum[msk,1,0] += d10; Gsum[msk,1,1] += d11; Gsum[msk,1,2] += d12
-                    Gsum[msk,2,0] += d20; Gsum[msk,2,1] += d21; Gsum[msk,2,2] += d22
-
-                Gfull = Gsum.reshape(nx,ny,nz,3,3)
-
-                # Integrate dudx -> U
-                kx = 2.0*np.pi*np.fft.fftfreq(nx, d=dx)
-                ky = 2.0*np.pi*np.fft.fftfreq(ny, d=dy)
-                kz = 2.0*np.pi*np.fft.fftfreq(nz, d=dz)
-                KX, KY, KZ = np.meshgrid(kx, ky, kz, indexing="ij")
-                K2 = KX*KX + KY*KY + KZ*KZ
-                K2[0,0,0] = 1.0
-
-                Ugrid = np.zeros((nx,ny,nz,3), dtype=np.float32)
-                for i in range(3):
-                    Gk0 = np.fft.fftn(Gfull[..., i, 0]); Gk1 = np.fft.fftn(Gfull[..., i, 1]); Gk2 = np.fft.fftn(Gfull[..., i, 2])
-                    Uk  = (1j*(KX*Gk0 + KY*Gk1 + KZ*Gk2)) / K2
-                    Uk[0,0,0] = 0.0
-                    Ugrid[..., i] = np.real(np.fft.ifftn(Uk)).astype(np.float32)
-
-                U = Ugrid.reshape(nx*ny*nz, 3).astype(dtype, copy=False)
-
-        # --------------------------
-        # LR-only branch
-        # --------------------------
-        if mode == "LR":
-            if gpu_ok:
-                U = u_long.reshape(nx*ny*nz, 3).get().astype(dtype, copy=False)
-            else:
-                U = u_long.reshape(nx*ny*nz, 3).astype(dtype, copy=False)
-
-        # --------------------------
-        # Final scaling and write-out
-        # --------------------------
+        conn = self._grid_tet4(nx, ny, nz, one_based=bool(one_based_connectivity))
+
+        # Displacement at the grid nodes
+        U = self.dislocation_displacement(Xref, use_gpu=use_gpu,
+                                          core_radius=core_radius, nu=nu)
+        U = np.asarray(U, dtype=dtype)
         if float(scale) != 1.0:
             U *= float(scale)
 
@@ -2466,7 +1361,254 @@ class defects(logging):
             "nodes_path": nodes_path,
             "conn_path": conn_path
         }
-        
+
+    @staticmethod
+    def _grid_tet4(nx, ny, nz, one_based=True):
+        """
+        Structured Tet4 connectivity of an (nx, ny, nz) node grid: six
+        tetrahedra per cell, node index i*ny*nz + j*nz + k, cells in
+        C order.
+
+        Args:
+            nx, ny, nz: Number of nodes per axis.
+            one_based: If True, indices start at 1.
+
+        Returns:
+            (6 * (nx-1) * (ny-1) * (nz-1), 4) int64 array.
+        """
+        ii, jj, kk = np.meshgrid(np.arange(nx - 1), np.arange(ny - 1), np.arange(nz - 1), indexing="ij")
+        base = (ii * ny * nz + jj * nz + kk).ravel().astype(np.int64)
+        v000, v100, v010, v110 = 0, ny * nz, nz, ny * nz + nz
+        v001, v101, v011, v111 = 1, ny * nz + 1, nz + 1, ny * nz + nz + 1
+        offsets = np.array([
+            [v000, v100, v110, v111],
+            [v000, v110, v010, v111],
+            [v000, v010, v011, v111],
+            [v000, v011, v001, v111],
+            [v000, v001, v101, v111],
+            [v000, v101, v100, v111],
+        ], dtype=np.int64)
+        conn = (base[:, None, None] + offsets[None, :, :]).reshape(-1, 4)
+        if one_based:
+            conn = conn + 1
+        return conn
+
+    def _dislocation_segment_records(self, reference_point=None):
+        """
+        Pack the network into (M, 12) float64 records [S0, S1, C, b] where C
+        is the closure point of each segment's triangle.
+
+        Segments are grouped into connected components through the node
+        connectivity in `_opendis_segments` (or, if that is unavailable, by
+        coincident endpoints), and C is the centroid of the component's
+        segment endpoints unless `reference_point` overrides it.
+
+        Args:
+            reference_point: Optional (3,) point used as C for every segment.
+
+        Returns:
+            (M, 12) float64 array.
+        """
+        S0 = np.asarray(self._opendis_S0, dtype=np.float64)
+        S1 = np.asarray(self._opendis_S1, dtype=np.float64)
+        Bv = np.asarray(self._opendis_bvec, dtype=np.float64)
+        M = int(S0.shape[0])
+        if M == 0:
+            raise ValueError("No dislocation segments loaded.")
+
+        if reference_point is not None:
+            C = np.tile(np.asarray(reference_point, dtype=np.float64).reshape(1, 3), (M, 1))
+        else:
+            segs = getattr(self, "_opendis_segments", None)
+            if segs is None or np.asarray(segs).shape != (M, 2):
+                # Fall back to endpoint coincidence when node ids are missing.
+                pts = np.round(np.vstack([S0, S1]), 4)
+                _, inv = np.unique(pts, axis=0, return_inverse=True)
+                inv = np.asarray(inv).ravel()
+                segs = np.stack([inv[:M], inv[M:]], axis=1)
+            segs = np.asarray(segs, dtype=np.int64)
+            n_nodes = int(segs.max()) + 1
+            from scipy.sparse import coo_matrix
+            from scipy.sparse.csgraph import connected_components
+            graph = coo_matrix((np.ones(M), (segs[:, 0], segs[:, 1])), shape=(n_nodes, n_nodes))
+            n_comp, node_comp = connected_components(graph, directed=False)
+            seg_comp = node_comp[segs[:, 0]]
+            csum = np.zeros((n_comp, 3), dtype=np.float64)
+            cnt = np.zeros(n_comp, dtype=np.float64)
+            np.add.at(csum, seg_comp, S0 + S1)
+            np.add.at(cnt, seg_comp, 2.0)
+            C = (csum / cnt[:, None])[seg_comp]
+            self._log("verbose", f"dislocation network: {n_comp} connected component(s) "
+                                 f"over {M} segments")
+        return np.concatenate([S0, S1, C, Bv], axis=1)
+
+    def dislocation_displacement(self, points, use_gpu=True, core_radius=5.0, nu=0.3,
+                                 reference_point=None, tile_points=None):
+        """
+        Isotropic Volterra displacement of the dislocation network at points.
+
+        Each segment S0->S1 is closed into the triangle (S0, S1, C) with the
+        reference point C of its connected component (Barnett 1985). Its
+        contribution is b*Omega/(4 pi), with Omega the solid angle of the
+        triangle, plus the Burgers-formula elastic terms integrated along the
+        real segment with |r| replaced by sqrt(r^2 + a^2). Summed over a
+        closed loop the fictitious edges to C cancel, and the field jumps by
+        b across the fan of triangles, which is the cut surface. Components
+        that are not closed (chains ending at the sample or box boundary) are
+        closed through C: their cut is the fan from C and the two edges
+        joining the chain ends to C carry an unscreened slip winding, so keep
+        such ends away from the region of interest or pass a
+        `reference_point` outside it.
+
+        Args:
+            points: (N, 3) positions in Angstrom, NumPy or CuPy.
+            use_gpu: If True and CuPy is available, evaluate on the GPU
+                (float32 terms from double-precision differences).
+                Defaults to True.
+            core_radius: Core radius a in Angstrom. Defaults to 5.0.
+            nu: Poisson's ratio in (0, 0.5). Defaults to 0.3.
+            reference_point: Optional (3,) closure point used for every
+                component instead of the component centroids.
+            tile_points: Points per evaluation tile. Defaults to 2**20 on
+                the GPU and 2048 on the CPU.
+
+        Returns:
+            (N, 3) float32 displacements in Angstrom on the same array
+            module as `points`.
+
+        Raises:
+            RuntimeError: If the dislocation network has not been imported.
+            ValueError: If `nu` or `core_radius` is out of range or no
+                segments are loaded.
+        """
+        if not hasattr(self, "_opendis_S0") or self._opendis_S0 is None:
+            raise RuntimeError("Call import_dislocation_network(...) first.")
+        nu = float(nu)
+        if not (0.0 < nu < 0.5):
+            raise ValueError("nu must be in (0, 0.5)")
+        a = float(core_radius)
+        if not (a > 0.0):
+            raise ValueError("core_radius must be positive")
+        seg = self._dislocation_segment_records(reference_point)
+
+        on_gpu = bool(use_gpu) and (cp is not None)
+        if on_gpu:
+            try:
+                on_gpu = cp.cuda.runtime.getDeviceCount() > 0
+            except Exception:
+                on_gpu = False
+        input_is_cupy = (cp is not None) and isinstance(points, cp.ndarray)
+
+        if not on_gpu:
+            P = cp.asnumpy(points) if input_is_cupy else np.asarray(points)
+            tp = 2048 if tile_points is None else int(tile_points)
+            U = _dislocation_displacement_numpy(P.reshape(-1, 3), seg, a, nu, tile_points=tp)
+            U = U.astype(np.float32)
+            return cp.asarray(U) if input_is_cupy else U
+
+        kernel = self._dislocation_displacement_kernel()
+        P = points if input_is_cupy else cp.asarray(points)
+        P = P.reshape(-1, 3)
+        N = int(P.shape[0])
+        seg64 = cp.ascontiguousarray(cp.asarray(seg, dtype=cp.float64))
+        M = int(seg64.shape[0])
+        out = cp.empty((N, 3), dtype=cp.float32)
+        tp = (1 << 20) if tile_points is None else int(tile_points)
+        threads = 128
+        a2 = np.float32(a * a)
+        c1 = np.float32(-1.0 / (4.0 * np.pi))
+        c2 = np.float32(1.0 / (8.0 * np.pi * (1.0 - nu)))
+        for p0 in range(0, N, tp):
+            p1 = min(N, p0 + tp)
+            P64 = cp.ascontiguousarray(P[p0:p1].astype(cp.float64))
+            n = p1 - p0
+            kernel(((n + threads - 1) // threads,), (threads,),
+                   (P64, np.int32(n), seg64, np.int32(M), a2, c1, c2, out[p0:p1]))
+        return out if input_is_cupy else cp.asnumpy(out)
+
+    def _dislocation_displacement_kernel(self):
+        """Compile and cache the CUDA segment-displacement kernel."""
+        if cp is None:
+            return None
+        k = getattr(self, "_dislocation_kernel", None)
+        if k is None:
+            k = cp.RawKernel(_DISLOCATION_DISPLACEMENT_KERNEL, "dislocation_displacement")
+            self._dislocation_kernel = k
+        return k
+
+    def apply_dislocation_displacement(self, sample, use_gpu=True, core_radius=5.0, nu=0.3,
+                                       force=False, reference_point=None):
+        """
+        Displace every atom of a sample by the dislocation network field.
+
+        Evaluates `dislocation_displacement` at the stored (thermal-free)
+        positions of each chunk, adds it, rewrites the chunk, updates the
+        sample bounding box and metadata, and records the operation on the
+        sample so it is not applied twice.
+
+        Args:
+            sample: Sample object providing chunk loading/writing methods.
+            use_gpu: If True and CuPy is available, evaluate on the GPU.
+            core_radius: Core radius a in Angstrom. Defaults to 5.0.
+            nu: Poisson's ratio. Defaults to 0.3.
+            force: If True, apply even if the same operation was already
+                recorded on the sample. Defaults to False.
+            reference_point: Optional (3,) closure point, see
+                `dislocation_displacement`.
+
+        Returns:
+            dict: ``atoms`` displaced, ``max_displacement`` (Angstrom),
+            ``segment_count``.
+
+        Raises:
+            RuntimeError: If the network is missing or the operation was
+                already applied and `force` is False.
+        """
+        if not hasattr(self, "_opendis_S0") or self._opendis_S0 is None:
+            raise RuntimeError("Call import_dislocation_network(...) first.")
+        M = int(np.asarray(self._opendis_S0).shape[0])
+        params = {
+            "source": getattr(self, "_opendis_source", None),
+            "segment_count": M,
+            "core_radius": float(core_radius),
+            "nu": float(nu),
+            "reference_point": None if reference_point is None
+                               else np.asarray(reference_point, dtype=np.float64).reshape(3).tolist(),
+        }
+        if not force and sample.has_modification("dislocation_displacement", params):
+            raise RuntimeError("dislocation_displacement with these parameters was already "
+                               f"applied to the sample in '{sample.directory}'. "
+                               "Pass force=True to apply it again.")
+
+        on_gpu = bool(use_gpu) and (cp is not None)
+        gmin = np.full(3, np.inf); gmax = np.full(3, -np.inf)
+        n_atoms = 0
+        umax = 0.0
+        for k in range(int(sample.chunk_total)):
+            X = sample.load_chunk_positions(k + 1, use_gpu=on_gpu, raw=True)
+            U = self.dislocation_displacement(X, use_gpu=on_gpu, core_radius=core_radius,
+                                              nu=nu, reference_point=reference_point)
+            xp = cp if (on_gpu and isinstance(X, cp.ndarray)) else np
+            Xn = X.astype(xp.float32) + U
+            umax = max(umax, float(xp.abs(U).max()) if U.shape[0] else 0.0)
+            if Xn.shape[0]:
+                gmin = np.minimum(gmin, np.asarray(cp.asnumpy(Xn.min(axis=0)) if xp is cp else Xn.min(axis=0), dtype=np.float64))
+                gmax = np.maximum(gmax, np.asarray(cp.asnumpy(Xn.max(axis=0)) if xp is cp else Xn.max(axis=0), dtype=np.float64))
+            n_atoms += int(Xn.shape[0])
+            sample.write_chunk_positions(cp.asnumpy(Xn) if xp is cp else Xn, k + 1)
+            del X, U, Xn
+
+        if np.all(np.isfinite(gmin)) and np.all(np.isfinite(gmax)):
+            sample._dimensions = (gmax - gmin).astype(np.float32)
+            sample._offset = ((gmin + gmax) * 0.5).astype(np.float32)
+            sample._matrix = np.diag(sample._dimensions.astype(np.float32))
+            sample._corners = (sample.get_unit_corners() @ sample._matrix) - (sample._dimensions * 0.5) + sample._offset
+        sample.write_sample_metadata()
+        sample.record_modification("dislocation_displacement", params)
+        self._log("normal", f"apply_dislocation_displacement: {n_atoms} atoms, "
+                            f"{M} segments, max |u| = {umax:.4f} A")
+        return {"atoms": n_atoms, "max_displacement": umax, "segment_count": M}
+
     # Helpers used by finalize_dislocation_sample
     def _nearest_neighbor_distance_from_crystal(self, crystal):
         """
@@ -2498,124 +1640,6 @@ class defects(logging):
         if not np.isfinite(dmin):
             dmin = float(np.linalg.norm(R[0, :]))  # fallback
         return float(dmin)
-
-    def _ensure_cuda_segU_phys_kernel(self, gp_ng=4, dtype="float32"):
-        """
-        Build and cache a CUDA kernel for near-core displacement.
-
-        Builds and caches a CUDA kernel that accumulates physically-accurate
-        near-core displacement by Gauss-Legendre line integration along
-        dislocation segments.
-
-        Args:
-            gp_ng: Number of Gauss points (4 or 8). Defaults to 4.
-            dtype: Data type string ("float32"). Defaults to "float32".
-
-        Returns:
-            The compiled CUDA kernel function, or None if CuPy is unavailable.
-
-        Note:
-            Cache key is ("segU_phys", dtype, gp_ng). The kernel expects
-            Gauss xi and w arrays as arguments.
-        """
-        if cp is None:
-            return None
-        if not hasattr(self, "_opendis_cuda_phys"):
-            self._opendis_cuda_phys = {}
-
-        key = ("segU_phys", str(dtype), int(gp_ng))
-        if key in self._opendis_cuda_phys:
-            return self._opendis_cuda_phys[key]
-
-        src = r'''
-        extern "C" __global__
-        void segU_phys(
-            const float* __restrict__ X,   // (Npts,3)
-            const float* __restrict__ S0,  // (Ns,3)
-            const float* __restrict__ S1,  // (Ns,3)
-            const float* __restrict__ B,   // (Ns,3)
-            const float* __restrict__ T,   // (Ns,3)
-            const float* __restrict__ MID, // (Ns,3)
-            const float* __restrict__ HL,  // (Ns,)
-            const int Ns, const int Npts, const float rcut,
-            const float* __restrict__ xi,  // (NG,)
-            const float* __restrict__ wg,  // (NG,)
-            const int NG,
-            const float A, const float c1, const float a2, const float scale,
-            float* __restrict__ Uout       // (Npts,3)
-        ){
-            int i = blockIdx.x * blockDim.x + threadIdx.x;
-            if (i >= Npts) return;
-
-            float x = X[3*i+0];
-            float y = X[3*i+1];
-            float z = X[3*i+2];
-
-            float ux = 0.0f, uy = 0.0f, uz = 0.0f;
-
-            for (int s=0; s<Ns; ++s){
-                // midpoint culling
-                float mx = MID[3*s+0], my = MID[3*s+1], mz = MID[3*s+2];
-                float dxm = x - mx, dym = y - my, dzm = z - mz;
-                float rad = rcut + HL[s];
-                if (dxm*dxm + dym*dym + dzm*dzm > rad*rad) continue;
-
-                float s0x = S0[3*s+0], s0y = S0[3*s+1], s0z = S0[3*s+2];
-                float s1x = S1[3*s+0], s1y = S1[3*s+1], s1z = S1[3*s+2];
-                float Lx = s1x - s0x, Ly = s1y - s0y, Lz = s1z - s0z;
-                float L2 = Lx*Lx + Ly*Ly + Lz*Lz;
-                if (!(L2 > 1.0e-20f)) continue;
-                float L = sqrtf(L2);
-                float seg_scale = 0.5f * L;
-
-                float bx = B[3*s+0], by = B[3*s+1], bz = B[3*s+2];
-                float tx = T[3*s+0], ty = T[3*s+1], tz = T[3*s+2];
-                float dotBT = bx*tx + by*ty + bz*tz;
-
-                for (int g=0; g<NG; ++g){
-                    float u = 0.5f*(xi[g] + 1.0f);
-                    float px = s0x + u*Lx;
-                    float py = s0y + u*Ly;
-                    float pz = s0z + u*Lz;
-
-                    float Rx = x - px;
-                    float Ry = y - py;
-                    float Rz = z - pz;
-
-                    float dotBR = bx*Rx + by*Ry + bz*Rz;
-                    float dotTR = tx*Rx + ty*Ry + tz*Rz;
-
-                    float r2   = Rx*Rx + Ry*Ry + Rz*Rz + a2;
-                    float invR = rsqrtf(r2);
-                    float invR3 = invR*invR*invR;
-                    float invR5 = invR3*invR*invR;
-
-                    // Same integrand as CPU fallback helper
-                    float Cx = (-c1)*bx*dotTR*invR3 + (tx*dotBR + dotBT*Rx)*invR3 - 3.0f*Rx*dotBR*dotTR*invR5;
-                    float Cy = (-c1)*by*dotTR*invR3 + (ty*dotBR + dotBT*Ry)*invR3 - 3.0f*Ry*dotBR*dotTR*invR5;
-                    float Cz = (-c1)*bz*dotTR*invR3 + (tz*dotBR + dotBT*Rz)*invR3 - 3.0f*Rz*dotBR*dotTR*invR5;
-
-                    float w = wg[g] * seg_scale * A;
-                    ux += w * Cx;
-                    uy += w * Cy;
-                    uz += w * Cz;
-                }
-            }
-
-            Uout[3*i+0] = scale * ux;
-            Uout[3*i+1] = scale * uy;
-            Uout[3*i+2] = scale * uz;
-        }
-        ''';
-
-        mod = cp.RawModule(
-            code=src,
-            backend='nvcc',
-            options=('--gpu-architecture=native', '-O3')
-        )
-        fn = mod.get_function('segU_phys')
-        self._opendis_cuda_phys[key] = fn
-        return fn
 
     def _ensure_cuda_helpers_for_cleanup(self):
         """
@@ -2736,73 +1760,6 @@ class defects(logging):
         }
         return self._cleanup_cuda
 
-    def _accum_segment_displacement_phys_cpu(self, X, S0f, S1f, Bf, Tf, MIDf, HLf,
-                                             xis, ws, A32, c132, a232, rcf, sc32):
-        """
-        Compute near-core displacement on CPU (fallback for CUDA).
-
-        CPU implementation for near-core displacement evaluation using the same
-        Gauss-Legendre line integration as the CUDA kernel.
-
-        Args:
-            X: Query positions as (N, 3) array.
-            S0f: Segment start points as (Ns, 3) array.
-            S1f: Segment end points as (Ns, 3) array.
-            Bf: Burgers vectors as (Ns, 3) array.
-            Tf: Unit tangent vectors as (Ns, 3) array.
-            MIDf: Segment midpoints as (Ns, 3) array.
-            HLf: Segment half-lengths as (Ns,) array.
-            xis: Gauss quadrature nodes as (NG,) array.
-            ws: Gauss quadrature weights as (NG,) array.
-            A32: Material constant A (float32).
-            c132: Material constant c1 (float32).
-            a232: Core radius squared (float32).
-            rcf: Cutoff radius (float32).
-            sc32: Scale factor (float32).
-
-        Returns:
-            numpy.ndarray: Displacement field as (N, 3) float32 array.
-        """
-        U = np.zeros_like(X, dtype=np.float32)
-        NG = int(xis.shape[0])
-        for i in range(X.shape[0]):
-            xi, yi, zi = X[i, 0], X[i, 1], X[i, 2]
-            ux = 0.0; uy = 0.0; uz = 0.0
-            for s in range(S0f.shape[0]):
-                # midpoint culling
-                mx, my, mz = MIDf[s, 0], MIDf[s, 1], MIDf[s, 2]
-                dxm = xi - mx; dym = yi - my; dzm = zi - mz
-                if (dxm*dxm + dym*dym + dzm*dzm) > (rcf + HLf[s])*(rcf + HLf[s]):
-                    continue
-                s0x, s0y, s0z = S0f[s, 0], S0f[s, 1], S0f[s, 2]
-                Lx = S1f[s, 0] - s0x; Ly = S1f[s, 1] - s0y; Lz = S1f[s, 2] - s0z
-                L = np.sqrt(Lx*Lx + Ly*Ly + Lz*Lz).astype(np.float32)
-                if L <= 1e-16:
-                    continue
-                bx, by, bz = Bf[s, 0], Bf[s, 1], Bf[s, 2]
-                tx, ty, tz = Tf[s, 0], Tf[s, 1], Tf[s, 2]
-                seg_scale = 0.5 * L
-                for g in range(NG):
-                    float_u = 0.5*(xis[g] + 1.0)
-                    px = s0x + float_u*Lx; py = s0y + float_u*Ly; pz = s0z + float_u*Lz
-                    Rx = xi - px; Ry = yi - py; Rz = zi - pz
-                    dotBR = bx*Rx + by*Ry + bz*Rz
-                    dotTR = tx*Rx + ty*Ry + tz*Rz
-                    dotBT = bx*tx + by*ty + bz*tz
-                    r2 = Rx*Rx + Ry*Ry + Rz*Rz + a232
-                    invR = 1.0/np.sqrt(r2)
-                    invR3 = invR*invR*invR
-                    invR5 = invR3*invR*invR
-                    Cx = (-c132) * bx * dotTR * invR3 + (tx * dotBR + dotBT * Rx) * invR3 - 3.0 * Rx * dotBR * dotTR * invR5
-                    Cy = (-c132) * by * dotTR * invR3 + (ty * dotBR + dotBT * Ry) * invR3 - 3.0 * Ry * dotBR * dotTR * invR5
-                    Cz = (-c132) * bz * dotTR * invR3 + (tz * dotBR + dotBT * Rz) * invR3 - 3.0 * Rz * dotBR * dotTR * invR5
-                    w = ws[g] * seg_scale * A32
-                    ux += w * Cx; uy += w * Cy; uz += w * Cz
-            U[i, 0] = sc32 * ux
-            U[i, 1] = sc32 * uy
-            U[i, 2] = sc32 * uz
-        return U
-
     def finalize_dislocation_sample(self,
                                     crystal,
                                     deformed_sample,
@@ -2812,86 +1769,87 @@ class defects(logging):
                                     nu=0.33,
                                     core_radius=5.0,
                                     near_factor=1.5,
-                                    gauss_points=4,
                                     relax_steps=3,
                                     relax_dt=0.125,
                                     relax_k=0.5,
                                     use_gpu=True,
-                                    dtype=np.float32):
+                                    dtype=np.float32,
+                                    force=False):
         """
-        Finalize dislocation sample with near-core correction and relaxation.
+        Finalize a dislocation sample: reset near-core atoms to the direct
+        segment displacement and relax overlaps.
 
-        Performs optimized near-core finalization with:
-            - Cached CUDA line-integral kernel
-            - Sub-chunking for large near-core sets to avoid OOM
-            - Streaming CPU midpoint test to avoid NxNs allocations
+        Per chunk:
+            1. Flag atoms within `near_factor * core_radius` of any segment
+               (midpoint sphere test).
+            2. If `pristine_sample` is given, reset the flagged atoms to
+               X = Xref + u with u from `dislocation_displacement`, which
+               removes the interpolation error of a grid field near the cores.
+            3. Run `relax_steps` iterations of a short-range repulsive
+               relaxation towards the nearest-neighbour distance of `crystal`.
 
         Args:
-            crystal: Crystal object for material properties.
+            crystal: Crystal object used for the nearest-neighbour distance.
             deformed_sample: Sample object with deformed atomic positions.
-            pristine_sample: Optional pristine sample for exact near-core
-                recomputation. If None, near-core positions are not recalculated.
+            pristine_sample: Optional pristine sample for the near-core reset.
+                If None, near-core positions are not recomputed.
             output_directory: Directory for output files. If None, uses
                 self.directory.
-            mu: Shear modulus. Defaults to 1.0.
+            mu: Accepted for API compatibility; the displacement depends on
+                `nu` only.
             nu: Poisson's ratio (must be in (0, 0.5)). Defaults to 0.33.
-            core_radius: Physical core radius. Defaults to 5.0.
-            near_factor: Factor multiplied by core_radius for near-core cutoff.
-                Defaults to 1.5.
-            gauss_points: Number of Gauss-Legendre integration points (4 or 8).
-                Defaults to 4.
+            core_radius: Core radius a in Angstrom. Defaults to 5.0.
+            near_factor: Factor multiplied by core_radius for the near-core
+                cutoff. Defaults to 1.5.
             relax_steps: Number of repulsive relaxation iterations. Defaults to 3.
             relax_dt: Time step for relaxation. Defaults to 0.125.
             relax_k: Spring constant for repulsive relaxation. Defaults to 0.5.
             use_gpu: If True and CuPy is available, use GPU acceleration.
                 Defaults to True.
             dtype: NumPy dtype for output arrays. Defaults to np.float32.
+            force: If True, run even if the same finalisation is already
+                recorded on the sample. Defaults to False.
 
         Raises:
-            RuntimeError: If OpenDiS network has not been imported.
+            RuntimeError: If the network has not been imported, or the same
+                finalisation was already applied in place and `force` is False.
             ValueError: If nu is out of range (0, 0.5).
-
-        Note:
-            The finalization procedure:
-                1. Flags atoms near any segment by midpoint radius test.
-                2. If pristine_sample provided, recomputes exact near-core
-                   displacements using Gauss-Legendre line integration.
-                3. Performs lightweight repulsive relaxation to resolve overlaps.
         """
-        if not hasattr(self, "_opendis_S0"):
-            raise RuntimeError("OpenDiS network must be imported first (prepare_opendis_fe or import_dislocation_network).")
+        if not hasattr(self, "_opendis_S0") or self._opendis_S0 is None:
+            raise RuntimeError("Dislocation network must be imported first (import_dislocation_network).")
 
         out_dir = output_directory if output_directory is not None else (self.directory if self.directory else ".")
         if not os.path.isdir(out_dir):
             os.makedirs(out_dir, exist_ok=True)
 
-        # Material constants for near-core evaluation
-        mu = float(mu)
         nu = float(nu)
         if not (0.0 < nu < 0.5):
             raise ValueError("nu must be in (0, 0.5)")
-        gp_ng = int(gauss_points) if int(gauss_points) in (4, 8) else 4
         a = float(core_radius)
-        a2 = a*a
-        c1 = float(3.0 - 4.0*nu)
-        A = float(1.0 / (16.0*np.pi*mu*(1.0 - nu)))
         near_rcut = float(near_factor) * a
 
         # Dislocation arrays (kept in float32 for GPU)
-        S0  = np.asarray(self._opendis_S0,   dtype=np.float32)
-        S1  = np.asarray(self._opendis_S1,   dtype=np.float32)
-        Bv  = np.asarray(self._opendis_bvec, dtype=np.float32)
-        Tv  = np.asarray(self._opendis_tvec, dtype=np.float32)
         MID = np.asarray(self._opendis_mids, dtype=np.float32)
         HL  = np.asarray(self._opendis_halfL, dtype=np.float32)
-        Ns = int(S0.shape[0])
+        Ns = int(MID.shape[0])
         if Ns == 0:
             raise ValueError("No dislocation segments loaded.")
+
+        params = {
+            "segment_count": Ns,
+            "core_radius": a,
+            "nu": nu,
+            "near_factor": float(near_factor),
+            "near_core_reset": pristine_sample is not None,
+            "relax_steps": int(relax_steps),
+            "relax_dt": float(relax_dt),
+            "relax_k": float(relax_k),
+        }
+        _check_modification(deformed_sample, out_dir, "dislocation_finalize", params, force)
 
         # Relaxation target spacing from crystal
         d0 = self._nearest_neighbor_distance_from_crystal(crystal)
 
-        # Prepare GPU env (matches generate_nodal_field pattern)
         gpu_ok = bool(use_gpu and (cp is not None))
         if gpu_ok:
             try:
@@ -2899,49 +1857,9 @@ class defects(logging):
             except Exception:
                 gpu_ok = False
 
-        # Precompute Gauss tables (host + device)
-        if gp_ng == 4:
-            xinp = np.array([-0.8611363115940526, -0.3399810435848563,
-                            0.3399810435848563,  0.8611363115940526], dtype=np.float32)
-            wgnp = np.array([ 0.3478548451374539,  0.6521451548625461,
-                            0.6521451548625461,  0.3478548451374539], dtype=np.float32)
-        else:
-            xinp = np.array([-0.9602898564975363, -0.7966664774136267, -0.5255324099163290, -0.1834346424956498,
-                            0.1834346424956498,  0.5255324099163290,  0.7966664774136267,  0.9602898564975363], dtype=np.float32)
-            wgnp = np.array([ 0.1012285362903763,  0.2223810344533745,  0.3137066458778873,  0.3626837833783620,
-                            0.3626837833783620,  0.3137066458778873,  0.2223810344533745,  0.1012285362903763], dtype=np.float32)
-
         if gpu_ok:
-            # Helpers used also in generate_nodal_field family
             cuda_helpers = self._ensure_cuda_helpers_for_cleanup()
-
-            # Segment data to device (one-time)
-            S0g  = cp.asarray(S0);  S1g  = cp.asarray(S1)
-            Bg   = cp.asarray(Bv);  Tg   = cp.asarray(Tv)
-            MIDg = cp.asarray(MID); HLg  = cp.asarray(HL)
-
-            # Gauss nodes/weights to device
-            xig  = cp.asarray(xinp)
-            wgg  = cp.asarray(wgnp)
-
-            # Compile and cache the line-integral kernel
-            segU_kernel = self._ensure_cuda_segU_phys_kernel(gp_ng=gp_ng, dtype="float32")
-
-        # CPU helper alias
-        def _cpu_accum_batch(Xbatchnp):
-            return self._accum_segment_displacement_phys_cpu(
-                Xbatchnp.astype(np.float32, copy=False),
-                S0.astype(np.float32, copy=False),
-                S1.astype(np.float32, copy=False),
-                Bv.astype(np.float32, copy=False),
-                Tv.astype(np.float32, copy=False),
-                MID.astype(np.float32, copy=False),
-                HL.astype(np.float32, copy=False),
-                xinp.astype(np.float32, copy=False),
-                wgnp.astype(np.float32, copy=False),
-                np.float32(A), np.float32(c1), np.float32(a2),
-                np.float32(near_rcut), np.float32(1.0)
-            )
+            MIDg = cp.asarray(MID); HLg = cp.asarray(HL)
 
         # Adaptive GPU batch size to prevent OOM
         def _gpu_batch_cap(default_cap=500000):
@@ -2949,23 +1867,19 @@ class defects(logging):
                 return 0
             try:
                 free_b, total_b = cp.cuda.runtime.memGetInfo()
-                # very conservative per-point footprint: ~ 2 arrays of 3 floats + overhead
-                bytes_per_pt = 3*4 + 3*4 + 64  # ~ 88 bytes
+                bytes_per_pt = 3*4 + 3*4 + 64
                 cap = int(0.6 * free_b / max(bytes_per_pt, 1))
                 cap = max(32768, min(cap, default_cap))
                 return cap
             except Exception:
                 return default_cap
 
-        # CPU batch size (smaller to keep cache friendly)
         CPU_BATCH = 200000
 
-        # Process chunks
         K = int(deformed_sample.chunk_total)
         for k in range(K):
-            # Load deformed positions and species
             if gpu_ok:
-                Xg = deformed_sample.load_chunk_positions(k+1, use_gpu=True)  # cp.ndarray (N,3)
+                Xg = deformed_sample.load_chunk_positions(k+1, use_gpu=True, raw=True)
                 spcnp = deformed_sample.load_chunk_species(k+1, use_gpu=False)
                 M = int(Xg.shape[0])
 
@@ -2973,55 +1887,37 @@ class defects(logging):
                 flags = cp.empty((M,), dtype=cp.uint8)
                 threads = 256
                 blocks = (M + threads - 1)//threads
-                self._ensure_cuda_helpers_for_cleanup()["flag_near_segments"](
+                cuda_helpers["flag_near_segments"](
                     (blocks,), (threads,),
                     (Xg.astype(cp.float32).ravel(),
                     MIDg.ravel(), HLg.ravel(),
-                    np.int32(int(HLg.shape[0])),
+                    np.int32(Ns),
                     cp.float32(near_rcut),
                     flags, np.int32(M))
                 )
                 near_idx = cp.where(flags != 0)[0]
 
-                # If pristine provided: recompute exact near-core U and reset those atoms
+                # Reset flagged atoms to Xref + u(Xref) from the segment formula
                 if pristine_sample is not None and near_idx.size > 0:
-                    # Gather pristine Xref for the flagged subset (host -> device)
-                    pos_refnp = pristine_sample.load_chunk_positions(k+1, use_gpu=False)
+                    pos_refnp = pristine_sample.load_chunk_positions(k+1, use_gpu=False, raw=True)
                     near_idxnp = near_idx.get()
-                    # Sub-chunk to avoid OOM
                     BATCH = _gpu_batch_cap()
                     for s0 in range(0, near_idxnp.size, BATCH):
                         s1 = min(near_idxnp.size, s0 + BATCH)
                         idx_slice = near_idxnp[s0:s1]
                         Xref_sel = cp.asarray(pos_refnp[idx_slice, :], dtype=cp.float32)
-                        Uout = cp.zeros((int(idx_slice.size), 3), dtype=cp.float32)
-
-                        # Launch kernel
-                        npts = np.int32(int(idx_slice.size))
-                        Ns32 = np.int32(int(S0g.shape[0]))
-                        segU_kernel(
-                            ((int(idx_slice.size) + 255)//256,), (256,),
-                            (
-                                Xref_sel.ravel(),
-                                S0g.ravel(), S1g.ravel(), Bg.ravel(), Tg.ravel(),
-                                MIDg.ravel(), HLg.ravel(),
-                                Ns32, npts, cp.float32(near_rcut),
-                                xig, wgg, np.int32(gp_ng),
-                                cp.float32(A), cp.float32(c1), cp.float32(a2), cp.float32(1.0),
-                                Uout.ravel()
-                            )
-                        )
-                        # Write back corrected positions: X = Xref + Uexact
+                        Uout = self.dislocation_displacement(Xref_sel, use_gpu=True,
+                                                             core_radius=a, nu=nu)
                         Xg[cp.asarray(idx_slice), :] = Xref_sel + Uout
 
-                # GPU relaxation via cell list (already chunked by construction)
+                # GPU relaxation via cell list
                 sorted_pos, sorted_idx, cell_start, cell_end, bbmin, cell_size, nx, ny, nz = \
                     deformed_sample.build_cell_list_gpu(Xg.astype(cp.float32), r_cut=float(d0))
 
                 out_sorted = cp.empty_like(sorted_pos)
                 threads3 = 256
                 blocks3 = (int(sorted_pos.shape[0]) + threads3 - 1)//threads3
-                relax_fn = self._ensure_cuda_helpers_for_cleanup()["relax_repulsive_sorted"]
+                relax_fn = cuda_helpers["relax_repulsive_sorted"]
                 for _ in range(int(relax_steps)):
                     relax_fn(
                         (blocks3,), (threads3,),
@@ -3034,40 +1930,37 @@ class defects(logging):
                         out_sorted.ravel(),
                         np.int32(int(sorted_pos.shape[0])))
                     )
-                    sorted_pos, out_sorted = out_sorted, sorted_pos  # ping-pong
+                    sorted_pos, out_sorted = out_sorted, sorted_pos
 
-                # Unsort back and persist
                 pos_out = cp.empty_like(Xg)
                 pos_out[sorted_idx, :] = sorted_pos
                 posnp = pos_out.get()
 
             else:
-                # CPU path (streaming midpoint test + sub-chunked line integral)
-                posnp = np.asarray(deformed_sample.load_chunk_positions(k+1, use_gpu=False), dtype=np.float32)
+                posnp = np.asarray(deformed_sample.load_chunk_positions(k+1, use_gpu=False, raw=True), dtype=np.float32)
                 spcnp = deformed_sample.load_chunk_species(k+1, use_gpu=False)
                 M = int(posnp.shape[0])
 
-                # Streaming midpoint cull to avoid NxNs memory
+                # Streaming midpoint test, one segment at a time
                 near_mask = np.zeros(M, dtype=bool)
-                # Expand each segment's sphere once
                 for s in range(Ns):
                     rad = near_rcut + HL[s]
-                    d = posnp - MID[s]  # (M,3)
+                    d = posnp - MID[s]
                     dist2 = (d[:, 0]*d[:, 0] + d[:, 1]*d[:, 1] + d[:, 2]*d[:, 2])
                     near_mask |= (dist2 <= rad*rad)
 
                 if pristine_sample is not None and np.any(near_mask):
-                    Xref_all = np.asarray(pristine_sample.load_chunk_positions(k+1, use_gpu=False), dtype=np.float32)
+                    Xref_all = np.asarray(pristine_sample.load_chunk_positions(k+1, use_gpu=False, raw=True), dtype=np.float32)
                     idx_all = np.flatnonzero(near_mask)
-                    # Sub-chunk CPU integration
                     for s0 in range(0, idx_all.size, CPU_BATCH):
                         s1 = min(idx_all.size, s0 + CPU_BATCH)
                         idx_slice = idx_all[s0:s1]
                         Xsel = Xref_all[idx_slice, :]
-                        Usel = _cpu_accum_batch(Xsel)
+                        Usel = self.dislocation_displacement(Xsel, use_gpu=False,
+                                                             core_radius=a, nu=nu)
                         posnp[idx_slice, :] = Xsel + Usel
 
-                # Simple CPU relaxation (reuse existing local scheme, but keep it light)
+                # CPU relaxation on a cell hash
                 cs = float(d0)
                 bbmin = posnp.min(axis=0)
                 idx_grid = np.floor((posnp - bbmin)/max(cs, 1e-12)).astype(np.int64)
@@ -3095,13 +1988,12 @@ class defects(logging):
                                         disp[ii] += s * r
                     posnp += relax_dt * disp
 
-            # Write chunk results
             deformed_sample.write_chunk_positions(posnp.astype(dtype, copy=False), k+1, override_directory=out_dir)
             deformed_sample.write_chunk_species(spcnp, k+1, override_directory=out_dir)
 
-        # Finalize metadata
+        _record_modification(deformed_sample, out_dir, "dislocation_finalize", params)
         deformed_sample.write_sample_metadata(override_directory=out_dir)
-        
+
     def visualize_dislocation_network(
         self,
         sample=None,
@@ -4068,33 +2960,60 @@ class defects(logging):
                 use_gpu: If True and CuPy is available, prepare GPU arrays for
                     later processing. Defaults to True.
             """
-            # Calculates the position of stacking faults.  The conventional
-            # lattice matrix holds a, b, c as its rows, so the Cartesian vector
-            # of a crystal direction is the transpose acting on its indices.
-            self.rotated_fault_normal = (crystal.lattice_matrix_conventional/crystal.lattice_lengths_conventional[:,None]).T@self.fault_normal
-            self.rotated_burgers_vector = (crystal.lattice_matrix_conventional/crystal.lattice_lengths_conventional[:,None]).T@self.burgers_vector
+            # The conventional lattice matrix holds a, b, c as its rows. The
+            # Burgers vector [uvw] is a direct-lattice direction, so its
+            # Cartesian form is the transpose of the normalised rows acting on
+            # the indices. The fault normal (hkl) is a reciprocal-lattice
+            # direction, n = h a* + k b* + l c* = inv(L) @ (h, k, l), which
+            # only coincides with [hkl] for orthogonal cells.
+            L = np.asarray(crystal.lattice_matrix_conventional, dtype=np.float64)
+            Lens = np.asarray(crystal.lattice_lengths_conventional, dtype=np.float64)
+            n = np.linalg.inv(L) @ np.asarray(self.fault_normal, dtype=np.float64)
+            self.rotated_fault_normal = n / np.linalg.norm(n)
+            self.rotated_burgers_vector = (L/Lens[:,None]).T@self.burgers_vector
             sample_center = sample.offset
             sample_center_proj = np.dot(sample_center,self.rotated_fault_normal)
             fault_offest_proj = np.dot(self.fault_offset,self.rotated_fault_normal)
             self.global_fault_positions = sample_center_proj + fault_offest_proj - (self.fault_number - 1)*(self.interfault_spacing+self.fault_gap)/2 + np.arange(self.fault_number, dtype=np.float32)*(self.interfault_spacing+self.fault_gap)
 
-            # Set up GPU arrays if requested and available
+            self._prepare_fault_tables(use_gpu=use_gpu)
+
+            if plotting:
+                self.plot_global_positions(sample)
+
+        def _prepare_fault_tables(self, use_gpu=True):
+            """
+            Build the sorted fault positions and the prefix sum of their
+            orientations used by `apply_stacking_fault_chunk`, plus GPU copies
+            when requested. Requires `global_fault_positions`,
+            `rotated_fault_normal` and `rotated_burgers_vector` to be set.
+
+            Args:
+                use_gpu: If True and CuPy is available, also stage the
+                    tables on the GPU. Defaults to True.
+            """
+            order = np.argsort(self.global_fault_positions, kind="stable")
+            self._fault_positions_sorted = np.asarray(self.global_fault_positions)[order]
+            orient = np.asarray(self.fault_orientation, dtype=np.int64)[order]
+            self._fault_orientation_prefix = np.concatenate(
+                [np.zeros(1, dtype=np.int64), np.cumsum(orient)])
             if cp is not None and use_gpu:
                 self._global_fault_positions_cp = cp.asarray(self.global_fault_positions)
+                self._fault_positions_sorted_cp = cp.asarray(self._fault_positions_sorted)
+                self._fault_orientation_prefix_cp = cp.asarray(self._fault_orientation_prefix)
                 self._rotated_burgers_vector_cp = cp.asarray(self.rotated_burgers_vector)
                 self._fault_gap_cp = cp.float32(self.fault_gap)
                 self._fault_normal_cp = cp.asarray(self.rotated_fault_normal)
                 self._fault_orientation_cp = cp.asarray(self.fault_orientation, dtype=cp.int8)
             else:
                 self._global_fault_positions_cp = None
+                self._fault_positions_sorted_cp = None
+                self._fault_orientation_prefix_cp = None
                 self._rotated_burgers_vector_cp = None
                 self._fault_gap_cp = None
                 self._fault_normal_cp = None
                 self._fault_orientation_cp = None
 
-            if plotting:
-                self.plot_global_positions(sample)
-            
         def plot_global_positions(self, sample, color='c', alpha=0.5, elev=0, azim=0):
             """
             Plot stacking fault planes intersecting the sample cuboid.
@@ -4198,31 +3117,51 @@ class defects(logging):
             plt.show()
             return fig, ax
 
-        def apply_to_sample(self, sample, use_gpu=True):
+        def apply_to_sample(self, sample, use_gpu=True, force=False):
             """
             Apply stacking faults to all chunks of a sample.
 
             Iterates through all sample chunks, applies stacking fault
-            displacements to atomic positions, and writes the modified data.
+            displacements to the stored (thermal-free) atomic positions, and
+            writes the modified data. When writing into the sample's own
+            directory the operation is recorded on the sample and refused on
+            a repeat call unless `force` is True.
 
             Args:
                 sample: Sample object providing chunk loading/writing methods.
                 use_gpu: If True and CuPy is available, use GPU acceleration.
                     Defaults to True.
+                force: If True, apply even if the same faults were already
+                    recorded on the sample. Defaults to False.
+
+            Raises:
+                RuntimeError: If the same faults were already applied in place
+                    and `force` is False.
             """
+            params = {
+                "fault_number": int(self.fault_number),
+                "fault_offset": np.asarray(self.fault_offset, dtype=np.float64).tolist(),
+                "fault_normal": np.asarray(self.fault_normal, dtype=np.float64).tolist(),
+                "interfault_spacing": float(self.interfault_spacing),
+                "burgers_vector": np.asarray(self.burgers_vector, dtype=np.float64).tolist(),
+                "fault_orientation": np.asarray(self.fault_orientation).tolist(),
+                "fault_gap": float(self.fault_gap),
+            }
+            _check_modification(sample, self.directory, "stacking_fault", params, force)
             for i in range(sample.chunk_total):
                 if cp is not None and use_gpu:
-                    positions_chunk_cp = sample.load_chunk_positions(i+1,use_gpu=True)
+                    positions_chunk_cp = sample.load_chunk_positions(i+1,use_gpu=True, raw=True)
                     positions_chunk_cp = self.apply_stacking_fault_chunk(positions_chunk_cp,use_gpu=True)
                     positions_chunknp = cp.asnumpy(positions_chunk_cp)
                 else:
-                    positions_chunknp = sample.load_chunk_positions(i+1,use_gpu=False)
+                    positions_chunknp = sample.load_chunk_positions(i+1,use_gpu=False, raw=True)
                     positions_chunknp = self.apply_stacking_fault_chunk(positions_chunknp,use_gpu=False)
 
                 sample.write_chunk_positions(positions_chunknp,i+1,override_directory=self.directory)
                 if self.directory is not None:
                     species_chunknp = sample.load_chunk_species(i + 1, use_gpu=False)
                     sample.write_chunk_species(species_chunknp,i+1,override_directory=self.directory)
+            _record_modification(sample, self.directory, "stacking_fault", params)
             sample.write_sample_metadata(override_directory=self.directory)
             
         def apply_stacking_fault_chunk(self, positions_chunk, use_gpu=True):
@@ -4231,7 +3170,10 @@ class defects(logging):
 
             Shifts atoms that lie beyond each fault plane by the Burgers vector,
             accounting for the fault orientation. Adds a small gap at each fault
-            plane crossing.
+            plane crossing. The number of planes below each atom comes from a
+            `searchsorted` on the sorted plane positions and the signed count
+            from a prefix sum of the orientations, so no (N x faults) array is
+            formed.
 
             Args:
                 positions_chunk: Array of atomic positions with shape (N, 3).
@@ -4245,9 +3187,9 @@ class defects(logging):
             """
             if cp is not None and use_gpu and self._global_fault_positions_cp is not None:
                 position_projection = cp.dot(positions_chunk, self._fault_normal_cp)
-                mask = cp.array(position_projection[:, None] > self._global_fault_positions_cp[None, :], dtype=cp.int8)
-                count_faults = cp.sum(mask * self._fault_orientation_cp, axis=1)  # orientation-based sum
-                count_faults_abs = cp.sum(mask, axis=1)  # how many planes crossed, ignoring orientation
+                # planes strictly below the atom, and the signed count of them
+                count_faults_abs = cp.searchsorted(self._fault_positions_sorted_cp, position_projection, side="left")
+                count_faults = self._fault_orientation_prefix_cp[count_faults_abs]
                 positions_chunk = positions_chunk \
                     + count_faults[:, None] * self._rotated_burgers_vector_cp \
                     + count_faults_abs[:, None] * self._fault_normal_cp * self._fault_gap_cp \
@@ -4255,9 +3197,8 @@ class defects(logging):
                 return positions_chunk
             else:
                 position_projection = np.dot(positions_chunk, self.rotated_fault_normal)
-                mask = (position_projection[:, None] > self.global_fault_positions[None, :]).astype(np.int8)
-                count_faults = np.sum(mask * self.fault_orientation, axis=1)
-                count_faults_abs = np.sum(mask, axis=1)
+                count_faults_abs = np.searchsorted(self._fault_positions_sorted, position_projection, side="left")
+                count_faults = self._fault_orientation_prefix[count_faults_abs]
                 positions_chunk = positions_chunk \
                     + count_faults[:, None] * self.rotated_burgers_vector \
                     + count_faults_abs[:, None] * self.rotated_fault_normal * self.fault_gap \
@@ -4313,31 +3254,42 @@ class defects(logging):
             self._hull_equations_cp = None
 
         ## Main Functions
-        def apply_to_sample(self, sample, use_gpu=True):
+        def apply_to_sample(self, sample, use_gpu=True, force=False):
             """
             Apply the crack to all chunks of a sample.
 
-            Iterates through all sample chunks and removes atoms that fall
-            inside the crack's convex hull.
+            Iterates through all sample chunks and removes atoms whose stored
+            (thermal-free) positions fall inside the crack's convex hull. When
+            writing into the sample's own directory the operation is recorded
+            on the sample and refused on a repeat call unless `force` is True.
 
             Args:
                 sample: Sample object providing chunk loading/writing methods.
                 use_gpu: If True and CuPy is available, use GPU acceleration.
                     Defaults to True.
+                force: If True, apply even if the same crack was already
+                    recorded on the sample. Defaults to False.
+
+            Raises:
+                RuntimeError: If the same crack was already applied in place
+                    and `force` is False.
             """
+            params = {"crack_points": np.asarray(self.crack_points, dtype=np.float64).tolist()}
+            _check_modification(sample, self.directory, "crack", params, force)
             for i in range(sample.chunk_total):
                 if cp is not None and use_gpu:
-                    positions_chunk_cp = sample.load_chunk_positions(i + 1, use_gpu=True)
+                    positions_chunk_cp = sample.load_chunk_positions(i + 1, use_gpu=True, raw=True)
                     species_chunknp = sample.load_chunk_species(i + 1, use_gpu=False)
                     positions_chunk_cp, species_chunknp = self.apply_crack_chunk(positions_chunk_cp,species_chunknp,use_gpu=True)
                     positions_chunknp = cp.asnumpy(positions_chunk_cp)
                 else:
-                    positions_chunknp = sample.load_chunk_positions(i + 1, use_gpu=False)
+                    positions_chunknp = sample.load_chunk_positions(i + 1, use_gpu=False, raw=True)
                     species_chunknp = sample.load_chunk_species(i + 1, use_gpu=False)
                     positions_chunknp, species_chunknp = self.apply_crack_chunk(positions_chunknp,species_chunknp,use_gpu=False)
 
                 sample.write_chunk_positions(positions_chunknp,i+1,override_directory=self.directory)
                 sample.write_chunk_species(species_chunknp,i+1,override_directory=self.directory)
+            _record_modification(sample, self.directory, "crack", params)
             sample.write_sample_metadata(override_directory=self.directory)
 
         def apply_crack_chunk(self, positions_chunk, species_chunknp, use_gpu=True):
@@ -4345,8 +3297,8 @@ class defects(logging):
             Remove atoms inside the crack's convex hull from a single chunk.
 
             Tests positions against the half-space inequalities defined by the
-            convex hull facets and removes atoms that satisfy all inequalities
-            (i.e., are inside the hull).
+            convex hull facets, one facet at a time in float32, and removes
+            atoms that satisfy all inequalities (i.e., are inside the hull).
 
             Args:
                 positions_chunk: Array of atomic positions with shape (N, 3).
@@ -4360,21 +3312,13 @@ class defects(logging):
             """
             if cp is not None and use_gpu:
                 if self._hull_equations_cp is None:
-                    self._hull_equations_cp = cp.asarray(self.hull_equations)
-                eq = self._hull_equations_cp
-                normals = eq[:, :3]
-                offsets = eq[:, 3]
-                dot_vals = normals @ positions_chunk.T + offsets[:, None]
-                inside_mask = cp.all(dot_vals <= 1e-12, axis=0)
+                    self._hull_equations_cp = cp.asarray(self.hull_equations, dtype=cp.float32)
+                inside_mask = _convex_hull_inside_mask(positions_chunk, self._hull_equations_cp)
                 positions_chunk = positions_chunk[~inside_mask]
                 species_chunknp = species_chunknp[~(inside_mask.get())]
                 return positions_chunk, species_chunknp
             else:
-                eq = self.hull_equations
-                normals = eq[:, :3]
-                offsets = eq[:, 3]
-                dot_vals = normals @ positions_chunk.T + offsets[:, None]
-                inside_mask = np.all(dot_vals <= 1e-12, axis=0)
+                inside_mask = _convex_hull_inside_mask(positions_chunk, self.hull_equations)
                 positions_chunk = positions_chunk[~inside_mask]
                 species_chunknp = species_chunknp[~inside_mask]
                 return positions_chunk, species_chunknp
@@ -4644,9 +3588,10 @@ class defects(logging):
             """
             Boolean mask selecting positions inside the band region.
 
-            In hull mode, applies the convex-hull half-space inequalities
-            (mirrors `crack.apply_crack_chunk`). In slab mode, projects each
-            position onto the slab basis and tests against the half-extents.
+            In hull mode, applies the convex-hull half-space inequalities one
+            facet at a time in float32 (mirrors `crack.apply_crack_chunk`). In
+            slab mode, projects each position onto the slab basis and tests
+            against the half-extents.
 
             Args:
                 positions: (N, 3) array of positions. Numpy or cupy.
@@ -4663,14 +3608,11 @@ class defects(logging):
             if self._mode == "hull":
                 if on_gpu:
                     if self._hull_equations_cp is None:
-                        self._hull_equations_cp = cp.asarray(self.hull_equations)
+                        self._hull_equations_cp = cp.asarray(self.hull_equations, dtype=cp.float32)
                     eq = self._hull_equations_cp
                 else:
                     eq = self.hull_equations
-                normals = eq[:, :3]
-                offsets = eq[:, 3]
-                dot_vals = normals @ positions.T + offsets[:, None]
-                return xp.all(dot_vals <= 1e-12, axis=0)
+                return _convex_hull_inside_mask(xp.asarray(positions), eq)
             else:
                 if on_gpu:
                     if self._slab_origin_cp is None:
@@ -4944,7 +3886,7 @@ class defects(logging):
             return total
 
         ## Main Functions
-        def apply_to_sample(self, sample, use_gpu=True):
+        def apply_to_sample(self, sample, use_gpu=True, force=False):
             """
             Apply the amorphous band to all chunks of a sample.
 
@@ -4967,14 +3909,35 @@ class defects(logging):
             The total number of replacement atoms is `number_density *
             volume(band ∩ sample_AABB)` when `number_density` is set, else
             `density_ratio * n_in_region`. New atoms are clipped to the
-            sample's bounding box.
+            sample's bounding box. Positions are read without thermal
+            displacements; when writing into the sample's own directory the
+            operation is recorded on the sample and refused on a repeat call
+            unless `force` is True.
 
             Args:
                 sample: Sample object providing chunk loading/writing methods.
                 use_gpu: If True and CuPy is available, the region inside-test
                     and the in-region filter run on the GPU per chunk.
                     Defaults to True.
+                force: If True, apply even if the same band was already
+                    recorded on the sample. Defaults to False.
+
+            Raises:
+                RuntimeError: If the same band was already applied in place
+                    and `force` is False.
             """
+            params = {
+                "mode": self._mode,
+                "band_points": self.band_points.tolist() if self.band_points is not None else None,
+                "center": self.center.tolist() if self.center is not None else None,
+                "length": self.length, "width": self.width, "thickness": self.thickness,
+                "orientation": self.orientation.tolist() if self.orientation is not None else None,
+                "period": self.period, "n_stripes": self.n_stripes,
+                "density_ratio": self.density_ratio,
+                "number_density": self.number_density,
+                "seed": self.seed,
+            }
+            _check_modification(sample, self.directory, "amorphous_band", params, force)
             rng = (np.random.RandomState(self.seed)
                    if self.seed is not None else np.random.RandomState())
             n_chunks = int(sample.chunk_total)
@@ -4994,7 +3957,7 @@ class defects(logging):
             species_dtype = None
             for i in range(n_chunks):
                 if on_gpu:
-                    pos_cp = sample.load_chunk_positions(i + 1, use_gpu=True)
+                    pos_cp = sample.load_chunk_positions(i + 1, use_gpu=True, raw=True)
                     mask_cp = self._in_region_mask(pos_cp, use_gpu=True)
                     n_in = int(cp.count_nonzero(mask_cp))
                     n_in_region += n_in
@@ -5008,7 +3971,7 @@ class defects(logging):
                         hist_counts_parts.append(c)
                     del pos_cp, mask_cp
                 else:
-                    pos_np = sample.load_chunk_positions(i + 1, use_gpu=False)
+                    pos_np = sample.load_chunk_positions(i + 1, use_gpu=False, raw=True)
                     mask_np = self._in_region_mask(pos_np, use_gpu=False)
                     n_in = int(np.count_nonzero(mask_np))
                     n_in_region += n_in
@@ -5060,7 +4023,7 @@ class defects(logging):
             remaining = n_target
             for i in range(n_chunks):
                 if on_gpu:
-                    pos_cp = sample.load_chunk_positions(i + 1, use_gpu=True)
+                    pos_cp = sample.load_chunk_positions(i + 1, use_gpu=True, raw=True)
                     spc_np = sample.load_chunk_species(i + 1, use_gpu=False)
                     keep_cp = ~self._in_region_mask(pos_cp, use_gpu=True)
                     # Filter on device, then transfer only the kept slice.
@@ -5069,7 +4032,7 @@ class defects(logging):
                     spc_np = spc_np[keep_np]
                     del pos_cp, keep_cp
                 else:
-                    pos_np = sample.load_chunk_positions(i + 1, use_gpu=False)
+                    pos_np = sample.load_chunk_positions(i + 1, use_gpu=False, raw=True)
                     spc_np = sample.load_chunk_species(i + 1, use_gpu=False)
                     keep_np = ~self._in_region_mask(pos_np, use_gpu=False)
                     pos_np = pos_np[keep_np]
@@ -5096,6 +4059,7 @@ class defects(logging):
                 sample.write_chunk_positions(pos_np, i + 1, override_directory=self.directory)
                 sample.write_chunk_species(spc_np, i + 1, override_directory=self.directory)
 
+            _record_modification(sample, self.directory, "amorphous_band", params)
             sample.write_sample_metadata(override_directory=self.directory)
 
         def plot_band_geometry(self, sample, color='c', alpha=0.5,
@@ -5280,10 +4244,12 @@ class defects(logging):
             self.interstitial_species = interstitial_species
             self.interstitial_min_separation = float(interstitial_min_separation) if interstitial_min_separation is not None else 0.0
 
-            # Logs of what was applied (positions and species changes)
-            self._applied_vacancies = []       # list of (3,) positions removed
-            self._applied_substitutions = []   # list of {"pos":(3,), "from":str, "to":str}
-            self._applied_interstitials = []   # list of {"pos":(3,), "species":str}
+            # Applied positions, one (M, 3) float32 array per chunk. Species
+            # changes are the object's substitution_to / interstitial_species.
+            self._applied_vacancies = []
+            self._applied_substitutions = []
+            self._applied_interstitials = []
+            self._applied_directory = None
 
             # Optional immediate relaxation configuration
             self._relax_after = bool(relax_after)
@@ -5410,7 +4376,7 @@ class defects(logging):
         # ------------------------
         # Core pipeline
 
-        def apply_to_sample(self, sample, use_gpu=False, tol_match=1e-4):
+        def apply_to_sample(self, sample, use_gpu=False, tol_match=1e-4, force=False):
             """
             Apply all configured point defects to a sample.
 
@@ -5420,7 +4386,11 @@ class defects(logging):
                 - Random and specific interstitial insertions
 
             Then optionally performs local relaxation and writes back modified
-            positions and species arrays.
+            positions and species arrays. Positions are read without thermal
+            displacements; when writing into the sample's own directory the
+            operation is recorded on the sample and refused on a repeat call
+            unless `force` is True. Applied positions are stored per chunk
+            (see `_write_applied_arrays`).
 
             Args:
                 sample: Sample object providing chunk loading/writing methods.
@@ -5428,11 +4398,19 @@ class defects(logging):
                     Defaults to False.
                 tol_match: Tolerance for position matching when applying
                     specific defects by position. Defaults to 1e-4.
+                force: If True, apply even if the same defects were already
+                    recorded on the sample. Defaults to False.
+
+            Raises:
+                RuntimeError: If the same defects were already applied in
+                    place and `force` is False.
 
             Note:
                 Uses sample.load_chunk_positions/species and write_* counterparts,
                 preserving the chunked .npy layout.
             """
+            params = self._spec_params()
+            _check_modification(sample, self.directory, "point_defects", params, force)
             rng = np.random.RandomState(self.seed) if self.seed is not None else np.random.RandomState()
             n_chunks = int(sample.chunk_total)
 
@@ -5443,7 +4421,7 @@ class defects(logging):
                 vac_total_cand = 0
                 sub_total_cand = 0
                 for i in range(n_chunks):
-                    pos_i = sample.load_chunk_positions(i+1, use_gpu=False)
+                    pos_i = sample.load_chunk_positions(i+1, use_gpu=False, raw=True)
                     spc_i = sample.load_chunk_species(i+1, use_gpu=False)
                     region_mask = self._region_mask(pos_i)
                     if vac_need_fraction:
@@ -5472,11 +4450,19 @@ class defects(logging):
             # Interstitial random distribution across chunks
             interstitials_remaining_random = int(self.interstitial_count or 0)
             interstitials_specific_left = None if self.interstitial_positions is None else list(range(self.interstitial_positions.shape[0]))
+            r_min = float(self.interstitial_min_separation)
+
+            self._applied_vacancies = []
+            self._applied_substitutions = []
+            self._applied_interstitials = []
+            empty = np.zeros((0, 3), dtype=np.float32)
 
             for i in range(n_chunks):
                 # Load
-                pos = sample.load_chunk_positions(i+1, use_gpu=False)
+                pos = sample.load_chunk_positions(i+1, use_gpu=False, raw=True)
                 spc = sample.load_chunk_species(i+1, use_gpu=False)
+                if spc.dtype.kind != "U":
+                    spc = spc.astype(str)
 
                 N = pos.shape[0]
                 region_mask = self._region_mask(pos)
@@ -5509,7 +4495,7 @@ class defects(logging):
 
                 # Substitutions
                 subs_mask_local = np.zeros(N, dtype=bool)
-                subs_to_species = None  # filled only for substituted indices
+                sub_pos = empty
                 if self.substitution_from is not None and self.substitution_to is not None:
                     # Specific substitutions by global index
                     if self.substitution_global_indices is not None:
@@ -5534,84 +4520,73 @@ class defects(logging):
                                 pick = rng.choice(cand_idx, size=min(k, cand_idx.size), replace=False)
                                 subs_mask_local[pick] = True
 
-                    # Commit substitution: change species at subs_mask_local
+                    # Commit substitution: change species at subs_mask_local.
+                    # Widen the string dtype if the new label is longer.
                     if np.any(subs_mask_local):
-                        spc = spc.astype(object, copy=True)  # robust for string updates
-                        from_mask = (spc == self.substitution_from)
+                        new_dtype = np.result_type(spc.dtype, np.asarray(str(self.substitution_to)).dtype)
+                        spc = spc.astype(new_dtype, copy=True)
+                        from_mask = (spc == str(self.substitution_from))
                         apply_mask = subs_mask_local & from_mask & (~delete_mask)
                         if np.any(apply_mask):
-                            # Log applied substitutions
-                            for idx in np.flatnonzero(apply_mask):
-                                self._applied_substitutions.append({
-                                    "pos": pos[idx].copy(),
-                                    "from": self.substitution_from,
-                                    "to": self.substitution_to
-                                })
-                            spc[apply_mask] = self.substitution_to
+                            sub_pos = pos[apply_mask].astype(np.float32, copy=True)
+                            spc[apply_mask] = str(self.substitution_to)
 
-                # Capture positions of atoms to be deleted (for plotting/relax)
-                if np.any(delete_mask):
-                    removed_positions = pos[delete_mask].copy()
-                    for p in removed_positions:
-                        self._applied_vacancies.append(p)
+                # Positions of deleted atoms (for plotting/relax)
+                vac_pos = pos[delete_mask].astype(np.float32, copy=True) if np.any(delete_mask) else empty
 
                 # Remove vacancies
                 keep_mask = ~delete_mask
                 pos = pos[keep_mask]
                 spc = spc[keep_mask]
 
+                # Interstitials: candidates must keep `interstitial_min_separation`
+                # from the chunk atoms and from interstitials already accepted
+                # in this chunk.
+                new_pos = empty
+                tree = None
+                if r_min > 0.0 and pos.shape[0] > 0:
+                    from scipy.spatial import cKDTree
+                    tree = cKDTree(pos)
+
                 # Interstitials: specific
-                new_pos_list = []
-                new_spc_list = []
                 if interstitials_specific_left is not None and len(interstitials_specific_left) > 0:
-                    # simple round-robin allocation of specific positions across chunks
-                    # compute a per-chunk slice size ~ evenly
+                    # round-robin allocation of specific positions across chunks
                     slice_len = max(0, int(np.ceil(len(interstitials_specific_left) / float(n_chunks - i))))
                     if slice_len > 0:
                         sel_idx = interstitials_specific_left[:slice_len]
                         interstitials_specific_left = interstitials_specific_left[slice_len:]
                         P = self.interstitial_positions[sel_idx, :]
-                        # region clip (optional)
                         if self.region_min is not None and self.region_max is not None:
-                            rm = self._in_region_mask(P)
-                            P = P[rm]
-                        for p in P:
-                            if self.interstitial_min_separation > 0.0:
-                                if not self._ok_min_sep(p, pos, self.interstitial_min_separation):
-                                    continue
-                            new_pos_list.append(p)
-                            new_spc_list.append(self.interstitial_species)
-                            self._applied_interstitials.append({"pos": p.copy(), "species": self.interstitial_species})
+                            P = P[self._in_region_mask(P)]
+                        new_pos = self._accept_min_sep(P, tree, r_min, new_pos)
 
                 # Interstitials: random
                 if interstitials_remaining_random > 0 and self.interstitial_species is not None:
-                    # take a per-chunk share
                     to_take = int(np.ceil(interstitials_remaining_random / float(n_chunks - i)))
                     if to_take > 0:
-                        # sample uniformly in region box if given, else sample box of sample
                         box_min, box_max = self._region_or_sample_box(sample)
-                        # try to generate respecting min separation
+                        n_before = new_pos.shape[0]
                         tries = 0
-                        added = 0
-                        while added < to_take and tries < 50 * to_take:
-                            tries += 1
-                            p = rng.uniform(low=box_min, high=box_max, size=(3,)).astype(np.float32)
+                        while (new_pos.shape[0] - n_before) < to_take and tries < 50 * to_take:
+                            need = to_take - (new_pos.shape[0] - n_before)
+                            batch = int(min(max(2 * need, 64), 50 * to_take - tries))
+                            cand = rng.uniform(low=box_min, high=box_max, size=(batch, 3)).astype(np.float32)
+                            tries += batch
                             if self.region_min is not None and self.region_max is not None:
-                                if not self._in_region_mask(p[None, :])[0]:
-                                    continue
-                            if self.interstitial_min_separation > 0.0:
-                                if not self._ok_min_sep(p, pos, self.interstitial_min_separation):
-                                    continue
-                            new_pos_list.append(p)
-                            new_spc_list.append(self.interstitial_species)
-                            self._applied_interstitials.append({"pos": p.copy(), "species": self.interstitial_species})
-                            added += 1
-                        interstitials_remaining_random -= added
+                                cand = cand[self._in_region_mask(cand)]
+                            new_pos = self._accept_min_sep(cand, tree, r_min, new_pos, limit=need)
+                        interstitials_remaining_random -= int(new_pos.shape[0] - n_before)
 
                 # Append interstitials to chunk arrays
-                if new_pos_list:
-                    pos = np.concatenate([pos, np.asarray(new_pos_list, dtype=np.float32)], axis=0)
-                    spc = np.concatenate([spc, np.asarray(new_spc_list, dtype=object)], axis=0)
+                if new_pos.shape[0] > 0:
+                    pos = np.concatenate([pos, new_pos], axis=0)
+                    spc = np.concatenate([spc, np.full(new_pos.shape[0], str(self.interstitial_species))], axis=0)
+                    if spc.dtype.kind != "U":
+                        spc = spc.astype(str)
+
+                self._applied_vacancies.append(vac_pos)
+                self._applied_substitutions.append(sub_pos)
+                self._applied_interstitials.append(new_pos.astype(np.float32, copy=False))
 
                 # Write updated arrays
                 sample.write_chunk_positions(pos, i+1, override_directory=self.directory)
@@ -5620,13 +4595,78 @@ class defects(logging):
                 # Advance global index window
                 global_start += N
 
-            # Finalize sample metadata in the chosen directory
+            # Applied positions and sample metadata in the chosen directory
+            self._write_applied_arrays(self.directory if self.directory is not None else sample.directory)
+            _record_modification(sample, self.directory, "point_defects", params)
             sample.write_sample_metadata(override_directory=self.directory)
 
             # Optional relaxation now
             if self._relax_after:
                 params = self._relax_params if self._relax_params else {}
                 self.relax_local_atoms(sample, **params)
+
+        def _spec_params(self):
+            """Defining parameters of this point-defect set, JSON-serialisable."""
+            def _lst(v):
+                return None if v is None else np.asarray(v).tolist()
+            return {
+                "seed": self.seed,
+                "region_min": _lst(self.region_min), "region_max": _lst(self.region_max),
+                "vacancy_fraction": self.vacancy_fraction, "vacancy_count": self.vacancy_count,
+                "vacancy_global_indices": _lst(self.vacancy_global_indices),
+                "vacancy_positions": _lst(self.vacancy_positions),
+                "vacancy_species_filter": self.vacancy_species_filter,
+                "substitution_fraction": self.substitution_fraction,
+                "substitution_count": self.substitution_count,
+                "substitution_from": self.substitution_from, "substitution_to": self.substitution_to,
+                "substitution_positions": _lst(self.substitution_positions),
+                "substitution_global_indices": _lst(self.substitution_global_indices),
+                "interstitial_count": self.interstitial_count,
+                "interstitial_positions": _lst(self.interstitial_positions),
+                "interstitial_species": self.interstitial_species,
+                "interstitial_min_separation": self.interstitial_min_separation,
+            }
+
+        @staticmethod
+        def _applied_filename(kind, chunk_num):
+            return f"point_defects_applied_{kind}_{chunk_num}.npy"
+
+        def _write_applied_arrays(self, directory):
+            """
+            Save the applied vacancy/substitution/interstitial positions as
+            one (M, 3) float32 `.npy` per chunk and kind in `directory`.
+            """
+            if directory is None:
+                return
+            os.makedirs(directory, exist_ok=True)
+            self._applied_directory = os.path.abspath(directory)
+            for kind, arrs in (("vacancies", self._applied_vacancies),
+                               ("substitutions", self._applied_substitutions),
+                               ("interstitials", self._applied_interstitials)):
+                for k, arr in enumerate(arrs):
+                    np.save(os.path.join(directory, self._applied_filename(kind, k + 1)),
+                            np.asarray(arr, dtype=np.float32).reshape(-1, 3))
+
+        def _load_applied_arrays(self, directory, n_chunks):
+            """Load the per-chunk applied-position arrays written by `_write_applied_arrays`."""
+            self._applied_directory = os.path.abspath(directory)
+            for kind, attr in (("vacancies", "_applied_vacancies"),
+                               ("substitutions", "_applied_substitutions"),
+                               ("interstitials", "_applied_interstitials")):
+                arrs = []
+                for k in range(int(n_chunks)):
+                    path = os.path.join(directory, self._applied_filename(kind, k + 1))
+                    arrs.append(np.load(path).reshape(-1, 3) if os.path.isfile(path)
+                                else np.zeros((0, 3), dtype=np.float32))
+                setattr(self, attr, arrs)
+
+        def _applied_centers(self):
+            """Concatenated (vacancy, substitution, interstitial) positions, each (M, 3) float32."""
+            def _cat(arrs):
+                arrs = [np.asarray(a, dtype=np.float32).reshape(-1, 3) for a in arrs]
+                return np.concatenate(arrs, axis=0) if arrs else np.zeros((0, 3), dtype=np.float32)
+            return (_cat(self._applied_vacancies), _cat(self._applied_substitutions),
+                    _cat(self._applied_interstitials))
 
         # ------------------------
         # Relaxation
@@ -5637,7 +4677,8 @@ class defects(logging):
                               strength=0.05,
                               iterations=2,
                               decay=0.8,
-                              use_gpu=False):
+                              use_gpu=False,
+                              force=False):
             """
             Perform local relaxation around defect sites.
 
@@ -5655,6 +4696,12 @@ class defects(logging):
                 decay: Strength decay factor per iteration. Defaults to 0.8.
                 use_gpu: If True, use GPU acceleration (currently not implemented).
                     Defaults to False.
+                force: If True, run even if the same relaxation was already
+                    recorded on the sample. Defaults to False.
+
+            Raises:
+                RuntimeError: If the same relaxation was already applied in
+                    place and `force` is False.
 
             Note:
                 The update rule per center c and neighbor x within r_cut is:
@@ -5662,17 +4709,10 @@ class defects(logging):
                     delta = sgn * strength * w * (x - c) / (r + 1e-12)
                 where sgn is +1 for interstitials (push), -1 for vacancies (pull),
                 and -0.5 for substitutions. Strength decays each iteration by decay.
+                Neighbours are found with a k-d tree on the chunk positions.
                 Operates chunk-by-chunk; atoms are clamped to sample AABB.
             """
-            # Collect centers
-            vacancy_centers = [np.asarray(p, dtype=np.float32).reshape(1,3) for p in self._applied_vacancies]
-            sub_centers = [np.asarray(x["pos"], dtype=np.float32).reshape(1,3) for x in self._applied_substitutions]
-            int_centers = [np.asarray(x["pos"], dtype=np.float32).reshape(1,3) for x in self._applied_interstitials]
-
-            # Concatenate to arrays
-            V = np.vstack(vacancy_centers) if vacancy_centers else np.zeros((0,3), dtype=np.float32)
-            S = np.vstack(sub_centers) if sub_centers else np.zeros((0,3), dtype=np.float32)
-            I = np.vstack(int_centers) if int_centers else np.zeros((0,3), dtype=np.float32)
+            V, S, I = self._applied_centers()
 
             box_min, box_max = self._region_or_sample_box(sample)
 
@@ -5680,11 +4720,16 @@ class defects(logging):
             if V.shape[0] == 0 and S.shape[0] == 0 and I.shape[0] == 0:
                 return
 
+            params = {"r_cut": float(r_cut), "strength": float(strength),
+                      "iterations": int(iterations), "decay": float(decay),
+                      "centers": [int(V.shape[0]), int(S.shape[0]), int(I.shape[0])]}
+            _check_modification(sample, self.directory, "point_defect_relax", params, force)
+
             n_chunks = int(sample.chunk_total)
             for it in range(int(iterations)):
                 step = float(strength) * (float(decay) ** it)
                 for i in range(n_chunks):
-                    pos = sample.load_chunk_positions(i+1, use_gpu=False)
+                    pos = sample.load_chunk_positions(i+1, use_gpu=False, raw=True)
                     spc = sample.load_chunk_species(i+1, use_gpu=False)  # unchanged species
 
                     # Accumulate displacements
@@ -5708,6 +4753,7 @@ class defects(logging):
                     sample.write_chunk_positions(pos, i+1, override_directory=self.directory)
                     sample.write_chunk_species(spc, i+1, override_directory=self.directory)
 
+            _record_modification(sample, self.directory, "point_defect_relax", params)
             sample.write_sample_metadata(override_directory=self.directory)
 
         # ------------------------
@@ -5743,15 +4789,13 @@ class defects(logging):
                 ax.plot(x,y,z, c="gray", lw=1)
 
             # plot defects
-            if self._applied_vacancies:
-                P = np.vstack([np.asarray(p, dtype=np.float32) for p in self._applied_vacancies])
-                ax.scatter(P[:,0], P[:,1], P[:,2], s=12, c="r", marker="x", label="vacancy")
-            if self._applied_substitutions:
-                P = np.vstack([np.asarray(x["pos"], dtype=np.float32) for x in self._applied_substitutions])
-                ax.scatter(P[:,0], P[:,1], P[:,2], s=10, c="g", marker="o", label="substitution")
-            if self._applied_interstitials:
-                P = np.vstack([np.asarray(x["pos"], dtype=np.float32) for x in self._applied_interstitials])
-                ax.scatter(P[:,0], P[:,1], P[:,2], s=10, c="m", marker="^", label="interstitial")
+            V, S, I = self._applied_centers()
+            if V.shape[0]:
+                ax.scatter(V[:,0], V[:,1], V[:,2], s=12, c="r", marker="x", label="vacancy")
+            if S.shape[0]:
+                ax.scatter(S[:,0], S[:,1], S[:,2], s=10, c="g", marker="o", label="substitution")
+            if I.shape[0]:
+                ax.scatter(I[:,0], I[:,1], I[:,2], s=10, c="m", marker="^", label="interstitial")
 
             ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
             ax.view_init(elev=elev, azim=azim)
@@ -5811,10 +4855,9 @@ class defects(logging):
             """
             mask = region_mask.copy()
             if self.vacancy_species_filter is not None:
-                spc_obj = spc.astype(object, copy=False)
-                allowed = np.zeros(spc_obj.shape[0], dtype=bool)
+                allowed = np.zeros(spc.shape[0], dtype=bool)
                 for s in self.vacancy_species_filter:
-                    allowed |= (spc_obj == s)
+                    allowed |= (spc == str(s))
                 mask &= allowed
             return mask
 
@@ -5832,8 +4875,7 @@ class defects(logging):
             """
             mask = region_mask.copy()
             if self.substitution_from is not None:
-                spc_obj = spc.astype(object, copy=False)
-                mask &= (spc_obj == self.substitution_from)
+                mask &= (spc == str(self.substitution_from))
             return mask
 
         def _indices_from_positions(self, pos, target_positions, tol=1e-4):
@@ -5859,23 +4901,46 @@ class defects(logging):
                     sel[hit[0]] = True
             return sel
 
-        def _ok_min_sep(self, p, pos, r_min):
+        def _accept_min_sep(self, cand, tree, r_min, accepted, limit=None):
             """
-            Check if a point satisfies minimum separation from all positions.
+            Append candidate positions that keep a minimum separation from
+            the chunk atoms and from each other.
 
             Args:
-                p: Single position with shape (3,).
-                pos: Array of existing positions with shape (N, 3).
-                r_min: Minimum required separation distance.
+                cand: (K, 3) candidate positions.
+                tree: scipy.spatial.cKDTree over the chunk atoms, or None.
+                r_min: Minimum separation; <= 0 accepts every candidate.
+                accepted: (M, 3) positions already accepted in this chunk.
+                limit: Optional maximum number of candidates to add.
 
             Returns:
-                bool: True if minimum separation is satisfied.
+                (M + m, 3) float32 array of accepted positions.
             """
-            if pos.shape[0] == 0:
-                return True
-            d = pos - p[None, :]
-            r2 = np.sum(d * d, axis=1)
-            return bool(np.all(r2 >= float(r_min * r_min)))
+            cand = np.asarray(cand, dtype=np.float32).reshape(-1, 3)
+            accepted = np.asarray(accepted, dtype=np.float32).reshape(-1, 3)
+            if cand.shape[0] == 0:
+                return accepted
+            if r_min <= 0.0:
+                take = cand if limit is None else cand[:int(limit)]
+                return np.concatenate([accepted, take], axis=0)
+            if tree is not None:
+                ok = tree.query_ball_point(cand, float(r_min), return_length=True) == 0
+                cand = cand[ok]
+            r2 = float(r_min) * float(r_min)
+            out = [accepted]
+            acc = accepted
+            n_added = 0
+            for p in cand:
+                if limit is not None and n_added >= int(limit):
+                    break
+                if acc.shape[0] > 0:
+                    d = acc - p[None, :]
+                    if np.min(np.einsum("ij,ij->i", d, d)) < r2:
+                        continue
+                out.append(p[None, :])
+                acc = np.concatenate([acc, p[None, :]], axis=0)
+                n_added += 1
+            return acc
 
         def _region_or_sample_box(self, sample):
             """
@@ -5897,7 +4962,8 @@ class defects(logging):
 
         def _accumulate_radial_disp(self, pos, centers, r_cut, step_signed):
             """
-            Accumulate radial displacements from defect centers.
+            Accumulate radial displacements from defect centers. Neighbours
+            within `r_cut` of each centre are found with a k-d tree on `pos`.
 
             Args:
                 pos: Array of positions with shape (N, 3).
@@ -5910,15 +4976,25 @@ class defects(logging):
             """
             if centers.shape[0] == 0 or pos.shape[0] == 0:
                 return np.zeros_like(pos, dtype=np.float32)
-            acc = np.zeros_like(pos, dtype=np.float32)
+            from scipy.spatial import cKDTree
+            acc = np.zeros((pos.shape[0], 3), dtype=np.float64)
             rc = float(r_cut)
-            for c in centers:
-                v = pos - c[None, :]
-                r = np.linalg.norm(v, axis=1)
-                mask = (r > 1e-12) & (r <= rc)
-                if not np.any(mask):
+            tree = cKDTree(pos)
+            centers = np.asarray(centers, dtype=np.float32).reshape(-1, 3)
+            batch = 4096
+            for c0 in range(0, centers.shape[0], batch):
+                cs = centers[c0:c0 + batch]
+                lists = tree.query_ball_point(cs, rc)
+                lens = np.fromiter((len(l) for l in lists), dtype=np.int64, count=len(lists))
+                if lens.sum() == 0:
                     continue
-                u = v[mask] / r[mask][:, None]
-                w = np.exp(-(r[mask] / rc) ** 2).astype(np.float32)
-                acc[mask] += (step_signed * w)[:, None] * u
-            return acc
+                j = np.concatenate([np.asarray(l, dtype=np.int64) for l in lists if len(l)])
+                ci = np.repeat(np.arange(len(lists)), lens)
+                v = pos[j].astype(np.float64) - cs[ci].astype(np.float64)
+                r = np.linalg.norm(v, axis=1)
+                m = r > 1e-12
+                if not np.any(m):
+                    continue
+                w = np.exp(-(r[m] / rc) ** 2)
+                np.add.at(acc, j[m], (step_signed * w)[:, None] * v[m] / r[m][:, None])
+            return acc.astype(np.float32)
