@@ -250,7 +250,7 @@ class analysis(logging):
             return X_fft, Y_fft, Z_fft_amp, Z_fft_pha, pixel_values_list
         return X_fft, Y_fft, Z_fft_amp, Z_fft_pha
     
-    def integrate_detector_along_axis(self, detector, data_type="Intensity", axis="x", system="cartesian", degrees=True, bins=200, aggregator="mean", plot=True, save_plot=False, title="Integrated Detector Data", xlabel=None, ylabel="Integrated Value", figsize=(8, 6)):
+    def integrate_detector_along_axis(self, detector, data_type="Intensity", axis="x", system="cartesian", degrees=True, bins=200, aggregator="mean", plot=True, save_plot=False, title="Integrated Detector Data", xlabel=None, ylabel="Integrated Value", figsize=(8, 6), show_plot=False, return_figure=False):
         """
         Integrate detector data along a specified axis.
 
@@ -270,9 +270,15 @@ class analysis(logging):
             xlabel (str, optional): X-axis label. Defaults to axis name if None.
             ylabel (str): Y-axis label. Defaults to "Integrated Value".
             figsize (tuple): Size of the figure. Defaults to (8, 6).
+            show_plot (bool): If True, display the plot with plt.show(). Defaults to False.
+            return_figure (bool): If True and `plot` is True, also return the
+                figure and axes and leave the figure open for the caller.
+                Defaults to False.
 
         Returns:
-            tuple: Bin centers (ndarray) and integrated values (ndarray).
+            tuple: Bin centers (ndarray) and integrated values (ndarray), followed
+                by (fig, ax) when `plot` and `return_figure` are both True. A figure
+                that is neither saved, shown nor returned is closed.
         """
         try:
             data_map = {
@@ -312,7 +318,12 @@ class analysis(logging):
                 ax.set_xlabel(xlabel or axis)
                 ax.set_ylabel(ylabel)
                 if save_plot:
-                    self._save_figure(fig, f"Integrated_{data_type}_{axis}.png")
+                    fig.savefig(os.path.join(self.directory, f"Integrated_{data_type}_{axis}.png"))
+                if show_plot:
+                    plt.show()
+                if return_figure:
+                    return bin_centers, hist, fig, ax
+                plt.close(fig)
 
             return bin_centers, hist
         except Exception as e:
