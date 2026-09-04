@@ -4556,7 +4556,42 @@ class beam(logging):
             Nz2 = beam._next_pow_two(Nz2)
 
         return int(Ny2), int(Nz2)
-    
+
+    @staticmethod
+    def _alias_free_step(Ny, Nz, dy, dz, wavelength, z, pad_factor=1.0):
+        """
+        Largest single propagation step the padded grid samples without
+        aliasing the transfer function.
+
+        The angular-spectrum propagator exp(i z sqrt(k^2 - kt^2)) is sampled
+        adequately on a grid of N points at pitch d only while
+        |z| <= z_max = N d^2 / lambda (the Nyquist distance of the transfer
+        function). N is the PADDED size from _choose_optimal_pad for the full
+        distance: with unconstrained geometric padding N grows with |z| and
+        z_max always exceeds |z|, so a single step results; only when the
+        padded size hits the 8192-pixel cap does z_max fall below |z| and the
+        distance has to be split into ceil(|z| / z_max) sub-steps.
+
+        Args:
+            Ny, Nz (int): Unpadded field sizes along Y and Z.
+            dy, dz (float): Pixel sizes in metres.
+            wavelength (float): Wavelength in metres.
+            z (float): Propagation distance in metres.
+            pad_factor (float): Minimum padding factor passed to
+                _choose_optimal_pad.
+
+        Returns:
+            float: z_max in metres (inf when the padded grid is alias-free for
+            any distance, i.e. when dy or dz is zero).
+        """
+        Ny2, Nz2 = beam._choose_optimal_pad(
+            int(Ny), int(Nz), float(dy), float(dz), float(wavelength), float(z),
+            safety=1.1, enforce_pow2=True, min_pad_factor=max(1.0, float(pad_factor))
+        )
+        zy = Ny2 * float(dy) ** 2 / float(wavelength)
+        zz = Nz2 * float(dz) ** 2 / float(wavelength)
+        return float(min(zy, zz)) if (zy > 0 and zz > 0) else float('inf')
+
     @staticmethod
     def build_propagation_multiplier_kernel():
         """
@@ -7599,10 +7634,15 @@ class beam(logging):
         The field is padded symmetrically to the size from _choose_optimal_pad
         (power of two, at least pad_factor times larger, sized for the full
         distance), then FFT -> transfer function (CUDA kernel) -> IFFT, and
-        centre-cropped back to (Nz, Ny).  The whole distance is one step: the
-        transfer function is exact at any z, and every extra step would crop
-        the field again, acting as a repeated hard aperture.  A finite
-        step_max still splits the distance for callers that want it.
+        centre-cropped back to (Nz, Ny).  The whole distance is one step
+        whenever the padded grid samples the transfer function without
+        aliasing (|z| <= z_max = N_pad d^2 / lambda, see _alias_free_step):
+        the transfer function is exact at any z, and every extra step would
+        crop the field again, acting as a repeated hard aperture.  When the
+        padded size hits its cap and |z| exceeds z_max, the distance is split
+        automatically into ceil(|z| / z_max) alias-free sub-steps.  A finite
+        step_max replaces the automatic limit for callers that want to fix the
+        step length themselves (including forcing a single step).
 
         Args:
             field: Complex (Nz, Ny) array, NumPy or CuPy.
@@ -7610,7 +7650,8 @@ class beam(logging):
             z (float): Propagation distance in metres, may be negative.
             kernel: "prop_mul_kernel" from build_propagation_multiplier_kernel.
             step_max (float or None): Maximum sub-step distance in metres;
-                None (default) propagates in a single step.
+                None (default) uses the automatic alias-free limit, a value
+                overrides it.
             pad_factor (float): Minimum padding factor (>= 1).
             padding_mode (str): "edge" replicates edges, "constant" uses pad_constant.
             cos_theta, k_g_axis, k_g_perp_y, k_g_perp_z: Carrier wavevector of
@@ -7625,24 +7666,28 @@ class beam(logging):
         if cp is None:
             raise RuntimeError('CuPy required for GPU propagation')
 
-        # Optional sub-stepping, only when a caller asks for it
+        # Sub-stepping: automatic alias-free limit of the padded grid, further
+        # capped by step_max when a caller asks for it
         z = float(z)
-        if step_max is not None and abs(z) > step_max:
-            n = int(np.ceil(abs(z) / step_max))
+        F0 = cp.asarray(field, dtype=cp.complex64)
+        Nz, Ny = int(F0.shape[0]), int(F0.shape[1])
+        if step_max is None:
+            step_limit = self._alias_free_step(Ny, Nz, dy, dz, self._wavelength, z, pad_factor)
+        else:
+            step_limit = float(step_max)     # explicit request overrides the automatic limit
+        if abs(z) > step_limit:
+            n = int(np.ceil(abs(z) / step_limit))
             dz_step = z / n
-            out = cp.asarray(field) if isinstance(field, cp.ndarray) else cp.asarray(field, dtype=cp.complex64)
+            out = F0
             for _ in range(n):
                 out = self._angular_spectrum_propagate_gpu(
                     out, dy, dz, dz_step, kernel,
-                    step_max=step_max, pad_factor=pad_factor,
+                    step_max=step_limit, pad_factor=pad_factor,
                     padding_mode=padding_mode, pad_constant=pad_constant,
                     cos_theta=cos_theta,
                     k_g_axis=k_g_axis, k_g_perp_y=k_g_perp_y, k_g_perp_z=k_g_perp_z,
                 )
             return out
-
-        F0 = cp.asarray(field, dtype=cp.complex64)
-        Nz, Ny = int(F0.shape[0]), int(F0.shape[1])
 
         # Symmetric padding from sampling, distance and pad_factor
         Ny2, Nz2 = self._choose_optimal_pad(
@@ -7712,20 +7757,25 @@ class beam(logging):
             np.ndarray: complex64 field after propagation, shape (Nz, Ny).
         """
         z = float(z)
-        if step_max is not None and abs(z) > step_max:
-            n = int(np.ceil(abs(z) / step_max))
+        F0 = np.asarray(field, dtype=np.complex64, order='C')
+        Nz, Ny = int(F0.shape[0]), int(F0.shape[1])
+        # Automatic alias-free sub-stepping (see _alias_free_step) unless the
+        # caller fixes the step length explicitly
+        if step_max is None:
+            step_limit = self._alias_free_step(Ny, Nz, dy, dz, self._wavelength, z, pad_factor)
+        else:
+            step_limit = float(step_max)
+        if abs(z) > step_limit:
+            n = int(np.ceil(abs(z) / step_limit))
             dz_step = z / n
-            out = field
+            out = F0
             for _ in range(n):
                 out = self._angular_spectrum_propagate_cpu(
                     out, dy, dz, dz_step, lib, ffi,
-                    step_max=step_max, pad_factor=pad_factor,
+                    step_max=step_limit, pad_factor=pad_factor,
                     padding_mode=padding_mode, pad_constant=pad_constant
                 )
             return out
-
-        F0 = np.asarray(field, dtype=np.complex64, order='C')
-        Nz, Ny = int(F0.shape[0]), int(F0.shape[1])
 
         # Symmetric padding
         Ny2, Nz2 = self._choose_optimal_pad(
