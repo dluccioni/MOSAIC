@@ -8084,7 +8084,18 @@ extern "C" __global__ void mosaic_fast(
 #if REMOVE_FWD
     float dvcut[PIX];
 #endif
+    // Per-pixel accumulator across chunks.  ACC_MODE 0: plain fp32 (one
+    // rounding per chunk fold, random-walking as sqrt(n_chunks));
+    // 1: Kahan-compensated fp32 (two extra registers per pixel);
+    // 2: fp64.
+#if ACC_MODE == 2
+    double2 acc[PIX];
+#else
     float2 acc[PIX];
+  #if ACC_MODE == 1
+    float2 accc[PIX];
+  #endif
+#endif
 
     #pragma unroll
     for (int p = 0; p < PIX; ++p) {
@@ -8103,7 +8114,14 @@ extern "C" __global__ void mosaic_fast(
 #else
         sincos_k(k_global, R0, sbv[p], cbv[p]);      // fp32 R0 form
 #endif
+#if ACC_MODE == 2
+        acc[p] = make_double2(0.0, 0.0);
+#else
         acc[p] = make_float2(0.0f, 0.0f);
+  #if ACC_MODE == 1
+        accc[p] = make_float2(0.0f, 0.0f);
+  #endif
+#endif
 #if REMOVE_FWD
         // Q < Q_cut  <=>  dotv > 1 - Q_cut^2/(2 k^2).  Q_cut is the diagonal
         // half-width of the pixel in Q, from both neighbours, exactly as the
@@ -8364,8 +8382,27 @@ extern "C" __global__ void mosaic_fast(
         }
         #pragma unroll
         for (int p = 0; p < PIX; ++p) {
-            acc[p].x += csum[p].x*c0[p] - csum[p].y*s0[p];
-            acc[p].y += csum[p].x*s0[p] + csum[p].y*c0[p];
+            const float fx = csum[p].x*c0[p] - csum[p].y*s0[p];
+            const float fy = csum[p].x*s0[p] + csum[p].y*c0[p];
+#if ACC_MODE == 2
+            acc[p].x += (double)fx;
+            acc[p].y += (double)fy;
+#elif ACC_MODE == 1
+            // Kahan: carry the rounding error of each fold into the next
+            {
+                const float yx = fx - accc[p].x;
+                const float tx_ = acc[p].x + yx;
+                accc[p].x = (tx_ - acc[p].x) - yx;
+                acc[p].x = tx_;
+                const float yy = fy - accc[p].y;
+                const float ty_ = acc[p].y + yy;
+                accc[p].y = (ty_ - acc[p].y) - yy;
+                acc[p].y = ty_;
+            }
+#else
+            acc[p].x += fx;
+            acc[p].y += fy;
+#endif
         }
         __syncthreads();
     }
@@ -8373,8 +8410,13 @@ extern "C" __global__ void mosaic_fast(
     #pragma unroll
     for (int p = 0; p < PIX; ++p) {
         if (vp[p]) {
-            const float rr = acc[p].x*cbv[p] - acc[p].y*sbv[p];
-            const float ii = acc[p].x*sbv[p] + acc[p].y*cbv[p];
+#if ACC_MODE == 2
+            const float ax = (float)acc[p].x, ay = (float)acc[p].y;
+#else
+            const float ax = acc[p].x, ay = acc[p].y;
+#endif
+            const float rr = ax*cbv[p] - ay*sbv[p];
+            const float ii = ax*sbv[p] + ay*cbv[p];
             out[pidx[p]].x += rr * rE;
             out[pidx[p]].y += ii * rE;
         }
@@ -8579,6 +8621,7 @@ def build(cfg):
         ("FUSED", int(cfg.get("fused", False))),
         ("FACTOR", int(cfg.get("factor", False))),
         ("POL_VEC", int(cfg.get("pol_vec", False))),
+        ("ACC_MODE", int(cfg.get("acc_mode", 0))),
     ))
     mod = cp.RawModule(code=defs + "\n" + _HELPERS + _KERNEL, backend="nvrtc")
     k = mod.get_function("mosaic_fast")
@@ -8625,7 +8668,8 @@ def autotune(cfg_base, launch_fn, npix, force=False):
            cfg_base["remove_fwd"], cfg_base.get("phasor_fp64", True),
            cfg_base.get("fdeg"), cfg_base.get("pdeg"),
            cfg_base.get("panel_chunk"), cfg_base.get("fused"),
-           cfg_base.get("factor"), cfg_base.get("pol_vec"))
+           cfg_base.get("factor"), cfg_base.get("pol_vec"),
+           cfg_base.get("acc_mode", 0))
     if not force and key in _TUNE_CACHE:
         return _TUNE_CACHE[key]
 
@@ -8703,7 +8747,11 @@ def recommended_streams(npix, pix, by, n_sm=None, bx=16):
 #:   factor           f, sqrt(P) once per (chunk, pixel); enabled only where
 #:                    their change across the chunk is below tol_f0
 DEFAULT_OPTS = dict(adaptive_degree=True, panel_chunk=True, fused=True,
-                    factor=True)
+                    factor=True,
+                    # per-pixel accumulator across chunks: 0 plain fp32, 1 Kahan-
+                    # compensated fp32 (default since 2026-09-03: 4x lower phase
+                    # error at equal speed), 2 fp64
+                    acc_mode=1)
 
 
 def fit_panels(fn, lo, hi, tol, deg, max_panels=MAX_PANELS, scale=None,
@@ -8941,7 +8989,8 @@ def plan(wk_params, dotv_lo, dotv_hi, k, R0_min, sample_half_m,
                decay=bool(decay), remove_fwd=bool(remove_fwd),
                phasor_fp64=bool(phasor_fp64), panel_chunk=panel_chunk,
                fused=bool(fused_on), factor=bool(factor_on),
-               pol_vec=bool(pol_vec_on))
+               pol_vec=bool(pol_vec_on),
+               acc_mode=int(opts.get("acc_mode", 0)))
     diag = dict(series_err_rad=ser_err, f0_rel_err=f0_err, npanel=npanel,
                 fdeg=fdeg, pdeg=pdeg, fused_on=fused_on, panel_chunk=panel_chunk,
                 factor_on=factor_on, factor_est=factor_est,
