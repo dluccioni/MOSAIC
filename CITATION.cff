@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use MOSAIC in your work, please cite the software release and the accompanying paper."
+title: "MOSAIC: Modular Optics Simulation for Atomistic Imaging of Crystals"
+type: software
+version: 1.0.0
+date-released: 2026-09-03
+license: MIT
+repository-code: "https://github.com/dluccioni/MOSAIC"
+authors:
+  - family-names: Luccioni
+    given-names: Dorian
+    affiliation: "Department of Materials Science and Engineering, Stanford University; SLAC National Accelerator Laboratory"
+  - family-names: Dresselhaus-Marais
+    given-names: Leora
+    affiliation: "Department of Materials Science and Engineering, Stanford University; SLAC National Accelerator Laboratory"
+keywords:
+  - coherent X-ray simulation
+  - kinematic scattering
+  - wave-optics propagation
+  - dark-field X-ray microscopy
+  - GPU computing
+preferred-citation:
+  type: article
+  title: "MOSAIC: Atomistic forward simulation of coherent X-ray experiments with GPU-accelerated wave optics"
+  authors:
+    - family-names: Luccioni
+      given-names: Dorian
+    - family-names: Dresselhaus-Marais
+      given-names: Leora
+  journal: "Journal of Applied Crystallography"
+  year: 2026
+  notes: "Submitted."

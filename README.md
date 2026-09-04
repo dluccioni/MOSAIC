@@ -815,13 +815,17 @@ dft.visualize_dislocation_network(
     azim=0.0
 )
 
-# Generate displacement field from dislocations
+# Generate displacement field from dislocations.
+# mode="direct" (default) sums the Barnett segment field at every node;
+# mode="LR+SR" runs the Bertin (2019) spectral solver on the periodic grid
+# with the analytic near-field correction, and accepts an anisotropic
+# stiffness={"cubic": (c11, c12, c44)}. Pad the box for the spectral modes.
 dft.generate_nodal_field(
-    crystal=xtal,
     mu=26e9 * (1e-10),      # Shear modulus (Pa converted to Angstrom units)
     nu=0.33,                 # Poisson ratio
     grid_shape=(256, 256, 32),
     core_radius=5.0,
+    mode="direct",
     write_directory="output/",
     nodes_filename="opendis_nodes_fe.npy",
     conn_filename="opendis_tet4.npy",
@@ -1035,6 +1039,23 @@ Install CuPy with the correct CUDA version, or run in CPU-only mode (automatic f
 - Ensure sample is generated before calling `atomic_direct_interaction`
 - Check that detector is positioned to capture the diffracted beam
 - Verify stage angles place sample in Bragg condition
+
+---
+
+## Documentation
+
+- This README is the reference for the scripting API: one section per module with the arguments and an example for every user-facing method.
+- [gui/QUICKSTART.md](gui/QUICKSTART.md) covers the graphical interface, presets, and the peak-alignment workflow.
+- The physical model, the coordinate conventions, the numerical scheme of the scattering kernel, and the validation benchmarks are described in the accompanying paper (see Citation).
+- Every public function carries a docstring; `help(Beam.beam.atomic_direct_interaction)` and the like give the full argument lists.
+
+## Citation
+
+If MOSAIC contributes to a publication, please cite the software release and the paper:
+
+> D. Luccioni and L. Dresselhaus-Marais, *MOSAIC: End-to-end atomistic forward simulation of coherent X-ray experiments with GPU-accelerated wave optics*, J. Appl. Cryst. (submitted, 2026).
+
+A machine-readable citation is provided in [CITATION.cff](CITATION.cff); GitHub's "Cite this repository" button reads it. The archived release (version 1.0.0) will carry a Zenodo DOI.
 
 ---
 
