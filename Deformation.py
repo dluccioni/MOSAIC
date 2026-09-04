@@ -6,6 +6,7 @@ import gc
 import json
 import threading
 from Logging import logging
+import hardware
 import numpy as np
 try:
     import cupy as cp  # Optional GPU backend
@@ -1670,7 +1671,7 @@ class deformation(logging):
                                                       float* out,
                                                       size_t n);
                         """)
-                        self._cffi_lib = ffi.verify(csrc, extra_compile_args=["-O3"])
+                        self._cffi_lib = ffi.verify(csrc, extra_compile_args=hardware.cffi_compile_args())
                         self._cffi = ffi
                     except Exception:
                         self._cffi_lib = None
@@ -3327,7 +3328,7 @@ class deformation(logging):
                 P = Xr
 
             n_gpus = cp.cuda.runtime.getDeviceCount()
-            streams_per_gpu = 8
+            streams_per_gpu = hardware.deform_gpu_workers(sample.max_chunk_atoms())
             total_workers = n_gpus * streams_per_gpu
 
             # Create streams for each GPU
@@ -3353,7 +3354,8 @@ class deformation(logging):
                 opt_kerns = self._get_fe_nodal_cuda_kernels(dtype=dtype, k=k)
                 sizeof_T = 8 if dtype == np.float64 else 4
                 block = 256
-                max_batch_size = 65536 * 2
+                per_row = sizeof_T * (k + 100 + 30 + 30) + 4 * (k + 1)   # idx, d2, A, b, coef, status
+                max_batch_size = hardware.deform_batch_rows(per_row, streams_per_gpu)
 
             # Copy node data and the cell list to every GPU
             cell_list_data = {}
@@ -3528,18 +3530,30 @@ class deformation(logging):
                         n_out_chunk = 0
                         n_fb_chunk = 0
 
-                        for s0 in range(0, rows, bs):
+                        s0 = 0
+                        while s0 < rows:
                             Xe = X[s0:s0+bs]
-                            idx_loc, d2 = _knn_gpu(Xe, P_sub)
-                            if P_sub is not P_gpu:
-                                idx_glob = cp.take(cand_idx, idx_loc)
-                            else:
-                                idx_glob = idx_loc
-                            Uadd, n_fb = _mls_displacement(Xe, P_gpu, U_gpu, idx_glob, d2)
-                            Uadd, n_out = _guard_batch(cp, Uadd, d2)
+                            try:
+                                idx_loc, d2 = _knn_gpu(Xe, P_sub)
+                                if P_sub is not P_gpu:
+                                    idx_glob = cp.take(cand_idx, idx_loc)
+                                else:
+                                    idx_glob = idx_loc
+                                Uadd, n_fb = _mls_displacement(Xe, P_gpu, U_gpu, idx_glob, d2)
+                                Uadd, n_out = _guard_batch(cp, Uadd, d2)
+                            except cp.cuda.memory.OutOfMemoryError as exc:
+                                # The batch has not been written yet: retry it smaller.
+                                cp.get_default_memory_pool().free_all_blocks()
+                                if bs <= 1024:
+                                    raise RuntimeError("out of device memory even for a 1024-atom batch") from exc
+                                bs = max(1024, bs // 2)
+                                self._log("normal", f"[deformation] device out of memory; retrying "
+                                                    f"with {bs:,} atoms per batch")
+                                continue
                             out[s0:s0+bs] = Xe + Uadd
                             n_out_chunk += n_out
                             n_fb_chunk += n_fb
+                            s0 += bs
 
                         stream.synchronize()
                         if abort.is_set():
@@ -3602,7 +3616,7 @@ class deformation(logging):
                 # Rows per MLS mini-batch from a byte budget covering the basis,
                 # gathered neighbours, normal matrices and einsum temporaries.
                 bytes_per = 8 if dtype == np.float64 else 4
-                budget = 256 * 1024 * 1024
+                budget = hardware.deform_cpu_batch_bytes()
                 per_row = max(1, bytes_per * (k * 10 * 3 + k * 3 * 5 + 100 * 2 + 30 * 2 + k * 4))
                 return max(4096, min(n_rows, budget // per_row))
 
