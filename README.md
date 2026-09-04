@@ -1,6 +1,10 @@
-# Xray-Simulator
+# MOSAIC
 
-A comprehensive Python toolkit for forward simulation of atomistic X-ray micorscopy experiments with full wave optics support. The simulator handles the complete workflow from crystal structure to detector image, including defect insertion, deformation fields, coherent beam propagation, and automated experimental scans. Made by Dorian Luccioni at Stanford University.
+**Modular Optics Simulation for Atomistic Imaging of Crystals**
+
+A GPU-accelerated Python toolkit for forward simulation of coherent X-ray microscopy and diffraction experiments directly from atomistic models, with full wave optics support. MOSAIC handles the complete workflow from crystal structure to detector image, including defect insertion, deformation fields, coherent beam propagation, and automated experimental scans. Made by Dorian Luccioni at Stanford University.
+
+Repository: https://github.com/dluccioni/MOSAIC
 
 ---
 
@@ -9,6 +13,7 @@ A comprehensive Python toolkit for forward simulation of atomistic X-ray micorsc
 - [Project Overview](#project-overview)
 - [Key Features](#key-features)
 - [Installation](#installation)
+  - [Graphical Interface](#graphical-interface)
 - [Dependencies](#dependencies)
 - [Architecture Overview](#architecture-overview)
 - [Detailed Modules](#detailed-modules)
@@ -32,7 +37,7 @@ A comprehensive Python toolkit for forward simulation of atomistic X-ray micorsc
 
 ## Project Overview
 
-**Xray-Simulator** models the complete X-ray diffraction experiment pipeline:
+**MOSAIC** models the complete X-ray diffraction experiment pipeline:
 
 ```
 Crystal → Sample → [Defects/Deformation] → Stage → Beam → Detector → Analysis
@@ -93,8 +98,8 @@ Crystal → Sample → [Defects/Deformation] → Stage → Beam → Detector →
 ### Standard Installation
 
 ```bash
-git clone <repository-url>
-cd Xray-Simulator
+git clone https://github.com/dluccioni/MOSAIC.git
+cd MOSAIC
 pip install numpy cupy pymatgen matplotlib scipy pandas cffi h5py pyvista
 ```
 
@@ -118,6 +123,17 @@ The simulator automatically falls back to NumPy when CuPy is unavailable:
 pip install numpy pymatgen matplotlib scipy pandas cffi h5py
 ```
 
+### Graphical Interface
+
+A PySide6 GUI wraps the same modules. From the repository root:
+
+```bash
+pip install PySide6
+python -m gui
+```
+
+See [gui/QUICKSTART.md](gui/QUICKSTART.md) for the workflow.
+
 ---
 
 ## Dependencies
@@ -133,6 +149,7 @@ pip install numpy pymatgen matplotlib scipy pandas cffi h5py
 | `cffi`       | C extension compilation for CPU kernels        | Yes      |
 | `h5py`       | HDF5 storage for large experiments             | No       |
 | `pyvista`    | 3D visualization of dislocation networks       | No       |
+| `PySide6`    | Graphical interface (`python -m gui`)          | No       |
 
 *Falls back to NumPy automatically if not installed.
 
@@ -168,6 +185,17 @@ Handles crystallographic data loading and lattice manipulation.
 | `get_dhkl(target_plane)` | Compute interplanar spacing for (hkl) |
 | `get_rotation(axis, angle)` | Generate rotation matrix |
 | `to_conventional()` / `to_primitive()` | Convert between cell types |
+
+The lattice matrices hold the Cartesian vectors **a**, **b**, **c** as their
+**rows** (pymatgen's convention), whether or not the crystal has been rotated.
+
+A set of Miller indices names two different vectors, which coincide only for
+cubic and other orthogonal cells: as a plane `(hkl)` it means the plane normal,
+`inv(lattice_matrix_conventional) @ [h,k,l]`; as a direction `[uvw]` it means
+`lattice_matrix_conventional.T @ [u,v,w]`. For α-quartz the two are 30° apart
+for `(100)`. `get_cartesian_from_indices` returns either, and `align_axes` reads
+its indices as plane normals by default, which is what a reflection means; pass
+`index_type="direction"` for real-space directions.
 
 #### Example
 
@@ -257,7 +285,8 @@ Defines the X-ray source and computes scattering.
 | `atomic_direct_interaction(sample, detector, stage, ...)` | Main scattering + transmission |
 | `atomic_scattering_kinematic(sample, detector, stage)` | GPU kinematic scattering |
 | `wavefield_propagation(detector, optics)` | Propagate through optics stack |
-| `set_phase_tolerance(tol)` | Set phase accuracy threshold |
+| `set_phase_tolerance(tol)` | Set phase accuracy threshold (default 1e-3 rad if never set) |
+| `set_wavefield(array)` | Supply a custom complex wavefield; shape must match `beam_samples`; call AFTER `create_beam` (re-creating or reloading the beam rebuilds the built-in profile) |
 
 #### Scattering Physics
 
@@ -365,13 +394,15 @@ Goniometer and sample positioning with motor coupling.
 
 | Motor | Type | Axis | Description |
 |-------|------|------|-------------|
-| mu (μ) | rotation | [1,0,0] | Sample rotation about X |
-| phi (φ) | rotation | [0,0,1] | Sample rotation about Z |
-| chi (χ) | rotation | [0,1,0] | Sample rotation about Y |
-| omega (ω) | rotation | [1,0,0] | Additional X rotation |
+| mu (μ) | rotation | [0,-1,0] | Sample rotation about -Y |
+| phi (φ) | rotation | [0,-1,0] | Sample rotation about -Y (nested in mu) |
+| chi (χ) | rotation | [-1,0,0] | Sample rotation about -X |
+| omega (ω) | rotation | [0,0,-1] | Sample rotation about -Z |
 | x | translation | [1,0,0] | X translation |
 | y | translation | [0,1,0] | Y translation |
 | z | translation | [0,0,1] | Z translation |
+
+A standard Busing-Levy four-circle configuration (motors `omega`, `chi`, `phi` about lab z, x, z plus `x`,`y`,`z` translations, composing R = R_z(omega) R_x(chi) R_z(phi)) is available via `create_stage(convention='busing-levy')`; the detector arm supplies 2theta separately.
 
 #### Example
 
@@ -400,7 +431,7 @@ Wavefield propagation through optical element stacks.
 | Method | Description |
 |--------|-------------|
 | `add_free_space(length_mm)` | Add drift space |
-| `add_CRL_box(number, focal_length, thickness)` | Compound refractive lenses |
+| `add_CRL_box(number, focal_length, thickness, mu_per_m=0.0, radius_of_curvature_m=inf)` | Compound refractive lenses; optional parabolic absorption: intensity T(r)=exp(-mu·N·r²/R) (off by default) |
 | `add_bragg_magnifier_2b(Mx, My)` | Asymmetric Bragg magnifier |
 | `add_angular_filter(half_angle, shape, rolloff)` | Analyzer crystal |
 | `add_aperture(width, shape)` | Hard aperture |
