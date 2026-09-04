@@ -1040,7 +1040,9 @@ Install CuPy with the correct CUDA version, or run in CPU-only mode (automatic f
 
 ## License
 
-Dorian Luccioni
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+Copyright (c) 2026 Dorian Luccioni
 
 ---
 
