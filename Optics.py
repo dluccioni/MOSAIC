@@ -761,8 +761,14 @@ class optics(logging):
         A simplified CRL "box" specification using thin-lens approximation.
 
         Args:
-            number (int): Number of identical lens elements in series.
-            focal_length_mm (float): Focal length of each lens element in millimeters.
+            number (int): Number of identical lens elements in series. Enters
+                only the absorption factors; the phase uses focal_length_mm
+                directly.
+            focal_length_mm (float): Focal length of the WHOLE stack in
+                millimeters (the thin-lens phase applied is
+                exp(-i k r^2 / (2 f)) with this f). For N bi-parabolic lenses
+                of apex radius R and refractive decrement delta,
+                f = R / (2 N delta).
             thickness_mm (float): Thickness of each lens element in millimeters
                 (used for absorption calculation).
             absorption_sigma (float): Absorption length in meters. Default is np.inf
