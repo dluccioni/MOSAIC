@@ -254,6 +254,16 @@ class experiment:
 
         # Allocate summed intensity grid
         grid_shape = tuple(len(a) for a in axis_vals)
+        try:
+            import hardware
+            n_steps = int(np.prod(grid_shape))
+            natoms = float(np.asarray(sample.chunk_volume).ravel()[0]) * int(sample.chunk_total or 1)
+            npix = int(np.asarray(detector.pixel_coordinates).shape[1])
+            est = hardware.estimate_runtime(natoms, npix, n_steps)
+            print(f"[experiment|NORMAL] {n_steps} steps over ~{natoms:.2e} atoms x {npix:,} px: "
+                  f"estimated {hardware.format_seconds(est)} on this machine")
+        except Exception:
+            pass
         sumI = np.zeros(grid_shape, dtype=float)
 
         # Utility: format a position string from labels (what we show on plots)
