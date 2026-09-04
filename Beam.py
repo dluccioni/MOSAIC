@@ -11,7 +11,9 @@ import math
 import time
 import threading
 import warnings
+import hashlib
 from Logging import logging
+import hardware
 try:
     import cupy as cp
     import cupyx
@@ -46,10 +48,8 @@ def polarization_from_rate(rho):
 
 
 def _cffi_compile_args():
-    """Optimisation flag for the C compiler cffi drives: MSVC takes /O2, others -O3."""
-    if sys.platform == "win32" and "GCC" not in sys.version:
-        return ["/O2"]
-    return ["-O3"]
+    """Compiler flags for the cffi CPU kernels; see hardware.cffi_compile_args."""
+    return hardware.cffi_compile_args()
 import databases.scattering
 import importlib.resources as pkg_resources
 
@@ -839,10 +839,119 @@ class beam(logging):
                 float *out_r, float *out_i
             );
         """)
-        C_mod = ffi_obj.verify(c_source, extra_compile_args=_cffi_compile_args())
+        C_mod = hardware.cffi_verify(ffi_obj, c_source, "compute_scattering_cffi",
+                                     extra_compile_args=_cffi_compile_args())
         _CFFI_CACHE["scatter"] = (ffi_obj, C_mod)
         return ffi_obj, C_mod
     
+    @staticmethod
+    def _cpu_scatter_numpy(pos_m, f0p, f0z, sanr, sani, amp_r, amp_i, cx, cy, cz, k_val,
+                           remove_forward, Ny, Nz, apply_pol, pol_deg, pol_e, apply_decay,
+                           out_r, out_i, tile_bytes=256 * 1024 ** 2):
+        """The CPU scattering kernel in NumPy, for machines without a C compiler.
+
+        Same arithmetic as compute_scattering_cffi (double precision, one
+        cast to float32 at the end), vectorised over atom tiles sized to
+        ``tile_bytes`` of temporaries.  Slower than the C kernel, needs
+        nothing beyond NumPy.
+
+        Args:
+            pos_m (np.ndarray): (N, 3) float64 positions in metres.
+            f0p (np.ndarray): (N, 11) Waasmaier-Kirfel parameters.
+            f0z, sanr, sani, amp_r, amp_i (np.ndarray): per-atom f0(0),
+                anomalous real/imag, incident amplitude real/imag.
+            cx, cy, cz (np.ndarray): pixel coordinates in metres, length Ny*Nz.
+            out_r, out_i (np.ndarray): float32 accumulators, added into.
+
+        Returns:
+            tuple: (out_r, out_i).
+        """
+        P = int(Ny) * int(Nz)
+        cx = np.asarray(cx, dtype=np.float64)
+        cy = np.asarray(cy, dtype=np.float64)
+        cz = np.asarray(cz, dtype=np.float64)
+        R0 = np.sqrt(cx * cx + cy * cy + cz * cz)
+        R0_safe = np.where(R0 > 0, R0, 1.0)
+        u = np.stack([cx, cy, cz], axis=1) / R0_safe[:, None]
+        u[R0 <= 0] = 0.0
+        # Forward-removal cut-off: half the pixel diagonal in Q, from the
+        # right and upper neighbours (edge pixels use the inner neighbour).
+        p = np.arange(P)
+        ix = p % int(Ny)
+        iy = p // int(Ny)
+        n_right = np.where(ix + 1 < Ny, p + 1, np.where(ix > 0, p - 1, p))
+        n_up = np.where(iy + 1 < Nz, p + Ny, np.where(iy > 0, p - Ny, p))
+
+        def _q_step(nb):
+            rr = np.stack([cx[nb], cy[nb], cz[nb]], axis=1)
+            Rr = np.sqrt((rr * rr).sum(axis=1))
+            cosd = np.where(Rr > 0, (u * rr).sum(axis=1) / np.where(Rr > 0, Rr, 1.0), 1.0)
+            cosd = np.clip(cosd, -1.0, 1.0)
+            return k_val * np.sqrt(np.maximum(0.0, 2.0 * (1.0 - cosd)))
+        Qx = _q_step(n_right)
+        Qy = _q_step(n_up)
+        Q_cut = 0.5 * np.sqrt(Qx * Qx + Qy * Qy)
+
+        pos = np.asarray(pos_m, dtype=np.float64)
+        f0p = np.asarray(f0p, dtype=np.float64)
+        a_, c_, b_ = f0p[:, 0:5], f0p[:, 5], f0p[:, 6:11]
+        f0z = np.asarray(f0z, dtype=np.float64)
+        sanr = np.asarray(sanr, dtype=np.float64)
+        sani = np.asarray(sani, dtype=np.float64)
+        amp_r = np.asarray(amp_r, dtype=np.float64)
+        amp_i = np.asarray(amp_i, dtype=np.float64)
+        ex, ey, ez = (float(v) for v in pol_e)
+        s_fac = 0.25e-10 / np.pi
+        rE = 2.81794092e-15
+        acc_r = np.zeros(P)
+        acc_i = np.zeros(P)
+        n_atoms = int(pos.shape[0])
+        tile = max(1, int(tile_bytes // max(1, P * 8 * 14)))
+        for a0 in range(0, n_atoms, tile):
+            a1 = min(a0 + tile, n_atoms)
+            ax = pos[a0:a1, 0][:, None]
+            ay = pos[a0:a1, 1][:, None]
+            az = pos[a0:a1, 2][:, None]
+            dx = cx[None, :] - ax
+            dy = cy[None, :] - ay
+            dz = cz[None, :] - az
+            r = np.sqrt(dx * dx + dy * dy + dz * dz)
+            ok = r > 0
+            r_safe = np.where(ok, r, 1.0)
+            dotv = dx / r_safe
+            Q = k_val * np.sqrt(np.maximum(0.0, 2.0 * (1.0 - dotv)))
+            ss = (s_fac * Q) ** 2
+            f0 = c_[a0:a1, None] + a_[a0:a1, 0][:, None] * np.exp(-b_[a0:a1, 0][:, None] * ss)
+            for i in range(1, 5):
+                f0 = f0 + a_[a0:a1, i][:, None] * np.exp(-b_[a0:a1, i][:, None] * ss)
+            s_re = f0 + sanr[a0:a1, None]
+            s_im = np.broadcast_to(sani[a0:a1, None], s_re.shape)
+            if remove_forward:
+                cut = Q < Q_cut[None, :]
+                s_re = np.where(cut, s_re - (f0z[a0:a1, None] + sanr[a0:a1, None]), s_re)
+                s_im = np.where(cut, s_im - sani[a0:a1, None], s_im)
+            ar = amp_r[a0:a1, None]
+            ai = amp_i[a0:a1, None]
+            t_re = ar * s_re - ai * s_im
+            t_im = ar * s_im + ai * s_re
+            phase = np.fmod(k_val * (ax + r), 2.0 * np.pi)
+            cph = np.cos(phase)
+            sph = np.sin(phase)
+            val_r = t_re * cph - t_im * sph
+            val_i = t_re * sph + t_im * cph
+            scale = np.full(r.shape, rE)
+            if apply_decay:
+                scale = scale * np.where(R0[None, :] > 0, R0_safe[None, :] / r_safe, 1.0)
+            if apply_pol:
+                er = (ex * dx + ey * dy + ez * dz) / r_safe
+                Pf = np.clip(0.5 * (1.0 - pol_deg) * (1.0 + dotv * dotv) + pol_deg * (1.0 - er * er), 0.0, 1.0)
+                scale = scale * np.sqrt(Pf)
+            acc_r += np.where(ok, val_r * scale, 0.0).sum(axis=0)
+            acc_i += np.where(ok, val_i * scale, 0.0).sum(axis=0)
+        out_r += acc_r.astype(np.float32)
+        out_i += acc_i.astype(np.float32)
+        return out_r, out_i
+
     @staticmethod
     def _ein_bilinear_cpu(
         pos_np,   # (N,3) float32, Angstrom, on host
@@ -1332,8 +1441,37 @@ class beam(logging):
                 return False
 
         amps = amps_host[:, 0] if getattr(amps_host, "ndim", 1) > 1 else amps_host
-        for c0 in range(0, n, scatter_chunk):
-            c1 = min(c0 + scatter_chunk, n)
+        # Each launch is also held under the device's time cap (display
+        # watchdog) from the live throughput estimate; the memory bound in
+        # scatter_chunk still applies.
+        timer = hardware.launch_timer("fast")
+        # Launch partials meet in this float64 field and reach dfield_gpu once
+        # per chunk, so the launch partition (memory and time bounds) does not
+        # change the result.
+        acc = cp.zeros(dfield_gpu.shape, cp.complex128)
+        c0 = 0
+        while c0 < n:
+            step = scatter_chunk
+            t_atoms = timer.atoms(Ny * Nz, chunk)
+            if t_atoms is not None:
+                step = max(chunk, min(scatter_chunk, t_atoms))
+            # The Morton sort in dispatch runs through Thrust, and CuPy cannot
+            # raise an allocation failure out of Thrust: the process aborts.
+            # So the step is shrunk here, before dispatch, until its staging
+            # fits what the device still has; the retry below stays as the
+            # last resort for the allocations that do raise.
+            try:
+                room = hardware.device_governor().free_now()
+                per_atom = hardware.bytes_per("scatter_device_staging") + 8.0
+                while step > chunk and step * per_atom > 0.8 * room:
+                    step = max(chunk, ((step // 2) // chunk) * chunk)
+            except Exception:
+                pass
+            c1 = min(c0 + step, n)
+            # dispatch accumulates species by species, so an allocation that
+            # fails part-way leaves acc partly updated: keep a copy to restore
+            # before retrying with a smaller sub-chunk.
+            snap = acc.copy()
             sl = amps[c0:c1]
             if isinstance(sl, cp.ndarray):
                 amp_g = cp.ascontiguousarray(sl.astype(cp.complex64))
@@ -1343,22 +1481,37 @@ class beam(logging):
             # No host-side hold on amp_g and no synchronize: CuPy's pool is
             # stream-ordered, and dispatch joins its side streams back into
             # this one before returning.
-            handled = dispatch(
-                pos_m_g[c0:c1], amp_g, code[c0:c1], wk, f0z, anom,
-                xg, yg, zg, dfield_gpu, Ny, Nz, float(k_global),
-                polarization=bool(polarization), pol_rate=float(pol_rate),
-                decay=bool(decay), remove_forward=bool(remove_forward),
-                m_beams=m_beams, analyser_kind=analyser_kind,
-                use_series=getattr(self, "_global_use_series", True),
-                chunk=chunk, tol_rad=tol, det_extent=det_extent,
-                tol_f0=tol_f0, phasor_fp64=phasor_fp64, tol_decline=tol_user,
-                opts=kernel_opts,
-                pol_vec=(beam._polarization_state(self) if polarization else None))
+            try:
+                handled = dispatch(
+                    pos_m_g[c0:c1], amp_g, code[c0:c1], wk, f0z, anom,
+                    xg, yg, zg, dfield_gpu, Ny, Nz, float(k_global),
+                    polarization=bool(polarization), pol_rate=float(pol_rate),
+                    decay=bool(decay), remove_forward=bool(remove_forward),
+                    m_beams=m_beams, analyser_kind=analyser_kind,
+                    use_series=getattr(self, "_global_use_series", True),
+                    chunk=chunk, tol_rad=tol, det_extent=det_extent,
+                    tol_f0=tol_f0, phasor_fp64=phasor_fp64, tol_decline=tol_user,
+                    opts=kernel_opts, acc=acc,
+                    pol_vec=(beam._polarization_state(self) if polarization else None))
+            except cp.cuda.memory.OutOfMemoryError as exc:
+                cp.cuda.Device().synchronize()
+                acc[...] = snap
+                del snap, amp_g
+                cp.get_default_memory_pool().free_all_blocks()
+                if scatter_chunk <= chunk:
+                    raise RuntimeError("out of device memory even for one kernel chunk of atoms") from exc
+                scatter_chunk = max(chunk, ((scatter_chunk // 2) // chunk) * chunk)
+                self._log("normal", f"[beam] device out of memory; retrying with "
+                                    f"{scatter_chunk:,} atoms per launch")
+                continue
+            del snap
             if not handled:            # cannot happen mid-way: checked above
                 return False
+            c0 = c1
+        dfield_gpu += acc.astype(cp.complex64)
         return True
 
-    def _scatter_subchunk_size(self, M=1, resident_bytes=0):
+    def _scatter_subchunk_size(self, M=1, resident_bytes=0, concurrency=1):
         """Atoms per scatter sub-chunk, so the per-atom staging fits in memory.
 
         Budget ~150 transient device bytes per atom (sorted positions, Morton
@@ -1370,6 +1523,8 @@ class beam(logging):
             M (int): beam channels (amplitude columns).
             resident_bytes (int): what the caller already holds for the whole
                 chunk while sub-chunks stream, so it is not counted twice.
+            concurrency (int): sub-chunks that may be staged at once (one per
+                stream); each gets an equal share of the device budget.
 
         Returns:
             int: atoms per sub-chunk, a multiple of the kernel CHUNK_SIZE.
@@ -1380,13 +1535,7 @@ class beam(logging):
         if getattr(self, "_scatter_chunk_override", None):
             n = int(self._scatter_chunk_override)
         else:
-            try:
-                free_gpu_b, _ = cp.cuda.runtime.memGetInfo()
-                budget = 0.8 * free_gpu_b - float(resident_bytes)
-                n = int(min(50_000_000,
-                            max(500_000, budget // (150 + 8 * int(M)))))
-            except Exception:
-                n = 500_000
+            n = hardware.scatter_subchunk_atoms(M, resident_bytes, concurrency=concurrency)
         return max(chunk, (n // chunk) * chunk)
 
     def _stage_general_subchunk(self, pos_sub, spc_sub, amp_rows, use_origins,
@@ -1547,7 +1696,9 @@ class beam(logging):
             return self._interaction_kernel_cache[key]
 
         _cuda_source = r'''
+        #ifndef __CUDACC_RTC__
         #include <math.h>
+        #endif
 
         // Compile-time settings
         #ifndef N_SERIES
@@ -2263,12 +2414,8 @@ class beam(logging):
         } // extern "C"
         ''';
 
-        kernel_module = cp.RawModule(
-            code=_cuda_source,
-            backend='nvcc',
-            options=(
-                '--gpu-architecture=native',
-                '-O3', '--ftz=true', '--fmad=true',
+        kernel_module = hardware.raw_module(
+            _cuda_source,
                 f'-DN_SERIES={N}',
                 f'-DGLOBAL_USE_SERIES={global_use_series}',
                 f'-DM_BEAMS_COMPILE={M_compile}',
@@ -2282,7 +2429,7 @@ class beam(logging):
                 f'-DPOL_EX={pol_ex:.9e}f',
                 f'-DPOL_EY={pol_ey:.9e}f',
                 f'-DPOL_EZ={pol_ez:.9e}f',
-            ) + ((f'-maxrregcount={int(maxreg)}',) if maxreg else ())
+            *((f'-maxrregcount={int(maxreg)}',) if maxreg else ())
         )
         kern = kernel_module.get_function('interaction_kernal')
         self._interaction_kernel_cache[key] = kern
@@ -2309,7 +2456,9 @@ class beam(logging):
             raise RuntimeError("CuPy is required for build_ein_sampler_kernel")
 
         src = r'''
+        #ifndef __CUDACC_RTC__
         #include <math.h>
+        #endif
 
         extern "C" __global__
         void ein_bilinear_kernel(
@@ -2425,11 +2574,7 @@ class beam(logging):
         }
         ''';
 
-        mod = cp.RawModule(
-            code=src,
-            backend='nvcc',
-            options=('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true')
-        )
+        mod = hardware.raw_module(src)
         return mod.get_function('ein_bilinear_kernel')
     # -------------------------------------
 
@@ -2950,7 +3095,9 @@ class beam(logging):
             raise RuntimeError("CuPy is required for beam coupling kernel.")
 
         src = r'''
+        #ifndef __CUDACC_RTC__
         #include <math.h>
+        #endif
 
         __device__ __forceinline__ float2 cmul(float2 a, float2 b) {
             return make_float2(a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x);
@@ -3048,11 +3195,7 @@ class beam(logging):
         }
         ''';
 
-        mod = cp.RawModule(
-            code=src,
-            backend='nvcc',
-            options=('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true')
-        )
+        mod = hardware.raw_module(src)
         return mod.get_function('beam_couple_2x2_kernel')
 
     def _beam_transmission_step_gpu(self, E_beams, chi_maps_slice, k_A):
@@ -4613,7 +4756,9 @@ class beam(logging):
         if dev in _PROP_KERNEL_CACHE:
             return _PROP_KERNEL_CACHE[dev]
         src = r'''
+        #ifndef __CUDACC_RTC__
         #include <math.h>
+        #endif
 
         extern "C" __global__
         void prop_mul_kernel(
@@ -4683,11 +4828,7 @@ class beam(logging):
         # Strict compilers want ASCII-only source.
         src = src.encode('ascii', 'backslashreplace').decode('ascii')
 
-        mod = cp.RawModule(
-            code    = src,
-            backend = 'nvcc',
-            options = ('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true')
-        )
+        mod = hardware.raw_module(src)
         kern = mod.get_function('prop_mul_kernel')
         _PROP_KERNEL_CACHE[dev] = kern
         return kern
@@ -4753,7 +4894,8 @@ class beam(logging):
         ffi = FFI()
         ffi.cdef('void prop_mul_cpu(int,int,const float*,const float*,float,float,'
                 'float*);')
-        lib = ffi.verify(source, extra_compile_args=_cffi_compile_args())
+        lib = hardware.cffi_verify(ffi, source, "prop_mul_cpu",
+                                   extra_compile_args=_cffi_compile_args())
         _CFFI_CACHE["prop"] = (ffi, lib)
         return ffi, lib
     
@@ -4944,17 +5086,15 @@ class beam(logging):
         T_host   = np.asarray(stage.translation, dtype=np.float32)
 
         try:
-            n_gpus = cp.cuda.runtime.getDeviceCount()
+            devices = hardware.gpu_devices() or [0]
         except Exception:
-            n_gpus = 1
-        n_gpus = max(1, n_gpus)
-        streams_per_gpu = max(1, int(os.getenv("BEAM_EIN_STREAMS_PER_GPU", "4")))
-        save_threads = max(1, int(os.getenv("BEAM_EIN_SAVE_THREADS", "6")))
+            devices = [0]
+        n_gpus = len(devices)
+        streams_per_gpu, save_threads = hardware.ein_cache_slots(sample.max_chunk_atoms())
 
-        # Round-robin chunks across GPUs.
-        shards = [[] for _ in range(n_gpus)]
-        for i, cid in enumerate(to_do):
-            shards[i % n_gpus].append(cid)
+        # Deal chunks across GPUs in proportion to their measured speed.
+        shards = [[to_do[i] for i in part]
+                  for part in hardware.split_round_robin(len(to_do), devices)]
 
         # The saver holds the pinned buffer alive until the write has finished.
         def _save_npz_keepalive(path, arr_view, pinned_mem):
@@ -4966,7 +5106,7 @@ class beam(logging):
         def gpu_worker(dev_id, my_chunks):
             if not my_chunks:
                 return
-            cp.cuda.Device(dev_id).use()
+            cp.cuda.Device(devices[dev_id]).use()
 
             tau_g = cp.asarray(tau_host)
             phi_g = cp.asarray(phi_host)
@@ -5041,10 +5181,19 @@ class beam(logging):
 
                     # Async D2H into pinned memory; the event marks completion.
                     nbytes = int(ein_g.size) * 8  # complex64
-                    pmem = cp.cuda.alloc_pinned_memory(nbytes)
-                    h_view = np.frombuffer(pmem, dtype=np.complex64, count=ein_g.size)
+                    try:
+                        pmem = cp.cuda.alloc_pinned_memory(nbytes)
+                        h_view = np.frombuffer(pmem, dtype=np.complex64, count=ein_g.size)
+                        dst_ptr = int(pmem.ptr)
+                    except Exception:
+                        # Pinned memory is capped well below RAM under WDDM;
+                        # pageable memory works, the copy just completes
+                        # synchronously.
+                        h_view = np.empty(int(ein_g.size), dtype=np.complex64)
+                        pmem = h_view
+                        dst_ptr = int(h_view.ctypes.data)
                     cp.cuda.runtime.memcpyAsync(
-                        int(pmem.ptr),
+                        dst_ptr,
                         int(ein_g.data.ptr),
                         nbytes,
                         cp.cuda.runtime.memcpyDeviceToHost,
@@ -5476,7 +5625,8 @@ class beam(logging):
                             initial_amp_complex=None,
                             apply_polarization=False,
                             apply_spherical_decay=True,
-                            positions_chunk=None):
+                            positions_chunk=None,
+                            species_chunk=None):
         """
         Kinematic scattering for one chunk on the CPU via the CFFI kernel.
 
@@ -5506,11 +5656,14 @@ class beam(logging):
             apply_spherical_decay (bool): Apply relative 1/R scaling.
             positions_chunk: Stage-transformed positions in Angstrom, (N, 3),
                 if the caller already loaded them; None loads and transforms.
+            species_chunk: Species labels for `positions_chunk`, same order;
+                None loads the whole chunk's species from the sample.
 
         Returns:
             np.ndarray: complex64 field of shape (Nz, Ny).
         """
-        species_chunk_np = sample.load_chunk_species(chunk_id, use_gpu=False)
+        species_chunk_np = (np.asarray(species_chunk) if species_chunk is not None
+                            else sample.load_chunk_species(chunk_id, use_gpu=False))
         atom_count = int(species_chunk_np.shape[0])
         if atom_count == 0:
             return np.zeros((Nz, Ny), dtype=np.complex64)
@@ -5570,6 +5723,16 @@ class beam(logging):
         s_anom_i          = np.ascontiguousarray(scattering_anom_np_imag)
         amp_r             = np.ascontiguousarray(amp_r)
         amp_i             = np.ascontiguousarray(amp_i)
+
+        if complied_code is None:
+            # No C compiler on this machine: the same arithmetic in NumPy.
+            out_r, out_i = beam._cpu_scatter_numpy(
+                positions_chunk_m, f0_params_np, f0_zero_np, s_anom_r, s_anom_i,
+                amp_r, amp_i, coords_x_m, coords_y_m, coords_z_m, float(k_val),
+                bool(remove_forward_component), Ny, Nz, bool(apply_polarization),
+                float(pol_deg), (float(pol_ex), float(pol_ey), float(pol_ez)),
+                bool(apply_spherical_decay), out_r, out_i)
+            return (out_r + 1j*out_i).reshape((Nz, Ny)).astype(np.complex64)
 
         positions_ptr = ffi_obj.cast("const double *", positions_chunk_m.ctypes.data)
         f0_params_ptr = ffi_obj.cast("const float *", f0_params_np.ctypes.data)
@@ -5700,11 +5863,19 @@ class beam(logging):
                     chunk_ids=missing
                 )
 
-        ffi_obj, complied_code = self.compile_compute_scattering_cffi()
+        try:
+            ffi_obj, complied_code = self.compile_compute_scattering_cffi()
+        except hardware.CompilerUnavailable as exc:
+            self._log("normal", f"[beam] {exc}")
+            self._log("normal", "[beam] running the NumPy scattering kernel instead (slower).")
+            ffi_obj, complied_code = None, None
 
-        import multiprocessing
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        n_threads = min(chunk_total, multiprocessing.cpu_count())
+        from concurrent.futures import ThreadPoolExecutor
+        n_threads = hardware.cpu_threads()
+        # Each task takes a slice of one chunk's atoms, so the threads share a
+        # chunk instead of each holding a whole one; the slice size keeps the
+        # per-atom tables of all threads inside the host budget.
+        slice_atoms = hardware.cpu_slice_atoms(n_threads, Ny * Nz)
 
         # Zero tau/phi maps give plain E0 sampling when depth Ein is off.
         tau_zero = np.zeros((self._beam_Ny, self._beam_Nz), dtype=np.float32)
@@ -5718,10 +5889,12 @@ class beam(logging):
         uc       = float(self._beam_uc)
         vc       = float(self._beam_vc)
 
-        def worker(chunk_id):
-            # Stage transform once; the scatter routine reuses these positions
-            # and builds the per-atom form-factor tables itself.
-            positions_chunk = sample.load_chunk_positions(chunk_id, use_gpu=False).astype(np.float32)
+        def worker(chunk_id, s0, s1, chunk_pos, chunk_spc):
+            # Stage transform of this slice (a view of the chunk loaded once
+            # by the caller); the scatter routine builds the per-atom
+            # form-factor tables for it.
+            positions_chunk = chunk_pos[s0:s1].astype(np.float32)
+            species_chunk = chunk_spc[s0:s1]
             atom_count = int(positions_chunk.shape[0])
             if atom_count == 0:
                 return np.zeros((Nz, Ny), dtype=np.complex64)
@@ -5732,7 +5905,7 @@ class beam(logging):
             if use_depth_ein:
                 cache_path = os.path.join(cache_dir, f"ein_chunk_{chunk_id}_{key_hash}.npz")
                 with np.load(cache_path) as npz:
-                    init_amp = npz["ein"].astype(np.complex64)
+                    init_amp = npz["ein"][s0:s1].astype(np.complex64)
             else:
                 init_amp = self._ein_bilinear_cpu(
                     pos_np=positions_chunk,
@@ -5752,15 +5925,34 @@ class beam(logging):
                 initial_amp_complex=init_amp,
                 apply_polarization=apply_polarization,
                 apply_spherical_decay=apply_spherical_decay,
-                positions_chunk=positions_chunk
+                positions_chunk=positions_chunk,
+                species_chunk=species_chunk
             )
             return out
 
+        counts = [int(sample.chunk_atom_count(cid)) for cid in range(1, chunk_total + 1)]
+        # Small samples still spread over the threads: no slice larger than
+        # the sample's share per thread, none smaller than 1000 atoms.
+        total = max(1, sum(counts))
+        slice_atoms = max(1000, min(slice_atoms, -(-total // max(1, n_threads))))
+        n_slices = sum(-(-max(1, n) // slice_atoms) for n in counts)
+        self._log("verbose", f"[beam] CPU path: {n_slices} slice(s) of up to {slice_atoms:,} atoms "
+                             f"on {min(n_threads, n_slices)} thread(s)")
         final_result = np.zeros((Nz, Ny), dtype=np.complex64)
-        with ThreadPoolExecutor(max_workers=n_threads) as exe:
-            futures = {exe.submit(worker, cid): cid for cid in range(1, chunk_total + 1)}
-            for fut in as_completed(futures):
-                final_result += fut.result()
+        # One chunk in host memory at a time; its slices run in parallel and
+        # are summed in slice order, so the result does not depend on which
+        # thread finished first.
+        with ThreadPoolExecutor(max_workers=max(1, min(n_threads, n_slices))) as exe:
+            for cid, n_atoms in zip(range(1, chunk_total + 1), counts):
+                if n_atoms == 0:
+                    continue
+                chunk_pos = sample.load_chunk_positions(cid, use_gpu=False)
+                chunk_spc = np.asarray(sample.load_chunk_species(cid, use_gpu=False))
+                futures = [exe.submit(worker, cid, s0, min(s0 + slice_atoms, n_atoms), chunk_pos, chunk_spc)
+                           for s0 in range(0, n_atoms, slice_atoms)]
+                for fut in futures:
+                    final_result += fut.result()
+                del chunk_pos, chunk_spc, futures
         return final_result
 
     def _ein_for_positions_gpu_fast(
@@ -5879,9 +6071,10 @@ class beam(logging):
             )
 
         try:
-            n_gpus = cp.cuda.runtime.getDeviceCount()
+            devices = hardware.gpu_devices()
         except Exception:
-            n_gpus = 0
+            devices = []
+        n_gpus = len(devices)
         if n_gpus < 1:
             self._log("normal", "[beam] No GPUs found, falling back to CPU.")
             if not _analyser_off:
@@ -5985,22 +6178,18 @@ class beam(logging):
                     chunk_ids=missing
                 )
 
-        # Split chunks across devices.
-        chunks_per_gpu = chunk_total // n_gpus
-        remainder = chunk_total % n_gpus
+        # Split chunks across devices in proportion to their measured speed.
+        ranges = hardware.split_ranges(chunk_total, devices)
         partial_results = [None] * n_gpus
 
-        try:
-            _streams_per_gpu = max(1, int(os.getenv("BEAM_STREAMS_PER_GPU", "3")))
-        except Exception:
-            _streams_per_gpu = 3
+        _streams_per_gpu = hardware.scatter_streams_per_gpu(Ny, Nz)
 
         # The Ein kernel also does E0-only sampling.
         if getattr(self, "_ein_kernel", None) is None:
             self._ein_kernel = self.build_ein_sampler_kernel()
 
         def gpu_worker(gpu_id, chunk_indices, result_index):
-            cp.cuda.Device(gpu_id).use()
+            cp.cuda.Device(devices[gpu_id]).use()
 
             Rg = cp.asarray(R_pin, dtype=cp.float32)
             Tg = cp.asarray(T_pin, dtype=cp.float32)
@@ -6066,16 +6255,34 @@ class beam(logging):
                         _anom_lu[str(el)] = complex(
                             self.get_f1f2_from_params(self._energy, tbl))
 
-                with streams[s_id]:
+                # A file chunk (flush_size atoms, up to 1e8) is handed to the
+                # device in host slices the card can hold; one slice on a
+                # card with room for the whole chunk.
+                host_slice = hardware.scatter_host_slice_atoms(len(streams))
+                if host_slice < nA:
+                    pos_host_full = np.asarray(sample.load_chunk_positions(cidx, use_gpu=False))
+                    slices = [(h0, min(h0 + host_slice, nA)) for h0 in range(0, nA, host_slice)]
+                else:
+                    pos_host_full = None
+                    slices = [(0, nA)]
+                spc_codes_full, spc_full, nA_full, species_key_full = spc_codes, spc, nA, species_key
+                for (h0, h1) in slices:
+                  if pos_host_full is not None:
+                    spc_codes = spc_codes_full[h0:h1] if spc_codes_full is not None else None
+                    spc = spc_full[h0:h1] if spc_full is not None else None
+                    nA = h1 - h0
+                    species_key = (species_key_full + (h0, h1)) if species_key_full is not None else None
+                  with streams[s_id]:
                     # Positions to device, then the stage transform.
-                    pos = cp.asarray(sample.load_chunk_positions(cidx, use_gpu=True), dtype=cp.float32)
+                    pos = cp.asarray(pos_host_full[h0:h1] if pos_host_full is not None
+                                     else sample.load_chunk_positions(cidx, use_gpu=True), dtype=cp.float32)
                     pos = pos @ Rg.T
                     pos += Tg
 
                     if use_depth_ein:
                         cache_path = os.path.join(cache_dir, f"ein_chunk_{cidx}_{key_hash}.npz")
                         with np.load(cache_path) as npz:
-                            arr = npz["ein"]
+                            arr = npz["ein"][h0:h1]
                         initial_amp = cp.asarray(arr.astype(np.complex64))
                     else:
                         # E0-only sampling (tau=0, phi=0), zero outside beam grid
@@ -6097,7 +6304,8 @@ class beam(logging):
                     # memory: a sample chunk is bounded only by chunk_volume
                     # and can be far too large to hand over whole.  Resident
                     # meanwhile: pos_m plus the incident field, 20 B/atom.
-                    sub_n = self._scatter_subchunk_size(1, resident_bytes=20 * nA)
+                    sub_n = self._scatter_subchunk_size(1, resident_bytes=20 * nA,
+                                                        concurrency=len(streams))
                     if self._fast_scatter(
                             pos_m, initial_amp,
                             spc if spc is not None else (spc_codes, spc_labels),
@@ -6114,13 +6322,31 @@ class beam(logging):
                     # General kernel, staged per sub-chunk, with a single
                     # global origin (use_origins=False).
                     spc_np = np.asarray(spc) if spc is not None else spc_labels[spc_codes]
-                    for c0 in range(0, nA, sub_n):
-                        c1 = min(c0 + sub_n, nA)
-                        sub = self._stage_general_subchunk(
-                            pos_m[c0:c1], spc_np[c0:c1], initial_amp[c0:c1],
-                            False, 128, db_f0, f0_zero, _anom_lu,
-                            (self._kx_scalar, self._ky_scalar, self._kz_scalar))
-                        interaction_kernel(
+                    timer_g = hardware.launch_timer("general")
+                    c0 = 0
+                    while c0 < nA:
+                        step = sub_n
+                        t_atoms = timer_g.atoms(Ny * Nz, 128)
+                        if t_atoms is not None:
+                            step = max(128, min(sub_n, t_atoms))
+                        c1 = min(c0 + step, nA)
+                        try:
+                            sub = self._stage_general_subchunk(
+                                pos_m[c0:c1], spc_np[c0:c1], initial_amp[c0:c1],
+                                False, 128, db_f0, f0_zero, _anom_lu,
+                                (self._kx_scalar, self._ky_scalar, self._kz_scalar))
+                        except cp.cuda.memory.OutOfMemoryError as exc:
+                            # Nothing of this sub-chunk has reached the field
+                            # yet: free the pool and retry it smaller.
+                            cp.get_default_memory_pool().free_all_blocks()
+                            if sub_n <= 128:
+                                raise RuntimeError("out of device memory even for one kernel chunk of atoms") from exc
+                            sub_n = max(128, ((sub_n // 2) // 128) * 128)
+                            self._log("normal", f"[beam] device out of memory; retrying with "
+                                                f"{sub_n:,} atoms per launch")
+                            continue
+                        hardware.timed_launch(
+                            "general", float(c1 - c0) * Ny * Nz, interaction_kernel,
                             grid, block,
                             (
                                 np.int32(sub["n"]),
@@ -6148,6 +6374,7 @@ class beam(logging):
                             stream=streams[s_id]
                         )
                         del sub
+                        c0 = c1
                     del pos_m, initial_amp
 
             for st in streams:
@@ -6163,12 +6390,8 @@ class beam(logging):
             gc.collect()
 
         threads = []
-        start_chunk = 1
-        for gid in range(n_gpus):
-            my_count = chunks_per_gpu + (1 if gid < remainder else 0)
-            end_chunk = start_chunk + my_count
+        for gid, (start_chunk, end_chunk) in enumerate(ranges):
             cinds = list(range(start_chunk, end_chunk))
-            start_chunk = end_chunk
             t = threading.Thread(target=gpu_worker, args=(gid, cinds, gid))
             t.start()
             threads.append(t)
@@ -6499,11 +6722,7 @@ class beam(logging):
         # decide window size for accumulator
         # Each window holds W slices; 2 flat arrays of W*bins float32
         accum_bytes_full = int(nS) * bins * 4 * 2
-        try:
-            free_b, _ = cp.cuda.runtime.memGetInfo()
-            budget = int(0.5 * free_b)  # reserve 50 % for atom data + temporaries
-        except Exception:
-            budget = 2 * 1024**3  # 2 GB fallback
+        budget = hardware.slice_accum_budget()  # half the device budget; the rest is atom data + temporaries
         if accum_bytes_full <= budget:
             window_size = nS  # fits in one shot
         else:
@@ -6515,14 +6734,8 @@ class beam(logging):
 
         # adaptive atom batch cap
         def _atom_batch_cap():
-            try:
-                free_b, _ = cp.cuda.runtime.memGetInfo()
-                # Per-atom footprint: pos(12) + fr,fi(8) + projections ~80 bytes + TSC ~120 bytes
-                bytes_per_atom = 220
-                cap = int(0.4 * free_b / max(bytes_per_atom, 1))
-                return max(32768, cap)
-            except Exception:
-                return 2_000_000
+            # Per-atom footprint: pos(12) + fr,fi(8) + projections ~80 bytes + TSC ~120 bytes
+            return hardware.slice_atom_batch()
 
         # Per-chunk host-side scattering factors. The full atom-positions +
         # forward-factor cache for a multi-tens-of-billions-of-atoms sample
@@ -6545,12 +6758,7 @@ class beam(logging):
                     fi_l[m]  = float(cplx.imag)
             return fr_l, fi_l
 
-        try:
-            import psutil
-            avail_host_b = int(psutil.virtual_memory().available)
-        except Exception:
-            avail_host_b = 4 * 1024**3  # conservative 4 GB fallback
-        cache_budget = max(int(0.9 * avail_host_b), 256 * 1024**2)
+        cache_budget = hardware.slice_cache_bytes()
 
         total_chunks = int(sample.chunk_total or 0)
         chunk_cache = {}      # cid -> (pos, fr_h, fi_h)
@@ -8629,13 +8837,20 @@ def build(cfg):
     return k
 
 
+#: Autotune winners persist per (device, source, shape); the source hash
+#: retires them when the kernel changes.
+_KERNEL_SRC_HASH = hashlib.sha1((_HELPERS + _KERNEL).encode("utf-8")).hexdigest()[:12]
+
+
 # ----------------------------------------------------------------- autotune
 
 #: (pix, unroll, bx, by) candidates, ordered by measured merit on Ada.
 #: PIX=6 and 32x32 blocks spill to local memory; unroll x PIX above ~128
 #: pixel-computations per iteration exceeds the L1 instruction cache.
 _TUNE_GRID = [(4, 4, 16, 32), (4, 4, 32, 16), (4, 8, 16, 32), (2, 8, 16, 32),
-              (4, 4, 16, 16), (2, 4, 16, 16), (1, 8, 16, 16), (1, 4, 16, 16)]
+              (4, 4, 16, 16), (2, 4, 16, 16), (1, 8, 16, 16), (1, 4, 16, 16),
+              # smaller blocks for cards whose SMs hold fewer warps than Ada
+              (2, 4, 8, 16), (2, 8, 8, 16), (1, 4, 32, 8)]
 
 
 #: Atoms the autotune probe carries.  Throughput is flat from ~100k atoms up,
@@ -8672,6 +8887,12 @@ def autotune(cfg_base, launch_fn, npix, force=False):
            cfg_base.get("acc_mode", 0))
     if not force and key in _TUNE_CACHE:
         return _TUNE_CACHE[key]
+    key_str = "|".join(str(x) for x in key[1:]) + "|" + _KERNEL_SRC_HASH
+    if not force:
+        stored = hardware.tune_entry(key_str)
+        if stored is not None and tuple(stored) in [tuple(c) for c in _TUNE_GRID]:
+            _TUNE_CACHE[key] = tuple(stored)
+            return _TUNE_CACHE[key]
 
     # Ramp the clocks first.  An idle 4090 sits at 210 MHz and takes seconds
     # to boost, so candidates timed on the way up get ranked by when they ran
@@ -8715,6 +8936,7 @@ def autotune(cfg_base, launch_fn, npix, force=False):
         if dt > 0 and (1.0 / dt) > best_t:
             best_t, best = 1.0 / dt, (pix, unroll, bx, by)
     _TUNE_CACHE[key] = best
+    hardware.save_tune_entry(key_str, best)
     return best
 
 
@@ -9137,7 +9359,7 @@ def _launch(cfg, st, bx, by, out, n_slices=1, chunks_per_slice=None):
 MAX_SLICES = 1024
 
 
-def _launch_filled(cfg, st, bx, by, out, chunk, n_sm):
+def _launch_filled(cfg, st, bx, by, out, chunk, n_sm, acc=None):
     """Launch with the atom range sliced across gridDim.z to fill the card.
 
     One launch occupies ceil(Ny/bx) * ceil(Nz/(by*PIX)) blocks in x-y; a
@@ -9153,14 +9375,20 @@ def _launch_filled(cfg, st, bx, by, out, chunk, n_sm):
     nch = max(1, int(st["n"]) // chunk)
     want = (2 * n_sm + blocks - 1) // max(blocks, 1)
     ns = int(max(1, min(want, nch, MAX_SLICES)))
-    if ns <= 1:
-        _launch(cfg, st, bx, by, out)
+    if ns <= 1 and acc is None:
+        hardware.timed_launch("fast", float(st["n"]) * Ny * Nz, _launch, cfg, st, bx, by, out)
         return
     per = (nch + ns - 1) // ns
     ns = (nch + per - 1) // per
     part = cp.zeros((ns, Ny * Nz), cp.complex64)
-    _launch(cfg, st, bx, by, part, n_slices=ns, chunks_per_slice=per)
-    out += part.sum(axis=0, dtype=cp.complex128).astype(cp.complex64)
+    hardware.timed_launch("fast", float(st["n"]) * Ny * Nz, _launch, cfg, st, bx, by, part,
+                          n_slices=ns, chunks_per_slice=per)
+    if acc is not None:
+        # Launch partials meet in float64; the caller casts once per chunk,
+        # so the launch partition does not change the result.
+        acc += part.sum(axis=0, dtype=cp.complex128)
+    else:
+        out += part.sum(axis=0, dtype=cp.complex128).astype(cp.complex64)
 
 
 def dispatch(pos_m_g, amp_g, species_code, wk_rows, f0z_rows, anom_rows,
@@ -9169,7 +9397,7 @@ def dispatch(pos_m_g, amp_g, species_code, wk_rows, f0z_rows, anom_rows,
              m_beams=1, analyser_kind=0, use_series=True,
              chunk=128, tol_rad=1e-6, tune=True, det_extent=None,
              tol_f0=1e-7, phasor_fp64=True, tol_decline=None, opts=None,
-             pol_vec=None):
+             pol_vec=None, acc=None):
     """Run one interaction pass on the fast path, or decline.
 
     ``tol_rad`` is the budget the series order is chosen against.
@@ -9264,5 +9492,5 @@ def dispatch(pos_m_g, amp_g, species_code, wk_rows, f0z_rows, anom_rows,
                 tuned = _TUNE_GRID[0]
         pix, unroll, bx, by = tuned
         _launch_filled(dict(cfg, pix=pix, unroll=unroll), st, bx, by, out,
-                       chunk, n_sm)
+                       chunk, n_sm, acc=acc)
     return True
