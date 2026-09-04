@@ -5,6 +5,7 @@ import numpy as np
 import os
 import json
 from Logging import logging
+import hardware
 try:
     import cupy as cp
 except ImportError:
@@ -17,8 +18,23 @@ from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED, FIRST_CO
 # -----------------------------------------------------------------------------
 # Multi-GPU Configuration (environment variables)
 # -----------------------------------------------------------------------------
-SAMPLE_STREAMS_PER_GPU = int(os.environ.get("SAMPLE_STREAMS_PER_GPU", "4"))
+# Streams per GPU: None means "derive from the device" (hardware.py); the
+# variable stays as an override.
+SAMPLE_STREAMS_PER_GPU = int(os.environ["SAMPLE_STREAMS_PER_GPU"]) if os.environ.get("SAMPLE_STREAMS_PER_GPU") else None
 SAMPLE_WRITER_THREADS = int(os.environ.get("SAMPLE_WRITER_THREADS", "3"))
+
+# Chunk files are read back through a host cache sized by hardware.py, so the
+# spare RAM of the machine holds the chunks a scan re-reads at every step.
+# MOSAIC_CHUNK_CACHE=0 turns it off.
+_CHUNK_CACHE = None
+
+
+def _chunk_cache():
+    global _CHUNK_CACHE
+    if _CHUNK_CACHE is None:
+        off = str(os.environ.get("MOSAIC_CHUNK_CACHE", "1")).strip().lower() in ("0", "off", "false")
+        _CHUNK_CACHE = False if off else hardware.HostCache("chunks")
+    return _CHUNK_CACHE or None
 
 # Tolerance of the in-box test, in position units (angstrom). The box is
 # half-open, [-tol, L - tol) per axis, so a lattice-commensurate box holds
@@ -308,6 +324,11 @@ class sample(logging):
 
         # Start from no rotation; store chunk_volume as a scalar
         self._rotation = np.eye(3, dtype=np.float32)
+        if isinstance(chunk_volume, str):
+            if chunk_volume.strip().lower() != "auto":
+                raise ValueError("chunk_volume must be a number of atoms or 'auto'")
+            chunk_volume = hardware.auto_chunk_volume()
+            self._log("normal", f"[sample] chunk_volume='auto' -> {int(chunk_volume):,} atoms per chunk")
         self._chunk_volume = np.array(chunk_volume, dtype=np.float32)
 
         # Build diagonal matrix and precompute corners in sample frame
@@ -540,10 +561,11 @@ class sample(logging):
         chunk_filename = f"{base}_{chunk_num}{ext}"
 
         # Persist the array in the appropriate directory
-        if override_directory is not None:
-            np.save(os.path.join(override_directory, chunk_filename), data)
-        else:
-            np.save(os.path.join(self.directory, chunk_filename), data)
+        target = os.path.join(override_directory if override_directory is not None
+                              else self.directory, chunk_filename)
+        np.save(target, data)
+        if _chunk_cache() is not None:
+            _chunk_cache().invalidate(key=target)
     
     def _encode_species(self, data):
         """
@@ -601,10 +623,16 @@ class sample(logging):
         same_dir = (override_directory is None
                     or os.path.abspath(override_directory) == os.path.abspath(self.directory))
         if not same_dir:
-            np.save(os.path.join(override_directory, chunk_filename), np.asarray(data))
+            target = os.path.join(override_directory, chunk_filename)
+            np.save(target, np.asarray(data))
+            if _chunk_cache() is not None:
+                _chunk_cache().invalidate(key=target)
             return
         codes, new_labels = self._encode_species(data)
-        np.save(os.path.join(self.directory, chunk_filename), codes)
+        target = os.path.join(self.directory, chunk_filename)
+        np.save(target, codes)
+        if _chunk_cache() is not None:
+            _chunk_cache().invalidate(key=target)
         if new_labels:
             self.write_sample_metadata()
             
@@ -647,6 +675,63 @@ class sample(logging):
             json.dump(sample_metadata, f, indent=4)
         self._log("verbose", f"Metadata written to {metadata_filename} in JSON format.")
     
+    def geometric_chunk_atoms(self, material=None):
+        """
+        Atoms in one generation chunk.
+
+        `chunk_volume` is a volume: the generators stream geometric chunks of
+        `chunk_volume / cell volume` unit cells (about 625k atoms for silicon
+        at the default). File chunks are larger; see `max_chunk_atoms`.
+
+        Args:
+            material (crystal, optional): Provides `lattice_volume` and the
+                basis atoms. If None, `chunk_volume` is returned as atoms.
+
+        Returns:
+            int: Atoms per geometric chunk, at least 1000.
+        """
+        try:
+            cells = float(np.asarray(self.chunk_volume).ravel()[0]) / float(material.lattice_volume)
+            basis = int(np.asarray(material.lattice_atom_cartesian).shape[0])
+            return int(max(1000, cells * basis))
+        except Exception:
+            return int(np.asarray(self.chunk_volume).ravel()[0]) if self._chunk_volume is not None else 12_500_000
+
+    def max_chunk_atoms(self):
+        """
+        Atoms in the largest file chunk.
+
+        This is what a path that loads a chunk whole must hold. In streaming
+        mode, or before any chunk exists, `chunk_volume` is returned as atoms.
+
+        Returns:
+            int: Atoms in the largest chunk.
+        """
+        total = int(self._chunk_total or 0)
+        if total <= 0 or getattr(self, "_streaming_mode", False):
+            return int(np.asarray(self.chunk_volume).ravel()[0]) if self._chunk_volume is not None else 12_500_000
+        return max(int(self.chunk_atom_count(c)) for c in range(1, total + 1))
+
+    def chunk_atom_count(self, chunk_number):
+        """
+        Atoms in a chunk, read from the file header without loading it.
+
+        Args:
+            chunk_number (int): 1-based chunk index.
+
+        Returns:
+            int: Atoms in the chunk (loads the chunk when the header cannot be
+            read, for example in streaming mode).
+        """
+        if not getattr(self, "_streaming_mode", False):
+            base, ext = os.path.splitext(self._default_filenames[0])
+            path = os.path.join(self.directory, f"{base}_{chunk_number}{ext}")
+            try:
+                return int(np.load(path, mmap_mode="r").shape[0])
+            except Exception:
+                pass
+        return int(np.asarray(self.load_chunk_positions(chunk_number, use_gpu=False, raw=True)).shape[0])
+
     def load_chunk_positions(self, chunk_number, use_gpu=True, raw=False):
         """
         Load a chunk's positions from disk, optionally on GPU.
@@ -687,11 +772,19 @@ class sample(logging):
         positions_filename = f"{base}_{chunk_number}{ext}"
         full_path = os.path.join(self.directory, positions_filename)
 
-        # Load on GPU if requested and available; else load on CPU
+        # Load through the host chunk cache (a hit skips the disk), then to
+        # the device if requested.  Host callers get their own copy, so an
+        # in-place edit never reaches the cached array.
+        cache = _chunk_cache()
+        cached = cache.get(full_path) if cache is not None else None
+        if cached is None:
+            cached = np.load(full_path)
+            if cache is not None:
+                cache.put(full_path, cached)
         if use_gpu and (cp is not None):
-            positions = cp.load(full_path)
+            positions = cp.asarray(cached)
         else:
-            positions = np.load(full_path)
+            positions = np.array(cached, copy=True)
 
         # Thermal effects are applied on load only; raw=True skips them.
         if self.enable_temp is True and not raw:
@@ -748,7 +841,13 @@ class sample(logging):
             arr = self._generate_chunk_on_demand(chunk_number, use_gpu, return_positions=False)
         else:
             base, ext = os.path.splitext(self._default_filenames[1])
-            arr = np.load(os.path.join(self.directory, f"{base}_{chunk_number}{ext}"))
+            spath = os.path.join(self.directory, f"{base}_{chunk_number}{ext}")
+            cache = _chunk_cache()
+            arr = cache.get(spath) if cache is not None else None
+            if arr is None:
+                arr = np.load(spath)
+                if cache is not None:
+                    cache.put(spath, arr)
         arr = np.asarray(arr)
 
         if arr.dtype.kind in "iu":
@@ -766,7 +865,7 @@ class sample(logging):
             labels, inv = np.unique(arr.astype(str), return_inverse=True)
             inv = inv.reshape(-1).astype(np.uint8 if labels.size <= 256 else np.uint16)
             return (cp.asarray(inv) if (use_gpu and cp is not None) else inv), labels
-        return arr
+        return np.array(arr, copy=True)
 
     # -------------------------------------
     # Streaming mode helpers
@@ -2460,7 +2559,8 @@ class sample(logging):
         """)
 
         # Compile and link the C code at runtime with optimization enabled
-        C_mod = ffi_obj.verify(c_source, extra_compile_args=["-O3"], libraries=[])
+        C_mod = hardware.cffi_verify(ffi_obj, c_source, "check_parallelepipeds_intersect_batch",
+                                     extra_compile_args=hardware.cffi_compile_args(), libraries=[])
 
         # Return both the FFI handle and the compiled module (used to call the function)
         return ffi_obj, C_mod
@@ -2530,11 +2630,7 @@ class sample(logging):
         }
         '''
         # Build the raw CUDA module and fetch the kernel entry point
-        kernel_module = cp.RawModule(
-            code=_cell_list_count_kernel,
-            backend='nvcc',
-            options=('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true')
-        )
+        kernel_module = hardware.raw_module(_cell_list_count_kernel)
         return kernel_module.get_function('cell_list_count_kernel')
 
     @staticmethod
@@ -2580,11 +2676,7 @@ class sample(logging):
         }
         '''
         # Build the raw CUDA module and fetch the kernel entry point
-        kernel_module = cp.RawModule(
-            code=_cell_list_fill_kernel,
-            backend='nvcc',
-            options=('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true')
-        )
+        kernel_module = hardware.raw_module(_cell_list_fill_kernel)
         return kernel_module.get_function('cell_list_fill_kernel')
     # -------------------------------------
         
@@ -2951,13 +3043,7 @@ class sample(logging):
         sample_corners_S = (self.get_unit_corners() @ self.matrix)
 
         # Batched candidate-chunk enumeration.
-        try:
-            import psutil
-            avail_host_b = int(psutil.virtual_memory().available)
-            TARGET_BATCH_BYTES = max(256 * 1024**2, int(0.9 * avail_host_b))
-        except Exception:
-            # psutil missing -- fall back to a generous default.
-            TARGET_BATCH_BYTES = 4 * 1024**3
+        TARGET_BATCH_BYTES = hardware.candidate_batch_bytes()
         # Per-candidate cost.  Live allocations during a batch include:
         #   ii, jj, kk (3 * float32)           = 12 B
         #   grid_C   (3 * float32)             = 12 B
@@ -3280,7 +3366,7 @@ class sample(logging):
         material,
         flush_size=100000000,
         use_gpu=True,
-        gpu_streams=4,
+        gpu_streams=None,
         writer_threads=3,
         n_gpus=None,
         alloy_species=None,
@@ -3410,7 +3496,8 @@ class sample(logging):
             available_gpus = 0
             if use_gpu and (cp is not None):
                 try:
-                    available_gpus = int(cp.cuda.runtime.getDeviceCount())
+                    devices = hardware.gpu_devices()
+                    available_gpus = len(devices)
                     gpu_ok = (available_gpus > 0)
                 except Exception:
                     gpu_ok = False
@@ -3426,20 +3513,20 @@ class sample(logging):
             # do not depend on which GPU finished first
             if gpu_ok and use_n_gpus > 1:
                 try:
-                    n_streams = max(1, int(gpu_streams))
+                    n_streams = hardware.gen_streams_per_gpu(self.geometric_chunk_atoms(material), gpu_streams)
 
-                    shards = [[] for _ in range(use_n_gpus)]
-                    for i in range(num_geom):
-                        shards[i % use_n_gpus].append(i)
+                    shards = hardware.split_round_robin(num_geom, devices[:use_n_gpus])
 
                     gpu_errors = [None] * use_n_gpus
-                    results = _OrderedResults(window=use_n_gpus * (n_streams + 1))
+                    results = _OrderedResults(window=hardware.host_chunk_slots(
+                        hardware.bytes_per("gen_host_per_atom"), self.geometric_chunk_atoms(material),
+                        use_n_gpus * (n_streams + 1), floor=use_n_gpus))
 
                     def gpu_worker(dev_id, my_chunks):
                         """Generate this GPU's chunks and hand them over in order."""
                         produced = 0
                         try:
-                            cp.cuda.Device(dev_id).use()
+                            cp.cuda.Device(devices[dev_id]).use()
 
                             # Per-GPU stream ring
                             streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
@@ -3486,10 +3573,27 @@ class sample(logging):
                                 del task
 
                             # Fill-drain loop for this GPU's chunks
+                            ring = n_streams
                             while ((enq_idx < len(my_chunks)) or inflight) and not results.stopped:
-                                while (enq_idx < len(my_chunks)) and (len(inflight) < n_streams):
-                                    s = streams[enq_idx % n_streams]
-                                    _enqueue_local(my_chunks[enq_idx], s)
+                                while (enq_idx < len(my_chunks)) and (len(inflight) < ring):
+                                    s = streams[enq_idx % ring]
+                                    try:
+                                        _enqueue_local(my_chunks[enq_idx], s)
+                                    except cp.cuda.memory.OutOfMemoryError as exc:
+                                        # Device full: let the ring drain, then
+                                        # carry on with one chunk less in flight.
+                                        if not inflight:
+                                            raise RuntimeError(
+                                                f"chunk {my_chunks[enq_idx] + 1} does not fit on GPU {dev_id} "
+                                                f"even on its own; create the sample with a smaller "
+                                                f"chunk_volume") from exc
+                                        while inflight:
+                                            _drain_local()
+                                        cp.get_default_memory_pool().free_all_blocks()
+                                        ring = max(1, ring - 1)
+                                        self._log("normal", f"[sample] GPU {dev_id} out of memory; "
+                                                            f"continuing with {ring} chunk(s) in flight")
+                                        continue
                                     enq_idx += 1
 
                                 if inflight:
@@ -3541,7 +3645,7 @@ class sample(logging):
                                         f"{type(e).__name__}: {e}")
                     try:
                         for dev_id in range(use_n_gpus):
-                            cp.cuda.Device(dev_id).use()
+                            cp.cuda.Device(devices[dev_id]).use()
                             cp.get_default_memory_pool().free_all_blocks()
                     except Exception:
                         pass
@@ -3550,7 +3654,8 @@ class sample(logging):
             # Single-GPU path
             elif gpu_ok:
                 try:
-                    n_streams = max(1, int(gpu_streams))
+                    cp.cuda.Device(devices[0]).use()
+                    n_streams = hardware.gen_streams_per_gpu(self.geometric_chunk_atoms(material), gpu_streams)
                     streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
 
                     # Preload invariants once
@@ -3602,11 +3707,27 @@ class sample(logging):
                         del pos_np, mask_np, spc_np, task
 
                     # Fill-drain loop
+                    ring = n_streams
                     while (enqueue_idx < num_geom) or inflight:
                         # Enqueue up to ring capacity
-                        while (enqueue_idx < num_geom) and (len(inflight) < n_streams):
-                            s = streams[enqueue_idx % n_streams]
-                            _enqueue(enqueue_idx, s)
+                        while (enqueue_idx < num_geom) and (len(inflight) < ring):
+                            s = streams[enqueue_idx % ring]
+                            try:
+                                _enqueue(enqueue_idx, s)
+                            except cp.cuda.memory.OutOfMemoryError as exc:
+                                # Device full: let the ring drain, then carry
+                                # on with one chunk less in flight.
+                                if not inflight:
+                                    raise RuntimeError(
+                                        f"chunk {enqueue_idx + 1} does not fit on the GPU even on its "
+                                        f"own; create the sample with a smaller chunk_volume") from exc
+                                while inflight:
+                                    _drain_one()
+                                cp.get_default_memory_pool().free_all_blocks()
+                                ring = max(1, ring - 1)
+                                self._log("normal", f"[sample] GPU out of memory; continuing with "
+                                                    f"{ring} chunk(s) in flight")
+                                continue
                             enqueue_idx += 1
 
                         # Drain at least one task if any are inflight
@@ -4036,11 +4157,7 @@ class sample(logging):
         G = int(seeds_cp.shape[0])
 
         # Get available GPU memory
-        try:
-            free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
-            budget_bytes = int(memory_fraction * total_bytes)
-        except Exception:
-            budget_bytes = 2 * 1024 * 1024 * 1024  # Default 2GB
+        budget_bytes = hardware.voronoi_budget(memory_fraction)
 
         # Fixed seed_tile (controls inner loop granularity)
         seed_tile = min(512, G)
@@ -4083,11 +4200,7 @@ class sample(logging):
         N = int(positions_cp.shape[0])
         G = int(seeds_cp.shape[0])
 
-        try:
-            free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
-            budget_bytes = int(memory_fraction * total_bytes)
-        except Exception:
-            budget_bytes = 2 * 1024 * 1024 * 1024  # Default 2GB
+        budget_bytes = hardware.voronoi_budget(memory_fraction)
 
         seed_tile = min(512, G)
 
@@ -4526,7 +4639,7 @@ class sample(logging):
         march_r=1.0,
         flush_size=100000000,
         use_gpu=True,
-        gpu_streams=4,
+        gpu_streams=None,
         grain_workers=None,
         writer_threads=3,
         n_gpus=None,
@@ -4696,7 +4809,8 @@ class sample(logging):
             available_gpus = 0
             if use_gpu and (cp is not None):
                 try:
-                    available_gpus = int(cp.cuda.runtime.getDeviceCount())
+                    devices = hardware.gpu_devices()
+                    available_gpus = len(devices)
                     gpu_ok = (available_gpus > 0)
                 except Exception:
                     gpu_ok = False
@@ -4715,18 +4829,18 @@ class sample(logging):
             # not depend on which GPU finished first
             if gpu_ok and use_n_gpus > 1:
                 try:
-                    shards = [[] for _ in range(use_n_gpus)]
-                    for i in range(num_regions):
-                        shards[i % use_n_gpus].append(i)
+                    shards = hardware.split_round_robin(num_regions, devices[:use_n_gpus])
 
                     gpu_errors = [None] * use_n_gpus
-                    results = _OrderedResults(window=2 * use_n_gpus)
+                    results = _OrderedResults(window=hardware.host_chunk_slots(
+                        hardware.bytes_per("gen_host_per_atom"), self.geometric_chunk_atoms(material),
+                        2 * use_n_gpus, floor=use_n_gpus))
 
                     def gpu_worker_poly(dev_id, my_regions):
                         """Generate this GPU's regions and hand them over in order."""
                         produced = 0
                         try:
-                            cp.cuda.Device(dev_id).use()
+                            cp.cuda.Device(devices[dev_id]).use()
 
                             for region_idx in my_regions:
                                 if results.stopped:
@@ -4779,7 +4893,7 @@ class sample(logging):
                                         f"{type(e).__name__}: {e}")
                     try:
                         for dev_id in range(use_n_gpus):
-                            cp.cuda.Device(dev_id).use()
+                            cp.cuda.Device(devices[dev_id]).use()
                             cp.get_default_memory_pool().free_all_blocks()
                     except Exception:
                         pass
@@ -4788,6 +4902,7 @@ class sample(logging):
             # Single-GPU path
             elif gpu_ok:
                 try:
+                    cp.cuda.Device(devices[0]).use()
                     for region_idx in range(num_regions):
                         pos_np, spc_np = self._generate_grain_region(
                             material, region_idx, use_gpu=True
