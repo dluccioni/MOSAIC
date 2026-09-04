@@ -20,6 +20,7 @@ import json
 import re
 import os
 from Logging import logging
+import hardware
 
 
 # -----------------------------------------------------------------------------
@@ -2182,7 +2183,7 @@ class defects(logging):
         seg64 = cp.ascontiguousarray(cp.asarray(seg, dtype=cp.float64))
         M = int(seg64.shape[0])
         out = cp.empty((N, 3), dtype=cp.float32)
-        tp = (1 << 20) if tile_points is None else int(tile_points)
+        tp = hardware.ddd_tile_points() if tile_points is None else int(tile_points)
         threads = 128
         a2 = np.float32(a * a)
         c1 = np.float32(-1.0 / (4.0 * np.pi))
@@ -2304,7 +2305,7 @@ class defects(logging):
         seg64 = cp.ascontiguousarray(cp.asarray(seg, dtype=cp.float64))
         M = int(seg64.shape[0])
         out = cp.empty((N, 3), dtype=cp.float32)
-        tp = (1 << 20) if tile_points is None else int(tile_points)
+        tp = hardware.ddd_tile_points() if tile_points is None else int(tile_points)
         threads = 128
         for p0 in range(0, N, tp):
             p1 = min(N, p0 + tp)
@@ -2529,10 +2530,8 @@ class defects(logging):
             out_sorted[3*i+1] = yi + dt * dy_acc;
             out_sorted[3*i+2] = zi + dt * dz_acc;
         }'''
-        mod_flag  = cp.RawModule(code=src_flag, backend="nvcc",
-                                 options=('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true'))
-        mod_relax = cp.RawModule(code=src_relax, backend="nvcc",
-                                 options=('--gpu-architecture=native', '-O3', '--ftz=true', '--fmad=true'))
+        mod_flag  = hardware.raw_module(src_flag)
+        mod_relax = hardware.raw_module(src_relax)
         self._cleanup_cuda = {
             "flag_near_segments": mod_flag.get_function("flag_near_segments"),
             "relax_repulsive_sorted": mod_relax.get_function("relax_repulsive_sorted"),
