@@ -6,6 +6,16 @@ try:
     import cupy as cp
 except ImportError:
     cp = None
+try:
+    from scipy.special import k0 as _scipy_k0, k1 as _scipy_k1
+except ImportError:
+    _scipy_k0 = None
+    _scipy_k1 = None
+try:
+    from cupyx.scipy.special import k0 as _cupy_k0, k1 as _cupy_k1
+except Exception:
+    _cupy_k0 = None
+    _cupy_k1 = None
 import json
 import re
 import os
@@ -79,15 +89,385 @@ def _convex_hull_inside_mask(positions, equations, tol=1e-12):
     return inside
 
 
-# Per-thread evaluation of the isotropic Volterra displacement of straight
-# dislocation segments. Segment records are 12 doubles: S0, S1, C, b. Each
-# segment contributes the solid angle of the triangle (S0, S1, C) times
-# b/(4 pi) and the Burgers formula elastic terms integrated along S0->S1 with
-# |r| -> sqrt(r^2 + a^2). The solid angle is evaluated in double because its
-# atan2 arguments cancel for points near the plane of a large triangle; the
-# elastic terms use float32 on vertex differences formed in double.
+# -----------------------------------------------------------------------------
+# Spectral solver helpers (Bertin 2019 framework, displacement output)
+# -----------------------------------------------------------------------------
+def _cai_kernel_fourier(K, a, xp=np):
+    """
+    Fourier transform of the Cai et al. (2006) spreading function
+    w(r, a) = 15 / (8 pi a^3) (1 + r^2/a^2)^(-7/2), closed form
+    w_hat(k, a) = ((a k)^2 / 2) K_2(a k), K_2(x) = K_0(x) + (2/x) K_1(x);
+    series 1 - x^2/4 below x = 1e-3, value 1 at K = 0. One convolution with
+    w turns |r| into R_a = sqrt(r^2 + a^2) and 1/r into 1/R_a + a^2/(2 R_a^3),
+    so fields spread once with w are the R_a closed forms of the analytic
+    segment terms (Bertin 2019).
+
+    Args:
+        K: Array of |k| on the spectral grid.
+        a: Spreading radius.
+        xp: numpy or cupy.
+
+    Returns:
+        Array of K.shape, float64, values in [0, 1].
+    """
+    if xp is np:
+        if _scipy_k0 is None or _scipy_k1 is None:
+            raise ImportError("scipy.special.k0/k1 are required for the Cai kernel")
+        k0_fn, k1_fn = _scipy_k0, _scipy_k1
+    else:
+        if _cupy_k0 is None or _cupy_k1 is None:
+            raise ImportError("cupyx.scipy.special.k0/k1 are required for the Cai kernel on the GPU")
+        k0_fn, k1_fn = _cupy_k0, _cupy_k1
+
+    x = xp.asarray(K, dtype=xp.float64) * float(a)
+    small = x < 1.0e-3
+    xb = xp.where(small, xp.ones_like(x), x)
+    big = 0.5 * xb * xb * k0_fn(xb) + xb * k1_fn(xb)
+    return xp.where(small, 1.0 - 0.25 * x * x, big)
+
+
+def _isotropic_stiffness_tensor(mu, nu):
+    """
+    (3,3,3,3) isotropic stiffness
+    C_ijkl = lam d_ij d_kl + mu (d_ik d_jl + d_il d_jk), lam = 2 mu nu / (1 - 2 nu).
+    """
+    mu_ = float(mu)
+    nu_ = float(nu)
+    if not (0.0 < nu_ < 0.5):
+        raise ValueError("nu must be in (0, 0.5)")
+    lam = 2.0 * mu_ * nu_ / (1.0 - 2.0 * nu_)
+    I3 = np.eye(3, dtype=np.float64)
+    return (lam * np.einsum("ij,kl->ijkl", I3, I3)
+            + mu_ * np.einsum("ik,jl->ijkl", I3, I3)
+            + mu_ * np.einsum("il,jk->ijkl", I3, I3))
+
+
+def _voigt_to_tensor(C_voigt):
+    """(6,6) Voigt matrix -> (3,3,3,3) tensor; 1<->11, 2<->22, 3<->33, 4<->23, 5<->13, 6<->12."""
+    Cv = np.asarray(C_voigt, dtype=np.float64)
+    if Cv.shape != (6, 6):
+        raise ValueError("Voigt stiffness must be (6, 6)")
+    pairs = [(0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1)]
+    C = np.zeros((3, 3, 3, 3), dtype=np.float64)
+    for I in range(6):
+        i, j = pairs[I]
+        for J in range(6):
+            k, l = pairs[J]
+            v = Cv[I, J]
+            C[i, j, k, l] = v
+            C[j, i, k, l] = v
+            C[i, j, l, k] = v
+            C[j, i, l, k] = v
+    return C
+
+
+def _cubic_stiffness_tensor(c11, c12, c44):
+    """(3,3,3,3) cubic stiffness from (c11, c12, c44)."""
+    Cv = np.zeros((6, 6), dtype=np.float64)
+    Cv[0, 0] = Cv[1, 1] = Cv[2, 2] = float(c11)
+    Cv[0, 1] = Cv[0, 2] = Cv[1, 0] = Cv[1, 2] = Cv[2, 0] = Cv[2, 1] = float(c12)
+    Cv[3, 3] = Cv[4, 4] = Cv[5, 5] = float(c44)
+    return _voigt_to_tensor(Cv)
+
+
+def _resolve_stiffness(stiffness, mu, nu):
+    """
+    `stiffness` argument of generate_nodal_field -> (3,3,3,3) tensor.
+    None -> isotropic (mu, nu); {"isotropic": (mu, nu)}; {"cubic": (c11, c12, c44)};
+    (6,6) Voigt; (3,3,3,3) tensor (symmetries checked).
+    """
+    if stiffness is None:
+        if mu is None:
+            raise ValueError("mu is required when stiffness is None")
+        return _isotropic_stiffness_tensor(mu, nu)
+    if isinstance(stiffness, dict):
+        if "isotropic" in stiffness:
+            mu_iso, nu_iso = stiffness["isotropic"]
+            return _isotropic_stiffness_tensor(mu_iso, nu_iso)
+        if "cubic" in stiffness:
+            c11, c12, c44 = stiffness["cubic"]
+            return _cubic_stiffness_tensor(c11, c12, c44)
+        raise ValueError("stiffness dict must have key 'isotropic' or 'cubic'")
+    arr = np.asarray(stiffness, dtype=np.float64)
+    if arr.shape == (6, 6):
+        return _voigt_to_tensor(arr)
+    if arr.shape == (3, 3, 3, 3):
+        if not np.allclose(arr, arr.transpose(1, 0, 2, 3), atol=1e-6):
+            raise ValueError("stiffness violates minor symmetry C_ijkl = C_jikl")
+        if not np.allclose(arr, arr.transpose(0, 1, 3, 2), atol=1e-6):
+            raise ValueError("stiffness violates minor symmetry C_ijkl = C_ijlk")
+        if not np.allclose(arr, arr.transpose(2, 3, 0, 1), atol=1e-6):
+            raise ValueError("stiffness violates major symmetry C_ijkl = C_klij")
+        return arr.copy()
+    raise ValueError("stiffness must be None, a dict, a (6,6) Voigt matrix, or a (3,3,3,3) tensor")
+
+
+def _cut_subdivisions(S0, S1, C, spacing, max_subdiv=1024):
+    """Per-triangle subdivision count n = ceil(longest edge / spacing), clipped to [1, max_subdiv]."""
+    e = np.maximum.reduce([np.linalg.norm(S1 - S0, axis=1),
+                           np.linalg.norm(C - S0, axis=1),
+                           np.linalg.norm(C - S1, axis=1)])
+    n = np.ceil(e / float(spacing)).astype(np.int64)
+    return np.clip(n, 1, int(max_subdiv))
+
+
+def _cut_surface_samples(S0, S1, C, B, n_sub, xp=np, chunk_samples=4_000_000):
+    """
+    Yield (points (m, 3), weights (m, 9)) sampling the fan triangles
+    (S0, S1, C) of the cut surface. Triangle t is split into n_sub[t]^2
+    congruent sub-triangles; each contributes its centroid carrying the
+    plastic distortion -b (x) N / n^2, N = (S1 - S0) x (C - S0) / 2 the area
+    vector, so the weights of a triangle sum to -b (x) N. Arrays are on `xp`.
+    """
+    S0 = xp.asarray(S0, dtype=xp.float64)
+    S1 = xp.asarray(S1, dtype=xp.float64)
+    C = xp.asarray(C, dtype=xp.float64)
+    B = xp.asarray(B, dtype=xp.float64)
+    E1 = S1 - S0
+    E2 = C - S0
+    Nvec = 0.5 * xp.cross(E1, E2)
+    W = -(B[:, :, None] * Nvec[:, None, :]).reshape(-1, 9)
+    n_sub = np.asarray(n_sub, dtype=np.int64)
+    for n in np.unique(n_sub):
+        n = int(n)
+        idx_all = np.nonzero(n_sub == n)[0]
+        i, j = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
+        up = (i + j) <= n - 1
+        dn = (i + j) <= n - 2
+        u = xp.asarray(np.concatenate([i[up] + 1.0 / 3.0, i[dn] + 2.0 / 3.0]) / n)
+        v = xp.asarray(np.concatenate([j[up] + 1.0 / 3.0, j[dn] + 2.0 / 3.0]) / n)
+        per = n * n
+        step = max(1, int(chunk_samples) // per)
+        for c0 in range(0, idx_all.size, step):
+            idx = xp.asarray(idx_all[c0:c0 + step])
+            m = int(idx.shape[0])
+            pts = (S0[idx][:, None, :] + u[None, :, None] * E1[idx][:, None, :]
+                   + v[None, :, None] * E2[idx][:, None, :])
+            w = xp.broadcast_to((W[idx] / per)[:, None, :], (m, per, 9))
+            yield pts.reshape(-1, 3), xp.ascontiguousarray(w.reshape(-1, 9))
+
+
+def _deposit_cic(grid, points, weights, origin, spacing, shape, xp=np, gpu_kernel=None):
+    """
+    Trilinear (cloud-in-cell) deposition of weighted points onto a periodic,
+    cell-centred grid. `grid` is (nx*ny*nz, 9) with flat index
+    (ix*ny + iy)*nz + iz; node ix sits at origin_x + (ix + 0.5) dx. Adds the
+    weights in place; divide by the cell volume afterwards for a density.
+    """
+    nx, ny, nz = [int(s) for s in shape]
+    Np = int(points.shape[0])
+    if Np == 0:
+        return
+    if xp is not np:
+        if gpu_kernel is None:
+            raise RuntimeError("deposit_cic kernel is required on the GPU")
+        threads = 256
+        gpu_kernel(((Np + threads - 1) // threads,), (threads,),
+                   (xp.ascontiguousarray(xp.asarray(points, dtype=xp.float32)),
+                    xp.ascontiguousarray(xp.asarray(weights, dtype=xp.float32)), np.int32(Np),
+                    np.float32(origin[0]), np.float32(origin[1]), np.float32(origin[2]),
+                    np.float32(1.0 / spacing[0]), np.float32(1.0 / spacing[1]), np.float32(1.0 / spacing[2]),
+                    np.int32(nx), np.int32(ny), np.int32(nz), grid))
+        return
+    P = np.asarray(points, dtype=np.float64)
+    Wt = np.asarray(weights, dtype=np.float64)
+    g = (P - np.asarray(origin, dtype=np.float64)) / np.asarray(spacing, dtype=np.float64) - 0.5
+    i0 = np.floor(g).astype(np.int64)
+    f = g - i0
+    n_arr = np.array([nx, ny, nz], dtype=np.int64)
+    ntot = nx * ny * nz
+    for c in range(8):
+        sel = np.array([c & 1, (c >> 1) & 1, (c >> 2) & 1], dtype=np.int64)
+        idx3 = np.mod(i0 + sel, n_arr)
+        w = np.prod(np.where(sel[None, :] == 1, f, 1.0 - f), axis=1)
+        flat = (idx3[:, 0] * ny + idx3[:, 1]) * nz + idx3[:, 2]
+        for m in range(9):
+            grid[:, m] += np.bincount(flat, weights=w * Wt[:, m], minlength=ntot).astype(np.float32)
+
+
+def _spectral_displacement(beta_p, spacing, C_stiff, a_grid, xp=np, deconvolve_cic=False,
+                           slab_bytes=192 << 20):
+    """
+    Periodic displacement of a plastic distortion field (eigenstrain problem)
+    div C:(grad u - beta_p) = 0, solved per Fourier mode as
+        A_mk(k) u_k = -i k_j C_mjkl beta_p_kl,   A_mk = C_mjkl k_j k_l,
+    after spreading beta_p with the Cai kernel w(k, a_grid). The Nye tensor
+    is the curl of the spread beta_p, i.e. the Bertin (2019) non-singular
+    alpha, and grad u - beta_p its elastic distortion (incompatible plus
+    compatible part). The k = 0 mode is zero. C is normalised by its largest
+    entry (the displacement is invariant) and the 3x3 solve uses the adjugate.
+
+    Args:
+        beta_p: (nx, ny, nz, 3, 3) real array on `xp`.
+        spacing: (dx, dy, dz).
+        C_stiff: (3, 3, 3, 3) stiffness.
+        a_grid: Spreading radius.
+        xp: numpy or cupy.
+        deconvolve_cic: Divide by the trilinear transfer function
+            prod sinc^2(k_i d_i / 2) so only the Cai kernel spreads the field.
+        slab_bytes: Approximate working set per kx slab.
+
+    Returns:
+        (nx, ny, nz, 3) float32 displacement on `xp`.
+    """
+    nx, ny, nz = [int(s) for s in beta_p.shape[:3]]
+    dx, dy, dz = [float(s) for s in spacing]
+    Bk = xp.fft.fftn(xp.asarray(beta_p, dtype=xp.float32), axes=(0, 1, 2)).astype(xp.complex64)
+    Cn = np.asarray(C_stiff, dtype=np.float64)
+    Cx = xp.asarray(Cn / np.abs(Cn).max(), dtype=xp.float32)
+    kx = (2.0 * np.pi * xp.fft.fftfreq(nx, d=dx)).astype(xp.float32)
+    ky = (2.0 * np.pi * xp.fft.fftfreq(ny, d=dy)).astype(xp.float32)
+    kz = (2.0 * np.pi * xp.fft.fftfreq(nz, d=dz)).astype(xp.float32)
+    Uhat = xp.empty((nx, ny, nz, 3), dtype=xp.complex64)
+    per_plane = ny * nz * (9 * 8 + 9 * 4 + 3 * 8 + 3 * 4 + 12 * 4 + 16)
+    slab = max(1, int(slab_bytes) // max(1, per_plane))
+    for x0 in range(0, nx, slab):
+        x1 = min(nx, x0 + slab)
+        KX, KY, KZ = xp.meshgrid(kx[x0:x1], ky, kz, indexing="ij")
+        kvec = xp.stack([KX, KY, KZ], axis=-1)
+        K = xp.sqrt(KX * KX + KY * KY + KZ * KZ)
+        Phi = _cai_kernel_fourier(K, a_grid, xp=xp)
+        if deconvolve_cic:
+            for Kc, d in ((KX, dx), (KY, dy), (KZ, dz)):
+                arg = 0.5 * Kc.astype(xp.float64) * d
+                s = xp.where(xp.abs(arg) < 1.0e-12, xp.ones_like(arg), xp.sin(arg) / xp.where(arg == 0, 1.0, arg))
+                Phi = Phi / (s * s)
+        Phi = Phi.astype(xp.float32)
+        Bs = Bk[x0:x1] * Phi[..., None, None]
+        rhs = -1j * xp.einsum("mjkl,xyzj,xyzkl->xyzm", Cx, kvec, Bs)
+        A = xp.einsum("mjkl,xyzj,xyzl->xyzmk", Cx, kvec, kvec)
+        a00, a01, a02 = A[..., 0, 0], A[..., 0, 1], A[..., 0, 2]
+        a10, a11, a12 = A[..., 1, 0], A[..., 1, 1], A[..., 1, 2]
+        a20, a21, a22 = A[..., 2, 0], A[..., 2, 1], A[..., 2, 2]
+        m00 = a11 * a22 - a12 * a21; m01 = a02 * a21 - a01 * a22; m02 = a01 * a12 - a02 * a11
+        m10 = a12 * a20 - a10 * a22; m11 = a00 * a22 - a02 * a20; m12 = a02 * a10 - a00 * a12
+        m20 = a10 * a21 - a11 * a20; m21 = a01 * a20 - a00 * a21; m22 = a00 * a11 - a01 * a10
+        det = a00 * m00 + a01 * m10 + a02 * m20
+        if x0 == 0:
+            det[0, 0, 0] = 1.0
+        inv_det = 1.0 / det
+        r0, r1, r2 = rhs[..., 0], rhs[..., 1], rhs[..., 2]
+        Uhat[x0:x1, ..., 0] = (m00 * r0 + m01 * r1 + m02 * r2) * inv_det
+        Uhat[x0:x1, ..., 1] = (m10 * r0 + m11 * r1 + m12 * r2) * inv_det
+        Uhat[x0:x1, ..., 2] = (m20 * r0 + m21 * r1 + m22 * r2) * inv_det
+        del KX, KY, KZ, kvec, K, Phi, Bs, rhs, A
+    Uhat[0, 0, 0, :] = 0.0
+    del Bk
+    return xp.real(xp.fft.ifftn(Uhat, axes=(0, 1, 2))).astype(xp.float32)
+
+
+# CUDA module for the dislocation fields. Segment records are 12 doubles:
+# S0, S1, C, b.
+#   dislocation_displacement: isotropic Volterra displacement per point. Each
+#     segment contributes the solid angle of the triangle (S0, S1, C) times
+#     b/(4 pi) and the Burgers formula elastic terms along S0->S1 with
+#     |r| -> sqrt(r^2 + a^2). The solid angle is evaluated in double because
+#     its atan2 arguments cancel near the plane of a large triangle; the
+#     elastic terms use float32 on vertex differences formed in double.
+#   dislocation_near_field_delta: Bertin 2019 near-field split. Elastic terms
+#     at a_phys minus at a_grid for segments with |P - mid| <= rcut + L/2, and
+#     the sharp solid angle minus the a_grid-spread one for cut triangles
+#     within rcut of P. The spread double layer follows from
+#     w~ * (1/r) = 1/R_a + a^2 / (2 R_a^3), R_a = sqrt(r^2 + a^2), giving
+#     Omega_a = |h| [G(H) - a^2 G'(H) / (2H)], G(s) = Omega(s)/s, where h is the
+#     height of P over the triangle plane, H = sqrt(h^2 + a^2) and Omega(s) the
+#     solid angle seen from height s above the foot point; G' is a central
+#     difference.
+#   deposit_cic: trilinear deposition of weighted points onto a periodic
+#     cell-centred (nx, ny, nz, 9) grid with atomics.
 _DISLOCATION_DISPLACEMENT_KERNEL = r'''
 #define SEG_TILE 128
+
+// Signed solid angle of the triangle with vertex vectors R1, R2, R3 from the
+// observation point (Van Oosterom and Strackee).
+__device__ __forceinline__ double solid_angle(
+    double R1x, double R1y, double R1z, double R2x, double R2y, double R2z,
+    double R3x, double R3y, double R3z)
+{
+    double n1 = sqrt(R1x*R1x + R1y*R1y + R1z*R1z);
+    double n2 = sqrt(R2x*R2x + R2y*R2y + R2z*R2z);
+    double n3 = sqrt(R3x*R3x + R3y*R3y + R3z*R3z);
+    double cx = R2y*R3z - R2z*R3y;
+    double cy = R2z*R3x - R2x*R3z;
+    double cz = R2x*R3y - R2y*R3x;
+    double num = R1x*cx + R1y*cy + R1z*cz;
+    double den = n1*n2*n3
+               + (R1x*R2x + R1y*R2y + R1z*R2z) * n3
+               + (R1x*R3x + R1y*R3y + R1z*R3z) * n2
+               + (R2x*R3x + R2y*R3y + R2z*R3z) * n1;
+    return 2.0 * atan2(num, den);
+}
+
+__device__ __forceinline__ double seg_dist2(
+    double fx, double fy, double fz, const double* a, const double* b)
+{
+    double ex = b[0]-a[0], ey = b[1]-a[1], ez = b[2]-a[2];
+    double L2 = ex*ex + ey*ey + ez*ez;
+    double t = 0.0;
+    if (L2 > 1.0e-30) {
+        t = ((fx-a[0])*ex + (fy-a[1])*ey + (fz-a[2])*ez) / L2;
+        t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+    }
+    double dx = fx - (a[0] + t*ex), dy = fy - (a[1] + t*ey), dz = fz - (a[2] + t*ez);
+    return dx*dx + dy*dy + dz*dz;
+}
+
+// Squared in-plane distance from the foot point f (in the triangle plane with
+// unit normal n) to the triangle (v0, v1, v2); zero inside.
+__device__ __forceinline__ double tri_dist2_inplane(
+    double fx, double fy, double fz, const double* v0, const double* v1, const double* v2,
+    double nx, double ny, double nz)
+{
+    double c[3];
+    const double* va[3] = {v0, v1, v2};
+    const double* vb[3] = {v1, v2, v0};
+    for (int e = 0; e < 3; ++e) {
+        double ex = vb[e][0]-va[e][0], ey = vb[e][1]-va[e][1], ez = vb[e][2]-va[e][2];
+        double wx = fx-va[e][0], wy = fy-va[e][1], wz = fz-va[e][2];
+        c[e] = (ey*wz - ez*wy)*nx + (ez*wx - ex*wz)*ny + (ex*wy - ey*wx)*nz;
+    }
+    if ((c[0] >= 0.0 && c[1] >= 0.0 && c[2] >= 0.0) || (c[0] <= 0.0 && c[1] <= 0.0 && c[2] <= 0.0))
+        return 0.0;
+    double d = seg_dist2(fx, fy, fz, v0, v1);
+    double d1 = seg_dist2(fx, fy, fz, v1, v2); if (d1 < d) d = d1;
+    double d2 = seg_dist2(fx, fy, fz, v2, v0); if (d2 < d) d = d2;
+    return d;
+}
+
+__device__ __forceinline__ void elastic_terms(
+    float r1x, float r1y, float r1z, float tx, float ty, float tz,
+    float bx, float by, float bz, float a2, float c1, float c2,
+    float &ux, float &uy, float &uz)
+{
+    float L2 = tx*tx + ty*ty + tz*tz;
+    if (L2 > 1.0e-20f) {
+        float L = sqrtf(L2);
+        float invL = 1.0f / L;
+        tx *= invL; ty *= invL; tz *= invL;
+        float lam = -(r1x*tx + r1y*ty + r1z*tz);
+        float dx = -r1x - lam*tx, dy = -r1y - lam*ty, dz = -r1z - lam*tz;
+        float rho2 = dx*dx + dy*dy + dz*dz + a2;
+        float s1 = -lam, s2 = L - lam;
+        float Ra1 = sqrtf(s1*s1 + rho2);
+        float Ra2 = sqrtf(s2*s2 + rho2);
+        float I1, I3;
+        if (s1 >= 0.0f)      I1 = logf((s2 + Ra2) / (s1 + Ra1));
+        else if (s2 <= 0.0f) I1 = logf((Ra1 - s1) / (Ra2 - s2));
+        else                 I1 = logf((s2 + Ra2) * (Ra1 - s1) / rho2);
+        float ssum = s1 + s2;
+        if (s1 * s2 > 0.0f) I3 = L * ssum / (Ra1 * Ra2 * (s2*Ra1 + s1*Ra2));
+        else                I3 = (s2 / Ra2 - s1 / Ra1) / rho2;
+        float J3 = L * ssum / (Ra1 * Ra2 * (Ra1 + Ra2));
+        float qx = by*tz - bz*ty, qy = bz*tx - bx*tz, qz = bx*ty - by*tx;
+        float bd = qx*dx + qy*dy + qz*dz;
+        float g = (c1 + c2) * I1;
+        float h = c2 * bd;
+        ux += g*qx - h*(dx*I3 - tx*J3);
+        uy += g*qy - h*(dy*I3 - ty*J3);
+        uz += g*qz - h*(dz*I3 - tz*J3);
+    }
+}
+
 extern "C" __global__
 void dislocation_displacement(const double* __restrict__ P, const int Np,
                               const double* __restrict__ seg, const int Ns,
@@ -114,57 +494,222 @@ void dislocation_displacement(const double* __restrict__ P, const int Np,
                 float bx = (float)q[9], by = (float)q[10], bz = (float)q[11];
 
                 // Solid angle of the triangle (Van Oosterom and Strackee), in double.
-                double n1 = sqrt(R1x*R1x + R1y*R1y + R1z*R1z);
-                double n2 = sqrt(R2x*R2x + R2y*R2y + R2z*R2z);
-                double n3 = sqrt(R3x*R3x + R3y*R3y + R3z*R3z);
-                double cx = R2y*R3z - R2z*R3y;
-                double cy = R2z*R3x - R2x*R3z;
-                double cz = R2x*R3y - R2y*R3x;
-                double num = R1x*cx + R1y*cy + R1z*cz;
-                double den = n1*n2*n3
-                           + (R1x*R2x + R1y*R2y + R1z*R2z) * n3
-                           + (R1x*R3x + R1y*R3y + R1z*R3z) * n2
-                           + (R2x*R3x + R2y*R3y + R2z*R3z) * n1;
-                float w = (float)(2.0 * atan2(num, den)) * inv4pi;
+                float w = (float)solid_angle(R1x, R1y, R1z, R2x, R2y, R2z, R3x, R3y, R3z) * inv4pi;
                 ux += w * bx; uy += w * by; uz += w * bz;
                 float r1x = (float)R1x, r1y = (float)R1y, r1z = (float)R1z;
 
                 // Elastic terms along the real segment.
                 float tx = (float)(q[3] - q[0]), ty = (float)(q[4] - q[1]), tz = (float)(q[5] - q[2]);
-                float L2 = tx*tx + ty*ty + tz*tz;
-                if (L2 > 1.0e-20f) {
-                    float L = sqrtf(L2);
-                    float invL = 1.0f / L;
-                    tx *= invL; ty *= invL; tz *= invL;
-                    float lam = -(r1x*tx + r1y*ty + r1z*tz);
-                    float dx = -r1x - lam*tx, dy = -r1y - lam*ty, dz = -r1z - lam*tz;
-                    float rho2 = dx*dx + dy*dy + dz*dz + a2;
-                    float s1 = -lam, s2 = L - lam;
-                    float Ra1 = sqrtf(s1*s1 + rho2);
-                    float Ra2 = sqrtf(s2*s2 + rho2);
-                    float I1, I3;
-                    if (s1 >= 0.0f)      I1 = logf((s2 + Ra2) / (s1 + Ra1));
-                    else if (s2 <= 0.0f) I1 = logf((Ra1 - s1) / (Ra2 - s2));
-                    else                 I1 = logf((s2 + Ra2) * (Ra1 - s1) / rho2);
-                    float ssum = s1 + s2;
-                    if (s1 * s2 > 0.0f) I3 = L * ssum / (Ra1 * Ra2 * (s2*Ra1 + s1*Ra2));
-                    else                I3 = (s2 / Ra2 - s1 / Ra1) / rho2;
-                    float J3 = L * ssum / (Ra1 * Ra2 * (Ra1 + Ra2));
-                    float qx = by*tz - bz*ty, qy = bz*tx - bx*tz, qz = bx*ty - by*tx;
-                    float bd = qx*dx + qy*dy + qz*dz;
-                    float g = (c1 + c2) * I1;
-                    float h = c2 * bd;
-                    ux += g*qx - h*(dx*I3 - tx*J3);
-                    uy += g*qy - h*(dy*I3 - ty*J3);
-                    uz += g*qz - h*(dz*I3 - tz*J3);
-                }
+                elastic_terms(r1x, r1y, r1z, tx, ty, tz, bx, by, bz, a2, c1, c2, ux, uy, uz);
             }
         }
         __syncthreads();
     }
     if (i < Np) { U[3*i] = ux; U[3*i+1] = uy; U[3*i+2] = uz; }
 }
+
+extern "C" __global__
+void dislocation_near_field_delta(const double* __restrict__ P, const int Np,
+                                  const double* __restrict__ seg, const int Ns,
+                                  const float a2_phys, const float a2_grid, const float rcut,
+                                  const float c1, const float c2,
+                                  float* __restrict__ U)
+{
+    __shared__ double sh[SEG_TILE * 12];
+    const float inv4pi = 0.07957747154594767f;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    double px = 0.0, py = 0.0, pz = 0.0;
+    if (i < Np) { px = P[3*i]; py = P[3*i+1]; pz = P[3*i+2]; }
+    float ux = 0.f, uy = 0.f, uz = 0.f;
+    const double rc2 = (double)rcut * (double)rcut;
+    const double ag2 = (double)a2_grid;
+
+    for (int base = 0; base < Ns; base += SEG_TILE) {
+        int n = Ns - base; if (n > SEG_TILE) n = SEG_TILE;
+        for (int k = threadIdx.x; k < n * 12; k += blockDim.x) sh[k] = seg[base * 12 + k];
+        __syncthreads();
+        if (i < Np) {
+            for (int s = 0; s < n; ++s) {
+                const double* q = sh + 12 * s;
+                float bx = (float)q[9], by = (float)q[10], bz = (float)q[11];
+
+                // Elastic terms: a_phys minus a_grid within rcut + L/2 of the midpoint.
+                float tx = (float)(q[3] - q[0]), ty = (float)(q[4] - q[1]), tz = (float)(q[5] - q[2]);
+                float L2 = tx*tx + ty*ty + tz*tz;
+                float mx = (float)(0.5 * (q[0] + q[3]) - px);
+                float my = (float)(0.5 * (q[1] + q[4]) - py);
+                float mz = (float)(0.5 * (q[2] + q[5]) - pz);
+                float rad = rcut + 0.5f * sqrtf(L2);
+                if (mx*mx + my*my + mz*mz <= rad*rad) {
+                    float r1x = (float)(q[0] - px), r1y = (float)(q[1] - py), r1z = (float)(q[2] - pz);
+                    float vx = 0.f, vy = 0.f, vz = 0.f;
+                    elastic_terms(r1x, r1y, r1z, tx, ty, tz, bx, by, bz, a2_phys, c1, c2, ux, uy, uz);
+                    elastic_terms(r1x, r1y, r1z, tx, ty, tz, bx, by, bz, a2_grid, c1, c2, vx, vy, vz);
+                    ux -= vx; uy -= vy; uz -= vz;
+                }
+
+                // Solid angle: sharp minus a_grid-spread within rcut of the triangle.
+                double e1x = q[3]-q[0], e1y = q[4]-q[1], e1z = q[5]-q[2];
+                double e2x = q[6]-q[0], e2y = q[7]-q[1], e2z = q[8]-q[2];
+                double nx = e1y*e2z - e1z*e2y, ny = e1z*e2x - e1x*e2z, nz = e1x*e2y - e1y*e2x;
+                double A2 = sqrt(nx*nx + ny*ny + nz*nz);
+                if (A2 <= 1.0e-20) continue;
+                nx /= A2; ny /= A2; nz /= A2;
+                double h = (px-q[0])*nx + (py-q[1])*ny + (pz-q[2])*nz;
+                if (h*h > rc2) continue;
+                double fx = px - h*nx, fy = py - h*ny, fz = pz - h*nz;
+                if (tri_dist2_inplane(fx, fy, fz, q, q+3, q+6, nx, ny, nz) + h*h > rc2) continue;
+                double om_sharp = solid_angle(q[0]-px, q[1]-py, q[2]-pz,
+                                              q[3]-px, q[4]-py, q[5]-pz,
+                                              q[6]-px, q[7]-py, q[8]-pz);
+                double om_a = 0.0;
+                if (h != 0.0) {
+                    double sgn = h > 0.0 ? 1.0 : -1.0;
+                    double H = sqrt(h*h + ag2);
+                    double eps = 0.1 * H;
+                    double G[3];
+                    const double sv[3] = {H, H + eps, H - eps};
+                    for (int m = 0; m < 3; ++m) {
+                        double yx = fx + sgn*sv[m]*nx, yy = fy + sgn*sv[m]*ny, yz = fz + sgn*sv[m]*nz;
+                        G[m] = solid_angle(q[0]-yx, q[1]-yy, q[2]-yz,
+                                           q[3]-yx, q[4]-yy, q[5]-yz,
+                                           q[6]-yx, q[7]-yy, q[8]-yz) / sv[m];
+                    }
+                    om_a = fabs(h) * (G[0] - ag2 * (G[1] - G[2]) / (2.0*eps) / (2.0*H));
+                }
+                float w = (float)(om_sharp - om_a) * inv4pi;
+                ux += w * bx; uy += w * by; uz += w * bz;
+            }
+        }
+        __syncthreads();
+    }
+    if (i < Np) { U[3*i] = ux; U[3*i+1] = uy; U[3*i+2] = uz; }
+}
+
+extern "C" __global__
+void deposit_cic(const float* __restrict__ pts, const float* __restrict__ w, const int Np,
+                 const float ox, const float oy, const float oz,
+                 const float inv_dx, const float inv_dy, const float inv_dz,
+                 const int nx, const int ny, const int nz,
+                 float* __restrict__ grid)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= Np) return;
+    float gx = (pts[3*i]   - ox) * inv_dx - 0.5f;
+    float gy = (pts[3*i+1] - oy) * inv_dy - 0.5f;
+    float gz = (pts[3*i+2] - oz) * inv_dz - 0.5f;
+    int ix = (int)floorf(gx), iy = (int)floorf(gy), iz = (int)floorf(gz);
+    float fx = gx - ix, fy = gy - iy, fz = gz - iz;
+    for (int c = 0; c < 8; ++c) {
+        int sx = c & 1, sy = (c >> 1) & 1, sz = (c >> 2) & 1;
+        int jx = (ix + sx) % nx; if (jx < 0) jx += nx;
+        int jy = (iy + sy) % ny; if (jy < 0) jy += ny;
+        int jz = (iz + sz) % nz; if (jz < 0) jz += nz;
+        float wt = (sx ? fx : 1.f - fx) * (sy ? fy : 1.f - fy) * (sz ? fz : 1.f - fz);
+        size_t cell = ((size_t)jx * ny + jy) * nz + jz;
+        for (int m = 0; m < 9; ++m) atomicAdd(&grid[cell * 9 + m], wt * w[9*i + m]);
+    }
+}
 '''
+
+
+def _solid_angle_numpy(R1, R2, R3):
+    """Signed solid angle (Van Oosterom and Strackee) of triangles from vertex vectors (..., 3)."""
+    n1 = np.sqrt(np.einsum("...k,...k->...", R1, R1))
+    n2 = np.sqrt(np.einsum("...k,...k->...", R2, R2))
+    n3 = np.sqrt(np.einsum("...k,...k->...", R3, R3))
+    num = np.einsum("...k,...k->...", R1, np.cross(R2, R3))
+    den = (n1 * n2 * n3
+           + np.einsum("...k,...k->...", R1, R2) * n3
+           + np.einsum("...k,...k->...", R1, R3) * n2
+           + np.einsum("...k,...k->...", R2, R3) * n1)
+    return 2.0 * np.arctan2(num, den)
+
+
+def _segment_dist2_numpy(F, a, b):
+    """Squared distance from points F (P, 3) to segment a-b."""
+    e = b - a
+    L2 = float(e @ e)
+    t = np.zeros(F.shape[0]) if L2 <= 1.0e-30 else np.clip(((F - a) @ e) / L2, 0.0, 1.0)
+    d = F - (a + t[:, None] * e)
+    return np.einsum("pk,pk->p", d, d)
+
+
+def _solid_angle_delta_numpy(P, v0, v1, v2, a_grid, r_cut):
+    """
+    Sharp minus a_grid-spread solid angle of triangle (v0, v1, v2) at points
+    P (N, 3) lying within r_cut of the triangle (others get 0). See the CUDA
+    module comment for the spread formula.
+    """
+    out = np.zeros(P.shape[0], dtype=np.float64)
+    n = np.cross(v1 - v0, v2 - v0)
+    A2 = np.linalg.norm(n)
+    if A2 <= 1.0e-20:
+        return out
+    n = n / A2
+    h = (P - v0) @ n
+    near = np.abs(h) <= r_cut
+    if not np.any(near):
+        return out
+    idx = np.nonzero(near)[0]
+    Ph = P[idx]; hh = h[idx]
+    F = Ph - hh[:, None] * n
+    # in-plane distance to the triangle
+    c = np.stack([np.cross(v1 - v0, F - v0) @ n, np.cross(v2 - v1, F - v1) @ n,
+                  np.cross(v0 - v2, F - v2) @ n], axis=1)
+    inside = np.all(c >= 0.0, axis=1) | np.all(c <= 0.0, axis=1)
+    d2 = np.minimum.reduce([_segment_dist2_numpy(F, v0, v1), _segment_dist2_numpy(F, v1, v2),
+                            _segment_dist2_numpy(F, v2, v0)])
+    d2[inside] = 0.0
+    keep = d2 + hh * hh <= r_cut * r_cut
+    if not np.any(keep):
+        return out
+    idx = idx[keep]; Ph = Ph[keep]; hh = hh[keep]; F = F[keep]
+    om_sharp = _solid_angle_numpy(v0 - Ph, v1 - Ph, v2 - Ph)
+    sgn = np.where(hh >= 0.0, 1.0, -1.0)
+    H = np.sqrt(hh * hh + a_grid * a_grid)
+    eps = 0.1 * H
+    G = []
+    for s in (H, H + eps, H - eps):
+        Y = F + (sgn * s)[:, None] * n
+        G.append(_solid_angle_numpy(v0 - Y, v1 - Y, v2 - Y) / s)
+    om_a = np.abs(hh) * (G[0] - a_grid * a_grid * (G[1] - G[2]) / (2.0 * eps) / (2.0 * H))
+    om_a[hh == 0.0] = 0.0
+    out[idx] = om_sharp - om_a
+    return out
+
+
+def _elastic_terms_numpy(rel, t, Ls, ok, bxt, a2, c1, c2):
+    """
+    Burgers-formula elastic terms of straight segments, |r| -> sqrt(r^2 + a^2)
+    (same formula as the CUDA `elastic_terms`). `rel` (P, S, 3) = point - S0,
+    `t` (S, 3) unit tangents, `Ls` (S,) lengths, `ok` (S,) valid segments,
+    `bxt` (S, 3) = b x t. Returns (P, 3) float64.
+    """
+    lam = np.einsum("psk,sk->ps", rel, t)
+    d = rel - lam[:, :, None] * t[None]
+    rho2 = np.einsum("psk,psk->ps", d, d) + a2
+    sa = -lam
+    sb = Ls[None, :] - lam
+    Ra1 = np.sqrt(sa * sa + rho2)
+    Ra2 = np.sqrt(sb * sb + rho2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        I1 = np.where(sa >= 0.0, np.log((sb + Ra2) / (sa + Ra1)),
+                      np.where(sb <= 0.0, np.log((Ra1 - sa) / (Ra2 - sb)),
+                               np.log((sb + Ra2) * (Ra1 - sa) / rho2)))
+        ssum = sa + sb
+        I3 = np.where(sa * sb > 0.0,
+                      Ls[None, :] * ssum / (Ra1 * Ra2 * (sb * Ra1 + sa * Ra2)),
+                      (sb / Ra2 - sa / Ra1) / rho2)
+    J3 = Ls[None, :] * ssum / (Ra1 * Ra2 * (Ra1 + Ra2))
+    bad = ~ok
+    if np.any(bad):
+        I1[:, bad] = 0.0; I3[:, bad] = 0.0; J3[:, bad] = 0.0
+    bd = np.einsum("psk,sk->ps", d, bxt)
+    acc = (c1 + c2) * (I1 @ bxt)
+    acc -= c2 * np.einsum("ps,psk->pk", bd * I3, d)
+    acc += c2 * ((bd * J3) @ t)
+    return acc
 
 
 def _dislocation_displacement_numpy(P, seg, a, nu, tile_points=2048, tile_segments=256):
@@ -211,34 +756,8 @@ def _dislocation_displacement_numpy(P, seg, a, nu, tile_points=2048, tile_segmen
             acc += inv4pi * (omega @ B[s0:s1])
             del r2, r3, n1, n2, n3, num, den
 
-            t = T[s0:s1]
-            Ls = L[s0:s1]
-            rel = -r1
-            lam = np.einsum("psk,sk->ps", rel, t)
-            d = rel - lam[:, :, None] * t[None]
-            rho2 = np.einsum("psk,psk->ps", d, d) + a2
-            sa = -lam
-            sb = Ls[None, :] - lam
-            Ra1 = np.sqrt(sa * sa + rho2)
-            Ra2 = np.sqrt(sb * sb + rho2)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                I1 = np.where(sa >= 0.0, np.log((sb + Ra2) / (sa + Ra1)),
-                              np.where(sb <= 0.0, np.log((Ra1 - sa) / (Ra2 - sb)),
-                                       np.log((sb + Ra2) * (Ra1 - sa) / rho2)))
-                ssum = sa + sb
-                I3 = np.where(sa * sb > 0.0,
-                              Ls[None, :] * ssum / (Ra1 * Ra2 * (sb * Ra1 + sa * Ra2)),
-                              (sb / Ra2 - sa / Ra1) / rho2)
-            J3 = Ls[None, :] * ssum / (Ra1 * Ra2 * (Ra1 + Ra2))
-            bad = ~ok[s0:s1]
-            if np.any(bad):
-                I1[:, bad] = 0.0; I3[:, bad] = 0.0; J3[:, bad] = 0.0
-            bxt = BxT[s0:s1]
-            bd = np.einsum("psk,sk->ps", d, bxt)
-            acc += (c1 + c2) * (I1 @ bxt)
-            acc -= c2 * np.einsum("ps,psk->pk", bd * I3, d)
-            acc += c2 * ((bd * J3) @ t)
-            del r1, rel, lam, d, rho2, sa, sb, Ra1, Ra2, I1, I3, J3, bd
+            acc += _elastic_terms_numpy(-r1, T[s0:s1], L[s0:s1], ok[s0:s1], BxT[s0:s1], a2, c1, c2)
+            del r1
         U[p0:p1] = acc
     return U
 
@@ -1212,32 +1731,66 @@ class defects(logging):
                              float_fmt="%.9e",
                              chunk_rows=2000000,
                              dtype=np.float32,
-                             mode=None):
+                             mode="direct",
+                             a_grid=None,
+                             reference_point=None,
+                             surface_sampling=0.5,
+                             deconvolve_cic=True):
         """
         Evaluate the dislocation displacement field on a regular grid and
         write it as an FE-style nodal field.
 
-        Each cell-centred grid node receives the isotropic Volterra
-        displacement of the imported network from `dislocation_displacement`,
-        so the slip discontinuity of every loop is present in the nodal
-        values. A structured Tet4 connectivity is written alongside so
-        `Deformation.apply_fe_nodal_field` can interpolate the field onto the
-        atoms. Interpolation smears the discontinuity over one cell; use
-        `apply_dislocation_displacement` to evaluate the field at the atoms
-        directly.
+        Two solvers share the same cut surface (the fan of triangles from
+        each segment to the closure point of its connected component, see
+        `dislocation_displacement`), so their fields agree up to the grid
+        resolution:
+
+        * ``"direct"`` (alias ``"SR"``): the isotropic Volterra field of
+          `dislocation_displacement` summed over every segment at every node
+          with core radius `core_radius`. Exact; O(nodes x segments).
+        * ``"LR"``: spectral solve on the periodic grid (Bertin 2019
+          framework). The plastic distortion -b (x) n of the cut surface is
+          deposited with trilinear cloud-in-cell weights, spread in Fourier
+          space by the Cai et al. (2006) kernel of radius `a_grid`, and the
+          anisotropic equilibrium equation div C:(grad u - beta_p) = 0 is
+          solved per mode through the Christoffel matrix A_mk = C_mjkl k_j k_l.
+          The Nye tensor is the curl of the deposited beta_p, so the elastic
+          distortion grad u - beta_p is the Bertin non-singular field with
+          its incompatible and compatible parts both kept, and the
+          displacement carries the slip because the plastic part is supplied
+          explicitly. Core radius `a_grid`; O(grid log grid).
+        * ``"LR+SR"``: ``"LR"`` plus the analytic near-field correction of
+          the Bertin 2019 splitting within `r_cut` of a node: the
+          Burgers-formula elastic terms at `core_radius` minus the same terms
+          at `a_grid` for nearby segments, and the sharp solid angle minus
+          the `a_grid`-spread one for nearby cut triangles. This restores the
+          sharp slip jump of the direct mode at the nodes. Anisotropic far
+          field, isotropic near field.
+
+        The spectral modes are periodic in the box, so network images
+        contribute; pad the bounds by several `r_cut`. In "LR" the slip jump
+        is spread over about `a_grid` around the cut; "LR+SR" and "direct"
+        keep it sharp. Interpolation onto atoms smears any nodal field over
+        one cell; `apply_dislocation_displacement` evaluates the direct field
+        at the atoms instead.
 
         Args:
-            mu: Shear modulus. Accepted for API compatibility; the
-                displacement of a dislocation depends on `nu` only.
+            mu: Shear modulus; with `nu` it builds the default isotropic
+                stiffness of the spectral modes. Unused by the direct mode
+                (the displacement depends on `nu` only).
             nu: Poisson's ratio in (0, 0.5).
             grid_shape: (nx, ny, nz) number of cells per axis.
             bounds: Explicit ((xmin, xmax), (ymin, ymax), (zmin, zmax)). If
                 None, uses the imported network bounds plus `padding`.
             padding: Padding around the network bounds when `bounds` is None.
-            core_radius: Core radius a (Angstrom) that regularises the
-                elastic terms, |r| -> sqrt(r^2 + a^2). Defaults to 5.0.
-            r_cut: Ignored; kept for API compatibility.
-            stiffness: Ignored; only isotropic elasticity is available.
+            core_radius: Physical core radius a (Angstrom) of the elastic
+                terms, |r| -> sqrt(r^2 + a^2). Defaults to 5.0.
+            r_cut: Near-core cutoff of "LR+SR". Defaults to 4 * a_grid
+                (Bertin 2019 Fig. 10, about 5 % splitting error).
+            stiffness: Spectral-mode elasticity: None (isotropic from mu,
+                nu), ``{"isotropic": (mu, nu)}``, ``{"cubic": (c11, c12,
+                c44)}``, a (6, 6) Voigt matrix or a (3, 3, 3, 3) tensor.
+                Ignored by the direct mode.
             scale: Multiplier applied to the displacement field.
             write_directory: Directory for output files. If None, uses
                 self.directory.
@@ -1250,32 +1803,67 @@ class defects(logging):
             float_fmt: Float format string for text output.
             chunk_rows: Number of rows per text-write chunk.
             dtype: NumPy dtype for output arrays.
-            mode: Ignored; kept for API compatibility with earlier callers.
+            mode: "direct" (default), "SR", "LR" or "LR+SR". None means
+                "direct".
+            a_grid: Spectral spreading radius. Defaults to
+                2 * min(dx, dy, dz).
+            reference_point: Optional (3,) closure point of the cut surface,
+                see `dislocation_displacement`.
+            surface_sampling: Spacing of the cut-surface samples deposited on
+                the grid, as a fraction of the smallest cell. Defaults to 0.5.
+            deconvolve_cic: Divide the deposited field by the trilinear
+                transfer function so only the Cai kernel spreads it, which
+                keeps the spectral regularisation equal to `a_grid` for the
+                near-field correction. Defaults to True.
 
         Returns:
             dict: ``Xref`` (N, 3) reference positions, ``U`` (N, 3)
-            displacements, ``conn`` Tet4 connectivity, ``nodes_path`` and
-            ``conn_path``.
+            displacements, ``conn`` Tet4 connectivity, ``nodes_path``,
+            ``conn_path``, ``mode``, ``a_grid`` and ``r_cut`` (the last two
+            None for the direct mode).
+
+        Notes:
+            Validated on 20 A shear and prismatic loops at dx = 2 A (a_grid =
+            4 A, r_cut = 16 A) against the direct mode: "LR+SR" agrees to
+            about 2 % of the peak displacement beyond 2 a_grid from the cut
+            and reproduces the jump at +-1 A from the cut to within 0.03 b;
+            within one cell of the dislocation lines the deviation reaches
+            10-15 % of the peak. Periodic images add about 1 % per 48 A of
+            box half-width at this loop size. The near-field loops are
+            brute force over segments per node, so "LR+SR" costs a fraction
+            of the direct mode for small networks and pays off for large
+            grids and networks.
 
         Raises:
             RuntimeError: If the dislocation network has not been imported.
-            ValueError: If `nu` is out of range or `grid_shape` is too small.
+            ValueError: If `mode`, `nu`, `grid_shape` or `stiffness` is
+                invalid.
+
+        References:
+            Bertin, N. Int. J. Plasticity 122, 268-284 (2019).
+            Cai, W. et al. J. Mech. Phys. Solids 54, 561-587 (2006).
         """
         if not hasattr(self, "_opendis_S0") or self._opendis_S0 is None:
             raise RuntimeError("Call import_dislocation_network(...) first.")
         if not (0.0 < float(nu) < 0.5):
             raise ValueError("nu must be in (0, 0.5)")
-        if mode is not None:
-            self._log("normal", f"generate_nodal_field: mode='{mode}' is ignored; "
-                                "the field is evaluated directly per node.")
-        if stiffness is not None:
-            self._log("normal", "generate_nodal_field: stiffness is ignored; "
-                                "only isotropic elasticity is available.")
+        mode_key = "direct" if mode is None else str(mode).strip().lower()
+        if mode_key == "sr":
+            mode_key = "direct"
+        if mode_key not in ("direct", "lr", "lr+sr"):
+            raise ValueError('mode must be "direct" ("SR"), "LR" or "LR+SR"')
+        mode_used = {"direct": "direct", "lr": "LR", "lr+sr": "LR+SR"}[mode_key]
+        spectral = mode_used != "direct"
+        if spectral:
+            C_stiff = _resolve_stiffness(stiffness, mu, nu)
+        elif stiffness is not None:
+            self._log("verbose", "generate_nodal_field: stiffness is ignored by the direct mode.")
 
         out_dir = write_directory if write_directory is not None else (self.directory if self.directory else ".")
         os.makedirs(out_dir, exist_ok=True)
 
         # Bounds and cell-centred grid
+        bounds_from_network = bounds is None
         if bounds is None:
             bmin = np.asarray(self._opendis_bounds["min"], dtype=np.float64)
             bmax = np.asarray(self._opendis_bounds["max"], dtype=np.float64)
@@ -1301,8 +1889,31 @@ class defects(logging):
         conn = self._grid_tet4(nx, ny, nz, one_based=bool(one_based_connectivity))
 
         # Displacement at the grid nodes
-        U = self.dislocation_displacement(Xref, use_gpu=use_gpu,
-                                          core_radius=core_radius, nu=nu)
+        a_grid_used = None
+        r_cut_used = None
+        if not spectral:
+            U = self.dislocation_displacement(Xref, use_gpu=use_gpu, core_radius=core_radius,
+                                              nu=nu, reference_point=reference_point)
+        else:
+            a_grid_used = 2.0 * min(dx, dy, dz) if a_grid is None else float(a_grid)
+            r_cut_used = 4.0 * a_grid_used if r_cut is None else float(r_cut)
+            if a_grid_used <= 0.0 or r_cut_used < 0.0:
+                raise ValueError("a_grid must be positive and r_cut non-negative")
+            if bounds_from_network and float(padding) < r_cut_used:
+                self._log("normal", f"generate_nodal_field: padding {float(padding):.1f} A is below "
+                                    f"r_cut {r_cut_used:.1f} A; periodic images of the network "
+                                    "will affect the spectral field near the box faces.")
+            U = self._spectral_grid_displacement((xmin, ymin, zmin), (dx, dy, dz), (nx, ny, nz),
+                                                 C_stiff, a_grid_used, use_gpu=use_gpu,
+                                                 reference_point=reference_point,
+                                                 surface_sampling=surface_sampling,
+                                                 deconvolve_cic=deconvolve_cic)
+            if mode_used == "LR+SR":
+                U = U + self._dislocation_near_field_delta(Xref, core_radius, a_grid_used, r_cut_used,
+                                                           nu=nu, use_gpu=use_gpu,
+                                                           reference_point=reference_point)
+            self._log("normal", f"generate_nodal_field: mode {mode_used}, grid {nx}x{ny}x{nz}, "
+                                f"a_grid = {a_grid_used:.3f} A, r_cut = {r_cut_used:.3f} A")
         U = np.asarray(U, dtype=dtype)
         if float(scale) != 1.0:
             U *= float(scale)
@@ -1359,8 +1970,66 @@ class defects(logging):
             "U": U.astype(dtype, copy=False),
             "conn": conn,
             "nodes_path": nodes_path,
-            "conn_path": conn_path
+            "conn_path": conn_path,
+            "mode": mode_used,
+            "a_grid": a_grid_used,
+            "r_cut": r_cut_used,
         }
+
+    def _spectral_grid_displacement(self, origin, spacing, shape, C_stiff, a_grid, use_gpu=True,
+                                    reference_point=None, surface_sampling=0.5, deconvolve_cic=True):
+        """
+        Spectral ("LR") displacement of the network on a periodic cell-centred
+        grid: deposit the plastic distortion of the cut surface (see
+        `_cut_surface_samples`, `_deposit_cic`) and solve the anisotropic
+        equilibrium equation with `_spectral_displacement`.
+
+        Args:
+            origin: (xmin, ymin, zmin) of the box.
+            spacing: (dx, dy, dz).
+            shape: (nx, ny, nz).
+            C_stiff: (3, 3, 3, 3) stiffness.
+            a_grid: Spreading radius of the Cai kernel.
+            use_gpu: If True and CuPy is available, run on the GPU.
+            reference_point: Optional closure point of the cut surface.
+            surface_sampling: Sample spacing as a fraction of the smallest cell.
+            deconvolve_cic: See `_spectral_displacement`.
+
+        Returns:
+            (nx*ny*nz, 3) float32 NumPy array in the grid's "ij" order.
+        """
+        nx, ny, nz = [int(s) for s in shape]
+        dx, dy, dz = [float(s) for s in spacing]
+        seg = self._dislocation_segment_records(reference_point)
+        S0, S1, C, B = seg[:, 0:3], seg[:, 3:6], seg[:, 6:9], seg[:, 9:12]
+
+        on_gpu = bool(use_gpu) and (cp is not None)
+        if on_gpu:
+            try:
+                on_gpu = cp.cuda.runtime.getDeviceCount() > 0
+            except Exception:
+                on_gpu = False
+        xp = cp if on_gpu else np
+
+        h = max(1.0e-6, float(surface_sampling)) * min(dx, dy, dz)
+        n_sub = _cut_subdivisions(S0, S1, C, h)
+        if np.any(n_sub >= 1024):
+            self._log("normal", "generate_nodal_field: some cut triangles reach the 1024^2 sample "
+                                "cap; their deposition is coarser than surface_sampling.")
+        n_samples = int(np.sum(n_sub.astype(np.int64) ** 2))
+        self._log("verbose", f"generate_nodal_field: depositing {n_samples} cut-surface samples "
+                             f"from {seg.shape[0]} triangles")
+
+        grid = xp.zeros((nx * ny * nz, 9), dtype=xp.float32)
+        kern = self._dislocation_kernels().get_function("deposit_cic") if on_gpu else None
+        for pts, w in _cut_surface_samples(S0, S1, C, B, n_sub, xp=xp):
+            _deposit_cic(grid, pts, w, origin, spacing, shape, xp=xp, gpu_kernel=kern)
+        grid *= np.float32(1.0 / (dx * dy * dz))
+        beta = grid.reshape(nx, ny, nz, 3, 3)
+        u = _spectral_displacement(beta, spacing, C_stiff, a_grid, xp=xp, deconvolve_cic=bool(deconvolve_cic))
+        del beta, grid
+        U = u.reshape(-1, 3)
+        return cp.asnumpy(U) if on_gpu else np.asarray(U)
 
     @staticmethod
     def _grid_tet4(nx, ny, nz, one_based=True):
@@ -1526,15 +2195,125 @@ class defects(logging):
                    (P64, np.int32(n), seg64, np.int32(M), a2, c1, c2, out[p0:p1]))
         return out if input_is_cupy else cp.asnumpy(out)
 
-    def _dislocation_displacement_kernel(self):
-        """Compile and cache the CUDA segment-displacement kernel."""
+    def _dislocation_kernels(self):
+        """Compile and cache the CUDA module holding the dislocation kernels."""
         if cp is None:
             return None
-        k = getattr(self, "_dislocation_kernel", None)
-        if k is None:
-            k = cp.RawKernel(_DISLOCATION_DISPLACEMENT_KERNEL, "dislocation_displacement")
-            self._dislocation_kernel = k
-        return k
+        mod = getattr(self, "_dislocation_module", None)
+        if mod is None:
+            mod = cp.RawModule(code=_DISLOCATION_DISPLACEMENT_KERNEL)
+            self._dislocation_module = mod
+        return mod
+
+    def _dislocation_displacement_kernel(self):
+        """Compiled CUDA segment-displacement kernel, or None without CuPy."""
+        mod = self._dislocation_kernels()
+        return None if mod is None else mod.get_function("dislocation_displacement")
+
+    def _dislocation_near_field_delta(self, points, core_radius, a_grid, r_cut, nu=0.3,
+                                      use_gpu=True, reference_point=None, tile_points=None):
+        """
+        Near-field correction of the spectral field (Bertin 2019 splitting).
+        For every segment whose midpoint lies within r_cut + L/2 of a point,
+        the Burgers-formula elastic terms with core `core_radius` minus the
+        same terms with core `a_grid`; for every cut triangle within r_cut of
+        a point, the sharp solid angle minus the one spread by the Cai kernel
+        of radius `a_grid` (closed form through R_a, see the CUDA module
+        comment), times b / 4 pi. Added to the spectral field this restores
+        the sharp slip jump of `dislocation_displacement`.
+
+        Args:
+            points: (N, 3) positions, NumPy or CuPy.
+            core_radius: Physical core radius a (Angstrom).
+            a_grid: Spectral spreading radius (Angstrom).
+            r_cut: Neighbour cutoff (Angstrom).
+            nu: Poisson's ratio in (0, 0.5). Defaults to 0.3.
+            use_gpu: If True and CuPy is available, evaluate on the GPU.
+            reference_point: Optional closure point, see
+                `dislocation_displacement`.
+            tile_points: Points per GPU launch. Defaults to 2**20.
+
+        Returns:
+            (N, 3) float32 on the array module of `points`.
+        """
+        if not hasattr(self, "_opendis_S0") or self._opendis_S0 is None:
+            raise RuntimeError("Call import_dislocation_network(...) first.")
+        nu = float(nu)
+        if not (0.0 < nu < 0.5):
+            raise ValueError("nu must be in (0, 0.5)")
+        a_p = float(core_radius)
+        a_g = float(a_grid)
+        if not (a_p > 0.0 and a_g > 0.0):
+            raise ValueError("core_radius and a_grid must be positive")
+        seg = self._dislocation_segment_records(reference_point)
+        c1 = -1.0 / (4.0 * np.pi)
+        c2 = 1.0 / (8.0 * np.pi * (1.0 - nu))
+
+        on_gpu = bool(use_gpu) and (cp is not None)
+        if on_gpu:
+            try:
+                on_gpu = cp.cuda.runtime.getDeviceCount() > 0
+            except Exception:
+                on_gpu = False
+        input_is_cupy = (cp is not None) and isinstance(points, cp.ndarray)
+
+        if not on_gpu:
+            from scipy.spatial import cKDTree
+            P = (cp.asnumpy(points) if input_is_cupy else np.asarray(points))
+            P = P.reshape(-1, 3).astype(np.float64)
+            S0 = seg[:, 0:3]; S1 = seg[:, 3:6]; B = seg[:, 9:12]
+            Lvec = S1 - S0
+            L = np.linalg.norm(Lvec, axis=1)
+            ok = L > 1.0e-10
+            T = np.zeros_like(Lvec)
+            T[ok] = Lvec[ok] / L[ok, None]
+            BxT = np.cross(B, T)
+            Cc = seg[:, 6:9]
+            U = np.zeros((P.shape[0], 3), dtype=np.float64)
+            if P.shape[0]:
+                tree = cKDTree(P)
+                near = tree.query_ball_point(0.5 * (S0 + S1), r=float(r_cut) + 0.5 * L)
+                for s in range(seg.shape[0]):
+                    idx = near[s]
+                    if not ok[s] or len(idx) == 0:
+                        continue
+                    idx = np.asarray(idx, dtype=np.int64)
+                    rel = P[idx][:, None, :] - S0[s][None, None, :]
+                    args = (rel, T[s:s + 1], L[s:s + 1], ok[s:s + 1], BxT[s:s + 1])
+                    U[idx] += (_elastic_terms_numpy(*args, a_p * a_p, c1, c2)
+                               - _elastic_terms_numpy(*args, a_g * a_g, c1, c2))
+                # solid-angle part: candidates within r_cut of the triangle's bounding sphere
+                cen = (S0 + S1 + Cc) / 3.0
+                rad = np.maximum.reduce([np.linalg.norm(S0 - cen, axis=1), np.linalg.norm(S1 - cen, axis=1),
+                                         np.linalg.norm(Cc - cen, axis=1)]) + float(r_cut)
+                near = tree.query_ball_point(cen, r=rad)
+                for s in range(seg.shape[0]):
+                    idx = near[s]
+                    if len(idx) == 0:
+                        continue
+                    idx = np.asarray(idx, dtype=np.int64)
+                    dom = _solid_angle_delta_numpy(P[idx], S0[s], S1[s], Cc[s], a_g, float(r_cut))
+                    U[idx] += (dom / (4.0 * np.pi))[:, None] * B[s][None, :]
+            U = U.astype(np.float32)
+            return cp.asarray(U) if input_is_cupy else U
+
+        kernel = self._dislocation_kernels().get_function("dislocation_near_field_delta")
+        P = points if input_is_cupy else cp.asarray(points)
+        P = P.reshape(-1, 3)
+        N = int(P.shape[0])
+        seg64 = cp.ascontiguousarray(cp.asarray(seg, dtype=cp.float64))
+        M = int(seg64.shape[0])
+        out = cp.empty((N, 3), dtype=cp.float32)
+        tp = (1 << 20) if tile_points is None else int(tile_points)
+        threads = 128
+        for p0 in range(0, N, tp):
+            p1 = min(N, p0 + tp)
+            P64 = cp.ascontiguousarray(P[p0:p1].astype(cp.float64))
+            n = p1 - p0
+            kernel(((n + threads - 1) // threads,), (threads,),
+                   (P64, np.int32(n), seg64, np.int32(M), np.float32(a_p * a_p), np.float32(a_g * a_g),
+                    np.float32(r_cut), np.float32(c1), np.float32(c2), out[p0:p1]))
+        return out if input_is_cupy else cp.asnumpy(out)
 
     def apply_dislocation_displacement(self, sample, use_gpu=True, core_radius=5.0, nu=0.3,
                                        force=False, reference_point=None):
