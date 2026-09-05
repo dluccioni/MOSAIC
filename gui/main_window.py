@@ -51,6 +51,7 @@ try:
     from gui.panels.simulation_method_panel import SimulationMethodPanel
     from gui.panels.run_simulation_panel import RunSimulationPanel
     from gui.panels.global_working_directory_panel import GlobalWorkingDirectoryPanel
+    from gui.panels.hardware_panel import HardwarePanel
     from gui.inspectors.crystal_inspector import CrystalInspector
     from gui.inspectors.sample_inspector import SampleInspector
     from gui.inspectors.beam_inspector import BeamInspector
@@ -71,6 +72,7 @@ except ImportError:
     from panels.simulation_method_panel import SimulationMethodPanel
     from panels.run_simulation_panel import RunSimulationPanel
     from panels.global_working_directory_panel import GlobalWorkingDirectoryPanel
+    from panels.hardware_panel import HardwarePanel
     from inspectors.crystal_inspector import CrystalInspector
     from inspectors.sample_inspector import SampleInspector
     from inspectors.beam_inspector import BeamInspector
@@ -239,6 +241,16 @@ class MainWindow(QMainWindow):
         # Stack run simulation below simulation method
         self.splitDockWidget(self.sim_method_dock, self.run_sim_dock, Qt.Vertical)
 
+        # Hardware profile: machine, memory budgets, calibration (tab next to Run)
+        self.hardware_dock = QDockWidget("Hardware", self)
+        self.hardware_dock.setObjectName("HardwareDock")
+        self.hardware_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.hardware_panel = HardwarePanel(self.state)
+        self.hardware_dock.setWidget(self.hardware_panel)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.hardware_dock)
+        self.tabifyDockWidget(self.run_sim_dock, self.hardware_dock)
+        self.run_sim_dock.raise_()
+
         # Connect simulation panel signals
         self.run_simulation_panel.simulation_started.connect(self._on_simulation_started)
         self.run_simulation_panel.simulation_finished.connect(self._on_simulation_finished)
@@ -391,6 +403,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.object_browser_dock.toggleViewAction())
         view_menu.addAction(self.inspector_dock.toggleViewAction())
         view_menu.addAction(self.console_dock.toggleViewAction())
+        view_menu.addAction(self.hardware_dock.toggleViewAction())
 
         view_menu.addSeparator()
 
