@@ -3926,6 +3926,12 @@ class defects(logging):
                 "fault_gap": float(self.fault_gap),
             }
             _check_modification(sample, self.directory, "stacking_fault", params, force)
+            # apply_stacking_fault_chunk reads the sorted-position and
+            # orientation-prefix tables, not global_fault_positions itself.
+            # generate_global_positions builds them, so any caller that sets
+            # the positions afterwards would otherwise be silently ignored.
+            if self.global_fault_positions is not None:
+                self._prepare_fault_tables(use_gpu=(cp is not None and use_gpu))
             for i in range(sample.chunk_total):
                 if cp is not None and use_gpu:
                     positions_chunk_cp = sample.load_chunk_positions(i+1,use_gpu=True, raw=True)
